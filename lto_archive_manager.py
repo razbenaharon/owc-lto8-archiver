@@ -11,10 +11,10 @@ from datetime import datetime
 from collections import defaultdict
 
 # ==============================================================================
-# LTO ARCHIVE MANAGEMENT SYSTEM (LAMS) v5.0
+# LTO ARCHIVE MANAGEMENT SYSTEM
 # ==============================================================================
 
-BUFFER_SIZE = 1024 * 1024 * 16  # 16 MB read buffer
+BUFFER_SIZE = 1024 * 1024 * 128  # 128 MB read buffer
 CONFIG_FILE  = "config.ini"
 LTFS_DIR     = r'C:\Program Files\IBM\LTFS'  # IBM LTFS tools must run from this directory
 
@@ -906,6 +906,27 @@ class TapeManager:
         except FileNotFoundError:
             print(f"[ERROR] LtfsCmdDrives.exe not found in: {LTFS_DIR}")
 
+    def eject_tape(self):
+        """Run LtfsCmdEject.exe to safely eject the tape."""
+        drive_arg = self.tape_drive.rstrip(":\\")
+        exe       = os.path.join(LTFS_DIR, 'LtfsCmdEject.exe')
+        cmd       = [exe, drive_arg]
+        print("\n" + "#" * 60)
+        print("[LTO] Ejecting tape...")
+        print("[LTO] PLEASE WAIT — this can take 1-2 minutes.")
+        print("#" * 60)
+        try:
+            result = subprocess.run(cmd, check=True, text=True, capture_output=True,
+                                    cwd=LTFS_DIR)
+            print("[LTO] Tape ejected successfully!")
+            if result.stdout:
+                print(result.stdout)
+        except subprocess.CalledProcessError as e:
+            print(f"[ERROR] Eject failed: {e.stderr}")
+            print(f"Try manually: cd /d \"{LTFS_DIR}\" && LtfsCmdEject.exe {drive_arg}")
+        except FileNotFoundError:
+            print(f"[ERROR] LtfsCmdEject.exe not found in: {LTFS_DIR}")
+
 
 # ==============================================================================
 # ARCHIVER WORKFLOW (ties together Analyzer, Packer, Backup)
@@ -1002,6 +1023,7 @@ def main():
             print("3. List available drives")
             print("4. Check tape         (LtfsCmdCheck.exe — repair filesystem errors)")
             print("5. Tape drives info   (LtfsCmdDrives.exe — list drives & status)")
+            print("6. Eject tape         (LtfsCmdEject.exe — safely eject tape)")
             print("0. Back")
             sub = input("Choose: ").strip()
             if sub == '1':
@@ -1014,6 +1036,8 @@ def main():
                 tape_mgr.check_tape()
             elif sub == '5':
                 tape_mgr.tape_info()
+            elif sub == '6':
+                tape_mgr.eject_tape()
 
         elif choice == '4':
             tapes = db.list_tapes()
