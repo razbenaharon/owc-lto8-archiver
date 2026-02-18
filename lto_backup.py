@@ -107,7 +107,8 @@ class DatabaseManager:
                 tape_id        INTEGER PRIMARY KEY AUTOINCREMENT,
                 volume_label   TEXT    UNIQUE NOT NULL,
                 date_formatted DATETIME,
-                total_capacity INTEGER
+                total_capacity INTEGER,
+                used_space     INTEGER DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS files_index (
                 file_id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,6 +125,12 @@ class DatabaseManager:
             );
         """)
         self.conn.commit()
+        # Migrate existing DB: add used_space if missing
+        try:
+            self.conn.execute("ALTER TABLE tapes ADD COLUMN used_space INTEGER DEFAULT 0")
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
     def register_tape(self, volume_label, capacity_gb=None):
         try:
@@ -160,7 +167,10 @@ class DatabaseManager:
         params = []
         if name_query:
             sql += " AND file_name LIKE ?"
-            params.append(name_query.replace('*', '%').replace('?', '_'))
+            pattern = name_query.replace('*', '%').replace('?', '_')
+            if '%' not in pattern and '_' not in pattern:
+                pattern = f'%{pattern}%'
+            params.append(pattern)
         if date_from:
             sql += " AND backup_date >= ?"
             params.append(date_from)
@@ -174,6 +184,13 @@ class DatabaseManager:
         return self.conn.execute(
             "SELECT * FROM files_index WHERE file_id = ?", (file_id,)
         ).fetchone()
+
+    def update_tape_used_space(self, volume_label, bytes_added):
+        self.conn.execute(
+            "UPDATE tapes SET used_space = COALESCE(used_space, 0) + ? WHERE volume_label = ?",
+            (bytes_added, volume_label)
+        )
+        self.conn.commit()
 
     def list_tapes(self):
         return self.conn.execute(
@@ -518,6 +535,9 @@ class LTOBackup:
                     packed_count += 1
             print(f"[DB] {packed_count} packed file records committed.")
 
+        if summary['bytes'] > 0:
+            self.db.update_tape_used_space(tape_label, summary['bytes'])
+
         total_time = time.time() - total_start
         print("\n" + "=" * 60)
         print("BACKUP SESSION SUMMARY")
@@ -682,8 +702,8 @@ class TapeManager:
         print(f"Target drive: {self.tape_drive}")
         print("=" * 60)
         print("WARNING: This will ERASE ALL DATA on the current tape.")
-        print('Type  ERASE  to confirm (or press Enter to cancel):')
-        if input(">> ").strip() != "ERASE":
+        print('Type  y  to confirm (or press Enter to cancel):')
+        if input(">> ").strip().lower() != "y":
             print("[ABORTED] Format cancelled.")
             return
 
@@ -869,12 +889,24 @@ def main():
             if not tapes:
                 print("[DB] No tapes registered yet.")
             else:
-                print(f"\n{'ID':>4}  {'Volume Label':<25}  {'Initialized':<20}  Capacity (GB)")
-                print("-" * 65)
+                BAR_W = 24
+                print(f"\n{'ID':>4}  {'Volume Label':<25}  {'Initialized':<19}  {'Used / Capacity':<22}  Space")
+                print("-" * 95)
                 for t in tapes:
-                    cap_s  = str(t['total_capacity']) if t['total_capacity'] else 'N/A'
-                    date_s = (t['date_formatted'] or '')[:19]
-                    print(f"{t['tape_id']:>4}  {t['volume_label']:<25}  {date_s:<20}  {cap_s}")
+                    date_s  = (t['date_formatted'] or '')[:19]
+                    cap_gb  = t['total_capacity']
+                    used_b  = t['used_space'] or 0
+                    used_gb = used_b / 1024**3
+
+                    if cap_gb:
+                        pct    = min(used_gb / cap_gb, 1.0)
+                        filled = round(pct * BAR_W)
+                        bar    = '█' * filled + '░' * (BAR_W - filled)
+                        space_s = f"[{bar}] {pct*100:.1f}%  {used_gb:.1f}/{cap_gb} GB"
+                    else:
+                        space_s = f"{used_gb:.1f} GB used  (no capacity set)"
+
+                    print(f"{t['tape_id']:>4}  {t['volume_label']:<25}  {date_s:<19}  {space_s}")
 
         elif choice == '5':
             cfg_abs = os.path.abspath(CONFIG_FILE)
