@@ -1,10 +1,12 @@
 import os
+import re
 import sys
 import time
 import shutil
 import hashlib
 import zipfile
 import sqlite3
+import threading
 import configparser
 import subprocess
 from datetime import datetime
@@ -14,7 +16,7 @@ from collections import defaultdict
 # LTO ARCHIVE MANAGEMENT SYSTEM
 # ==============================================================================
 
-BUFFER_SIZE = 1024 * 1024 * 128  # 128 MB read buffer
+BUFFER_SIZE = 1024 * 1024 * 16  # 128 MB read buffer
 CONFIG_FILE  = "config.ini"
 LTFS_DIR     = r'C:\Program Files\IBM\LTFS'  # IBM LTFS tools must run from this directory
 
@@ -34,6 +36,144 @@ def get_volume_label(drive_path):
     except Exception:
         pass
     return None
+
+
+def _hash_file(path):
+    """Compute SHA-256 hash of a file, reading in chunks."""
+    hasher = hashlib.sha256()
+    with open(path, 'rb') as f:
+        while True:
+            buf = f.read(BUFFER_SIZE)
+            if not buf:
+                break
+            hasher.update(buf)
+    return hasher.hexdigest()
+
+
+def _robocopy_file(src, dst, display_name=None):
+    """
+    Copy a single file using robocopy with unbuffered I/O.
+    Streams live transfer speed and progress to stdout while copying.
+    Returns True on success (robocopy exit code < 8).
+    """
+    src_dir  = os.path.dirname(os.path.abspath(src))
+    dst_dir  = os.path.dirname(os.path.abspath(dst))
+    filename = os.path.basename(src)
+    os.makedirs(dst_dir, exist_ok=True)
+
+    fsize = os.path.getsize(src)
+    label = display_name or filename
+    disp  = (label[:15] + '..' + label[-5:]) if len(label) > 22 else label
+
+    proc = subprocess.Popen(
+        ['robocopy', src_dir, dst_dir, filename,
+         '/J',    # unbuffered I/O — optimized for large files / tape
+         '/IS',   # include same files (always copy)
+         '/IT',   # include tweaked files (always copy)
+         '/R:3',  # retry 3 times on failure
+         '/W:10', # wait 10 s between retries
+         '/NP', '/NDL', '/NJH', '/NJS', '/NFL',
+        ],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+
+    # Monitor destination file growth to compute live MB/s
+    stop_evt = threading.Event()
+
+    def _monitor():
+        prev_size = 0
+        prev_time = time.time()
+        while not stop_evt.is_set():
+            time.sleep(0.5)
+            try:
+                cur_size = os.path.getsize(dst) if os.path.exists(dst) else 0
+            except OSError:
+                cur_size = 0
+            now     = time.time()
+            delta_t = now - prev_time
+            speed   = ((cur_size - prev_size) / 1024**2) / delta_t if delta_t > 0 else 0
+            pct     = (cur_size / fsize * 100) if fsize else 100
+            sys.stdout.write(f"\r[COPYING] {disp} | {min(pct, 100):.1f}% | {speed:.1f} MB/s   ")
+            sys.stdout.flush()
+            prev_size = cur_size
+            prev_time = now
+
+    t = threading.Thread(target=_monitor, daemon=True)
+    t.start()
+    proc.wait()
+    stop_evt.set()
+    t.join(timeout=2)
+
+    # robocopy exit codes < 8 indicate success (0=nothing done, 1=ok, 2-7=ok+extras)
+    return proc.returncode < 8
+
+
+def _parse_robocopy_bytes(tokens, idx):
+    """
+    Consume one bytes value from a robocopy summary token list.
+    Handles both '4.52 g' (two tokens) and '1234567890' (one token).
+    Returns (bytes_int, next_idx).
+    """
+    if idx >= len(tokens):
+        return 0, idx
+    val = tokens[idx].replace(',', '')
+    idx += 1
+    if idx < len(tokens) and tokens[idx].lower() in ('k', 'm', 'g', 't'):
+        mult = {'k': 1024, 'm': 1024**2, 'g': 1024**3, 't': 1024**4}[tokens[idx].lower()]
+        idx += 1
+        try:
+            return int(float(val) * mult), idx
+        except ValueError:
+            return 0, idx
+    try:
+        return int(float(val)), idx
+    except ValueError:
+        return 0, idx
+
+
+def _parse_robocopy_summary(output):
+    """
+    Parse robocopy's captured stdout and return a dict with:
+      files_copied, files_skipped, files_failed,
+      bytes_copied, speed_mbs, elapsed
+    """
+    result = {
+        'files_copied': 0, 'files_skipped': 0, 'files_failed': 0,
+        'bytes_copied': 0, 'speed_mbs': 0.0, 'elapsed': '',
+    }
+    for line in output.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+
+        # "Files :  5  5  0  0  0  0"  (Total Copied Skipped Mismatch Failed Extras)
+        if parts[0] == 'Files' and len(parts) >= 7 and parts[1] == ':':
+            try:
+                result['files_copied']  = int(parts[3])
+                result['files_skipped'] = int(parts[4])
+                result['files_failed']  = int(parts[6])
+            except (ValueError, IndexError):
+                pass
+
+        # "Bytes :  4.52 g  4.52 g  0  0  0  0"
+
+        elif parts[0] == 'Bytes' and len(parts) >= 4 and parts[1] == ':':
+            _,          i = _parse_robocopy_bytes(parts, 2)  # total (skip)
+            bytes_copied, _ = _parse_robocopy_bytes(parts, i)
+            result['bytes_copied'] = bytes_copied
+
+        # "Speed :  59993856 Bytes/Sec."
+        elif parts[0] == 'Speed' and len(parts) >= 4 and parts[1] == ':' and 'bytes/sec' in parts[3].lower():
+            try:
+                result['speed_mbs'] = float(parts[2].replace(',', '')) / 1024**2
+            except (ValueError, IndexError):
+                pass
+
+        # "Times :  0:01:18  0:01:18  ..."
+        elif parts[0] == 'Times' and len(parts) >= 3 and parts[1] == ':':
+            result['elapsed'] = parts[2]
+
+    return result
 
 
 # ==============================================================================
@@ -145,6 +285,12 @@ class DatabaseManager:
         except sqlite3.IntegrityError:
             print(f"[DB] Tape '{volume_label}' is already in the database.")
             return False
+
+    def delete_tape(self, volume_label):
+        self.conn.execute("DELETE FROM files_index WHERE tape_label = ?", (volume_label,))
+        self.conn.execute("DELETE FROM tapes WHERE volume_label = ?", (volume_label,))
+        self.conn.commit()
+        print(f"[DB] Tape '{volume_label}' and its file records removed from database.")
 
     def tape_exists(self, volume_label):
         return bool(self.conn.execute(
@@ -375,8 +521,8 @@ class LTOPacker:
 
                     else:
                         dst_path = os.path.join(dest, rel)
-                        os.makedirs(os.path.dirname(os.path.abspath(dst_path)), exist_ok=True)
-                        shutil.copy2(src, dst_path)
+                        if not _robocopy_file(src, dst_path):
+                            raise RuntimeError(f"robocopy failed for: {src}")
                         total_loose += 1
 
                         metadata.append({
@@ -458,92 +604,139 @@ class LTOBackup:
                 if not m['is_packed']:
                     meta_by_rel[m['stored_path']] = m
 
-        summary     = {'ok': 0, 'skip': 0, 'fail': 0, 'bytes': 0}
         total_start = time.time()
+
+        # ---------------------------------------------------------------
+        # Phase 1 — Hash files that are new / changed since last backup
+        # ---------------------------------------------------------------
+        print("[BACKUP] Scanning and hashing files...")
+        # hash_map: rel_path -> {'hash', 'fsize', 'src', 'dst'}
+        hash_map = {}
+        skipped  = 0
 
         for root, _, files in os.walk(source):
             rel_folder  = os.path.relpath(root, source)
             dest_folder = os.path.join(tape_root, rel_folder)
-            os.makedirs(dest_folder, exist_ok=True)
-
             for file in files:
                 src      = os.path.join(root, file)
                 dst      = os.path.join(dest_folder, file)
                 rel_path = os.path.relpath(src, source)
-
-                # Skip if already on tape at the same size
+                # Already on tape at the same size → skip hashing
                 if os.path.exists(dst):
                     try:
                         if os.path.getsize(src) == os.path.getsize(dst):
-                            print(f"\r[SKIP] {file[:55]}", end="")
-                            summary['skip'] += 1
+                            skipped += 1
                             continue
                     except OSError:
                         pass
-
                 try:
-                    fsize  = os.path.getsize(src)
-                    hasher = hashlib.sha256()
-                    copied = 0
-                    start  = time.time()
-
-                    with open(src, 'rb') as fsrc, open(dst, 'wb') as fdst:
-                        while True:
-                            buf = fsrc.read(BUFFER_SIZE)
-                            if not buf:
-                                break
-                            hasher.update(buf)
-                            fdst.write(buf)
-                            copied += len(buf)
-
-                            elapsed = time.time() - start
-                            if elapsed > 0.5:
-                                speed = (copied / 1024**2) / elapsed
-                                pct   = (copied / fsize * 100) if fsize else 100
-                                disp  = (file[:15] + '..' + file[-5:]) if len(file) > 22 else file
-                                sys.stdout.write(f"\r[WRITING] {disp} | {pct:.1f}% | {speed:.1f} MB/s")
-                                sys.stdout.flush()
-
-                        fdst.flush()
-                        os.fsync(fdst.fileno())
-
-                    file_hash = hasher.hexdigest()
-                    summary['ok']    += 1
-                    summary['bytes'] += fsize
-                    sys.stdout.write(f"\r[OK] {file[:58]}\n")
-
-                    # --- DB INSERT ---
-                    is_bundle = file.startswith("Bundle_") and file.endswith(".zip")
-
-                    if packer_metadata is None:
-                        # Direct backup: every file is a loose tape record
-                        self.db.insert_file(
-                            file_name=file, original_path=src,
-                            file_size_bytes=fsize, file_hash=file_hash,
-                            tape_label=tape_label, is_packed=False,
-                            container_name=None, stored_path=dst,
-                        )
-
-                    elif packer_metadata:
-                        # Staged backup with full metadata
-                        if is_bundle:
-                            pass  # packed-file records handled in batch below
-                        elif rel_path in meta_by_rel:
-                            m = meta_by_rel[rel_path]
-                            self.db.insert_file(
-                                file_name=file, original_path=m['original_path'],
-                                file_size_bytes=fsize, file_hash=file_hash,
-                                tape_label=tape_label, is_packed=False,
-                                container_name=None, stored_path=dst,
-                            )
-                    # else: packer_metadata == [] (existing staging) -> no DB records
-
+                    fsize = os.path.getsize(src)
+                    disp  = (file[:15] + '..' + file[-5:]) if len(file) > 22 else file
+                    sys.stdout.write(f"\r[HASHING] {disp}...  ")
+                    sys.stdout.flush()
+                    fhash = _hash_file(src)
+                    hash_map[rel_path] = {'hash': fhash, 'fsize': fsize,
+                                          'src': src, 'dst': dst}
                 except Exception as e:
-                    print(f"\n[FAIL] {file}: {e}")
-                    summary['fail'] += 1
+                    print(f"\n[WARN] Cannot hash {file}: {e}")
 
-        # Batch-insert individual packed-file records
-        if packer_metadata:
+        total_bytes = sum(v['fsize'] for v in hash_map.values())
+        print(f"\r[BACKUP] {len(hash_map)} file(s) to copy "
+              f"({total_bytes / 1024**3:.2f} GB) | {skipped} already on tape.  ")
+
+        # ---------------------------------------------------------------
+        # Phase 2 — Single robocopy call: source directory → tape
+        # ---------------------------------------------------------------
+        print("[BACKUP] Copying to tape via robocopy...")
+
+        def _dir_size(path):
+            total = 0
+            try:
+                for r, _, fs in os.walk(path):
+                    for f in fs:
+                        try:
+                            total += os.path.getsize(os.path.join(r, f))
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+            return total
+
+        initial_tape_bytes = _dir_size(tape_root)
+        stop_evt = threading.Event()
+
+        def _monitor():
+            prev_bytes = 0
+            prev_time  = time.time()
+            while not stop_evt.is_set():
+                time.sleep(1)
+                cur   = max(0, _dir_size(tape_root) - initial_tape_bytes)
+                now   = time.time()
+                dt    = now - prev_time
+                speed = ((cur - prev_bytes) / 1024**2) / dt if dt > 0 else 0
+                pct   = (cur / total_bytes * 100) if total_bytes else 100
+                sys.stdout.write(
+                    f"\r[COPYING] {min(pct, 100):.1f}% | {speed:.1f} MB/s   ")
+                sys.stdout.flush()
+                prev_bytes = cur
+                prev_time  = now
+
+        mon = threading.Thread(target=_monitor, daemon=True)
+        mon.start()
+
+        rc = subprocess.run(
+            ['robocopy', source, tape_root,
+             '/E',     # recurse subdirectories including empty ones
+             '/J',     # unbuffered I/O — optimised for large files / tape
+             '/R:3', '/W:10',
+             '/NP',    # no per-file progress %
+             '/NDL',   # no directory listing lines
+             '/NFL',   # no per-file listing lines (keep job header+summary)
+            ],
+            capture_output=True, text=True
+        )
+
+        stop_evt.set()
+        mon.join(timeout=2)
+        print()  # end progress line
+
+        rc_sum = _parse_robocopy_summary(rc.stdout)
+
+        if rc.returncode >= 8:
+            print(f"[WARN] Robocopy finished with exit code {rc.returncode} "
+                  f"— check for errors above.")
+
+        # ---------------------------------------------------------------
+        # Phase 3 — DB inserts (only files that were hashed / new this run)
+        # ---------------------------------------------------------------
+        if packer_metadata is None:
+            # Direct backup: every hashed file is a loose tape record
+            for rel_path, info in hash_map.items():
+                self.db.insert_file(
+                    file_name=os.path.basename(info['src']),
+                    original_path=info['src'],
+                    file_size_bytes=info['fsize'],
+                    file_hash=info['hash'],
+                    tape_label=tape_label, is_packed=False,
+                    container_name=None, stored_path=info['dst'],
+                )
+
+        elif packer_metadata:
+            # Staged backup: loose large files + batch-insert packed-file records
+            for rel_path, info in hash_map.items():
+                file = os.path.basename(info['src'])
+                if file.startswith("Bundle_") and file.endswith(".zip"):
+                    continue  # bundle records handled below
+                if rel_path in meta_by_rel:
+                    m = meta_by_rel[rel_path]
+                    self.db.insert_file(
+                        file_name=file,
+                        original_path=m['original_path'],
+                        file_size_bytes=info['fsize'],
+                        file_hash=info['hash'],
+                        tape_label=tape_label, is_packed=False,
+                        container_name=None, stored_path=info['dst'],
+                    )
             print("[DB] Recording packed file entries...")
             packed_count = 0
             for m in packer_metadata:
@@ -551,27 +744,35 @@ class LTOBackup:
                     tape_zip_path = os.path.join(tape_root, m['container_name'])
                     self.db.insert_file(
                         file_name=m['file_name'], original_path=m['original_path'],
-                        file_size_bytes=m['file_size_bytes'], file_hash=m.get('file_hash', ''),
+                        file_size_bytes=m['file_size_bytes'],
+                        file_hash=m.get('file_hash', ''),
                         tape_label=tape_label, is_packed=True,
                         container_name=tape_zip_path,
                         stored_path=m['stored_path'],
                     )
                     packed_count += 1
             print(f"[DB] {packed_count} packed file records committed.")
+        # else: packer_metadata == [] (existing staging) -> no DB records
 
-        if summary['bytes'] > 0:
-            self.db.update_tape_used_space(tape_label, summary['bytes'])
+        if rc_sum['bytes_copied'] > 0:
+            self.db.update_tape_used_space(tape_label, rc_sum['bytes_copied'])
 
+        # ---------------------------------------------------------------
+        # Phase 4 — Print Robocopy job summary
+        # ---------------------------------------------------------------
         total_time = time.time() - total_start
         print("\n" + "=" * 60)
-        print("BACKUP SESSION SUMMARY")
+        print("BACKUP SESSION SUMMARY  [Robocopy]")
         print("=" * 60)
         print(f"Tape            : {tape_label}")
-        print(f"Total Time      : {total_time/60:.1f} minutes")
-        print(f"Total Data      : {summary['bytes']/1024**3:.2f} GB")
-        print(f"Files OK        : {summary['ok']}")
-        print(f"Files Skipped   : {summary['skip']}")
-        print(f"Files Failed    : {summary['fail']}")
+        print(f"Total Time      : {total_time / 60:.1f} minutes")
+        print(f"Data Copied     : {rc_sum['bytes_copied'] / 1024**3:.2f} GB")
+        print(f"Avg Speed       : {rc_sum['speed_mbs']:.1f} MB/s")
+        print(f"Files Copied    : {rc_sum['files_copied']}")
+        print(f"Files Skipped   : {rc_sum['files_skipped'] + skipped}")
+        print(f"Files Failed    : {rc_sum['files_failed']}")
+        if rc_sum['elapsed']:
+            print(f"Robocopy Time   : {rc_sum['elapsed']}")
         print("-" * 60)
 
         self.eject_tape(tape_drive)
@@ -725,11 +926,10 @@ class LTORetriever:
         src = record['stored_path']
         dst = os.path.join(self.restore_dir, record['file_name'])
         print(f"\n[RESTORE] Copying loose file: {record['file_name']}")
-        try:
-            shutil.copy2(src, dst)
+        if _robocopy_file(src, dst):
             print(f"[RESTORE] Saved to: {dst}")
-        except Exception as e:
-            print(f"[ERROR] Restore failed: {e}")
+        else:
+            print(f"[ERROR] Restore failed: robocopy error")
 
     def _restore_packed(self, record):
         tape_zip_path = record['container_name']   # full path of ZIP on tape
@@ -740,10 +940,8 @@ class LTORetriever:
         print(f"[RESTORE] Step 1/3: Copying ZIP from tape to staging...")
 
         os.makedirs(self.staging_dir, exist_ok=True)
-        try:
-            shutil.copy2(tape_zip_path, local_zip)
-        except Exception as e:
-            print(f"[ERROR] Could not copy ZIP from tape: {e}")
+        if not _robocopy_file(tape_zip_path, local_zip):
+            print(f"[ERROR] Could not copy ZIP from tape: robocopy error")
             return
 
         print(f"[RESTORE] Step 2/3: Extracting '{record['file_name']}' from ZIP...")
@@ -774,10 +972,8 @@ class LTORetriever:
         local_zip = os.path.join(self.staging_dir, os.path.basename(tape_zip_path))
         print(f"\n[RESTORE] Copying {os.path.basename(tape_zip_path)} from tape to staging...")
         os.makedirs(self.staging_dir, exist_ok=True)
-        try:
-            shutil.copy2(tape_zip_path, local_zip)
-        except Exception as e:
-            print(f"[ERROR] Could not copy ZIP from tape: {e}")
+        if not _robocopy_file(tape_zip_path, local_zip):
+            print(f"[ERROR] Could not copy ZIP from tape: robocopy error")
             return
         print(f"[RESTORE] Extracting {len(records)} file(s)...")
         try:
@@ -839,6 +1035,10 @@ class TapeManager:
             print("[ABORTED] Format cancelled.")
             return
 
+        old_label = get_volume_label(self.tape_drive)
+        if old_label:
+            print(f"[INFO] Current tape label detected: {old_label}")
+
         label = input("New Volume Label (e.g. Scalpelab_Tape_X): ").strip()
         if not label:
             print("[ABORTED] No label provided.")
@@ -857,6 +1057,8 @@ class TapeManager:
             print("[FORMAT] Complete.")
             if result.stdout:
                 print(result.stdout)
+            if old_label and self.db.tape_exists(old_label):
+                self.db.delete_tape(old_label)
             cap      = input("Tape capacity in GB (optional, Enter to skip): ").strip()
             capacity = int(cap) if cap.isdigit() else None
             self.db.register_tape(label, capacity)
@@ -929,56 +1131,90 @@ class TapeManager:
 
 
 # ==============================================================================
+# WINDOWS DEFENDER EXCLUSION HELPERS
+# ==============================================================================
+
+def _manage_defender_exclusions(action, paths):
+    """
+    Add or remove Windows Defender path exclusions via PowerShell.
+    action : 'Add' or 'Remove'
+    Requires the script to be run as Administrator.
+    """
+    verb = 'Add-MpPreference' if action == 'Add' else 'Remove-MpPreference'
+    for path in paths:
+        try:
+            result = subprocess.run(
+                ['powershell', '-NonInteractive', '-Command',
+                 f'{verb} -ExclusionPath "{path}"'],
+                capture_output=True, text=True
+            )
+            if result.returncode == 0:
+                print(f"[DEFENDER] {action}ed exclusion: {path}")
+            else:
+                err = (result.stderr or result.stdout).strip()
+                print(f"[DEFENDER] Warning: could not {action.lower()} exclusion "
+                      f"for {path}: {err}")
+        except FileNotFoundError:
+            print(f"[DEFENDER] Warning: PowerShell not found — "
+                  f"skipping {action.lower()} exclusion.")
+
+
+# ==============================================================================
 # ARCHIVER WORKFLOW (ties together Analyzer, Packer, Backup)
 # ==============================================================================
 
 def run_archiver(cfg: ConfigManager, db: DatabaseManager):
-    LTOAnalyzer().analyze(cfg.source_dir, cfg.zip_threshold_mb)
+    exclusion_paths = [cfg.staging_dir, cfg.lto_drive]
+    _manage_defender_exclusions('Add', exclusion_paths)
+    try:
+        LTOAnalyzer().analyze(cfg.source_dir, cfg.zip_threshold_mb)
 
-    # Identify the tape currently in the drive
-    detected_label = get_volume_label(cfg.lto_drive)
-    if detected_label:
-        print(f"\n[TAPE] Detected label: {detected_label}")
-        tape_label = detected_label
-    else:
-        print("[TAPE] Could not auto-detect tape label.")
-        tape_label = input("Enter Volume Label manually: ").strip()
-
-    if not tape_label:
-        print("[ABORTED] No tape label provided.")
-        return
-
-    if not db.tape_exists(tape_label):
-        print(f"[TAPE] '{tape_label}' is not registered in the database.")
-        if input("Register now? (y/n): ").strip().lower() == 'y':
-            cap = input("Capacity in GB (optional): ").strip()
-            db.register_tape(tape_label, int(cap) if cap.isdigit() else None)
+        # Identify the tape currently in the drive
+        detected_label = get_volume_label(cfg.lto_drive)
+        if detected_label:
+            print(f"\n[TAPE] Detected label: {detected_label}")
+            tape_label = detected_label
         else:
-            print("[ABORTED] Cannot backup to an unregistered tape.")
+            print("[TAPE] Could not auto-detect tape label.")
+            tape_label = input("Enter Volume Label manually: ").strip()
+
+        if not tape_label:
+            print("[ABORTED] No tape label provided.")
             return
 
-    print(f"\nBackup Mode:")
-    print(f"1. AUTO-PILOT  (Pack files < {cfg.zip_threshold_mb:.0f} MB into ZIPs, then backup)")
-    print("2. DIRECT BACKUP (Copy files as-is, no packing)")
-    print("0. Cancel")
-    mode = input("Choose: ").strip()
+        if not db.tape_exists(tape_label):
+            print(f"[TAPE] '{tape_label}' is not registered in the database.")
+            if input("Register now? (y/n): ").strip().lower() == 'y':
+                cap = input("Capacity in GB (optional): ").strip()
+                db.register_tape(tape_label, int(cap) if cap.isdigit() else None)
+            else:
+                print("[ABORTED] Cannot backup to an unregistered tape.")
+                return
 
-    backup = LTOBackup(db, cfg.ibm_eject_cmd)
+        print(f"\nBackup Mode:")
+        print(f"1. AUTO-PILOT  (Pack files < {cfg.zip_threshold_mb:.0f} MB into ZIPs, then backup)")
+        print("2. DIRECT BACKUP (Copy files as-is, no packing)")
+        print("0. Cancel")
+        mode = input("Choose: ").strip()
 
-    if mode == '1':
-        packer   = LTOPacker(cfg.max_zip_size_gb)
-        metadata = packer.run(cfg.source_dir, cfg.staging_dir, cfg.zip_threshold_mb)
-        if metadata is None:
-            print("[ABORTED]")
-            return
-        print("\n>>> Staging complete. Starting backup in 3 seconds...")
-        time.sleep(3)
-        backup.run(cfg.staging_dir, cfg.lto_drive, tape_label, packer_metadata=metadata)
+        backup = LTOBackup(db, cfg.ibm_eject_cmd)
 
-    elif mode == '2':
-        print("\n>>> Starting direct backup...")
-        time.sleep(2)
-        backup.run(cfg.source_dir, cfg.lto_drive, tape_label, packer_metadata=None)
+        if mode == '1':
+            packer   = LTOPacker(cfg.max_zip_size_gb)
+            metadata = packer.run(cfg.source_dir, cfg.staging_dir, cfg.zip_threshold_mb)
+            if metadata is None:
+                print("[ABORTED]")
+                return
+            print("\n>>> Staging complete. Starting backup in 3 seconds...")
+            time.sleep(3)
+            backup.run(cfg.staging_dir, cfg.lto_drive, tape_label, packer_metadata=metadata)
+
+        elif mode == '2':
+            print("\n>>> Starting direct backup...")
+            time.sleep(2)
+            backup.run(cfg.source_dir, cfg.lto_drive, tape_label, packer_metadata=None)
+    finally:
+        _manage_defender_exclusions('Remove', exclusion_paths)
 
 
 # ==============================================================================
