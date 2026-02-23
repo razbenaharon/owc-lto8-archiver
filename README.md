@@ -41,7 +41,7 @@ ibm_eject_cmd = C:\Program Files\IBM\LTFS\LtfsCmdEject.exe
 
 [SETTINGS]
 zip_threshold_mb = 100   ; files smaller than this are packed into ZIPs
-max_zip_size_gb  = 20    ; maximum size per ZIP bundle
+max_zip_size_gb  = 100   ; maximum size per ZIP bundle
 ```
 
 ## Usage
@@ -67,7 +67,13 @@ python lto_archive_manager.py
 2. You choose **AUTO-PILOT** or **DIRECT BACKUP**:
    - **AUTO-PILOT** — files under `zip_threshold_mb` are packed into `Bundle_NNN.zip` archives in the staging directory; large files are staged as-is. The staged tree is then copied to tape.
    - **DIRECT BACKUP** — files are copied from source to tape without packing.
-3. After copying, the tape is ejected automatically via `LtfsCmdEject.exe`.
+3. The backup runs in three phases:
+   - **Hash scan** — SHA-256 each file not already on tape at the same size.
+   - **Robocopy** — transfers the full directory tree to tape with live MB/s progress display (`/J` unbuffered I/O, `/R:3 /W:10` retry).
+   - **DB insert** — records every file (hash, size, tape label, container) to the SQLite index.
+4. After copying, a session summary is printed and the tape is ejected automatically via `LtfsCmdEject.exe`.
+
+> **Windows Defender** — during archive operations the script automatically adds the staging directory and LTO drive as Defender exclusions (requires Administrator) and removes them when the run completes.
 
 ### Retrieve Workflow
 
@@ -89,6 +95,7 @@ After search results are shown, enter a file ID to restore one file, or `ALL` to
 | List drives | `wmic logicaldisk` |
 | Check tape | `LtfsCmdCheck.exe` — repair filesystem errors |
 | Tape drives info | `LtfsCmdDrives.exe` — list connected drives |
+| Eject tape | `LtfsCmdEject.exe` — safely eject without archiving |
 
 ## Database Schema
 
