@@ -50,6 +50,25 @@ def _hash_file(path):
     return hasher.hexdigest()
 
 
+def _verify_restored_hash(local_path, record):
+    """Verify a restored file against the stored DB hash.
+    Runs entirely on local disk after tape transfer is complete — no impact on tape speed."""
+    try:
+        stored_hash = record['file_hash']
+    except (KeyError, IndexError):
+        stored_hash = None
+    if not stored_hash:
+        print(f"[VERIFY] No stored hash for {record['file_name']} — skipping.")
+        return
+    actual_hash = _hash_file(local_path)
+    if actual_hash == stored_hash:
+        print(f"[VERIFY] OK  {record['file_name']}")
+    else:
+        print(f"[VERIFY] FAIL  {record['file_name']}")
+        print(f"         expected: {stored_hash}")
+        print(f"         got:      {actual_hash}")
+
+
 def _robocopy_file(src, dst, display_name=None):
     """
     Copy a single file using robocopy with unbuffered I/O.
@@ -928,6 +947,7 @@ class LTORetriever:
         print(f"\n[RESTORE] Copying loose file: {record['file_name']}")
         if _robocopy_file(src, dst):
             print(f"[RESTORE] Saved to: {dst}")
+            _verify_restored_hash(dst, record)
         else:
             print(f"[ERROR] Restore failed: robocopy error")
 
@@ -958,6 +978,7 @@ class LTORetriever:
                 with zf.open(candidates[0]) as zf_src, open(dst, 'wb') as out:
                     shutil.copyfileobj(zf_src, out)
             print(f"[RESTORE] Saved to: {dst}")
+            _verify_restored_hash(dst, record)
         except Exception as e:
             print(f"[ERROR] Extraction failed: {e}")
         finally:
@@ -992,6 +1013,7 @@ class LTORetriever:
                         with zf.open(candidates[0]) as zf_src, open(dst, 'wb') as out:
                             shutil.copyfileobj(zf_src, out)
                         print(f"[OK] {record['file_name']}")
+                        _verify_restored_hash(dst, record)
                     except Exception as e:
                         print(f"[ERROR] {record['file_name']}: {e}")
         except Exception as e:
@@ -1224,7 +1246,7 @@ def run_archiver(cfg: ConfigManager, db: DatabaseManager):
 def main():
     os.system('cls' if os.name == 'nt' else 'clear')
     print("=" * 60)
-    print("   LTO ARCHIVE MANAGEMENT SYSTEM (LAMS) v5.0")
+    print("   LTO ARCHIVE MANAGEMENT SYSTEM")
     print("=" * 60)
 
     cfg       = ConfigManager()
@@ -1250,7 +1272,12 @@ def main():
             run_archiver(cfg, db)
 
         elif choice == '2':
-            retriever.run()
+            exclusion_paths = [cfg.lto_drive, cfg.staging_dir, cfg.restore_dir]
+            _manage_defender_exclusions('Add', exclusion_paths)
+            try:
+                retriever.run()
+            finally:
+                _manage_defender_exclusions('Remove', exclusion_paths)
 
         elif choice == '3':
             print("\n--- Tape Maintenance ---")
