@@ -1,4 +1,4 @@
-# OWC LTO-8 Archiver — LAMS v5.0
+# OWC LTO-8 Archiver
 
 A Python CLI for archiving files to LTO tape using an OWC Mercury Pro LTO-8 drive and IBM LTFS on Windows.
 
@@ -73,18 +73,34 @@ python lto_archive_manager.py
    - **DB insert** — records every file (hash, size, tape label, container) to the SQLite index.
 4. After copying, a session summary is printed and the tape is ejected automatically via `LtfsCmdEject.exe`.
 
-> **Windows Defender** — during archive operations the script automatically adds the staging directory and LTO drive as Defender exclusions (requires Administrator) and removes them when the run completes.
-
 ### Retrieve Workflow
 
-Search options:
-1. Filename / wildcard (e.g. `*.mov`, `IMG_*`)
-2. Date range
-3. Both
-4. Restore full directory (by original path prefix)
-5. Restore full backup session
+Choose a search mode:
 
-After search results are shown, enter a file ID to restore one file, or `ALL` to restore everything. If the required tape is not mounted, you'll be prompted to swap it.
+| Option | Search |
+|--------|--------|
+| 1 | Filename / wildcard (e.g. `*.mov`, `IMG_*`) |
+| 2 | Date range (backed-up from / to, YYYY-MM-DD) |
+| 3 | Both filename and date range |
+| 4 | Restore full directory — partial path match against original paths |
+| 5 | Restore full backup session — select from a dated session list |
+
+Results are displayed in a table showing file ID, filename, size, backup date, and tape label.
+
+- Enter a **file ID** to restore a single file.
+- Enter **ALL** to restore every result.
+- Enter **0** to cancel.
+
+**Tape handling** — before each restore the script checks the mounted tape label. If the wrong tape is inserted you'll be prompted to swap it before copying begins.
+
+**Packed files (ZIP bundles)** — files that were archived via AUTO-PILOT are stored inside `Bundle_NNN.zip` containers on tape. The restore process:
+1. Copies the ZIP from tape to the staging directory via robocopy.
+2. Extracts the target file(s) from the ZIP to the restore directory.
+3. Deletes the staging ZIP automatically.
+
+When restoring multiple files from the same ZIP bundle, the bundle is copied from tape only once.
+
+**Hash verification** — after each file is restored its SHA-256 hash is verified against the value stored in the database. A `[VERIFY] OK` or `[VERIFY] FAIL` line is printed for each file.
 
 ### Tape Maintenance Sub-menu
 
@@ -108,8 +124,6 @@ After search results are shown, enter a file ID to restore one file, or `ALL` to
 - `file_name`, `original_path`, `file_size_bytes`, `file_hash` (SHA-256)
 - `backup_date`, `tape_label`, `is_packed`, `container_name`, `stored_path`
 
-## Notes
+## Important
 
-- The script hashes every file during packing/copying (SHA-256). Hashes are stored in the DB but not automatically verified on restore — manual spot-checks are recommended for long-term archival.
-- Staging ZIPs use `ZIP_STORED` (no compression) to maximize tape write speed and LTO hardware compression compatibility.
-- `os.fsync()` is called after each file write to ensure data is flushed before moving on.
+**Run the script as Administrator.** Windows Defender exclusions are added automatically during both archive and retrieval operations (covering the LTO drive, staging directory, and restore directory) and require elevated privileges. Exclusions are removed automatically when each operation completes.
