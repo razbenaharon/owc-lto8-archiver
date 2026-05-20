@@ -5,3 +5,8 @@
 # Python bytecode cache
 __pycache__/
 *.pyc
+
+# Local archive working directories
+source/
+staging/
+restored/
