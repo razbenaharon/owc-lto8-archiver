@@ -9,6 +9,8 @@ import sqlite3
 import threading
 import configparser
 import subprocess
+import tempfile
+import shlex
 from datetime import datetime
 from collections import defaultdict
 
@@ -204,6 +206,320 @@ def _parse_robocopy_summary(output):
     return result
 
 
+def _has_command(name):
+    return shutil.which(name) is not None
+
+
+def _openssh_askpass_env(password):
+    """Build an environment that lets OpenSSH read a configured password."""
+    helper_path = os.path.join(tempfile.gettempdir(), 'lto_ssh_askpass.cmd')
+    helper_body = (
+        "@echo off\r\n"
+        "powershell -NoProfile -ExecutionPolicy Bypass "
+        "-Command \"[Console]::Out.Write($env:LTO_REMOTE_PASSWORD)\"\r\n"
+    )
+    try:
+        with open(helper_path, 'w', encoding='utf-8', newline='') as f:
+            f.write(helper_body)
+    except OSError as e:
+        raise RuntimeError(f"Could not create SSH askpass helper: {e}") from e
+
+    env = os.environ.copy()
+    env['LTO_REMOTE_PASSWORD'] = password
+    env['SSH_ASKPASS'] = helper_path
+    env['SSH_ASKPASS_REQUIRE'] = 'force'
+    env['DISPLAY'] = env.get('DISPLAY') or 'lto-archive-manager'
+    return env
+
+
+def _ssh_run(remote_user, remote_host, command, capture=True, password=''):
+    """Run a command on the remote host.
+
+    Blank password uses normal OpenSSH key auth. A configured password uses
+    sshpass when available, or PuTTY plink on Windows-style installations.
+    """
+    password = password or ''
+    if password:
+        if _has_command('sshpass'):
+            ssh_cmd = [
+                'sshpass', '-e',
+                'ssh',
+                '-o', 'BatchMode=no',
+                '-o', 'PubkeyAuthentication=no',
+                '-o', 'StrictHostKeyChecking=accept-new',
+                f'{remote_user}@{remote_host}',
+                command,
+            ]
+            env = os.environ.copy()
+            env['SSHPASS'] = password
+            if capture:
+                return subprocess.run(ssh_cmd, capture_output=True, text=True, env=env)
+            return subprocess.run(ssh_cmd, env=env)
+        if _has_command('ssh'):
+            ssh_cmd = [
+                'ssh',
+                '-o', 'BatchMode=no',
+                '-o', 'PubkeyAuthentication=no',
+                '-o', 'NumberOfPasswordPrompts=1',
+                '-o', 'StrictHostKeyChecking=accept-new',
+                f'{remote_user}@{remote_host}',
+                command,
+            ]
+            env = _openssh_askpass_env(password)
+            if capture:
+                return subprocess.run(
+                    ssh_cmd,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                )
+            return subprocess.run(ssh_cmd, stdin=subprocess.DEVNULL, env=env)
+        if _has_command('plink'):
+            ssh_cmd = [
+                'plink',
+                '-batch',
+                '-pw', password,
+                f'{remote_user}@{remote_host}',
+                command,
+            ]
+            if capture:
+                return subprocess.run(ssh_cmd, capture_output=True, text=True)
+            return subprocess.run(ssh_cmd)
+        return subprocess.CompletedProcess(
+            args=['ssh'],
+            returncode=255,
+            stdout='',
+            stderr=(
+                "remote_password is set, but no password-capable SSH helper was found. "
+                "Install OpenSSH, sshpass, or PuTTY plink/pscp; or configure SSH key auth."
+            ),
+        )
+
+    ssh_cmd = [
+        'ssh',
+        '-o', 'BatchMode=yes',
+        '-o', 'StrictHostKeyChecking=accept-new',
+        f'{remote_user}@{remote_host}',
+        command,
+    ]
+    if capture:
+        return subprocess.run(ssh_cmd, capture_output=True, text=True)
+    return subprocess.run(ssh_cmd)
+
+
+def _scp_fetch_file(remote_user, remote_host, remote_file_path, local_dest_path, password=''):
+    """Copy a single file from remote_user@remote_host:remote_file_path to
+    local_dest_path using SCP.  stdout/stderr are NOT redirected so SCP's
+    native progress output is visible in the terminal.
+    Returns SCP's exit code (0 = success).
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(local_dest_path)), exist_ok=True)
+    remote_spec = f'{remote_user}@{remote_host}:{remote_file_path}'
+
+    password = password or ''
+    if password:
+        if _has_command('sshpass'):
+            env = os.environ.copy()
+            env['SSHPASS'] = password
+            proc = subprocess.Popen(
+                ['sshpass', '-e', 'scp', '-p', remote_spec, local_dest_path],
+                env=env
+            )
+            return proc.wait()
+        if _has_command('scp'):
+            env = _openssh_askpass_env(password)
+            proc = subprocess.Popen(
+                [
+                    'scp',
+                    '-o', 'BatchMode=no',
+                    '-o', 'PubkeyAuthentication=no',
+                    '-o', 'NumberOfPasswordPrompts=1',
+                    '-p',
+                    remote_spec,
+                    local_dest_path,
+                ],
+                stdin=subprocess.DEVNULL,
+                env=env,
+            )
+            return proc.wait()
+        if _has_command('pscp'):
+            proc = subprocess.Popen([
+                'pscp',
+                '-scp',
+                '-p',
+                '-pw', password,
+                remote_spec,
+                local_dest_path,
+            ])
+            return proc.wait()
+        print("[REMOTE] remote_password is set, but scp, sshpass, or PuTTY pscp was not found.")
+        return 255
+
+    proc = subprocess.Popen(['scp', '-p', remote_spec, local_dest_path])
+    return proc.wait()
+
+
+def _ssh_stream_command(remote_user, remote_host, command, password=''):
+    """Return a command/env pair for an SSH process that streams stdin/stdout."""
+    password = password or ''
+    if password:
+        if _has_command('sshpass'):
+            env = os.environ.copy()
+            env['SSHPASS'] = password
+            return [
+                'sshpass', '-e',
+                'ssh',
+                '-o', 'BatchMode=no',
+                '-o', 'PubkeyAuthentication=no',
+                '-o', 'StrictHostKeyChecking=accept-new',
+                f'{remote_user}@{remote_host}',
+                command,
+            ], env, None
+        if _has_command('ssh'):
+            return [
+                'ssh',
+                '-o', 'BatchMode=no',
+                '-o', 'PubkeyAuthentication=no',
+                '-o', 'NumberOfPasswordPrompts=1',
+                '-o', 'StrictHostKeyChecking=accept-new',
+                f'{remote_user}@{remote_host}',
+                command,
+            ], _openssh_askpass_env(password), None
+        if _has_command('plink'):
+            return [
+                'plink',
+                '-batch',
+                '-pw', password,
+                f'{remote_user}@{remote_host}',
+                command,
+            ], None, None
+        return None, None, (
+            "remote_password is set, but no password-capable SSH helper was found. "
+            "Install OpenSSH, sshpass, or PuTTY plink/pscp; or configure SSH key auth."
+        )
+
+    if not _has_command('ssh'):
+        return None, None, "ssh was not found on PATH."
+    return [
+        'ssh',
+        '-o', 'BatchMode=yes',
+        '-o', 'StrictHostKeyChecking=accept-new',
+        f'{remote_user}@{remote_host}',
+        command,
+    ], None, None
+
+
+def _safe_remote_relpath(path):
+    """Return a tar-safe remote relative path using forward slashes."""
+    rel = (path or '').replace('\\', '/')
+    if rel.startswith('/') or re.match(r'^[A-Za-z]:/', rel):
+        raise ValueError(f"unsafe relative path: {path}")
+    rel = rel.strip('/')
+    raw_parts = [part for part in rel.split('/') if part]
+    if any(part in ('.', '..') for part in raw_parts):
+        raise ValueError(f"unsafe relative path: {path}")
+    normalized = os.path.normpath(rel).replace('\\', '/')
+    if normalized in ('', '.'):
+        raise ValueError("empty relative path")
+    parts = normalized.split('/')
+    if normalized.startswith('/') or any(part in ('', '.', '..') for part in parts):
+        raise ValueError(f"unsafe relative path: {path}")
+    return normalized
+
+
+def _remote_tar_fetch(remote_user, remote_host, remote_base, rel_paths, local_dest_dir,
+                      password=''):
+    """Fetch many remote files in one tar stream over SSH.
+
+    rel_paths must be relative to remote_base and use POSIX separators.
+    Returns (ok, error_message).
+    """
+    if not rel_paths:
+        return True, ''
+    if not _has_command('tar'):
+        return False, "local tar executable was not found on PATH"
+
+    os.makedirs(local_dest_dir, exist_ok=True)
+    safe_paths = []
+    try:
+        for rel in rel_paths:
+            safe_paths.append(_safe_remote_relpath(rel))
+    except ValueError as e:
+        return False, str(e)
+
+    remote_cmd = f"tar -C {shlex.quote(remote_base)} -cf - --null -T -"
+    ssh_cmd, ssh_env, err = _ssh_stream_command(
+        remote_user, remote_host, remote_cmd, password=password
+    )
+    if err:
+        return False, err
+
+    tar_cmd = ['tar', '-C', local_dest_dir, '-xf', '-']
+    ssh_proc = None
+    tar_proc = None
+    ssh_stderr = []
+
+    def _drain_stderr(pipe):
+        try:
+            while True:
+                chunk = pipe.read(4096)
+                if not chunk:
+                    break
+                ssh_stderr.append(chunk)
+        except OSError:
+            pass
+
+    try:
+        ssh_proc = subprocess.Popen(
+            ssh_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=ssh_env,
+        )
+        stderr_thread = threading.Thread(
+            target=_drain_stderr, args=(ssh_proc.stderr,), daemon=True
+        )
+        stderr_thread.start()
+
+        tar_proc = subprocess.Popen(
+            tar_cmd,
+            stdin=ssh_proc.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        ssh_proc.stdout.close()
+
+        file_list = ''.join(f'{rel}\0' for rel in safe_paths).encode('utf-8')
+        try:
+            ssh_proc.stdin.write(file_list)
+            ssh_proc.stdin.close()
+        except OSError:
+            pass
+
+        tar_stdout, tar_stderr = tar_proc.communicate()
+        ssh_rc = ssh_proc.wait()
+        stderr_thread.join(timeout=2)
+        tar_rc = tar_proc.returncode
+    except OSError as e:
+        for proc in (tar_proc, ssh_proc):
+            if proc and proc.poll() is None:
+                proc.kill()
+        return False, str(e)
+
+    ssh_err_text = b''.join(ssh_stderr).decode('utf-8', errors='replace').strip()
+    tar_err_text = (tar_stderr or b'').decode('utf-8', errors='replace').strip()
+    if ssh_rc != 0 or tar_rc != 0:
+        parts = []
+        if ssh_rc != 0:
+            parts.append(f"remote tar/ssh exit {ssh_rc}: {ssh_err_text}")
+        if tar_rc != 0:
+            parts.append(f"local tar exit {tar_rc}: {tar_err_text}")
+        return False, '\n'.join(parts)
+    return True, ''
+
+
 # ==============================================================================
 # CONFIGURATION MANAGER
 # ==============================================================================
@@ -235,6 +551,13 @@ class ConfigManager:
             'zip_threshold_mb': '100',
             'max_zip_size_gb':  '100',
         }
+        self.config['REMOTE'] = {
+            'remote_host':      'so02.iem.technion.ac.il',
+            'remote_user':      '',
+            'remote_password':  '',
+            'remote_path':      '',
+            'staging_fill_pct': '0.80',
+        }
         with open(self.config_path, 'w', encoding='utf-8') as f:
             self.config.write(f)
 
@@ -256,6 +579,21 @@ class ConfigManager:
     def zip_threshold_mb(self): return float(self.config['SETTINGS']['zip_threshold_mb'])
     @property
     def max_zip_size_gb(self):  return float(self.config['SETTINGS']['max_zip_size_gb'])
+    @property
+    def remote_host(self):      return self.config.get('REMOTE', 'remote_host', fallback='')
+    @property
+    def remote_user(self):      return self.config.get('REMOTE', 'remote_user', fallback='')
+    @property
+    def remote_password(self):
+        value = self.config.get('REMOTE', 'remote_password', fallback='', raw=True)
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+            value = value[1:-1]
+        return value
+    @property
+    def remote_path(self):      return self.config.get('REMOTE', 'remote_path', fallback='')
+    @property
+    def staging_fill_pct(self): return float(self.config.get('REMOTE', 'staging_fill_pct', fallback='0.80'))
 
 
 # ==============================================================================
@@ -266,10 +604,19 @@ class DatabaseManager:
     def __init__(self, db_path):
         db_path = _clean_config_path(db_path)
         db_dir = os.path.dirname(os.path.abspath(db_path))
-        os.makedirs(db_dir, exist_ok=True)
-        self.conn = sqlite3.connect(db_path)
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+            self.conn = sqlite3.connect(db_path)
+        except (OSError, sqlite3.Error) as e:
+            raise RuntimeError(
+                f"[DB] Cannot open database at: {db_path}\n"
+                f"     Directory: {db_dir}\n"
+                f"     Reason: {e}\n"
+                f"     Edit {CONFIG_FILE} and set [PATHS] db_path to a writable location."
+            ) from e
         self.conn.row_factory = sqlite3.Row
         self._init_schema()
+        self._init_remote_schema()
 
     def _init_schema(self):
         self.conn.executescript("""
@@ -301,6 +648,134 @@ class DatabaseManager:
             self.conn.commit()
         except sqlite3.OperationalError:
             pass  # column already exists
+
+    def _init_remote_schema(self):
+        """Create remote_sessions and remote_manifest tables if they don't exist.
+        Safe to call on existing databases — uses CREATE TABLE IF NOT EXISTS."""
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS remote_sessions (
+                session_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_label TEXT    NOT NULL,
+                remote_host   TEXT    NOT NULL,
+                remote_user   TEXT    NOT NULL,
+                remote_path   TEXT    NOT NULL,
+                tape_label    TEXT    NOT NULL,
+                staging_dir   TEXT    NOT NULL,
+                total_files   INTEGER DEFAULT 0,
+                total_bytes   INTEGER DEFAULT 0,
+                chunk_count   INTEGER DEFAULT 0,
+                created_at    DATETIME NOT NULL,
+                completed_at  DATETIME,
+                status        TEXT NOT NULL DEFAULT 'active'
+                    CHECK(status IN ('active','completed','abandoned'))
+            );
+            CREATE TABLE IF NOT EXISTS remote_manifest (
+                manifest_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id      INTEGER NOT NULL
+                    REFERENCES remote_sessions(session_id),
+                chunk_index     INTEGER NOT NULL,
+                remote_path     TEXT    NOT NULL,
+                file_name       TEXT    NOT NULL,
+                file_size_bytes INTEGER NOT NULL,
+                local_rel_path  TEXT,
+                status          TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN (
+                        'pending','fetching','fetched','packing','packed',
+                        'backing','backed','done','fetch_failed','backup_failed'
+                    )),
+                chunk_status    TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(chunk_status IN (
+                        'pending','fetching','packing','backing','done',
+                        'fetch_failed','backup_failed'
+                    )),
+                error_msg       TEXT,
+                updated_at      DATETIME
+            );
+            CREATE INDEX IF NOT EXISTS idx_remote_manifest_session_chunk
+                ON remote_manifest(session_id, chunk_index);
+        """)
+        self.conn.commit()
+
+    def create_remote_session(self, session_label, remote_host, remote_user,
+                               remote_path, tape_label, staging_dir):
+        cur = self.conn.execute(
+            """INSERT INTO remote_sessions
+               (session_label, remote_host, remote_user, remote_path,
+                tape_label, staging_dir, created_at, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'active')""",
+            (session_label, remote_host, remote_user, remote_path,
+             tape_label, staging_dir, datetime.now().isoformat())
+        )
+        self.conn.commit()
+        return cur.lastrowid
+
+    def update_remote_session(self, session_id, **kwargs):
+        sets = ', '.join(f"{k} = ?" for k in kwargs)
+        vals = list(kwargs.values()) + [session_id]
+        self.conn.execute(
+            f"UPDATE remote_sessions SET {sets} WHERE session_id = ?", vals
+        )
+        self.conn.commit()
+
+    def get_active_remote_session(self, remote_host, remote_path):
+        return self.conn.execute(
+            """SELECT * FROM remote_sessions
+               WHERE remote_host = ? AND remote_path = ? AND status = 'active'
+               ORDER BY session_id DESC LIMIT 1""",
+            (remote_host, remote_path)
+        ).fetchone()
+
+    def insert_remote_manifest_batch(self, session_id, rows):
+        """rows: list of (chunk_index, remote_path, file_name, file_size_bytes)"""
+        self.conn.executemany(
+            """INSERT INTO remote_manifest
+               (session_id, chunk_index, remote_path, file_name, file_size_bytes,
+                status, chunk_status, updated_at)
+               VALUES (?, ?, ?, ?, ?, 'pending', 'pending', ?)""",
+            [(session_id, r[0], r[1], r[2], r[3], datetime.now().isoformat())
+             for r in rows]
+        )
+        self.conn.commit()
+
+    def get_chunk_files(self, session_id, chunk_index):
+        return self.conn.execute(
+            """SELECT * FROM remote_manifest
+               WHERE session_id = ? AND chunk_index = ?
+               ORDER BY manifest_id""",
+            (session_id, chunk_index)
+        ).fetchall()
+
+    def update_manifest_row(self, manifest_id, **kwargs):
+        kwargs['updated_at'] = datetime.now().isoformat()
+        sets = ', '.join(f"{k} = ?" for k in kwargs)
+        vals = list(kwargs.values()) + [manifest_id]
+        self.conn.execute(
+            f"UPDATE remote_manifest SET {sets} WHERE manifest_id = ?", vals
+        )
+        self.conn.commit()
+
+    def update_chunk_status(self, session_id, chunk_index, status):
+        self.conn.execute(
+            """UPDATE remote_manifest SET chunk_status = ?, updated_at = ?
+               WHERE session_id = ? AND chunk_index = ?""",
+            (status, datetime.now().isoformat(), session_id, chunk_index)
+        )
+        self.conn.commit()
+
+    def get_pending_chunks(self, session_id):
+        rows = self.conn.execute(
+            """SELECT DISTINCT chunk_index FROM remote_manifest
+               WHERE session_id = ? AND chunk_status NOT IN ('done')
+               ORDER BY chunk_index""",
+            (session_id,)
+        ).fetchall()
+        return [r[0] for r in rows]
+
+    def count_chunks(self, session_id):
+        return self.conn.execute(
+            "SELECT COUNT(DISTINCT chunk_index) FROM remote_manifest WHERE session_id = ?",
+            (session_id,)
+        ).fetchone()[0]
 
     def register_tape(self, volume_label, capacity_gb=None):
         try:
@@ -1086,6 +1561,447 @@ class LTORetriever:
 
 
 # ==============================================================================
+# MODULE E: REMOTE ORCHESTRATOR
+# SSH-scan → chunk → SCP fetch → LTOPacker → LTOBackup → flush
+# Supports resumeable sessions via remote_sessions + remote_manifest tables.
+# ==============================================================================
+
+class _NoEjectBackup(LTOBackup):
+    """LTOBackup variant that suppresses the automatic post-backup tape eject.
+    RemoteOrchestrator uses this for every chunk so the tape stays mounted,
+    then calls eject_tape() once explicitly after the final chunk."""
+    def eject_tape(self, tape_drive):
+        pass
+
+
+class RemoteOrchestrator:
+    """Orchestrates archiving files from a remote Linux host to LTO tape.
+
+    Pipeline per chunk:
+      1. SSH find  → file manifest (paths + sizes)
+      2. Greedy bin-pack into staging-sized chunks
+      3. Per chunk: SCP fetch → LTOPacker.run() → LTOBackup.run() → flush staging
+
+    Sessions are persisted in remote_sessions / remote_manifest so an
+    interrupted run can be resumed from the last completed chunk.
+    """
+
+    def __init__(self, cfg, db):
+        self.cfg          = cfg
+        self.db           = db
+        self.remote_host  = cfg.remote_host
+        self.remote_user  = cfg.remote_user
+        self.remote_password = cfg.remote_password
+        self.remote_path  = cfg.remote_path
+        self.staging_dir  = cfg.staging_dir
+        self.fill_pct     = cfg.staging_fill_pct
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+
+    def run(self):
+        self._validate_config()
+
+        existing = self.db.get_active_remote_session(self.remote_host, self.remote_path)
+        if existing:
+            pending = self.db.get_pending_chunks(existing['session_id'])
+            total   = self.db.count_chunks(existing['session_id'])
+            done    = total - len(pending)
+            print(f"\n[REMOTE] Found active session: {existing['session_label']}")
+            print(f"         Created : {existing['created_at']}")
+            print(f"         Progress: {done}/{total} chunks completed.")
+            print("1. Resume from last completed chunk")
+            print("2. Abandon and start a fresh session")
+            print("0. Cancel")
+            choice = input("Choose: ").strip()
+            if choice == '1':
+                self._run_session(existing['session_id'])
+                return
+            elif choice == '2':
+                self.db.update_remote_session(existing['session_id'], status='abandoned')
+            else:
+                return
+
+        self._start_new_session()
+
+    # ------------------------------------------------------------------
+    # Session lifecycle
+    # ------------------------------------------------------------------
+
+    def _validate_config(self):
+        missing = [k for k in ('remote_host', 'remote_user', 'remote_path')
+                   if not getattr(self.cfg, k)]
+        if missing:
+            raise RuntimeError(
+                f"[REMOTE] Missing values in [REMOTE] config section: "
+                f"{', '.join(missing)}\n"
+                f"Edit config.ini and fill in remote_host, remote_user, remote_path."
+            )
+
+    def _start_new_session(self):
+        tape_label = self._resolve_tape_label()
+        if not tape_label:
+            return
+
+        ts            = datetime.now().strftime('%Y%m%d_%H%M%S')
+        session_label = f"REMOTE_{self.remote_host.split('.')[0]}_{ts}"
+
+        print(f"\n[REMOTE] Session : {session_label}")
+        print(f"[REMOTE] Scanning {self.remote_user}@{self.remote_host}:{self.remote_path} ...")
+
+        manifest = self._scan_remote()
+        if not manifest:
+            print("[REMOTE] No files found on remote host. Aborting.")
+            return
+
+        total_bytes = sum(sz for _, sz in manifest)
+        print(f"[REMOTE] Found {len(manifest)} file(s) "
+              f"({total_bytes / 1024**3:.2f} GB total).")
+
+        chunks = self._bin_pack(manifest)
+        print(f"[REMOTE] Split into {len(chunks)} chunk(s) "
+              f"(staging budget: {self._chunk_budget() / 1024**3:.2f} GB each).")
+
+        session_id = self.db.create_remote_session(
+            session_label=session_label,
+            remote_host=self.remote_host,
+            remote_user=self.remote_user,
+            remote_path=self.remote_path,
+            tape_label=tape_label,
+            staging_dir=self.staging_dir,
+        )
+        self.db.update_remote_session(
+            session_id,
+            total_files=len(manifest),
+            total_bytes=total_bytes,
+            chunk_count=len(chunks),
+        )
+
+        rows = []
+        for chunk_idx, chunk_files in enumerate(chunks):
+            for remote_fpath, fsize in chunk_files:
+                rows.append((chunk_idx, remote_fpath,
+                              os.path.basename(remote_fpath), fsize))
+        self.db.insert_remote_manifest_batch(session_id, rows)
+
+        if not self.db.tape_exists(tape_label):
+            print(f"[TAPE] '{tape_label}' not in database. Registering...")
+            cap = input("Tape capacity in GB (default 12288 for 12 TB, Enter to skip): ").strip()
+            self.db.register_tape(tape_label, int(cap) if cap.isdigit() else 12288)
+
+        self._run_session(session_id)
+
+    def _resolve_tape_label(self):
+        detected = get_volume_label(self.cfg.lto_drive)
+        if detected:
+            print(f"[TAPE] Detected label: {detected}")
+            return detected
+        print("[TAPE] Could not auto-detect tape label.")
+        label = input("Enter tape Volume Label manually (or Enter to cancel): ").strip()
+        return label if label else None
+
+    # ------------------------------------------------------------------
+    # Remote scanning
+    # ------------------------------------------------------------------
+
+    def _scan_remote(self):
+        """SSH find with -printf '%s %p\n' to get size + path for every file."""
+        find_cmd = f"find {shlex.quote(self.remote_path)} -type f -printf '%s %p\\n'"
+        result   = _ssh_run(
+            self.remote_user,
+            self.remote_host,
+            find_cmd,
+            capture=True,
+            password=self.remote_password,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"[REMOTE] SSH scan failed (exit {result.returncode}):\n"
+                f"{result.stderr.strip()}"
+            )
+        manifest = []
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(' ', 1)
+            if len(parts) != 2:
+                continue
+            try:
+                manifest.append((parts[1].strip(), int(parts[0])))
+            except ValueError:
+                continue
+        return manifest
+
+    # ------------------------------------------------------------------
+    # Bin-packing
+    # ------------------------------------------------------------------
+
+    def _chunk_budget(self):
+        return int(shutil.disk_usage(self.staging_dir).free * self.fill_pct)
+
+    def _bin_pack(self, manifest):
+        """Greedy largest-first bin-packing into chunks that fit staging budget.
+        Files larger than the budget get their own single-file chunk."""
+        budget  = self._chunk_budget()
+        chunks  = []
+        current = []
+        cur_sz  = 0
+
+        for remote_path, fsize in sorted(manifest, key=lambda x: x[1], reverse=True):
+            if fsize > budget:
+                print(f"[WARN] File exceeds staging budget "
+                      f"({fsize/1024**3:.2f} GB > {budget/1024**3:.2f} GB), "
+                      f"placing in dedicated chunk: {os.path.basename(remote_path)}")
+                chunks.append([(remote_path, fsize)])
+                continue
+            if cur_sz + fsize > budget and current:
+                chunks.append(current)
+                current = []
+                cur_sz  = 0
+            current.append((remote_path, fsize))
+            cur_sz += fsize
+
+        if current:
+            chunks.append(current)
+        return chunks
+
+    # ------------------------------------------------------------------
+    # Pipeline execution
+    # ------------------------------------------------------------------
+
+    def _run_session(self, session_id):
+        session_row    = self.db.conn.execute(
+            "SELECT * FROM remote_sessions WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        tape_label     = session_row['tape_label']
+        pending_chunks = self.db.get_pending_chunks(session_id)
+        total_chunks   = self.db.count_chunks(session_id)
+        done_count     = total_chunks - len(pending_chunks)
+
+        if not pending_chunks:
+            print("[REMOTE] All chunks already completed.")
+            self.db.update_remote_session(
+                session_id, status='completed',
+                completed_at=datetime.now().isoformat()
+            )
+            return
+
+        print(f"\n[REMOTE] Processing {len(pending_chunks)} pending chunk(s) "
+              f"({done_count}/{total_chunks} already done).")
+
+        for i, chunk_index in enumerate(pending_chunks):
+            chunk_files   = self.db.get_chunk_files(session_id, chunk_index)
+            is_last_chunk = (i == len(pending_chunks) - 1)
+            print(f"\n[REMOTE] === Chunk {chunk_index + 1}/{total_chunks} "
+                  f"({len(chunk_files)} file(s)) ===")
+
+            success = self._process_chunk(
+                session_id, chunk_index, chunk_files,
+                tape_label, eject_after=is_last_chunk
+            )
+            if not success:
+                print(f"[REMOTE] Chunk {chunk_index + 1} failed. "
+                      f"Re-run to retry from this chunk.")
+                return
+
+        self.db.update_remote_session(
+            session_id, status='completed',
+            completed_at=datetime.now().isoformat()
+        )
+        print("\n[REMOTE] Session complete. All chunks archived to tape.")
+
+    def _process_chunk(self, session_id, chunk_index, chunk_files,
+                        tape_label, eject_after=False):
+        fetch_dir = os.path.join(self.staging_dir, f"_fetch_{chunk_index:03d}")
+        pack_dir  = os.path.join(self.staging_dir, f"_pack_{chunk_index:03d}")
+
+        # --- FETCH ---
+        self.db.update_chunk_status(session_id, chunk_index, 'fetching')
+        if not self._fetch_chunk(session_id, chunk_index, chunk_files, fetch_dir):
+            self.db.update_chunk_status(session_id, chunk_index, 'fetch_failed')
+            self._cleanup_dir(fetch_dir)
+            return False
+
+        # --- PACK ---
+        self.db.update_chunk_status(session_id, chunk_index, 'packing')
+        try:
+            metadata = LTOPacker(self.cfg.max_zip_size_gb).run(
+                source=fetch_dir,
+                dest=pack_dir,
+                threshold_mb=self.cfg.zip_threshold_mb,
+            )
+        except Exception as e:
+            print(f"[REMOTE] Packer error: {e}")
+            self.db.update_chunk_status(session_id, chunk_index, 'fetch_failed')
+            self._cleanup_dir(fetch_dir)
+            self._cleanup_dir(pack_dir)
+            return False
+
+        if metadata is None:
+            print("[REMOTE] Packer aborted by user.")
+            return False
+
+        # --- BACKUP ---
+        self.db.update_chunk_status(session_id, chunk_index, 'backing')
+        # Use _NoEjectBackup to keep tape mounted; eject only after final chunk.
+        backup_cls = LTOBackup if eject_after else _NoEjectBackup
+        try:
+            backup_cls(self.db, self.cfg.ibm_eject_cmd).run(
+                source=pack_dir,
+                tape_drive=self.cfg.lto_drive,
+                tape_label=tape_label,
+                packer_metadata=metadata,
+            )
+        except Exception as e:
+            print(f"[REMOTE] Backup error: {e}")
+            self.db.update_chunk_status(session_id, chunk_index, 'backup_failed')
+            return False
+
+        self.db.update_chunk_status(session_id, chunk_index, 'done')
+
+        # --- FLUSH ---
+        print(f"[REMOTE] Flushing staged files for chunk {chunk_index + 1}...")
+        self._cleanup_dir(fetch_dir)
+        self._cleanup_dir(pack_dir)
+        return True
+
+    # ------------------------------------------------------------------
+    # Fetch helpers
+    # ------------------------------------------------------------------
+
+    def _fetch_chunk(self, session_id, chunk_index, chunk_files, fetch_dir):
+        os.makedirs(fetch_dir, exist_ok=True)
+        remote_base = self.remote_path.rstrip('/')
+        total_chunks = self.db.count_chunks(session_id)
+        records = []
+        pending = []
+
+        for row in chunk_files:
+            remote_fpath = row['remote_path']
+            fsize        = row['file_size_bytes']
+            manifest_id  = row['manifest_id']
+
+            if not remote_fpath.startswith(remote_base + '/'):
+                self.db.update_manifest_row(
+                    manifest_id,
+                    status='fetch_failed',
+                    error_msg=f"remote path outside base: {remote_fpath}",
+                )
+                print(f"[REMOTE] Invalid remote path outside base: {remote_fpath}")
+                return False
+
+            rel = remote_fpath[len(remote_base):].lstrip('/')
+            try:
+                rel = _safe_remote_relpath(rel)
+            except ValueError as e:
+                self.db.update_manifest_row(
+                    manifest_id,
+                    status='fetch_failed',
+                    error_msg=str(e),
+                )
+                print(f"[REMOTE] Invalid relative path: {e}")
+                return False
+
+            local_path = os.path.join(fetch_dir, rel.replace('/', os.sep))
+            records.append((row, rel, local_path))
+
+            # Skip if already fetched with matching size (resume support)
+            if os.path.exists(local_path):
+                try:
+                    if os.path.getsize(local_path) == fsize:
+                        print(f"[REMOTE] Skip (already fetched): {rel}")
+                        self.db.update_manifest_row(manifest_id, status='fetched',
+                                                    local_rel_path=rel)
+                        continue
+                    os.remove(local_path)  # partial file from interrupted run
+                except OSError:
+                    pass
+
+            self.db.update_manifest_row(manifest_id, status='fetching')
+            pending.append((row, rel, local_path))
+
+        if pending:
+            pending_bytes = sum(row['file_size_bytes'] for row, _, _ in pending)
+            print(f"[REMOTE] Fetching chunk {chunk_index + 1}/{total_chunks}: "
+                  f"{len(pending)} file(s), {pending_bytes / 1024**3:.2f} GB")
+
+            ok, err = _remote_tar_fetch(
+                self.remote_user,
+                self.remote_host,
+                remote_base,
+                [rel for _, rel, _ in pending],
+                fetch_dir,
+                password=self.remote_password,
+            )
+            if not ok:
+                print(f"[REMOTE] Tar fetch failed:\n{err}")
+                for row, rel, _ in pending:
+                    self.db.update_manifest_row(
+                        row['manifest_id'],
+                        status='fetch_failed',
+                        error_msg=err[:500],
+                    )
+                return False
+        else:
+            print(f"[REMOTE] Chunk {chunk_index + 1}/{total_chunks}: "
+                  "all files already fetched.")
+
+        for row, rel, local_path in records:
+            fsize       = row['file_size_bytes']
+            manifest_id = row['manifest_id']
+            if not os.path.exists(local_path):
+                print(f"[REMOTE] Missing after fetch: {rel}")
+                self.db.update_manifest_row(
+                    manifest_id,
+                    status='fetch_failed',
+                    error_msg="missing after tar fetch",
+                )
+                return False
+
+            try:
+                actual = os.path.getsize(local_path)
+            except OSError as e:
+                self.db.update_manifest_row(
+                    manifest_id,
+                    status='fetch_failed',
+                    error_msg=f"stat failed: {e}",
+                )
+                return False
+
+            if actual != fsize:
+                print(f"[REMOTE] Size mismatch for {rel}: "
+                      f"expected {fsize} B, got {actual} B")
+                try:
+                    os.remove(local_path)
+                except OSError:
+                    pass
+                self.db.update_manifest_row(
+                    manifest_id,
+                    status='fetch_failed',
+                    error_msg=f"size mismatch: expected {fsize}, got {actual}",
+                )
+                return False
+
+            self.db.update_manifest_row(manifest_id, status='fetched',
+                                        local_rel_path=rel)
+        return True
+
+    # ------------------------------------------------------------------
+    # Utility
+    # ------------------------------------------------------------------
+
+    def _cleanup_dir(self, path):
+        if os.path.exists(path):
+            try:
+                shutil.rmtree(path)
+                print(f"[REMOTE] Cleaned: {path}")
+            except OSError as e:
+                print(f"[REMOTE] Warning — could not clean {path}: {e}")
+
+
+# ==============================================================================
 # MODULE D: TAPE MANAGER — Formatting & registration
 # ==============================================================================
 
@@ -1093,6 +2009,52 @@ class TapeManager:
     def __init__(self, db: DatabaseManager, tape_drive: str):
         self.db         = db
         self.tape_drive = tape_drive
+
+    def _drive_letter(self):
+        return self.tape_drive.rstrip(":\\/")
+
+    def _ltfs_drive_status(self):
+        """Return the current IBM LTFS status for this drive, if available."""
+        exe = os.path.join(LTFS_DIR, 'LtfsCmdDrives.exe')
+        try:
+            result = subprocess.run([exe], text=True, capture_output=True, cwd=LTFS_DIR)
+        except FileNotFoundError:
+            return None, None, f"LtfsCmdDrives.exe not found in: {LTFS_DIR}"
+
+        output = ((result.stdout or '') + (result.stderr or '')).strip()
+        drive_letter = self._drive_letter().upper()
+        for line in output.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and parts[0].upper() == drive_letter:
+                return parts[-1], output, None
+        return None, output, None
+
+    def _print_drive_status(self, prefix="[INFO]"):
+        status, output, error = self._ltfs_drive_status()
+        if error:
+            print(f"{prefix} {error}")
+            return status
+        if status:
+            print(f"{prefix} IBM LTFS drive status for {self._drive_letter()}: {status}")
+        elif output:
+            print(f"{prefix} Could not identify drive {self._drive_letter()} in LtfsCmdDrives.exe output:")
+            print(output)
+        return status
+
+    def _print_invalid_medium_hint(self, operation, output):
+        if "LTFS60233E" not in (output or ""):
+            return
+        status = self._print_drive_status("[HINT]")
+        print(f"[HINT] IBM LTFS says the medium is not valid for {operation}.")
+        if status == "NO_LTFS_MEDIA":
+            print("[HINT] The drive currently reports NO_LTFS_MEDIA.")
+            print("       Check that a writable data cartridge is fully loaded, not a cleaning/WORM cartridge,")
+            print("       then wait for the drive to become ready and try again.")
+        elif status:
+            print(f"[HINT] Current medium status is {status}.")
+            print("       Eject/reload the tape, confirm the cartridge is writable, and close any app using the drive.")
+        else:
+            print("[HINT] Run Tape Maintenance -> Tape drives info, then confirm the cartridge is loaded and writable.")
 
     def list_drives(self):
         if os.name == 'nt':
@@ -1110,6 +2072,7 @@ class TapeManager:
     def format_tape(self):
         print("\n[TAPE MANAGER] Format / Initialize Tape")
         print(f"Target drive: {self.tape_drive}")
+        self._print_drive_status()
         print("=" * 60)
         print("WARNING: This will ERASE ALL DATA on the current tape.")
         print('Type  y  to confirm (or press Enter to cancel):')
@@ -1126,7 +2089,7 @@ class TapeManager:
             print("[ABORTED] No label provided.")
             return
 
-        drive_letter = self.tape_drive.rstrip(":\\/")
+        drive_letter = self._drive_letter()
         exe          = os.path.join(LTFS_DIR, 'LtfsCmdFormat.exe')
         cmd          = [exe, drive_letter, f'/N:{label}']
 
@@ -1141,11 +2104,13 @@ class TapeManager:
                 print(result.stdout)
             if old_label and self.db.tape_exists(old_label):
                 self.db.delete_tape(old_label)
-            cap      = input("Tape capacity in GB (optional, Enter to skip): ").strip()
-            capacity = int(cap) if cap.isdigit() else None
+            cap      = input("Tape capacity in GB (default 12288 for 12 TB, Enter to skip): ").strip()
+            capacity = int(cap) if cap.isdigit() else 12288
             self.db.register_tape(label, capacity)
         except subprocess.CalledProcessError as e:
-            print(f"[ERROR] LtfsCmdFormat.exe failed:\n{e.stderr}")
+            output = ((e.stdout or '') + (e.stderr or '')).strip()
+            print(f"[ERROR] LtfsCmdFormat.exe failed:\n{output}")
+            self._print_invalid_medium_hint("Format", output)
         except FileNotFoundError:
             print(f"[ERROR] LtfsCmdFormat.exe not found in: {LTFS_DIR}")
 
@@ -1153,16 +2118,17 @@ class TapeManager:
         label = input("Volume label of tape to register: ").strip()
         if not label:
             return
-        cap      = input("Capacity in GB (optional, Enter to skip): ").strip()
-        capacity = int(cap) if cap.isdigit() else None
+        cap      = input("Capacity in GB (default 12288 for 12 TB, Enter to skip): ").strip()
+        capacity = int(cap) if cap.isdigit() else 12288
         self.db.register_tape(label, capacity)
 
     def check_tape(self):
         """Run LtfsCmdCheck.exe to check and repair the tape filesystem."""
-        drive_letter = self.tape_drive.rstrip(":\\/")
+        drive_letter = self._drive_letter()
         exe          = os.path.join(LTFS_DIR, 'LtfsCmdCheck.exe')
         cmd          = [exe, drive_letter]
         print(f"\n[CHECK] Running: LtfsCmdCheck.exe {drive_letter}")
+        self._print_drive_status("[CHECK]")
         print("[CHECK] This may take several minutes...")
         try:
             result = subprocess.run(cmd, text=True, capture_output=True, cwd=LTFS_DIR)
@@ -1173,6 +2139,7 @@ class TapeManager:
                 print("[CHECK] Complete — no errors found.")
             else:
                 print(f"[CHECK] Finished with code {result.returncode}.")
+                self._print_invalid_medium_hint("Check", output)
         except FileNotFoundError:
             print(f"[ERROR] LtfsCmdCheck.exe not found in: {LTFS_DIR}")
 
@@ -1373,8 +2340,8 @@ def run_archiver(cfg: ConfigManager, db: DatabaseManager):
         if not db.tape_exists(tape_label):
             print(f"[TAPE] '{tape_label}' is not registered in the database.")
             if input("Register now? (y/n): ").strip().lower() == 'y':
-                cap = input("Capacity in GB (optional): ").strip()
-                db.register_tape(tape_label, int(cap) if cap.isdigit() else None)
+                cap = input("Capacity in GB (default 12288 for 12 TB, Enter to skip): ").strip()
+                db.register_tape(tape_label, int(cap) if cap.isdigit() else 12288)
             else:
                 print("[ABORTED] Cannot backup to an unregistered tape.")
                 return
@@ -1406,6 +2373,30 @@ def run_archiver(cfg: ConfigManager, db: DatabaseManager):
             _remove_robocopy_exclusion()
 
 
+def run_remote_archiver(cfg, db):
+    """Menu option 6: pull files from a remote host and archive to LTO tape."""
+    if not cfg.remote_host or not cfg.remote_user or not cfg.remote_path:
+        print("\n[REMOTE] The [REMOTE] section in config.ini is incomplete.")
+        print("  Required: remote_host, remote_user, remote_path")
+        print("  Optional: remote_password, staging_fill_pct  (default 0.80)")
+        cfg_abs = os.path.abspath(CONFIG_FILE)
+        print(f"\n[INFO] Config path: {cfg_abs}")
+        if os.name == 'nt':
+            os.startfile(cfg_abs)
+        return
+
+    added_exclusion = _prepare_robocopy_exclusion()
+    try:
+        RemoteOrchestrator(cfg, db).run()
+    except RuntimeError as e:
+        print(str(e))
+    except KeyboardInterrupt:
+        print("\n[REMOTE] Interrupted. Session state saved — re-run to resume.")
+    finally:
+        if added_exclusion:
+            _remove_robocopy_exclusion()
+
+
 # ==============================================================================
 # MAIN MENU — persistent loop
 # ==============================================================================
@@ -1430,6 +2421,7 @@ def main():
         print("  3. Tape Maintenance — Format / Register tapes")
         print("  4. List Registered Tapes")
         print("  5. Open config.ini")
+        print("  6. Remote Archive — Fetch from remote host & backup to LTO")
         print("  0. Exit")
         print("-" * 60)
 
@@ -1499,6 +2491,9 @@ def main():
             if os.name == 'nt':
                 os.startfile(cfg_abs)
 
+        elif choice == '6':
+            run_remote_archiver(cfg, db)
+
         elif choice == '0':
             print("Goodbye.")
             db.close()
@@ -1511,5 +2506,7 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except RuntimeError as e:
+        print(f"\n{e}")
     except KeyboardInterrupt:
         print("\n\n[ABORTED] User stopped the script.")
