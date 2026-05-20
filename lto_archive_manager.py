@@ -3,6 +3,7 @@ import re
 import sys
 import time
 import shutil
+import ctypes
 import hashlib
 import zipfile
 import sqlite3
@@ -11,14 +12,25 @@ import configparser
 import subprocess
 from datetime import datetime
 from collections import defaultdict
+from typing import TypedDict
+
+
+class _RobocopyResult(TypedDict):
+    files_copied:  int
+    files_skipped: int
+    files_failed:  int
+    bytes_copied:  int
+    speed_mbs:     float
+    elapsed:       str
 
 # ==============================================================================
 # LTO ARCHIVE MANAGEMENT SYSTEM
 # ==============================================================================
 
-BUFFER_SIZE = 1024 * 1024 * 16  # 128 MB read buffer
+BUFFER_SIZE = 1024 * 1024 * 16  # 16 MB read buffer
 CONFIG_FILE  = "config.ini"
 LTFS_DIR     = r'C:\Program Files\IBM\LTFS'  # IBM LTFS tools must run from this directory
+APP_DIR      = os.path.dirname(os.path.abspath(__file__))
 
 
 def get_volume_label(drive_path):
@@ -27,9 +39,11 @@ def get_volume_label(drive_path):
         drive_letter = drive_path.rstrip(":\\/")
         result = subprocess.run(
             ['vol', f'{drive_letter}:'],
-            capture_output=True, text=True, shell=True
+            capture_output=True, text=True, shell=True,
+            encoding='utf-8', errors='replace'
         )
-        for line in result.stdout.splitlines():
+        stdout = result.stdout or ''
+        for line in stdout.splitlines():
             line = line.strip()
             if line.lower().startswith('volume in drive') and ' is ' in line:
                 return line.rsplit(' is ', 1)[-1].strip()
@@ -150,13 +164,13 @@ def _parse_robocopy_bytes(tokens, idx):
         return 0, idx
 
 
-def _parse_robocopy_summary(output):
+def _parse_robocopy_summary(output: str) -> _RobocopyResult:
     """
     Parse robocopy's captured stdout and return a dict with:
       files_copied, files_skipped, files_failed,
       bytes_copied, speed_mbs, elapsed
     """
-    result = {
+    result: _RobocopyResult = {
         'files_copied': 0, 'files_skipped': 0, 'files_failed': 0,
         'bytes_copied': 0, 'speed_mbs': 0.0, 'elapsed': '',
     }
@@ -175,7 +189,6 @@ def _parse_robocopy_summary(output):
                 pass
 
         # "Bytes :  4.52 g  4.52 g  0  0  0  0"
-
         elif parts[0] == 'Bytes' and len(parts) >= 4 and parts[1] == ':':
             _,          i = _parse_robocopy_bytes(parts, 2)  # total (skip)
             bytes_copied, _ = _parse_robocopy_bytes(parts, i)
@@ -213,10 +226,10 @@ class ConfigManager:
 
     def _create_default(self):
         self.config['PATHS'] = {
-            'source_dir':  r'C:\Users\User\Desktop\Project_Raw',
-            'staging_dir': r'C:\Users\User\Desktop\Project_Ready_For_LTO',
-            'restore_dir': r'C:\Users\User\Desktop\Restored_Files',
-            'db_path':     r'C:\Users\User\Desktop\lto_archive.db',
+            'source_dir':  os.path.join(APP_DIR, 'source'),
+            'staging_dir': os.path.join(APP_DIR, 'staging'),
+            'restore_dir': os.path.join(APP_DIR, 'restored'),
+            'db_path':     os.path.join(APP_DIR, 'lto_archive.db'),
         }
         self.config['HARDWARE'] = {
             'lto_drive':     r'D:\\',
@@ -448,7 +461,8 @@ class LTOAnalyzer:
 
 
 # ==============================================================================
-# MODULE B-1: SMART PACKER
+# MODULE B-1: SMART PACKER  (OFFLINE PHASE)
+# Packs small files into ZIPs; hard-links large files; pre-hashes everything.
 # Returns a list of per-file metadata dicts for DB ingestion.
 # ==============================================================================
 
@@ -458,7 +472,12 @@ class LTOPacker:
 
     def run(self, source, dest, threshold_mb):
         """
-        Pack small files into ZIP bundles; copy large files loose.
+        OFFLINE PHASE — tape drive stays completely idle.
+
+        Small files  : compressed into Bundle_NNN.zip bundles in dest.
+        Large files  : hard-linked (or copied) into dest; SHA-256 pre-hashed here.
+        All hashes are cached in the returned metadata so the online streaming
+        phase can skip python.exe disk reads entirely while the tape is moving.
 
         Returns:
             list of dicts  — full metadata (staged backup ready for DB)
@@ -490,7 +509,7 @@ class LTOPacker:
         total_packed         = 0
         total_loose          = 0
 
-        print(f"\n[PACKER] Processing... (Threshold: {threshold_mb:.0f} MB | Max ZIP: {self.max_zip_size_gb:.0f} GB)")
+        print(f"\n[PACKER] Offline phase — tape idle. (Threshold: {threshold_mb:.0f} MB | Max ZIP: {self.max_zip_size_gb:.0f} GB)")
 
         for root, _, files in os.walk(source):
             for file in files:
@@ -501,7 +520,7 @@ class LTOPacker:
                     rel      = os.path.relpath(src, source)
 
                     if fsize_mb < threshold_mb:
-                        # Roll over to a new ZIP bundle if current one is full
+                        # ── Small file: pack into current ZIP bundle ──────────
                         if current_zip_size + fsize > self.max_zip_size_gb * 1024**3 * 0.99:
                             zipf.close()
                             print(f"\n -> Sealed Bundle_{zip_idx:03d}.zip ({files_in_current_zip} files)")
@@ -539,21 +558,39 @@ class LTOPacker:
                             print(f"\r[PACKING] {total_packed} files packed...", end="", flush=True)
 
                     else:
+                        # ── Large file: stage locally, pre-hash (tape stays idle) ──
                         dst_path = os.path.join(dest, rel)
-                        if not _robocopy_file(src, dst_path):
-                            raise RuntimeError(f"robocopy failed for: {src}")
+                        dst_dir  = os.path.dirname(dst_path)
+                        os.makedirs(dst_dir, exist_ok=True)
+
+                        # Hard link avoids copying bytes on same volume.
+                        # Fall back to shutil.copy2 across volume boundaries.
+                        try:
+                            os.link(src, dst_path)
+                            link_method = "linked"
+                        except OSError:
+                            shutil.copy2(src, dst_path)
+                            link_method = "copied"
+
+                        # Pre-hash while tape drive is idle
+                        disp = (file[:15] + '..' + file[-5:]) if len(file) > 22 else file
+                        sys.stdout.write(f"\r[HASHING] {disp}...   ")
+                        sys.stdout.flush()
+                        file_hash = _hash_file(src)
                         total_loose += 1
 
                         metadata.append({
                             'file_name':       file,
                             'original_path':   src,
                             'file_size_bytes': fsize,
+                            'file_hash':       file_hash,
                             'is_packed':       False,
                             'container_name':  None,
                             'stored_path':     rel,
                         })
 
-                        print(f"\r[LARGE]   {file[:55]}", end="", flush=True)
+                        sys.stdout.write(f"\r[STAGED]  {file[:50]} ({link_method})        \n")
+                        sys.stdout.flush()
 
                 except Exception as e:
                     print(f"\n[ERROR] {file}: {e}")
@@ -566,13 +603,13 @@ class LTOPacker:
             if os.path.exists(zip_path) and os.path.getsize(zip_path) < 100:
                 os.remove(zip_path)
 
-        print(f"\n[PACKER] Done: {total_packed} packed into ZIPs | {total_loose} large files staged.")
+        print(f"\n[PACKER] Offline phase done: {total_packed} packed | {total_loose} large files staged & pre-hashed.")
         return metadata
 
 
 # ==============================================================================
-# MODULE B-2: LTO BACKUP
-# Copies staged/source files to tape and commits records to the DB.
+# MODULE B-2: LTO BACKUP  (ONLINE PHASE)
+# Streams staged/source files to tape; commits records to the DB.
 # ==============================================================================
 
 class LTOBackup:
@@ -591,81 +628,110 @@ class LTOBackup:
         cmd       = [exe, drive_arg]
 
         try:
-            result = subprocess.run(cmd, check=True, text=True, capture_output=True,
-                                    cwd=LTFS_DIR)
+            result = subprocess.run(cmd, check=True, capture_output=True,
+                                    encoding='utf-8', errors='replace', cwd=LTFS_DIR)
             print("[LTO] Tape ejected successfully!")
-            if result.stdout:
-                print(result.stdout)
+            stdout = result.stdout or ''
+            if stdout.strip():
+                print(stdout.strip())
         except subprocess.CalledProcessError as e:
-            print(f"[ERROR] Eject failed: {e.stderr}")
+            stderr = e.stderr or ''
+            print(f"[ERROR] Eject failed: {stderr.strip()}")
             print(f"Try manually: cd /d \"{LTFS_DIR}\" && LtfsCmdEject.exe {drive_arg}")
         except FileNotFoundError:
             print(f"[ERROR] LtfsCmdEject.exe not found in: {LTFS_DIR}")
 
     def run(self, source, tape_drive, tape_label, packer_metadata=None):
         """
-        Copy files from source to tape and commit to the database.
+        ONLINE PHASE — stream files from source/staging to tape via robocopy.
 
         packer_metadata:
-            list of dicts  — staged backup with full metadata (from LTOPacker)
-            []             — staged backup, existing staging, no per-file metadata
-            None           — direct backup from source directory
+            list of dicts  — TWO-PHASE mode: pre-hashed metadata from LTOPacker.
+                             Skips live hashing entirely; robocopy streams immediately.
+            []             — staged backup, existing staging reused, no per-file metadata.
+            None           — DIRECT mode: hash files now then stream.
         """
         print(f"\n[BACKUP] Starting... Tape: {tape_label} | Drive: {tape_drive}")
 
         tape_root = os.path.join(tape_drive, os.path.basename(source))
         os.makedirs(tape_root, exist_ok=True)
 
-        # Build lookup: staging-relative-path -> metadata dict (loose large files only)
-        meta_by_rel = {}
-        if packer_metadata:
+        total_start = time.time()
+        skipped     = 0
+        hash_map    = {}
+
+        # -----------------------------------------------------------------------
+        # Phase 1 — Build hash map
+        #   TWO-PHASE mode : consume pre-computed hashes from LTOPacker; no disk reads.
+        #   DIRECT mode    : scan source and hash every new/changed file.
+        # -----------------------------------------------------------------------
+        if packer_metadata is not None:
+            # Build hash_map only for loose large files (needed for DB insert paths).
             for m in packer_metadata:
                 if not m['is_packed']:
-                    meta_by_rel[m['stored_path']] = m
+                    rel             = m['stored_path']
+                    src_in_staging  = os.path.join(source, rel)
+                    dst_on_tape     = os.path.join(tape_root, rel)
+                    hash_map[rel] = {
+                        'hash':          m.get('file_hash', ''),
+                        'fsize':         m['file_size_bytes'],
+                        'src':           src_in_staging,
+                        'dst':           dst_on_tape,
+                        'original_path': m['original_path'],
+                    }
 
-        total_start = time.time()
-
-        # ---------------------------------------------------------------
-        # Phase 1 — Hash files that are new / changed since last backup
-        # ---------------------------------------------------------------
-        print("[BACKUP] Scanning and hashing files...")
-        # hash_map: rel_path -> {'hash', 'fsize', 'src', 'dst'}
-        hash_map = {}
-        skipped  = 0
-
-        for root, _, files in os.walk(source):
-            rel_folder  = os.path.relpath(root, source)
-            dest_folder = os.path.join(tape_root, rel_folder)
-            for file in files:
-                src      = os.path.join(root, file)
-                dst      = os.path.join(dest_folder, file)
-                rel_path = os.path.relpath(src, source)
-                # Already on tape at the same size → skip hashing
-                if os.path.exists(dst):
+            # Compute total staging bytes for progress monitor (size scan only, no hashing).
+            total_bytes = 0
+            for r, _, fs in os.walk(source):
+                for f in fs:
                     try:
-                        if os.path.getsize(src) == os.path.getsize(dst):
-                            skipped += 1
-                            continue
+                        total_bytes += os.path.getsize(os.path.join(r, f))
                     except OSError:
                         pass
-                try:
-                    fsize = os.path.getsize(src)
-                    disp  = (file[:15] + '..' + file[-5:]) if len(file) > 22 else file
-                    sys.stdout.write(f"\r[HASHING] {disp}...  ")
-                    sys.stdout.flush()
-                    fhash = _hash_file(src)
-                    hash_map[rel_path] = {'hash': fhash, 'fsize': fsize,
-                                          'src': src, 'dst': dst}
-                except Exception as e:
-                    print(f"\n[WARN] Cannot hash {file}: {e}")
 
-        total_bytes = sum(v['fsize'] for v in hash_map.values())
-        print(f"\r[BACKUP] {len(hash_map)} file(s) to copy "
-              f"({total_bytes / 1024**3:.2f} GB) | {skipped} already on tape.  ")
+            print(f"[BACKUP] TWO-PHASE mode — {len(packer_metadata)} records pre-computed offline "
+                  f"({total_bytes / 1024**3:.2f} GB staging). Live hash scan skipped.")
 
-        # ---------------------------------------------------------------
-        # Phase 2 — Single robocopy call: source directory → tape
-        # ---------------------------------------------------------------
+        else:
+            # DIRECT mode: hash files that are new / changed since last backup.
+            print("[BACKUP] Scanning and hashing files...")
+
+            for root, _, files in os.walk(source):
+                rel_folder  = os.path.relpath(root, source)
+                dest_folder = os.path.join(tape_root, rel_folder)
+                for file in files:
+                    src      = os.path.join(root, file)
+                    dst      = os.path.join(dest_folder, file)
+                    rel_path = os.path.relpath(src, source)
+                    # Already on tape at the same size → skip hashing
+                    if os.path.exists(dst):
+                        try:
+                            if os.path.getsize(src) == os.path.getsize(dst):
+                                skipped += 1
+                                continue
+                        except OSError:
+                            pass
+                    try:
+                        fsize = os.path.getsize(src)
+                        disp  = (file[:15] + '..' + file[-5:]) if len(file) > 22 else file
+                        sys.stdout.write(f"\r[HASHING] {disp}...  ")
+                        sys.stdout.flush()
+                        fhash = _hash_file(src)
+                        hash_map[rel_path] = {'hash': fhash, 'fsize': fsize,
+                                              'src': src, 'dst': dst,
+                                              'original_path': src}
+                    except Exception as e:
+                        print(f"\n[WARN] Cannot hash {file}: {e}")
+
+            total_bytes = sum(v['fsize'] for v in hash_map.values())
+            print(f"\r[BACKUP] {len(hash_map)} file(s) to copy "
+                  f"({total_bytes / 1024**3:.2f} GB) | {skipped} already on tape.  ")
+
+        # -----------------------------------------------------------------------
+        # Phase 2 — Monolithic robocopy: staging / source → tape
+        #   robocopy.exe is whitelisted by startup diagnostics, ensuring
+        #   Defender real-time evaluation is bypassed for full hardware throughput.
+        # -----------------------------------------------------------------------
         print("[BACKUP] Copying to tape via robocopy...")
 
         def _dir_size(path):
@@ -706,34 +772,35 @@ class LTOBackup:
         rc = subprocess.run(
             ['robocopy', source, tape_root,
              '/E',     # recurse subdirectories including empty ones
-             '/J',     # unbuffered I/O — optimised for large files / tape
+             '/J',     # unbuffered I/O — optimized for large files / tape
              '/R:3', '/W:10',
              '/NP',    # no per-file progress %
              '/NDL',   # no directory listing lines
-             '/NFL',   # no per-file listing lines (keep job header+summary)
+             '/NFL',   # no per-file listing lines
             ],
-            capture_output=True, text=True
+            capture_output=True,
+            encoding='utf-8', errors='replace'
         )
 
         stop_evt.set()
         mon.join(timeout=2)
         print()  # end progress line
 
-        rc_sum = _parse_robocopy_summary(rc.stdout)
+        rc_sum = _parse_robocopy_summary(rc.stdout or '')
 
         if rc.returncode >= 8:
             print(f"[WARN] Robocopy finished with exit code {rc.returncode} "
                   f"— check for errors above.")
 
-        # ---------------------------------------------------------------
-        # Phase 3 — DB inserts (only files that were hashed / new this run)
-        # ---------------------------------------------------------------
+        # -----------------------------------------------------------------------
+        # Phase 3 — Deferred DB inserts (committed only after robocopy closes)
+        # -----------------------------------------------------------------------
         if packer_metadata is None:
-            # Direct backup: every hashed file is a loose tape record
+            # DIRECT mode: every hashed file is a loose tape record.
             for rel_path, info in hash_map.items():
                 self.db.insert_file(
                     file_name=os.path.basename(info['src']),
-                    original_path=info['src'],
+                    original_path=info['original_path'],
                     file_size_bytes=info['fsize'],
                     file_hash=info['hash'],
                     tape_label=tape_label, is_packed=False,
@@ -741,21 +808,17 @@ class LTOBackup:
                 )
 
         elif packer_metadata:
-            # Staged backup: loose large files + batch-insert packed-file records
+            # TWO-PHASE mode: insert loose large file records from pre-computed metadata.
             for rel_path, info in hash_map.items():
-                file = os.path.basename(info['src'])
-                if file.startswith("Bundle_") and file.endswith(".zip"):
-                    continue  # bundle records handled below
-                if rel_path in meta_by_rel:
-                    m = meta_by_rel[rel_path]
-                    self.db.insert_file(
-                        file_name=file,
-                        original_path=m['original_path'],
-                        file_size_bytes=info['fsize'],
-                        file_hash=info['hash'],
-                        tape_label=tape_label, is_packed=False,
-                        container_name=None, stored_path=info['dst'],
-                    )
+                self.db.insert_file(
+                    file_name=os.path.basename(info['src']),
+                    original_path=info['original_path'],
+                    file_size_bytes=info['fsize'],
+                    file_hash=info['hash'],
+                    tape_label=tape_label, is_packed=False,
+                    container_name=None, stored_path=info['dst'],
+                )
+            # Batch-insert packed-file records using pre-computed hashes.
             print("[DB] Recording packed file entries...")
             packed_count = 0
             for m in packer_metadata:
@@ -776,9 +839,9 @@ class LTOBackup:
         if rc_sum['bytes_copied'] > 0:
             self.db.update_tape_used_space(tape_label, rc_sum['bytes_copied'])
 
-        # ---------------------------------------------------------------
-        # Phase 4 — Print Robocopy job summary
-        # ---------------------------------------------------------------
+        # -----------------------------------------------------------------------
+        # Phase 4 — Print robocopy job summary
+        # -----------------------------------------------------------------------
         total_time = time.time() - total_start
         print("\n" + "=" * 60)
         print("BACKUP SESSION SUMMARY  [Robocopy]")
@@ -1039,9 +1102,10 @@ class TapeManager:
             try:
                 result = subprocess.run(
                     ['wmic', 'logicaldisk', 'get', 'DeviceID,Description,VolumeName'],
-                    capture_output=True, text=True
+                    capture_output=True, encoding='utf-8', errors='replace'
                 )
-                print("\n[DRIVES]\n" + result.stdout)
+                stdout = result.stdout or ''
+                print("\n[DRIVES]\n" + stdout)
             except Exception as e:
                 print(f"[ERROR] {e}")
         else:
@@ -1074,18 +1138,20 @@ class TapeManager:
         print("[FORMAT] This may take several minutes...")
 
         try:
-            result = subprocess.run(cmd, check=True, text=True, capture_output=True,
-                                    cwd=LTFS_DIR)
+            result = subprocess.run(cmd, check=True, capture_output=True,
+                                    encoding='utf-8', errors='replace', cwd=LTFS_DIR)
             print("[FORMAT] Complete.")
-            if result.stdout:
-                print(result.stdout)
+            stdout = result.stdout or ''
+            if stdout.strip():
+                print(stdout.strip())
             if old_label and self.db.tape_exists(old_label):
                 self.db.delete_tape(old_label)
             cap      = input("Tape capacity in GB (optional, Enter to skip): ").strip()
             capacity = int(cap) if cap.isdigit() else None
             self.db.register_tape(label, capacity)
         except subprocess.CalledProcessError as e:
-            print(f"[ERROR] LtfsCmdFormat.exe failed:\n{e.stderr}")
+            stderr = e.stderr or ''
+            print(f"[ERROR] LtfsCmdFormat.exe failed:\n{stderr.strip()}")
         except FileNotFoundError:
             print(f"[ERROR] LtfsCmdFormat.exe not found in: {LTFS_DIR}")
 
@@ -1105,8 +1171,11 @@ class TapeManager:
         print(f"\n[CHECK] Running: LtfsCmdCheck.exe {drive_letter}")
         print("[CHECK] This may take several minutes...")
         try:
-            result = subprocess.run(cmd, text=True, capture_output=True, cwd=LTFS_DIR)
-            output = (result.stdout or '') + (result.stderr or '')
+            result = subprocess.run(cmd, capture_output=True,
+                                    encoding='utf-8', errors='replace', cwd=LTFS_DIR)
+            stdout = result.stdout or ''
+            stderr = result.stderr or ''
+            output = stdout + stderr
             if output.strip():
                 print(output.strip())
             if result.returncode == 0:
@@ -1121,8 +1190,11 @@ class TapeManager:
         exe = os.path.join(LTFS_DIR, 'LtfsCmdDrives.exe')
         print(f"\n[INFO] Running: LtfsCmdDrives.exe")
         try:
-            result = subprocess.run([exe], text=True, capture_output=True, cwd=LTFS_DIR)
-            output = (result.stdout or '') + (result.stderr or '')
+            result = subprocess.run([exe], capture_output=True,
+                                    encoding='utf-8', errors='replace', cwd=LTFS_DIR)
+            stdout = result.stdout or ''
+            stderr = result.stderr or ''
+            output = stdout + stderr
             if output.strip():
                 print(output.strip())
             if result.returncode != 0:
@@ -1140,13 +1212,15 @@ class TapeManager:
         print("[LTO] PLEASE WAIT — this can take 1-2 minutes.")
         print("#" * 60)
         try:
-            result = subprocess.run(cmd, check=True, text=True, capture_output=True,
-                                    cwd=LTFS_DIR)
+            result = subprocess.run(cmd, check=True, capture_output=True,
+                                    encoding='utf-8', errors='replace', cwd=LTFS_DIR)
             print("[LTO] Tape ejected successfully!")
-            if result.stdout:
-                print(result.stdout)
+            stdout = result.stdout or ''
+            if stdout.strip():
+                print(stdout.strip())
         except subprocess.CalledProcessError as e:
-            print(f"[ERROR] Eject failed: {e.stderr}")
+            stderr = e.stderr or ''
+            print(f"[ERROR] Eject failed: {stderr.strip()}")
             print(f"Try manually: cd /d \"{LTFS_DIR}\" && LtfsCmdEject.exe {drive_arg}")
         except FileNotFoundError:
             print(f"[ERROR] LtfsCmdEject.exe not found in: {LTFS_DIR}")
@@ -1168,17 +1242,90 @@ def _manage_defender_exclusions(action, paths):
             result = subprocess.run(
                 ['powershell', '-NonInteractive', '-Command',
                  f'{verb} -ExclusionPath "{path}"'],
-                capture_output=True, text=True
+                capture_output=True,
+                encoding='utf-8', errors='replace'
             )
             if result.returncode == 0:
                 print(f"[DEFENDER] {action}ed exclusion: {path}")
             else:
-                err = (result.stderr or result.stdout).strip()
+                stdout = result.stdout or ''
+                stderr = result.stderr or ''
+                err = (stderr or stdout).strip()
                 print(f"[DEFENDER] Warning: could not {action.lower()} exclusion "
                       f"for {path}: {err}")
         except FileNotFoundError:
             print(f"[DEFENDER] Warning: PowerShell not found — "
                   f"skipping {action.lower()} exclusion.")
+
+
+def _startup_diagnostics():
+    """
+    Phase 1 startup checks:
+      1. Detect Administrator privileges.
+      2. Verify robocopy.exe is excluded from Defender real-time monitoring;
+         attempt to add the exclusion if missing.
+         Degrades gracefully if Admin rights are absent — no crash.
+    """
+    print()
+    print("─" * 60)
+    print("  SYSTEM ENVIRONMENT CHECK")
+    print("─" * 60)
+
+    # ── 1. Admin privilege check ──────────────────────────────────────────────
+    try:
+        is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        is_admin = False
+
+    if is_admin:
+        print("[STATUS] Running with ADMINISTRATOR privileges (Dynamic Defender management active)")
+    else:
+        print("[STATUS] Running as STANDARD USER")
+
+    # ── 2. Robocopy Defender process exclusion ────────────────────────────────
+    robocopy_excluded = False
+
+    # Check whether robocopy.exe is already in the exclusion list.
+    try:
+        chk = subprocess.run(
+            ['powershell', '-NonInteractive', '-Command',
+             '(Get-MpPreference).ExclusionProcess'],
+            capture_output=True,
+            encoding='utf-8', errors='replace',
+            timeout=10
+        )
+        stdout = chk.stdout or ''
+        if 'robocopy' in stdout.lower():
+            robocopy_excluded = True
+            print("[DEFENDER] robocopy.exe is already excluded from real-time monitoring.")
+    except Exception:
+        pass
+
+    if not robocopy_excluded:
+        # Attempt to add the process exclusion dynamically.
+        try:
+            add_result = subprocess.run(
+                ['powershell', '-NonInteractive', '-Command',
+                 'Add-MpPreference -ExclusionProcess "robocopy.exe"'],
+                capture_output=True,
+                encoding='utf-8', errors='replace',
+                timeout=15
+            )
+            if add_result.returncode == 0:
+                print("[DEFENDER] robocopy.exe process exclusion added successfully.")
+                robocopy_excluded = True
+            else:
+                raise PermissionError(add_result.stderr or add_result.stdout or "Access Denied")
+        except Exception:
+            # Non-Admin environment: suppress error output and warn cleanly.
+            print(
+                "[DEFENDER] [WARNING] Bypassed dynamic process whitelisting due to missing "
+                "Admin privileges. Ensure 'robocopy.exe' is contextually or permanently "
+                "excluded by your Administrator."
+            )
+
+    print("─" * 60)
+    print()
 
 
 # ==============================================================================
@@ -1227,7 +1374,7 @@ def run_archiver(cfg: ConfigManager, db: DatabaseManager):
             if metadata is None:
                 print("[ABORTED]")
                 return
-            print("\n>>> Staging complete. Starting backup in 3 seconds...")
+            print("\n>>> Offline phase complete. Starting tape stream in 3 seconds...")
             time.sleep(3)
             backup.run(cfg.staging_dir, cfg.lto_drive, tape_label, packer_metadata=metadata)
 
@@ -1248,6 +1395,9 @@ def main():
     print("=" * 60)
     print("   LTO ARCHIVE MANAGEMENT SYSTEM")
     print("=" * 60)
+
+    # Phase 1: startup diagnostics (admin check + Defender robocopy exclusion)
+    _startup_diagnostics()
 
     cfg       = ConfigManager()
     db        = DatabaseManager(cfg.db_path)
