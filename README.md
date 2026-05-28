@@ -9,6 +9,7 @@ A Python CLI for archiving files to LTO tape using an OWC Mercury Pro LTO-8 driv
 - **Restore** — search by filename/wildcard, date range, original directory, or full backup session; restore individual files or entire sets
 - **Tape management** — format, register, check, and inspect tapes via IBM LTFS command-line tools
 - **Multi-tape support** — tracks multiple tapes; prompts you to swap tapes during restore when needed
+- **Database Inspector GUI** — standalone CustomTkinter app for browsing and editing the tape/file index without touching the CLI
 
 ## Requirements
 
@@ -16,6 +17,7 @@ A Python CLI for archiving files to LTO tape using an OWC Mercury Pro LTO-8 driv
 - Python 3.8+
 - [IBM LTFS SDE](https://www.ibm.com/support/pages/ibm-linear-tape-file-system-ltfs) installed to `C:\Program Files\IBM\LTFS\`
 - OWC Mercury Pro LTO-8 (or compatible LTFS-formatted LTO drive)
+- `customtkinter` (required only for the DB Inspector GUI): `pip install customtkinter`
 
 The `Framework & Drivers` folder in this repo contains the installers used during setup:
 - `IBM_LTFS_SDE_2.4.8.1.10519_x64.exe`
@@ -47,7 +49,11 @@ max_zip_size_gb  = 100   ; maximum size per ZIP bundle
 ## Usage
 
 ```
+# CLI (no extra dependencies)
 python lto_archive_manager.py
+
+# Database Inspector GUI (requires customtkinter)
+python db_inspector.py
 ```
 
 ### Main Menu
@@ -112,6 +118,23 @@ When restoring multiple files from the same ZIP bundle, the bundle is copied fro
 | Check tape | `LtfsCmdCheck.exe` — repair filesystem errors |
 | Tape drives info | `LtfsCmdDrives.exe` — list connected drives |
 | Eject tape | `LtfsCmdEject.exe` — safely eject without archiving |
+
+## Database Inspector GUI
+
+`db_inspector.py` is a standalone dark-theme GUI (CustomTkinter) for browsing and editing the SQLite archive index without using the CLI.
+
+```
+python db_inspector.py
+```
+
+**Tapes tab** — lists all registered tapes with capacity bars and file counts. Select a tape to enable:
+- **Rename** — update the volume label (cascades to all file records)
+- **Set Capacity** — manually set the tape's total capacity in GB
+- **Recalculate Used** — recompute used space from the files_index
+- **Wipe File Records** — delete all file records for the tape (tape entry kept); type the label to confirm
+- **Delete Tape** — permanently remove the tape and all its file records; type the label to confirm
+
+**Files tab** — searchable view of the `files_index` table. Filter by name fragment, tape label, and date range. Select one or more rows to **Delete Selected** or double-click a row to open a **View Details** panel showing all fields (including the full SHA-256 hash).
 
 ## Database Schema
 
