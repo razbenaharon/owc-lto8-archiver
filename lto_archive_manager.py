@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import shlex
 import posixpath
+import atexit
 from datetime import datetime
 from collections import defaultdict
 
@@ -19,7 +20,7 @@ from collections import defaultdict
 # LTO ARCHIVE MANAGEMENT SYSTEM
 # ==============================================================================
 
-BUFFER_SIZE = 1024 * 1024 * 16  # 128 MB read buffer
+BUFFER_SIZE = 1024 * 1024 * 16  # 16 MB read buffer
 CONFIG_FILE  = "config.ini"
 LTFS_DIR     = r'C:\Program Files\IBM\LTFS'  # IBM LTFS tools must run from this directory
 APP_DIR      = os.path.dirname(os.path.abspath(__file__))
@@ -94,7 +95,11 @@ def _robocopy_file(src, dst, display_name=None):
     filename = os.path.basename(src)
     os.makedirs(dst_dir, exist_ok=True)
 
-    fsize = os.path.getsize(src)
+    try:
+        fsize = os.path.getsize(src)
+    except OSError as e:
+        print(f"\n[ERROR] Cannot access source file: {src} ({e})")
+        return False
     label = display_name or filename
     disp  = (label[:15] + '..' + label[-5:]) if len(label) > 22 else label
 
@@ -225,6 +230,19 @@ def _has_command(name):
     return shutil.which(name) is not None
 
 
+_ASKPASS_HELPERS = set()
+
+
+@atexit.register
+def _cleanup_askpass_helpers():
+    """Remove any SSH askpass helper scripts created during this run."""
+    for helper_path in _ASKPASS_HELPERS:
+        try:
+            os.remove(helper_path)
+        except OSError:
+            pass
+
+
 def _openssh_askpass_env(password):
     """Build an environment that lets OpenSSH read a configured password."""
     helper_path = os.path.join(tempfile.gettempdir(), 'lto_ssh_askpass.cmd')
@@ -238,6 +256,7 @@ def _openssh_askpass_env(password):
             f.write(helper_body)
     except OSError as e:
         raise RuntimeError(f"Could not create SSH askpass helper: {e}") from e
+    _ASKPASS_HELPERS.add(helper_path)
 
     env = os.environ.copy()
     env['LTO_REMOTE_PASSWORD'] = password
@@ -633,7 +652,7 @@ def _ensure_lto_drive_ready(tape_drive, prefix="[TAPE]"):
 
 class ConfigManager:
     def __init__(self, config_path=CONFIG_FILE):
-        self.config      = configparser.ConfigParser()
+        self.config      = configparser.ConfigParser(interpolation=None)
         self.config_path = config_path
 
         if not os.path.exists(config_path):
@@ -1126,11 +1145,11 @@ class DatabaseManager:
                 pattern = f'%{pattern}%'
             params.append(pattern)
         if date_from:
-            sql += " AND backup_date >= ?"
+            sql += " AND DATE(backup_date) >= ?"
             params.append(date_from)
         if date_to:
-            sql += " AND backup_date <= ?"
-            params.append(date_to + " 23:59:59")
+            sql += " AND DATE(backup_date) <= ?"
+            params.append(date_to)
         sql += " ORDER BY backup_date DESC"
         return self.conn.execute(sql, params).fetchall()
 
@@ -1522,6 +1541,7 @@ class LTOPacker:
                     rel      = os.path.relpath(src, source)
 
                     if fsize_mb < threshold_mb:
+                        zip_rel = rel.replace('\\', '/')  # ZIP entries use POSIX separators
                         # Roll over to a new ZIP bundle if current one is full
                         if current_zip_size + fsize > self.max_zip_size_gb * 1024**3 * 0.99:
                             zipf.close()
@@ -1534,7 +1554,7 @@ class LTOPacker:
 
                         container = f"Bundle_{zip_idx:03d}.zip"
                         hasher = hashlib.sha256()
-                        with open(src, 'rb') as fsrc, zipf.open(rel, 'w', force_zip64=True) as zdst:
+                        with open(src, 'rb') as fsrc, zipf.open(zip_rel, 'w', force_zip64=True) as zdst:
                             while True:
                                 buf = fsrc.read(BUFFER_SIZE)
                                 if not buf:
@@ -1553,7 +1573,7 @@ class LTOPacker:
                             'file_hash':       file_hash,
                             'is_packed':       True,
                             'container_name':  container,
-                            'stored_path':     rel,
+                            'stored_path':     zip_rel,
                         })
 
                         if total_packed % 500 == 0:
@@ -1616,12 +1636,13 @@ class LTOBackup:
         print("#" * 60)
 
         drive_arg = tape_drive.rstrip(":\\")
-        exe       = os.path.join(LTFS_DIR, 'LtfsCmdEject.exe')
+        exe       = self.ibm_eject_cmd or os.path.join(LTFS_DIR, 'LtfsCmdEject.exe')
+        exe_dir   = os.path.dirname(exe) or LTFS_DIR
         cmd       = [exe, drive_arg]
 
         try:
             result = subprocess.run(cmd, check=True, text=True, capture_output=True,
-                                    cwd=LTFS_DIR)
+                                    cwd=exe_dir)
             print("[LTO] Tape ejected successfully!")
             if result.stdout:
                 print(result.stdout)
@@ -1766,7 +1787,7 @@ class LTOBackup:
             prev_bytes = 0
             prev_time  = time.time()
             while not stop_evt.is_set():
-                time.sleep(1)
+                time.sleep(2)  # walking the LTFS tree is not free; don't hammer it
                 cur   = max(0, _dir_size(tape_root) - initial_tape_bytes)
                 now   = time.time()
                 dt    = now - prev_time
@@ -1893,7 +1914,13 @@ class LTOBackup:
             print(f"[DB] {packed_count} packed file records committed.")
         # else: packer_metadata == [] (existing staging) -> no DB records
 
-        used_delta = rc_sum['bytes_copied'] + recovered_existing_bytes
+        # The robocopy summary parser is English-only; on a localized console
+        # it yields 0 bytes. Fall back to the measured growth of the tape
+        # directory so used-space accounting still works.
+        copied_bytes = rc_sum['bytes_copied']
+        if copied_bytes <= 0:
+            copied_bytes = max(0, _dir_size(tape_root) - initial_tape_bytes)
+        used_delta = copied_bytes + recovered_existing_bytes
         if used_delta > 0:
             self.db.update_tape_used_space(tape_label, used_delta)
 
@@ -1906,7 +1933,7 @@ class LTOBackup:
         print("=" * 60)
         print(f"Tape            : {tape_label}")
         print(f"Total Time      : {total_time / 60:.1f} minutes")
-        print(f"Data Copied     : {rc_sum['bytes_copied'] / 1024**3:.2f} GB")
+        print(f"Data Copied     : {copied_bytes / 1024**3:.2f} GB")
         print(f"Avg Speed       : {rc_sum['speed_mbs']:.1f} MB/s")
         print(f"Files Copied    : {rc_sum['files_copied']}")
         print(f"Files Skipped   : {rc_sum['files_skipped'] + skipped}")
@@ -1929,6 +1956,18 @@ class LTORetriever:
         self.tape_drive  = tape_drive
         self.staging_dir = staging_dir
         self.restore_dir = restore_dir
+
+    def _unique_dest(self, file_name):
+        """Return a restore path under restore_dir that won't overwrite an
+        existing file. Distinct source files that share a basename would
+        otherwise silently clobber each other when flattened into restore_dir."""
+        base, ext = os.path.splitext(file_name)
+        candidate = os.path.join(self.restore_dir, file_name)
+        counter = 1
+        while os.path.exists(candidate):
+            candidate = os.path.join(self.restore_dir, f"{base}_{counter}{ext}")
+            counter += 1
+        return candidate
 
     def run(self):
         print("\n--- RETRIEVER: Search & Restore ---")
@@ -1971,7 +2010,7 @@ class LTORetriever:
                 idx = int(input("Select session # (0 = cancel): ").strip())
             except ValueError:
                 return
-            if idx == 0 or idx > len(sessions):
+            if idx < 1 or idx > len(sessions):
                 return
             s = sessions[idx - 1]
             results = self.db.search_by_session(s['session_date'], s['tape_label'])
@@ -2064,7 +2103,7 @@ class LTORetriever:
 
     def _restore_loose(self, record):
         src = record['stored_path']
-        dst = os.path.join(self.restore_dir, record['file_name'])
+        dst = self._unique_dest(record['file_name'])
         print(f"\n[RESTORE] Copying loose file: {record['file_name']}")
         if _robocopy_file(src, dst):
             print(f"[RESTORE] Saved to: {dst}")
@@ -2086,7 +2125,7 @@ class LTORetriever:
             return
 
         print(f"[RESTORE] Step 2/3: Extracting '{record['file_name']}' from ZIP...")
-        dst = os.path.join(self.restore_dir, record['file_name'])
+        dst = self._unique_dest(record['file_name'])
         try:
             with zipfile.ZipFile(local_zip, 'r') as zf:
                 candidates = [n for n in zf.namelist()
@@ -2123,7 +2162,7 @@ class LTORetriever:
                 zip_names = zf.namelist()
                 for record in records:
                     stored_in_zip = record['stored_path']
-                    dst = os.path.join(self.restore_dir, record['file_name'])
+                    dst = self._unique_dest(record['file_name'])
                     candidates = [n for n in zip_names
                                   if n == stored_in_zip
                                   or os.path.basename(n) == record['file_name']]
@@ -2228,7 +2267,17 @@ class LocalOrchestrator:
             return
 
         print(f"\n[LOCAL] Processing {len(pending)} pending chunk(s).")
-        for chunk_index in pending:
+        for loop_idx, chunk_index in enumerate(pending):
+            if loop_idx > 0:
+                # The previous chunk finished and ejected its tape. A local
+                # session uses one tape per chunk, so pause for a tape swap and
+                # re-verify drive readiness before continuing.
+                print("\n[LOCAL] The previous tape has been ejected.")
+                input("Insert the NEXT blank/formatted tape, wait until ready, "
+                      "then press Enter...")
+                if not _ensure_lto_drive_ready(self.cfg.lto_drive):
+                    print("[LOCAL] Drive not ready. Re-run option 1 to resume.")
+                    return
             entries = self.db.get_local_chunk_entries(session_id, chunk_index)
             print(f"\n[LOCAL] === Tape {chunk_index + 1}/{session['total_chunks']} ===")
             ok = self._process_chunk(session, chunk_index, entries)
@@ -2857,19 +2906,6 @@ class RemoteOrchestrator:
     # Utility
     # ------------------------------------------------------------------
 
-    def _cleanup_dir(self, path):
-        if os.path.exists(path):
-            try:
-                shutil.rmtree(path)
-                print(f"[REMOTE] Cleaned: {path}")
-            except OSError as e:
-                print(f"[REMOTE] Warning — could not clean {path}: {e}")
-
-
-# ==============================================================================
-# MODULE D: TAPE MANAGER — Formatting & registration
-# ==============================================================================
-
     def _cleanup_remote_staging_dirs(self):
         """Remove remote-session temp folders before a truly fresh run."""
         staging_root = os.path.abspath(self.staging_dir)
@@ -2888,15 +2924,24 @@ class RemoteOrchestrator:
                 continue
             self._cleanup_dir(path)
 
+    def _cleanup_dir(self, path):
+        if os.path.exists(path):
+            try:
+                shutil.rmtree(path)
+                print(f"[REMOTE] Cleaned: {path}")
+            except OSError as e:
+                print(f"[REMOTE] Warning — could not clean {path}: {e}")
+
 
 # ==============================================================================
 # MODULE D: TAPE MANAGER - Formatting & registration
 # ==============================================================================
 
 class TapeManager:
-    def __init__(self, db: DatabaseManager, tape_drive: str):
-        self.db         = db
-        self.tape_drive = tape_drive
+    def __init__(self, db: DatabaseManager, tape_drive: str, ibm_eject_cmd=None):
+        self.db            = db
+        self.tape_drive    = tape_drive
+        self.ibm_eject_cmd = ibm_eject_cmd
 
     def _drive_letter(self):
         return _drive_letter(self.tape_drive)
@@ -3043,7 +3088,8 @@ class TapeManager:
     def eject_tape(self):
         """Run LtfsCmdEject.exe to safely eject the tape."""
         drive_arg = self.tape_drive.rstrip(":\\")
-        exe       = os.path.join(LTFS_DIR, 'LtfsCmdEject.exe')
+        exe       = self.ibm_eject_cmd or os.path.join(LTFS_DIR, 'LtfsCmdEject.exe')
+        exe_dir   = os.path.dirname(exe) or LTFS_DIR
         cmd       = [exe, drive_arg]
         print("\n" + "#" * 60)
         print("[LTO] Ejecting tape...")
@@ -3051,7 +3097,7 @@ class TapeManager:
         print("#" * 60)
         try:
             result = subprocess.run(cmd, check=True, text=True, capture_output=True,
-                                    cwd=LTFS_DIR)
+                                    cwd=exe_dir)
             print("[LTO] Tape ejected successfully!")
             if result.stdout:
                 print(result.stdout)
@@ -3256,9 +3302,9 @@ def _print_tapes_table(db):
             pct     = min(used_gb / cap_gb, 1.0)
             filled  = round(pct * BAR_W)
             bar     = '█' * filled + '░' * (BAR_W - filled)
-            space_s = f"[{bar}] {pct*100:.1f}%  {used_gb:.1f}/{cap_gb} GB"
+            space_s = f"[{bar}] {pct*100:.1f}%  {used_gb:.1f}/{cap_gb:.0f} GiB"
         else:
-            space_s = f"{used_gb:.1f} GB used  (no capacity set)"
+            space_s = f"{used_gb:.1f} GiB used  (no capacity set)"
         print(f"{t['tape_id']:>4}  {t['volume_label']:<25}  {date_s:<19}  {space_s}")
     return tapes
 
@@ -3393,7 +3439,7 @@ def main():
 
     cfg       = ConfigManager()
     db        = DatabaseManager(cfg.db_path)
-    tape_mgr  = TapeManager(db, cfg.lto_drive)
+    tape_mgr  = TapeManager(db, cfg.lto_drive, cfg.ibm_eject_cmd)
     retriever = LTORetriever(db, cfg.lto_drive, cfg.staging_dir, cfg.restore_dir)
 
     while True:
@@ -3464,9 +3510,9 @@ def main():
                         pct    = min(used_gb / cap_gb, 1.0)
                         filled = round(pct * BAR_W)
                         bar    = '█' * filled + '░' * (BAR_W - filled)
-                        space_s = f"[{bar}] {pct*100:.1f}%  {used_gb:.1f}/{cap_gb} GB"
+                        space_s = f"[{bar}] {pct*100:.1f}%  {used_gb:.1f}/{cap_gb:.0f} GiB"
                     else:
-                        space_s = f"{used_gb:.1f} GB used  (no capacity set)"
+                        space_s = f"{used_gb:.1f} GiB used  (no capacity set)"
 
                     print(f"{t['tape_id']:>4}  {t['volume_label']:<25}  {date_s:<19}  {space_s}")
 
