@@ -7,6 +7,14 @@ try:
 except ImportError:
     sys.exit("customtkinter is not installed. Run: pip install customtkinter")
 
+APP_FONT_FAMILY = "Roboto"
+APP_FONT_SIZE = 18
+APP_FONT_SIZE_SMALL = 16
+APP_FONT_SIZE_MONO = 15
+TREE_FONT_SIZE = 26
+TREE_HEADING_SIZE = 24
+TREE_ROW_HEIGHT = 48
+
 
 # ==============================================================================
 # HELPERS
@@ -30,6 +38,19 @@ def _bar_str(pct, width=18):
     return "█" * filled + "░" * (width - filled)
 
 
+def _prepare_database_connection(db):
+    if not callable(getattr(db, "_require_updated", None)):
+        def _require_updated(cur, message):
+            if cur.rowcount == 0:
+                raise RuntimeError(message)
+        db._require_updated = _require_updated
+
+    db.conn.execute("PRAGMA foreign_keys = ON")
+    enabled = db.conn.execute("PRAGMA foreign_keys").fetchone()[0]
+    if enabled != 1:
+        raise RuntimeError("[DB] Could not enable SQLite foreign key checks.")
+
+
 def _apply_treeview_dark_style(style):
     style.theme_use("clam")
     style.configure("Treeview",
@@ -38,13 +59,13 @@ def _apply_treeview_dark_style(style):
         fieldbackground="#212121",
         bordercolor="#474747",
         borderwidth=1,
-        rowheight=24,
-        font=("Roboto", 12))
+        rowheight=TREE_ROW_HEIGHT,
+        font=(APP_FONT_FAMILY, TREE_FONT_SIZE))
     style.configure("Treeview.Heading",
         background="#1a1a1a",
         foreground="#DCE4EE",
         relief="flat",
-        font=("Roboto", 12, "bold"))
+        font=(APP_FONT_FAMILY, TREE_HEADING_SIZE, "bold"))
     style.map("Treeview",
         background=[("selected", "#1f538d")],
         foreground=[("selected", "#DCE4EE")])
@@ -326,6 +347,13 @@ class TapesPanel(ctk.CTkFrame):
     def _tape_labels_from_db(self):
         return [t["volume_label"] for t in self._db.list_tapes()]
 
+    def _show_db_error_and_refresh(self, exc):
+        messagebox.showerror(
+            "Database Changed",
+            f"{exc}\n\nThe database view will refresh.",
+            parent=self.winfo_toplevel())
+        self._app.refresh_all()
+
     # ------------------------------------------------------------------
 
     def _on_rename(self):
@@ -344,7 +372,11 @@ class TapesPanel(ctk.CTkFrame):
                                  f"Label '{new_label}' already exists.",
                                  parent=self.winfo_toplevel())
             return
-        self._db.rename_tape(label, new_label)
+        try:
+            self._db.rename_tape(label, new_label)
+        except Exception as e:
+            self._show_db_error_and_refresh(e)
+            return
         self.refresh()
         self._app.files_panel.refresh(self._tape_labels_from_db())
 
@@ -356,7 +388,11 @@ class TapesPanel(ctk.CTkFrame):
         self.wait_window(dlg)
         if dlg.result is None:
             return
-        self._db.update_tape_capacity(label, dlg.result)
+        try:
+            self._db.update_tape_capacity(label, dlg.result)
+        except Exception as e:
+            self._show_db_error_and_refresh(e)
+            return
         self.refresh()
 
     def _on_recalc(self):
@@ -368,7 +404,11 @@ class TapesPanel(ctk.CTkFrame):
                 f"Recalculate used space for '{label}'?",
                 parent=self.winfo_toplevel()):
             return
-        new_bytes = self._db.recalculate_tape_used_space(label)
+        try:
+            new_bytes = self._db.recalculate_tape_used_space(label)
+        except Exception as e:
+            self._show_db_error_and_refresh(e)
+            return
         messagebox.showinfo(
             "Done",
             f"Used space for '{label}' updated to {new_bytes / 1024**3:.3f} GB.",
@@ -380,15 +420,17 @@ class TapesPanel(ctk.CTkFrame):
         if not label:
             return
         count = self._db.count_tape_file_records(label)
-        dlg = ctk.CTkInputDialog(
-            text=(f"Wipe {count} file record(s) for '{label}'?\n"
-                  f"The tape entry is kept.\n\n"
-                  f"Type the tape label to confirm:"),
-            title="Wipe File Records")
-        entered = dlg.get_input()
-        if entered != label:
+        if not messagebox.askyesno(
+                "Wipe File Records",
+                f"Wipe {count} file record(s) for '{label}'?\n\n"
+                f"The tape entry will be kept. This cannot be undone.",
+                parent=self.winfo_toplevel()):
             return
-        self._db.delete_files_for_tape(label)
+        try:
+            self._db.delete_files_for_tape(label)
+        except Exception as e:
+            self._show_db_error_and_refresh(e)
+            return
         self.refresh()
         self._app.files_panel.refresh()
 
@@ -397,15 +439,17 @@ class TapesPanel(ctk.CTkFrame):
         if not label:
             return
         count = self._db.count_tape_file_records(label)
-        dlg = ctk.CTkInputDialog(
-            text=(f"PERMANENTLY delete tape '{label}'\n"
-                  f"and {count} file record(s). Cannot be undone.\n\n"
-                  f"Type the tape label to confirm:"),
-            title="Delete Tape")
-        entered = dlg.get_input()
-        if entered != label:
+        if not messagebox.askyesno(
+                "Delete Tape",
+                f"Permanently delete tape '{label}' and "
+                f"{count} file record(s)?\n\nThis cannot be undone.",
+                parent=self.winfo_toplevel()):
             return
-        self._db.delete_tape(label)
+        try:
+            self._db.delete_tape(label)
+        except Exception as e:
+            self._show_db_error_and_refresh(e)
+            return
         self.refresh()
         self._app.files_panel.refresh(self._tape_labels_from_db())
 
@@ -600,9 +644,19 @@ class FilesPanel(ctk.CTkFrame):
                 f"Delete {len(sel)} file record(s)? This cannot be undone.",
                 parent=self.winfo_toplevel()):
             return
+        missing = []
         for iid in sel:
-            self._db.delete_file(int(iid))
+            try:
+                self._db.delete_file(int(iid))
+            except RuntimeError as e:
+                missing.append(str(e))
         self._on_search()
+        if missing:
+            messagebox.showwarning(
+                "Database Changed",
+                "Some selected record(s) were no longer present.\n\n"
+                + "\n".join(missing[:5]),
+                parent=self.winfo_toplevel())
 
     def _on_view_details(self):
         sel = self._tree.selection()
@@ -611,6 +665,12 @@ class FilesPanel(ctk.CTkFrame):
         rec = self._db.get_file_by_id(int(sel[0]))
         if rec:
             FileDetailDialog(self, rec)
+        else:
+            self._on_search()
+            messagebox.showinfo(
+                "Database Changed",
+                "The selected file record is no longer present.",
+                parent=self.winfo_toplevel())
 
     def refresh(self, tape_labels=None):
         if tape_labels is not None:
@@ -629,6 +689,7 @@ class FilesPanel(ctk.CTkFrame):
 class DBInspectorApp(ctk.CTk):
     def __init__(self, db, db_path):
         super().__init__()
+        _prepare_database_connection(db)
         self._db = db
 
         self.title("LTO Archive — Database Inspector")
@@ -677,6 +738,7 @@ if __name__ == "__main__":
 
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("dark-blue")
+    ctk.set_widget_scaling(1.25)
 
     app = DBInspectorApp(db, cfg.db_path)
     try:

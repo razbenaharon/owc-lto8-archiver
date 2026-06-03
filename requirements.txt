@@ -1,0 +1,10 @@
+# LTO-8 archiver — Python dependencies
+#
+# psutil is optional but strongly recommended: it enables HIGH CPU priority for
+# the robocopy tape writer and CPU-affinity isolation between the SSH/fetch
+# workers and the tape writer (the [PERFORMANCE] section in config.ini).
+# Without it the tool still runs, just without priority/affinity tuning.
+#
+# NOTE: for the remote fetch buffer, install `mbuffer` on the REMOTE Linux host
+# (e.g. `apt install mbuffer`). It is invoked there, not on this Windows PC.
+psutil>=5.9
