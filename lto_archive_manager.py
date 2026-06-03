@@ -2,6 +2,8 @@ import os
 import re
 import sys
 import time
+import queue
+import signal
 import shutil
 import hashlib
 import zipfile
@@ -16,6 +18,11 @@ import atexit
 from datetime import datetime
 from collections import defaultdict
 
+try:
+    import psutil
+except ImportError:  # optional dependency — priority/affinity degrade gracefully
+    psutil = None
+
 # ==============================================================================
 # LTO ARCHIVE MANAGEMENT SYSTEM
 # ==============================================================================
@@ -26,6 +33,263 @@ LTFS_DIR     = r'C:\Program Files\IBM\LTFS'  # IBM LTFS tools must run from this
 APP_DIR      = os.path.dirname(os.path.abspath(__file__))
 LOCAL_TAPE_BUDGET_BYTES = int(11.5 * 1000**4)
 ROOT_FILES_GROUP = "_ROOT_FILES"
+
+
+# ==============================================================================
+# RUNTIME INFRASTRUCTURE — status output, cancellation, CPU priority/affinity
+# These helpers are shared by the streaming pipeline so the user always sees
+# which phase is active and can stop the job cleanly with Ctrl+C.
+# ==============================================================================
+
+def _ts():
+    """Wall-clock timestamp prefix for status lines."""
+    return time.strftime('%H:%M:%S')
+
+
+def _phase(tag, msg):
+    """Print a prominent phase-transition banner (e.g. SSH -> FETCH -> TAPE)."""
+    print(f"\n[{_ts()}] ===== {tag}: {msg} =====")
+    sys.stdout.flush()
+
+
+def _status(tag, msg):
+    """Print a timestamped one-line status update."""
+    print(f"[{_ts()}] [{tag}] {msg}")
+    sys.stdout.flush()
+
+
+# --- Graceful cancellation (Ctrl+C) -------------------------------------------
+
+CANCEL = threading.Event()        # set by the SIGINT handler; polled by workers
+_PROCS = set()                    # live child Popen objects we may need to kill
+# RLock (not Lock): the SIGINT handler runs in the main thread and may fire while
+# that thread is already inside register/unregister, so it must be re-entrant.
+_PROCS_LOCK = threading.RLock()
+_SIGNAL_INSTALLED = False
+_PREV_SIGINT = None
+_PREV_SIGBREAK = None
+_PERF_WARNED = False
+
+
+def register_proc(proc):
+    """Track a live subprocess so Ctrl+C can terminate it (and its children)."""
+    if proc is not None:
+        with _PROCS_LOCK:
+            _PROCS.add(proc)
+
+
+def unregister_proc(proc):
+    with _PROCS_LOCK:
+        _PROCS.discard(proc)
+
+
+def _kill_proc_tree(proc):
+    """Terminate a process and every child it spawned, escalating to kill()."""
+    if proc is None:
+        return
+    if psutil is not None:
+        try:
+            parent = psutil.Process(proc.pid)
+            targets = parent.children(recursive=True) + [parent]
+        except psutil.Error:
+            targets = []
+        if targets:
+            for p in targets:
+                try:
+                    p.terminate()
+                except psutil.Error:
+                    pass
+            _, alive = psutil.wait_procs(targets, timeout=3)
+            for p in alive:
+                try:
+                    p.kill()
+                except psutil.Error:
+                    pass
+            return
+    # Fallback when psutil is unavailable
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except Exception:
+            proc.kill()
+    except Exception:
+        pass
+
+
+def _terminate_all_procs():
+    with _PROCS_LOCK:
+        procs = list(_PROCS)
+        _PROCS.clear()
+    for p in procs:
+        _kill_proc_tree(p)
+
+
+def _cancel_handler(signum, frame):
+    """First Ctrl+C: cancel gracefully + kill active transfers. Second: hard exit."""
+    if CANCEL.is_set():
+        print("\n[ABORTED] Second interrupt — forcing immediate exit.")
+        _terminate_all_procs()
+        raise KeyboardInterrupt
+    CANCEL.set()
+    print("\n\n[STOP] Cancellation requested — stopping safely "
+          "(terminating active transfers).")
+    print("[STOP] The session is saved; re-run to resume. "
+          "Press Ctrl+C again to force-quit.")
+    _terminate_all_procs()
+
+
+def install_cancel_handler():
+    """Install SIGINT/SIGBREAK handlers for graceful cancellation (idempotent)."""
+    global _SIGNAL_INSTALLED, _PREV_SIGINT, _PREV_SIGBREAK
+    if _SIGNAL_INSTALLED:
+        return
+    try:
+        _PREV_SIGINT = signal.signal(signal.SIGINT, _cancel_handler)
+    except (ValueError, OSError):
+        return  # not on the main thread / unsupported
+    if hasattr(signal, 'SIGBREAK'):
+        try:
+            _PREV_SIGBREAK = signal.signal(signal.SIGBREAK, _cancel_handler)
+        except (ValueError, OSError):
+            pass
+    _SIGNAL_INSTALLED = True
+
+
+def uninstall_cancel_handler():
+    """Restore the previous SIGINT/SIGBREAK handlers (so menu input() behaves
+    normally again after an operation finishes)."""
+    global _SIGNAL_INSTALLED, _PREV_SIGINT, _PREV_SIGBREAK
+    if not _SIGNAL_INSTALLED:
+        return
+    try:
+        if _PREV_SIGINT is not None:
+            signal.signal(signal.SIGINT, _PREV_SIGINT)
+    except (ValueError, OSError):
+        pass
+    if hasattr(signal, 'SIGBREAK') and _PREV_SIGBREAK is not None:
+        try:
+            signal.signal(signal.SIGBREAK, _PREV_SIGBREAK)
+        except (ValueError, OSError):
+            pass
+    _SIGNAL_INSTALLED = False
+    _PREV_SIGINT = None
+    _PREV_SIGBREAK = None
+
+
+def reset_cancel():
+    """Clear the cancellation flag at the start of a fresh operation."""
+    CANCEL.clear()
+
+
+# --- CPU priority / affinity (psutil, best-effort, no admin needed for HIGH) ---
+
+def _priority_class(name):
+    """Map a config priority name to a Windows psutil priority class constant."""
+    if psutil is None:
+        return None
+    return {
+        'realtime': getattr(psutil, 'REALTIME_PRIORITY_CLASS', None),
+        'high':     getattr(psutil, 'HIGH_PRIORITY_CLASS', None),
+        'normal':   getattr(psutil, 'NORMAL_PRIORITY_CLASS', None),
+    }.get((name or 'normal').strip().lower())
+
+
+def _warn_no_psutil(what):
+    global _PERF_WARNED
+    if not _PERF_WARNED:
+        _status('PERF', f"psutil not installed — skipping {what}. "
+                        "Run 'pip install psutil' to enable priority/affinity.")
+        _PERF_WARNED = True
+
+
+def _apply_proc_tuning(proc, priority=None, affinity=None, label=''):
+    """Best-effort: set a child process CPU priority class and core affinity.
+    Never fatal — logs a [PERF] note and continues (e.g. REALTIME needs admin)."""
+    if proc is None:
+        return
+    if psutil is None:
+        if priority or affinity:
+            _warn_no_psutil("CPU priority/affinity")
+        return
+    try:
+        ps = psutil.Process(proc.pid)
+    except psutil.Error:
+        return
+    if priority is not None:
+        try:
+            ps.nice(priority)
+        except (psutil.Error, OSError, PermissionError) as e:
+            _status('PERF', f"Could not set {label} priority: {e}")
+    if affinity:
+        try:
+            ps.cpu_affinity(list(affinity))
+        except (psutil.Error, OSError, ValueError) as e:
+            _status('PERF', f"Could not set {label} affinity: {e}")
+
+
+def _parse_core_list(spec):
+    """Parse '0-5' or '0,1,4-7' into a sorted list of logical core indices."""
+    cores = set()
+    for part in str(spec).split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            a, b = part.split('-', 1)
+            cores.update(range(int(a), int(b) + 1))
+        else:
+            cores.add(int(part))
+    return sorted(cores)
+
+
+def compute_affinity_sets(spec):
+    """Return (producer_cores, consumer_cores), or (None, None) to skip pinning.
+
+    spec='auto' -> consumer (tape writer) gets the last 2 logical cores so it
+                   never competes with SSH decryption / Python packing.
+    spec='fetch=0-5;tape=6-7' -> explicit split (groups separated by ';').
+    spec='off' -> disabled.
+    """
+    n = os.cpu_count() or 1
+    spec = (spec or 'auto').strip().lower()
+    if spec in ('off', 'none', 'disabled'):
+        return None, None
+    if spec in ('', 'auto'):
+        if n <= 3:
+            return None, None  # too few cores to bother isolating
+        return list(range(0, n - 2)), list(range(n - 2, n))
+    fetch_cores = tape_cores = None
+    for group in spec.split(';'):
+        group = group.strip()
+        if group.startswith('fetch='):
+            fetch_cores = _parse_core_list(group[len('fetch='):])
+        elif group.startswith('tape='):
+            tape_cores = _parse_core_list(group[len('tape='):])
+    if fetch_cores and tape_cores:
+        return fetch_cores, tape_cores
+    return None, None
+
+
+def pin_current_process(cores, label='main'):
+    """Pin the current (Python) process to a core set — hashing/packing run here."""
+    if psutil is None or not cores:
+        return
+    try:
+        psutil.Process().cpu_affinity(list(cores))
+        _status('PERF', f"Pinned {label} process to cores {cores}.")
+    except (psutil.Error, OSError, ValueError) as e:
+        _status('PERF', f"Could not pin {label} process: {e}")
+
+
+def unpin_current_process():
+    """Restore the current process to all cores (after a tuned session)."""
+    if psutil is None:
+        return
+    try:
+        psutil.Process().cpu_affinity(list(range(os.cpu_count() or 1)))
+    except (psutil.Error, OSError, ValueError):
+        pass
 
 
 def _clean_config_path(value):
@@ -114,6 +378,7 @@ def _robocopy_file(src, dst, display_name=None):
         ],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
+    register_proc(proc)  # so Ctrl+C can terminate a long restore copy
 
     # Monitor destination file growth to compute live MB/s
     stop_evt = threading.Event()
@@ -138,7 +403,10 @@ def _robocopy_file(src, dst, display_name=None):
 
     t = threading.Thread(target=_monitor, daemon=True)
     t.start()
-    proc.wait()
+    try:
+        proc.wait()
+    finally:
+        unregister_proc(proc)
     stop_evt.set()
     t.join(timeout=2)
 
@@ -224,6 +492,45 @@ def _run_robocopy_capture(cmd):
         encoding='utf-8',
         errors='replace',
     )
+
+
+def _run_robocopy_tuned(cmd, priority=None, affinity=None):
+    """Run robocopy as a tracked, cancellable child with optional CPU priority
+    and core affinity (the tape-write step). Returns a CompletedProcess with
+    .stdout/.returncode so it is a drop-in for _run_robocopy_capture.
+
+    Registering the process lets Ctrl+C terminate the live tape write; the HIGH
+    priority + dedicated cores keep the LTO drive streaming without contention."""
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+    )
+    register_proc(proc)
+    _apply_proc_tuning(proc, priority=priority, affinity=affinity, label='robocopy-tape')
+    try:
+        out, err = proc.communicate()
+    finally:
+        unregister_proc(proc)
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
+def _dir_tree_size(path):
+    """Total size in bytes of every file under path (0 if missing/unreadable)."""
+    total = 0
+    try:
+        for root, _, files in os.walk(path):
+            for f in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, f))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
 
 
 def _has_command(name):
@@ -394,16 +701,23 @@ def _scp_fetch_file(remote_user, remote_host, remote_file_path, local_dest_path,
     return proc.wait()
 
 
-def _ssh_stream_command(remote_user, remote_host, command, password=''):
-    """Return a command/env pair for an SSH process that streams stdin/stdout."""
+def _ssh_stream_command(remote_user, remote_host, command, password='', cipher=''):
+    """Return a command/env pair for an SSH process that streams stdin/stdout.
+
+    cipher: optional OpenSSH cipher name (e.g. aes128-gcm@openssh.com). When set,
+            it is requested with SSH-level compression disabled — a fast AES-NI
+            cipher keeps the fetch stream from being CPU-bound on incompressible
+            media. Ignored for PuTTY plink (different cipher naming)."""
     password = password or ''
+    # OpenSSH cipher/compression tuning, inserted right after the 'ssh' binary.
+    cipher_opts = (['-c', cipher, '-o', 'Compression=no'] if cipher else [])
     if password:
         if _has_command('sshpass'):
             env = os.environ.copy()
             env['SSHPASS'] = password
             return [
                 'sshpass', '-e',
-                'ssh',
+                'ssh', *cipher_opts,
                 '-o', 'BatchMode=no',
                 '-o', 'PubkeyAuthentication=no',
                 '-o', 'StrictHostKeyChecking=accept-new',
@@ -412,7 +726,7 @@ def _ssh_stream_command(remote_user, remote_host, command, password=''):
             ], env, None
         if _has_command('ssh'):
             return [
-                'ssh',
+                'ssh', *cipher_opts,
                 '-o', 'BatchMode=no',
                 '-o', 'PubkeyAuthentication=no',
                 '-o', 'NumberOfPasswordPrompts=1',
@@ -436,7 +750,7 @@ def _ssh_stream_command(remote_user, remote_host, command, password=''):
     if not _has_command('ssh'):
         return None, None, "ssh was not found on PATH."
     return [
-        'ssh',
+        'ssh', *cipher_opts,
         '-o', 'BatchMode=yes',
         '-o', 'StrictHostKeyChecking=accept-new',
         f'{remote_user}@{remote_host}',
@@ -493,16 +807,26 @@ def _remote_fetch_base_and_rel(configured_remote_path, remote_fpath):
 
 
 def _remote_tar_fetch(remote_user, remote_host, remote_base, rel_paths, local_dest_dir,
-                      password=''):
+                      password='', cipher='', use_mbuffer=False, mbuffer_size='2G',
+                      fetch_cores=None):
     """Fetch many remote files in one tar stream over SSH.
 
     rel_paths must be relative to remote_base and use POSIX separators.
     Returns (ok, error_message).
+
+    Performance knobs:
+      cipher       — fast OpenSSH cipher for the stream (AES-NI, low CPU).
+      use_mbuffer  — wrap the remote tar in mbuffer (if installed remotely) so a
+                     large RAM ring smooths the tar->ssh handoff against jitter.
+      fetch_cores  — pin the ssh/tar children to these cores, isolating SSH
+                     decryption from the tape-writer's cores.
     """
     if not rel_paths:
         return True, ''
     if not _has_command('tar'):
         return False, "local tar executable was not found on PATH"
+    if CANCEL.is_set():
+        return False, "cancelled"
 
     os.makedirs(local_dest_dir, exist_ok=True)
     safe_paths = []
@@ -512,13 +836,29 @@ def _remote_tar_fetch(remote_user, remote_host, remote_base, rel_paths, local_de
     except ValueError as e:
         return False, str(e)
 
-    remote_cmd = f"tar -C {shlex.quote(remote_base)} -cf - --null -T -"
+    # -b 512 -> 256 KiB records: fewer syscalls than tar's tiny default block.
+    tar_core = f"tar -C {shlex.quote(remote_base)} -b 512 -cf - --null -T -"
+    if use_mbuffer:
+        # Use mbuffer only if it exists on the remote; otherwise fall back to a
+        # plain tar so a missing binary never fails the fetch. stdin (the NUL
+        # file list) flows to whichever tar runs.
+        remote_cmd = (
+            f"if command -v mbuffer >/dev/null 2>&1; then "
+            f"{tar_core} | mbuffer -q -m {shlex.quote(mbuffer_size)}; "
+            f"else {tar_core}; fi"
+        )
+    else:
+        remote_cmd = tar_core
+
     ssh_cmd, ssh_env, err = _ssh_stream_command(
-        remote_user, remote_host, remote_cmd, password=password
+        remote_user, remote_host, remote_cmd, password=password, cipher=cipher
     )
     if err:
         return False, err
 
+    # Local extract: read the stream as-is. A tar stream is a 512-byte-record
+    # byte stream over the pipe, so the remote -b 512 does not need to be matched
+    # here — and this stays compatible with Windows' bsdtar (no GNU -b/-B flags).
     tar_cmd = ['tar', '-C', local_dest_dir, '-xf', '-']
     ssh_proc = None
     tar_proc = None
@@ -527,7 +867,7 @@ def _remote_tar_fetch(remote_user, remote_host, remote_base, rel_paths, local_de
     def _drain_stderr(pipe):
         try:
             while True:
-                chunk = pipe.read(4096)
+                chunk = pipe.read(65536)
                 if not chunk:
                     break
                 ssh_stderr.append(chunk)
@@ -542,6 +882,8 @@ def _remote_tar_fetch(remote_user, remote_host, remote_base, rel_paths, local_de
             stderr=subprocess.PIPE,
             env=ssh_env,
         )
+        register_proc(ssh_proc)
+        _apply_proc_tuning(ssh_proc, affinity=fetch_cores, label='ssh-fetch')
         stderr_thread = threading.Thread(
             target=_drain_stderr, args=(ssh_proc.stderr,), daemon=True
         )
@@ -553,6 +895,8 @@ def _remote_tar_fetch(remote_user, remote_host, remote_base, rel_paths, local_de
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+        register_proc(tar_proc)
+        _apply_proc_tuning(tar_proc, affinity=fetch_cores, label='tar-extract')
         ssh_proc.stdout.close()
 
         file_list = ''.join(f'{rel}\0' for rel in safe_paths).encode('utf-8')
@@ -571,6 +915,12 @@ def _remote_tar_fetch(remote_user, remote_host, remote_base, rel_paths, local_de
             if proc and proc.poll() is None:
                 proc.kill()
         return False, str(e)
+    finally:
+        unregister_proc(ssh_proc)
+        unregister_proc(tar_proc)
+
+    if CANCEL.is_set():
+        return False, "cancelled"
 
     ssh_err_text = b''.join(ssh_stderr).decode('utf-8', errors='replace').strip()
     tar_err_text = (tar_stderr or b'').decode('utf-8', errors='replace').strip()
@@ -684,6 +1034,16 @@ class ConfigManager:
             'remote_path':      '',
             'staging_fill_pct': '0.80',
         }
+        self.config['PERFORMANCE'] = {
+            'chunk_cap_gb':          '100',
+            'prefetch_chunks_ahead': '2',
+            'staging_max_gb':        '350',
+            'robocopy_priority':     'high',
+            'cpu_affinity':          'auto',
+            'ssh_cipher':            'aes128-gcm@openssh.com',
+            'use_mbuffer':           'true',
+            'mbuffer_size':          '2G',
+        }
         with open(self.config_path, 'w', encoding='utf-8') as f:
             self.config.write(f)
 
@@ -721,6 +1081,32 @@ class ConfigManager:
     @property
     def staging_fill_pct(self): return float(self.config.get('REMOTE', 'staging_fill_pct', fallback='0.80'))
 
+    # --- [PERFORMANCE] : continuous-streaming pipeline tuning -----------------
+    @property
+    def chunk_cap_gb(self):
+        return float(self.config.get('PERFORMANCE', 'chunk_cap_gb', fallback='100'))
+    @property
+    def prefetch_chunks_ahead(self):
+        return max(1, int(float(self.config.get('PERFORMANCE', 'prefetch_chunks_ahead', fallback='2'))))
+    @property
+    def staging_max_gb(self):
+        return float(self.config.get('PERFORMANCE', 'staging_max_gb', fallback='350'))
+    @property
+    def robocopy_priority(self):
+        return self.config.get('PERFORMANCE', 'robocopy_priority', fallback='high').strip().lower()
+    @property
+    def cpu_affinity(self):
+        return self.config.get('PERFORMANCE', 'cpu_affinity', fallback='auto')
+    @property
+    def ssh_cipher(self):
+        return self.config.get('PERFORMANCE', 'ssh_cipher', fallback='aes128-gcm@openssh.com').strip()
+    @property
+    def use_mbuffer(self):
+        return self.config.get('PERFORMANCE', 'use_mbuffer', fallback='true').strip().lower() in ('1', 'true', 'yes', 'on')
+    @property
+    def mbuffer_size(self):
+        return self.config.get('PERFORMANCE', 'mbuffer_size', fallback='2G').strip()
+
 
 # ==============================================================================
 # DATABASE MANAGER
@@ -732,7 +1118,10 @@ class DatabaseManager:
         db_dir = os.path.dirname(os.path.abspath(db_path))
         try:
             os.makedirs(db_dir, exist_ok=True)
-            self.conn = sqlite3.connect(db_path)
+            # check_same_thread=False: the streaming pipeline updates the DB from
+            # both the producer (fetch/pack) thread and the consumer (tape) thread.
+            # self.lock serialises every write so the shared connection stays safe.
+            self.conn = sqlite3.connect(db_path, check_same_thread=False)
         except (OSError, sqlite3.Error) as e:
             raise RuntimeError(
                 f"[DB] Cannot open database at: {db_path}\n"
@@ -741,9 +1130,19 @@ class DatabaseManager:
                 f"     Edit {CONFIG_FILE} and set [PATHS] db_path to a writable location."
             ) from e
         self.conn.row_factory = sqlite3.Row
+        self.lock = threading.RLock()
         self._init_schema()
         self._init_remote_schema()
         self._init_local_schema()
+
+    def _require_updated(self, cur, message):
+        """Raise if the preceding UPDATE/DELETE matched no rows (target missing).
+
+        sqlite3 reports an accurate rowcount for UPDATE/DELETE, so a value of 0
+        means the WHERE clause matched nothing — i.e. the row we expected to
+        change does not exist. Callers pass a '[DB] ... not found' message."""
+        if cur.rowcount == 0:
+            raise RuntimeError(message)
 
     def _init_schema(self):
         self.conn.executescript("""
@@ -868,24 +1267,29 @@ class DatabaseManager:
 
     def create_remote_session(self, session_label, remote_host, remote_user,
                                remote_path, tape_label, staging_dir):
-        cur = self.conn.execute(
-            """INSERT INTO remote_sessions
-               (session_label, remote_host, remote_user, remote_path,
-                tape_label, staging_dir, created_at, status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, 'active')""",
-            (session_label, remote_host, remote_user, remote_path,
-             tape_label, staging_dir, datetime.now().isoformat())
-        )
-        self.conn.commit()
-        return cur.lastrowid
+        with self.lock:
+            cur = self.conn.execute(
+                """INSERT INTO remote_sessions
+                   (session_label, remote_host, remote_user, remote_path,
+                    tape_label, staging_dir, created_at, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'active')""",
+                (session_label, remote_host, remote_user, remote_path,
+                 tape_label, staging_dir, datetime.now().isoformat())
+            )
+            self.conn.commit()
+            return cur.lastrowid
 
     def update_remote_session(self, session_id, **kwargs):
+        if not kwargs:
+            return
         sets = ', '.join(f"{k} = ?" for k in kwargs)
         vals = list(kwargs.values()) + [session_id]
-        self.conn.execute(
-            f"UPDATE remote_sessions SET {sets} WHERE session_id = ?", vals
-        )
-        self.conn.commit()
+        with self.lock:
+            cur = self.conn.execute(
+                f"UPDATE remote_sessions SET {sets} WHERE session_id = ?", vals
+            )
+            self._require_updated(cur, f"[DB] Remote session not found: {session_id}")
+            self.conn.commit()
 
     def get_active_remote_session(self, remote_host, remote_path):
         return self.conn.execute(
@@ -897,15 +1301,16 @@ class DatabaseManager:
 
     def insert_remote_manifest_batch(self, session_id, rows):
         """rows: list of (chunk_index, remote_path, file_name, file_size_bytes)"""
-        self.conn.executemany(
-            """INSERT INTO remote_manifest
-               (session_id, chunk_index, remote_path, file_name, file_size_bytes,
-                status, chunk_status, updated_at)
-               VALUES (?, ?, ?, ?, ?, 'pending', 'pending', ?)""",
-            [(session_id, r[0], r[1], r[2], r[3], datetime.now().isoformat())
-             for r in rows]
-        )
-        self.conn.commit()
+        with self.lock:
+            self.conn.executemany(
+                """INSERT INTO remote_manifest
+                   (session_id, chunk_index, remote_path, file_name, file_size_bytes,
+                    status, chunk_status, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'pending', 'pending', ?)""",
+                [(session_id, r[0], r[1], r[2], r[3], datetime.now().isoformat())
+                 for r in rows]
+            )
+            self.conn.commit()
 
     def get_chunk_files(self, session_id, chunk_index):
         return self.conn.execute(
@@ -919,18 +1324,25 @@ class DatabaseManager:
         kwargs['updated_at'] = datetime.now().isoformat()
         sets = ', '.join(f"{k} = ?" for k in kwargs)
         vals = list(kwargs.values()) + [manifest_id]
-        self.conn.execute(
-            f"UPDATE remote_manifest SET {sets} WHERE manifest_id = ?", vals
-        )
-        self.conn.commit()
+        with self.lock:
+            cur = self.conn.execute(
+                f"UPDATE remote_manifest SET {sets} WHERE manifest_id = ?", vals
+            )
+            self._require_updated(cur, f"[DB] Remote manifest row not found: {manifest_id}")
+            self.conn.commit()
 
     def update_chunk_status(self, session_id, chunk_index, status):
-        self.conn.execute(
-            """UPDATE remote_manifest SET chunk_status = ?, updated_at = ?
-               WHERE session_id = ? AND chunk_index = ?""",
-            (status, datetime.now().isoformat(), session_id, chunk_index)
-        )
-        self.conn.commit()
+        with self.lock:
+            cur = self.conn.execute(
+                """UPDATE remote_manifest SET chunk_status = ?, updated_at = ?
+                   WHERE session_id = ? AND chunk_index = ?""",
+                (status, datetime.now().isoformat(), session_id, chunk_index)
+            )
+            self._require_updated(
+                cur,
+                f"[DB] Remote chunk not found: session {session_id}, chunk {chunk_index}"
+            )
+            self.conn.commit()
 
     def get_pending_chunks(self, session_id):
         rows = self.conn.execute(
@@ -953,37 +1365,42 @@ class DatabaseManager:
         chunks: list of lists containing allocation dicts with name/size_bytes.
         """
         now = datetime.now().isoformat()
-        with self.conn:
-            cur = self.conn.execute(
-                """INSERT INTO local_sessions
-                   (session_label, source_dir, total_chunks, created_at, status)
-                   VALUES (?, ?, ?, ?, 'active')""",
-                (session_label, source_dir, len(chunks), now)
-            )
-            session_id = cur.lastrowid
-            rows = []
-            for chunk_index, entries in enumerate(chunks):
-                for entry in entries:
-                    rows.append((
-                        session_id, chunk_index, entry['name'],
-                        entry['size_bytes'], 'pending', now
-                    ))
-            self.conn.executemany(
-                """INSERT INTO local_chunks_manifest
-                   (session_id, chunk_index, top_level_dir, dir_size_bytes,
-                    status, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                rows
-            )
-        return session_id
+        with self.lock:
+            with self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO local_sessions
+                       (session_label, source_dir, total_chunks, created_at, status)
+                       VALUES (?, ?, ?, ?, 'active')""",
+                    (session_label, source_dir, len(chunks), now)
+                )
+                session_id = cur.lastrowid
+                rows = []
+                for chunk_index, entries in enumerate(chunks):
+                    for entry in entries:
+                        rows.append((
+                            session_id, chunk_index, entry['name'],
+                            entry['size_bytes'], 'pending', now
+                        ))
+                self.conn.executemany(
+                    """INSERT INTO local_chunks_manifest
+                       (session_id, chunk_index, top_level_dir, dir_size_bytes,
+                        status, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    rows
+                )
+            return session_id
 
     def update_local_session(self, session_id, **kwargs):
+        if not kwargs:
+            return
         sets = ', '.join(f"{k} = ?" for k in kwargs)
         vals = list(kwargs.values()) + [session_id]
-        self.conn.execute(
-            f"UPDATE local_sessions SET {sets} WHERE session_id = ?", vals
-        )
-        self.conn.commit()
+        with self.lock:
+            cur = self.conn.execute(
+                f"UPDATE local_sessions SET {sets} WHERE session_id = ?", vals
+            )
+            self._require_updated(cur, f"[DB] Local session not found: {session_id}")
+            self.conn.commit()
 
     def get_active_local_session(self, source_dir):
         return self.conn.execute(
@@ -1018,16 +1435,21 @@ class DatabaseManager:
         ).fetchall()
 
     def assign_local_chunk_tape(self, session_id, chunk_index, tape_label):
-        self.conn.execute(
-            """UPDATE local_chunks_manifest
-               SET tape_label = COALESCE(tape_label, ?),
-                   started_at = COALESCE(started_at, ?),
-                   updated_at = ?
-               WHERE session_id = ? AND chunk_index = ?""",
-            (tape_label, datetime.now().isoformat(), datetime.now().isoformat(),
-             session_id, chunk_index)
-        )
-        self.conn.commit()
+        now = datetime.now().isoformat()
+        with self.lock:
+            cur = self.conn.execute(
+                """UPDATE local_chunks_manifest
+                   SET tape_label = COALESCE(tape_label, ?),
+                       started_at = COALESCE(started_at, ?),
+                       updated_at = ?
+                   WHERE session_id = ? AND chunk_index = ?""",
+                (tape_label, now, now, session_id, chunk_index)
+            )
+            self._require_updated(
+                cur,
+                f"[DB] Local chunk not found: session {session_id}, chunk {chunk_index}"
+            )
+            self.conn.commit()
 
     def update_local_chunk_status(self, session_id, chunk_index, status):
         kwargs = {
@@ -1038,22 +1460,31 @@ class DatabaseManager:
             kwargs['completed_at'] = datetime.now().isoformat()
         sets = ', '.join(f"{k} = ?" for k in kwargs)
         vals = list(kwargs.values()) + [session_id, chunk_index]
-        self.conn.execute(
-            f"""UPDATE local_chunks_manifest SET {sets}
-                WHERE session_id = ? AND chunk_index = ?""",
-            vals
-        )
-        self.conn.commit()
+        with self.lock:
+            cur = self.conn.execute(
+                f"""UPDATE local_chunks_manifest SET {sets}
+                    WHERE session_id = ? AND chunk_index = ?""",
+                vals
+            )
+            self._require_updated(
+                cur,
+                f"[DB] Local chunk not found: session {session_id}, chunk {chunk_index}"
+            )
+            self.conn.commit()
 
     def update_local_manifest_row(self, manifest_id, **kwargs):
+        if not kwargs:
+            return
         kwargs['updated_at'] = datetime.now().isoformat()
         sets = ', '.join(f"{k} = ?" for k in kwargs)
         vals = list(kwargs.values()) + [manifest_id]
-        self.conn.execute(
-            f"UPDATE local_chunks_manifest SET {sets} WHERE manifest_id = ?",
-            vals
-        )
-        self.conn.commit()
+        with self.lock:
+            cur = self.conn.execute(
+                f"UPDATE local_chunks_manifest SET {sets} WHERE manifest_id = ?",
+                vals
+            )
+            self._require_updated(cur, f"[DB] Local manifest row not found: {manifest_id}")
+            self.conn.commit()
 
     def count_tape_file_records(self, tape_label):
         return self.conn.execute(
@@ -1085,55 +1516,94 @@ class DatabaseManager:
 
     def file_record_exists(self, original_path, tape_label, local_session_id=None,
                            local_chunk_index=None):
-        sql = """SELECT 1 FROM files_index
-                 WHERE original_path = ? AND tape_label = ?"""
-        params = [original_path, tape_label]
-        if local_session_id is not None:
-            sql += " AND local_session_id = ?"
-            params.append(local_session_id)
-        if local_chunk_index is not None:
-            sql += " AND local_chunk_index = ?"
-            params.append(local_chunk_index)
-        return bool(self.conn.execute(sql, params).fetchone())
+        with self.lock:
+            return bool(self.conn.execute(
+                """SELECT 1 FROM files_index
+                   WHERE COALESCE(original_path, '') = COALESCE(?, '')
+                     AND COALESCE(tape_label, '') = COALESCE(?, '')
+                     AND COALESCE(local_session_id, -1) = COALESCE(?, -1)
+                     AND COALESCE(local_chunk_index, -1) = COALESCE(?, -1)""",
+                (original_path, tape_label, local_session_id, local_chunk_index)
+            ).fetchone())
 
     def register_tape(self, volume_label, capacity_gb=None):
-        try:
-            self.conn.execute(
-                "INSERT INTO tapes (volume_label, date_formatted, total_capacity) VALUES (?, ?, ?)",
-                (volume_label, datetime.now().isoformat(), capacity_gb)
-            )
-            self.conn.commit()
-            print(f"[DB] Tape '{volume_label}' registered successfully.")
-            return True
-        except sqlite3.IntegrityError:
-            print(f"[DB] Tape '{volume_label}' is already in the database.")
-            return False
+        with self.lock:
+            try:
+                self.conn.execute(
+                    "INSERT INTO tapes (volume_label, date_formatted, total_capacity) VALUES (?, ?, ?)",
+                    (volume_label, datetime.now().isoformat(), capacity_gb)
+                )
+                self.conn.commit()
+                print(f"[DB] Tape '{volume_label}' registered successfully.")
+                return True
+            except sqlite3.IntegrityError:
+                print(f"[DB] Tape '{volume_label}' is already in the database.")
+                return False
 
     def delete_tape(self, volume_label):
-        self.conn.execute("DELETE FROM files_index WHERE tape_label = ?", (volume_label,))
-        self.conn.execute("DELETE FROM tapes WHERE volume_label = ?", (volume_label,))
-        self.conn.commit()
-        print(f"[DB] Tape '{volume_label}' and its file records removed from database.")
+        with self.lock:
+            self.conn.execute("DELETE FROM files_index WHERE tape_label = ?", (volume_label,))
+            cur = self.conn.execute("DELETE FROM tapes WHERE volume_label = ?", (volume_label,))
+            self._require_updated(cur, f"[DB] Tape not found: {volume_label}")
+            self.conn.commit()
+            print(f"[DB] Tape '{volume_label}' and its file records removed from database.")
 
     def tape_exists(self, volume_label):
-        return bool(self.conn.execute(
-            "SELECT 1 FROM tapes WHERE volume_label = ?", (volume_label,)
-        ).fetchone())
+        with self.lock:
+            return bool(self.conn.execute(
+                "SELECT 1 FROM tapes WHERE volume_label = ?", (volume_label,)
+            ).fetchone())
 
     def insert_file(self, file_name, original_path, file_size_bytes, file_hash,
                     tape_label, is_packed, container_name, stored_path,
                     local_session_id=None, local_chunk_index=None):
-        self.conn.execute(
-            """INSERT INTO files_index
-               (file_name, original_path, file_size_bytes, file_hash, backup_date,
-                tape_label, is_packed, container_name, stored_path,
-                local_session_id, local_chunk_index)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (file_name, original_path, file_size_bytes, file_hash,
-             datetime.now().isoformat(), tape_label, is_packed, container_name,
-             stored_path, local_session_id, local_chunk_index)
-        )
-        self.conn.commit()
+        with self.lock:
+            if not self.conn.execute(
+                "SELECT 1 FROM tapes WHERE volume_label = ?", (tape_label,)
+            ).fetchone():
+                raise RuntimeError(
+                    f"[DB] Cannot index file for unregistered tape: {tape_label}"
+                )
+
+            now = datetime.now().isoformat()
+            existing = self.conn.execute(
+                """SELECT file_id FROM files_index
+                   WHERE COALESCE(original_path, '') = COALESCE(?, '')
+                     AND COALESCE(tape_label, '') = COALESCE(?, '')
+                     AND COALESCE(local_session_id, -1) = COALESCE(?, -1)
+                     AND COALESCE(local_chunk_index, -1) = COALESCE(?, -1)""",
+                (original_path, tape_label, local_session_id, local_chunk_index)
+            ).fetchone()
+
+            if existing:
+                self.conn.execute(
+                    """UPDATE files_index
+                       SET file_name = ?,
+                           file_size_bytes = ?,
+                           file_hash = ?,
+                           backup_date = ?,
+                           is_packed = ?,
+                           container_name = ?,
+                           stored_path = ?
+                       WHERE file_id = ?""",
+                    (file_name, file_size_bytes, file_hash, now, is_packed,
+                     container_name, stored_path, existing['file_id'])
+                )
+                self.conn.commit()
+                return False
+
+            self.conn.execute(
+                """INSERT INTO files_index
+                   (file_name, original_path, file_size_bytes, file_hash, backup_date,
+                    tape_label, is_packed, container_name, stored_path,
+                    local_session_id, local_chunk_index)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (file_name, original_path, file_size_bytes, file_hash, now,
+                 tape_label, is_packed, container_name, stored_path,
+                 local_session_id, local_chunk_index)
+            )
+            self.conn.commit()
+            return True
 
     def search_files(self, name_query=None, date_from=None, date_to=None):
         sql    = "SELECT * FROM files_index WHERE 1=1"
@@ -1182,11 +1652,13 @@ class DatabaseManager:
         ).fetchall()
 
     def update_tape_used_space(self, volume_label, bytes_added):
-        self.conn.execute(
-            "UPDATE tapes SET used_space = COALESCE(used_space, 0) + ? WHERE volume_label = ?",
-            (bytes_added, volume_label)
-        )
-        self.conn.commit()
+        with self.lock:
+            cur = self.conn.execute(
+                "UPDATE tapes SET used_space = COALESCE(used_space, 0) + ? WHERE volume_label = ?",
+                (bytes_added, volume_label)
+            )
+            self._require_updated(cur, f"[DB] Tape not found: {volume_label}")
+            self.conn.commit()
 
     def list_tapes(self):
         return self.conn.execute(
@@ -1194,34 +1666,67 @@ class DatabaseManager:
         ).fetchall()
 
     def delete_file(self, file_id):
-        self.conn.execute("DELETE FROM files_index WHERE file_id = ?", (file_id,))
-        self.conn.commit()
+        with self.lock:
+            cur = self.conn.execute("DELETE FROM files_index WHERE file_id = ?", (file_id,))
+            self._require_updated(cur, f"[DB] File record not found: {file_id}")
+            self.conn.commit()
 
     def rename_tape(self, old_label, new_label):
-        self.conn.execute("UPDATE tapes SET volume_label = ? WHERE volume_label = ?", (new_label, old_label))
-        self.conn.execute("UPDATE files_index SET tape_label = ? WHERE tape_label = ?", (new_label, old_label))
-        self.conn.commit()
+        with self.lock:
+            try:
+                self.conn.execute("BEGIN")
+                self.conn.execute("PRAGMA defer_foreign_keys = ON")
+                cur = self.conn.execute(
+                    "UPDATE tapes SET volume_label = ? WHERE volume_label = ?",
+                    (new_label, old_label)
+                )
+                self._require_updated(cur, f"[DB] Tape not found: {old_label}")
+                self.conn.execute(
+                    "UPDATE files_index SET tape_label = ? WHERE tape_label = ?",
+                    (new_label, old_label)
+                )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
         print(f"[DB] Tape '{old_label}' renamed to '{new_label}'.")
 
     def update_tape_capacity(self, volume_label, capacity_gb):
-        self.conn.execute("UPDATE tapes SET total_capacity = ? WHERE volume_label = ?", (capacity_gb, volume_label))
-        self.conn.commit()
+        with self.lock:
+            cur = self.conn.execute(
+                "UPDATE tapes SET total_capacity = ? WHERE volume_label = ?",
+                (capacity_gb, volume_label)
+            )
+            self._require_updated(cur, f"[DB] Tape not found: {volume_label}")
+            self.conn.commit()
         print(f"[DB] Tape '{volume_label}' capacity set to {capacity_gb} GB.")
 
     def recalculate_tape_used_space(self, volume_label):
-        row = self.conn.execute(
-            "SELECT COALESCE(SUM(file_size_bytes), 0) FROM files_index WHERE tape_label = ?",
-            (volume_label,)
-        ).fetchone()
-        new_used = row[0]
-        self.conn.execute("UPDATE tapes SET used_space = ? WHERE volume_label = ?", (new_used, volume_label))
-        self.conn.commit()
-        return new_used
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT COALESCE(SUM(file_size_bytes), 0) FROM files_index WHERE tape_label = ?",
+                (volume_label,)
+            ).fetchone()
+            new_used = row[0]
+            cur = self.conn.execute(
+                "UPDATE tapes SET used_space = ? WHERE volume_label = ?",
+                (new_used, volume_label)
+            )
+            self._require_updated(cur, f"[DB] Tape not found: {volume_label}")
+            self.conn.commit()
+            return new_used
 
     def delete_files_for_tape(self, volume_label):
-        cur = self.conn.execute("DELETE FROM files_index WHERE tape_label = ?", (volume_label,))
-        self.conn.commit()
-        print(f"[DB] Removed {cur.rowcount} file record(s) for tape '{volume_label}' (tape entry kept).")
+        with self.lock:
+            if not self.conn.execute(
+                "SELECT 1 FROM tapes WHERE volume_label = ?", (volume_label,)
+            ).fetchone():
+                raise RuntimeError(f"[DB] Tape not found: {volume_label}")
+            cur = self.conn.execute("DELETE FROM files_index WHERE tape_label = ?", (volume_label,))
+            removed = cur.rowcount
+            self.conn.execute("UPDATE tapes SET used_space = 0 WHERE volume_label = ?", (volume_label,))
+            self.conn.commit()
+            print(f"[DB] Removed {removed} file record(s) for tape '{volume_label}' (tape entry kept).")
 
     def close(self):
         self.conn.close()
@@ -1625,9 +2130,12 @@ class LTOPacker:
 # ==============================================================================
 
 class LTOBackup:
-    def __init__(self, db: DatabaseManager, ibm_eject_cmd: str):
-        self.db           = db
+    def __init__(self, db: DatabaseManager, ibm_eject_cmd: str,
+                 tape_priority=None, tape_affinity=None):
+        self.db            = db
         self.ibm_eject_cmd = ibm_eject_cmd
+        self.tape_priority = tape_priority   # psutil priority class for robocopy
+        self.tape_affinity = tape_affinity   # consumer (tape-writer) core set
 
     def eject_tape(self, tape_drive):
         print("\n" + "#" * 60)
@@ -1667,6 +2175,15 @@ class LTOBackup:
         print(f"\n[BACKUP] Starting... Tape: {tape_label} | Drive: {tape_drive}")
         if not _ensure_lto_drive_ready(tape_drive, prefix="[BACKUP]"):
             raise RuntimeError("LTO drive is not ready for backup.")
+        if not self.db.tape_exists(tape_label):
+            raise RuntimeError(
+                f"[DB] Tape '{tape_label}' is not registered; cannot sync file records."
+            )
+        if packer_metadata == []:
+            raise RuntimeError(
+                "[DB] Cannot sync staged backup without packer metadata. "
+                "Repack the staging data before backing up."
+            )
 
         exclude_file_paths = exclude_file_paths or []
         exclude_dir_paths  = exclude_dir_paths or []
@@ -1692,7 +2209,7 @@ class LTOBackup:
         hash_map = {}
         skipped  = 0
         skipped_existing = []
-        recovered_existing_bytes = 0
+        recovered_direct_existing = []
 
         if packer_metadata is not None:
             # AUTO-PILOT path (metadata list, possibly empty).
@@ -1733,6 +2250,22 @@ class LTOBackup:
                         try:
                             if os.path.getsize(src) == os.path.getsize(dst):
                                 skipped += 1
+                                if not self.db.file_record_exists(
+                                    src, tape_label,
+                                    local_session_id=local_session_id,
+                                    local_chunk_index=local_chunk_index,
+                                ):
+                                    disp = ((file[:15] + '..' + file[-5:])
+                                            if len(file) > 22 else file)
+                                    sys.stdout.write(f"\r[HASHING] {disp}...  ")
+                                    sys.stdout.flush()
+                                    recovered_direct_existing.append({
+                                        'file_name': file,
+                                        'original_path': src,
+                                        'file_size_bytes': os.path.getsize(src),
+                                        'file_hash': _hash_file(src),
+                                        'stored_path': dst,
+                                    })
                                 continue
                         except OSError:
                             pass
@@ -1765,6 +2298,17 @@ class LTOBackup:
         # ---------------------------------------------------------------
         # Phase 2 — Single robocopy call: source directory → tape
         # ---------------------------------------------------------------
+        prio_label = (
+            (self.tape_priority is not None) and
+            {getattr(psutil, 'REALTIME_PRIORITY_CLASS', None): 'REALTIME',
+             getattr(psutil, 'HIGH_PRIORITY_CLASS', None): 'HIGH',
+             getattr(psutil, 'NORMAL_PRIORITY_CLASS', None): 'NORMAL'}.get(
+                 self.tape_priority, 'custom')
+        ) or 'default'
+        cores_label = (f"cores {self.tape_affinity}"
+                       if self.tape_affinity else "all cores")
+        _phase('TAPE', f"PC → Tape (LTFS) | {tape_label} | "
+                       f"priority={prio_label}, {cores_label}")
         print("[BACKUP] Copying to tape via robocopy...")
 
         def _dir_size(path):
@@ -1816,11 +2360,19 @@ class LTOBackup:
         if exclude_dir_paths:
             robocopy_cmd.extend(['/XD'] + exclude_dir_paths)
 
-        rc = _run_robocopy_capture(robocopy_cmd)
+        rc = _run_robocopy_tuned(robocopy_cmd,
+                                 priority=self.tape_priority,
+                                 affinity=self.tape_affinity)
 
         stop_evt.set()
         mon.join(timeout=2)
         print()  # end progress line
+
+        # If the user pressed Ctrl+C, robocopy was terminated mid-write. Skip the
+        # DB commit and the eject so the chunk stays resumable and the tape is
+        # left mounted for the next run.
+        if CANCEL.is_set():
+            raise RuntimeError("tape write cancelled by user")
 
         rc_sum = _parse_robocopy_summary(rc.stdout)
 
@@ -1833,6 +2385,21 @@ class LTOBackup:
         # ---------------------------------------------------------------
         if packer_metadata is None:
             # Direct backup: every hashed file is a loose tape record
+            recovered_count = 0
+            for info in recovered_direct_existing:
+                if self.db.insert_file(
+                    file_name=info['file_name'],
+                    original_path=info['original_path'],
+                    file_size_bytes=info['file_size_bytes'],
+                    file_hash=info['file_hash'],
+                    tape_label=tape_label, is_packed=False,
+                    container_name=None, stored_path=info['stored_path'],
+                    local_session_id=local_session_id,
+                    local_chunk_index=local_chunk_index,
+                ):
+                    recovered_count += 1
+            if recovered_count:
+                print(f"[DB] Recovered {recovered_count} existing tape file record(s).")
             for rel_path, info in hash_map.items():
                 self.db.insert_file(
                     file_name=os.path.basename(info['src']),
@@ -1845,8 +2412,9 @@ class LTOBackup:
                     local_chunk_index=local_chunk_index,
                 )
 
-        elif packer_metadata:
+        else:
             # Staged backup: loose large files + batch-insert packed-file records
+            recovered_count = 0
             for rel_path, m, dst in skipped_existing:
                 if self.db.file_record_exists(
                     m['original_path'], tape_label,
@@ -1854,7 +2422,7 @@ class LTOBackup:
                     local_chunk_index=local_chunk_index,
                 ):
                     continue
-                self.db.insert_file(
+                if self.db.insert_file(
                     file_name=m['file_name'],
                     original_path=m['original_path'],
                     file_size_bytes=m['file_size_bytes'],
@@ -1865,8 +2433,8 @@ class LTOBackup:
                     stored_path=dst,
                     local_session_id=local_session_id,
                     local_chunk_index=local_chunk_index,
-                )
-                recovered_existing_bytes += m['file_size_bytes']
+                ):
+                    recovered_count += 1
             for rel_path, info in hash_map.items():
                 file = os.path.basename(info['src'])
                 if file.startswith("Bundle_") and file.endswith(".zip"):
@@ -1911,8 +2479,9 @@ class LTOBackup:
                         local_chunk_index=local_chunk_index,
                     )
                     packed_count += 1
-            print(f"[DB] {packed_count} packed file records committed.")
-        # else: packer_metadata == [] (existing staging) -> no DB records
+            if recovered_count:
+                print(f"[DB] Recovered {recovered_count} existing loose file record(s).")
+            print(f"[DB] {packed_count} packed file record(s) synchronized.")
 
         # The robocopy summary parser is English-only; on a localized console
         # it yields 0 bytes. Fall back to the measured growth of the tape
@@ -1920,9 +2489,8 @@ class LTOBackup:
         copied_bytes = rc_sum['bytes_copied']
         if copied_bytes <= 0:
             copied_bytes = max(0, _dir_size(tape_root) - initial_tape_bytes)
-        used_delta = copied_bytes + recovered_existing_bytes
-        if used_delta > 0:
-            self.db.update_tape_used_space(tape_label, used_delta)
+        new_used = self.db.recalculate_tape_used_space(tape_label)
+        print(f"[DB] Tape used space reconciled to {new_used / 1024**3:.3f} GB.")
 
         # ---------------------------------------------------------------
         # Phase 4 — Print Robocopy job summary
@@ -2500,6 +3068,21 @@ class RemoteOrchestrator:
         self.staging_dir  = cfg.staging_dir
         self.fill_pct     = cfg.staging_fill_pct
 
+        # --- continuous-streaming pipeline tuning (from [PERFORMANCE]) --------
+        self.chunk_cap_bytes   = int(cfg.chunk_cap_gb * 1024**3)
+        self.staging_max_bytes = int(cfg.staging_max_gb * 1024**3)
+        self.prefetch_ahead    = cfg.prefetch_chunks_ahead
+        self.ssh_cipher        = cfg.ssh_cipher
+        self.use_mbuffer       = cfg.use_mbuffer
+        self.mbuffer_size      = cfg.mbuffer_size
+        self.tape_priority     = _priority_class(cfg.robocopy_priority)
+        self.fetch_cores, self.tape_cores = compute_affinity_sets(cfg.cpu_affinity)
+
+        # Producer/consumer coordination (initialised per session).
+        self._staged_bytes = 0                 # bytes currently resident in staging
+        self._staged_lock  = threading.Lock()
+        self._producer_err = None              # first fatal producer error, if any
+
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
@@ -2648,7 +3231,10 @@ class RemoteOrchestrator:
     # ------------------------------------------------------------------
 
     def _chunk_budget(self):
-        return int(shutil.disk_usage(self.staging_dir).free * self.fill_pct)
+        # Cap each chunk at chunk_cap_gb so the deep-prefetch pipeline can keep
+        # 2+ chunks resident on the NVMe staging disk under the staging_max cap.
+        free_budget = int(shutil.disk_usage(self.staging_dir).free * self.fill_pct)
+        return min(free_budget, self.chunk_cap_bytes)
 
     def _bin_pack(self, manifest):
         """Greedy largest-first bin-packing into chunks that fit staging budget.
@@ -2681,6 +3267,13 @@ class RemoteOrchestrator:
     # ------------------------------------------------------------------
 
     def _run_session(self, session_id):
+        """Stream pending chunks to tape with a deep-prefetch pipeline.
+
+        A background producer fetches + packs chunks onto NVMe staging up to
+        `prefetch_ahead` chunks in front of the tape writer, while this thread
+        (the consumer) keeps robocopy streaming to the LTO drive. The staging
+        footprint is capped (backpressure) so the disk never overruns, and the
+        tape never starves on the network (no shoe-shining)."""
         session_row    = self.db.conn.execute(
             "SELECT * FROM remote_sessions WHERE session_id = ?", (session_id,)
         ).fetchone()
@@ -2700,44 +3293,172 @@ class RemoteOrchestrator:
         if not _ensure_lto_drive_ready(self.cfg.lto_drive):
             return
 
-        print(f"\n[REMOTE] Processing {len(pending_chunks)} pending chunk(s) "
-              f"({done_count}/{total_chunks} already done).")
+        # --- per-session pipeline state ---
+        self._staged_bytes   = 0
+        self._producer_err   = None
+        self._producer_chunk = None
+        self._consumer_chunk = None
+        last_chunk = pending_chunks[-1]
 
-        for i, chunk_index in enumerate(pending_chunks):
-            chunk_files   = self.db.get_chunk_files(session_id, chunk_index)
-            is_last_chunk = (i == len(pending_chunks) - 1)
-            print(f"\n[REMOTE] === Chunk {chunk_index + 1}/{total_chunks} "
-                  f"({len(chunk_files)} file(s)) ===")
+        # Pin hashing/packing (this process) to the fetch cores so the tape
+        # writer's cores stay free of SSH decryption + Python packing.
+        if self.fetch_cores:
+            pin_current_process(self.fetch_cores, label='fetch/pack')
 
-            success = self._process_chunk(
-                session_id, chunk_index, chunk_files,
-                tape_label, eject_after=is_last_chunk
+        _phase('PIPELINE', f"Streaming {len(pending_chunks)} chunk(s) to tape "
+                           f"({done_count}/{total_chunks} already done) | prefetch "
+                           f"{self.prefetch_ahead} ahead | staging cap "
+                           f"{self.staging_max_bytes / 1024**3:.0f} GB")
+
+        chunk_files_map = {ci: self.db.get_chunk_files(session_id, ci)
+                           for ci in pending_chunks}
+        planned = {ci: sum(r['file_size_bytes'] for r in chunk_files_map[ci])
+                   for ci in pending_chunks}
+
+        ready_q       = queue.Queue(maxsize=self.prefetch_ahead)
+        stop_pipeline = threading.Event()
+        SENTINEL      = object()
+
+        def _producer():
+            try:
+                for ci in pending_chunks:
+                    if CANCEL.is_set() or stop_pipeline.is_set():
+                        break
+                    self._await_staging_capacity(planned[ci], stop_pipeline)
+                    if CANCEL.is_set() or stop_pipeline.is_set():
+                        break
+                    desc = self._stage_chunk(session_id, ci, chunk_files_map[ci])
+                    if desc is None:
+                        if not CANCEL.is_set():
+                            self._producer_err = f"chunk {ci + 1} could not be staged"
+                        break
+                    # Enqueue, staying responsive to pipeline shutdown.
+                    queued = False
+                    while not (CANCEL.is_set() or stop_pipeline.is_set()):
+                        try:
+                            ready_q.put(desc, timeout=1)
+                            queued = True
+                            break
+                        except queue.Full:
+                            continue
+                    if not queued:
+                        self._discard_desc(desc)
+                        break
+            except Exception as e:
+                self._producer_err = str(e)
+            finally:
+                ready_q.put(SENTINEL)
+
+        prod = threading.Thread(target=_producer, name='prefetch-producer',
+                                daemon=True)
+        prod.start()
+
+        hb_stop = threading.Event()
+        self._start_pipeline_heartbeat(hb_stop, ready_q, total_chunks)
+
+        completed = 0
+        failed    = False
+        try:
+            while True:
+                desc = ready_q.get()
+                if desc is SENTINEL:
+                    break
+                if CANCEL.is_set():
+                    self._discard_desc(desc)
+                    break
+                ci          = desc['chunk_index']
+                eject_after = (ci == last_chunk)
+                if not self._write_chunk(session_id, desc, tape_label, eject_after):
+                    failed = True
+                    break
+                completed += 1
+        finally:
+            stop_pipeline.set()
+            hb_stop.set()
+            # Drain the queue so a producer blocked on a full put() can exit,
+            # and clean up any prefetched-but-unused chunks.
+            try:
+                while True:
+                    leftover = ready_q.get_nowait()
+                    if leftover is not SENTINEL:
+                        self._discard_desc(leftover)
+            except queue.Empty:
+                pass
+            prod.join(timeout=15)
+            if self.fetch_cores:
+                unpin_current_process()
+
+        if CANCEL.is_set():
+            print("\n[ABORTED] Stopped by user. Session saved — "
+                  "re-run option 6 to resume from the interrupted chunk.")
+            return
+        if failed or self._producer_err:
+            msg = self._producer_err or "a chunk failed during tape write"
+            print(f"\n[REMOTE] Pipeline stopped: {msg}. "
+                  f"Re-run to resume from the failed chunk.")
+            return
+        if completed == len(pending_chunks):
+            self.db.update_remote_session(
+                session_id, status='completed',
+                completed_at=datetime.now().isoformat()
             )
-            if not success:
-                print(f"[REMOTE] Chunk {chunk_index + 1} failed. "
-                      f"Re-run to retry from this chunk.")
+            print("\n[REMOTE] Session complete. All chunks archived to tape.")
+
+    # ------------------------------------------------------------------
+    # Producer: fetch + pack a chunk onto staging  (runs off the main thread)
+    # ------------------------------------------------------------------
+
+    def _await_staging_capacity(self, planned_bytes, stop_evt):
+        """Block until there is room to stage another chunk without breaching the
+        staging cap or starving the disk. Accounts for the ~2x transient
+        footprint while a chunk is packed (fetch_dir + pack_dir coexist)."""
+        need  = 2 * planned_bytes          # peak while fetch + pack dirs coexist
+        floor = 20 * 1024**3               # keep >=20 GB free on the staging volume
+        warned = False
+        while not (CANCEL.is_set() or stop_evt.is_set()):
+            with self._staged_lock:
+                resident = self._staged_bytes
+            try:
+                free = shutil.disk_usage(self.staging_dir).free
+            except OSError:
+                free = need + floor
+            room_cap  = (resident + need) <= self.staging_max_bytes
+            room_disk = (free - need) >= floor
+            alone     = (resident == 0)    # nothing else resident: must proceed
+            if (room_cap and room_disk) or alone:
                 return
+            if not warned:
+                _status('PIPELINE',
+                        f"Backpressure — {resident / 1024**3:.0f} GB staged, "
+                        f"waiting for the tape to drain before fetching the next "
+                        f"chunk (cap {self.staging_max_bytes / 1024**3:.0f} GB).")
+                warned = True
+            time.sleep(2)
 
-        self.db.update_remote_session(
-            session_id, status='completed',
-            completed_at=datetime.now().isoformat()
-        )
-        print("\n[REMOTE] Session complete. All chunks archived to tape.")
-
-    def _process_chunk(self, session_id, chunk_index, chunk_files,
-                        tape_label, eject_after=False):
+    def _stage_chunk(self, session_id, chunk_index, chunk_files):
+        """Fetch then pack one chunk. Returns a ready-descriptor or None."""
+        self._producer_chunk = chunk_index
         fetch_dir = os.path.join(self.staging_dir, f"_fetch_{chunk_index:03d}")
         pack_dir  = os.path.join(self.staging_dir, f"_pack_{chunk_index:03d}")
 
-        # --- FETCH ---
+        # --- FETCH (remote -> PC) ---
         self.db.update_chunk_status(session_id, chunk_index, 'fetching')
         if not self._fetch_chunk(session_id, chunk_index, chunk_files, fetch_dir):
-            self.db.update_chunk_status(session_id, chunk_index, 'fetch_failed')
+            if not CANCEL.is_set():
+                self.db.update_chunk_status(session_id, chunk_index, 'fetch_failed')
             self._cleanup_dir(fetch_dir)
-            return False
+            return None
+        if CANCEL.is_set():
+            self._cleanup_dir(fetch_dir)
+            return None
 
-        # --- PACK ---
+        # --- PACK (small files -> ZIP, large files staged loose) ---
         self.db.update_chunk_status(session_id, chunk_index, 'packing')
+        # Hand the packer a clean dest so it never hits its interactive prompt
+        # from this worker thread.
+        self._cleanup_dir(pack_dir)
+        _phase('PACK', f"Packing chunk {chunk_index + 1}: "
+                       f"small files -> ZIP, large files staged loose")
         try:
             metadata = LTOPacker(self.cfg.max_zip_size_gb).run(
                 source=fetch_dir,
@@ -2746,42 +3467,110 @@ class RemoteOrchestrator:
             )
         except Exception as e:
             print(f"[REMOTE] Packer error: {e}")
-            self.db.update_chunk_status(session_id, chunk_index, 'fetch_failed')
+            if not CANCEL.is_set():
+                self.db.update_chunk_status(session_id, chunk_index, 'fetch_failed')
             self._cleanup_dir(fetch_dir)
             self._cleanup_dir(pack_dir)
-            return False
+            return None
 
-        if metadata is None:
-            print("[REMOTE] Packer aborted by user.")
-            return False
-        if metadata == []:
-            print("[REMOTE] Existing staged files cannot be used for remote archive recovery.")
-            print("[REMOTE] Re-run this chunk and choose option 1 to repack from fetched files.")
-            return False
+        if not metadata:
+            if not CANCEL.is_set():
+                print(f"[REMOTE] Chunk {chunk_index + 1}: nothing to pack "
+                      f"(empty fetch). Marking failed.")
+                self.db.update_chunk_status(session_id, chunk_index, 'fetch_failed')
+            self._cleanup_dir(fetch_dir)
+            self._cleanup_dir(pack_dir)
+            return None
 
-        # --- BACKUP ---
+        # Free the raw fetched copy now that packing is done — this halves the
+        # per-chunk staging footprint so the prefetch buffer stays under the cap.
+        self._cleanup_dir(fetch_dir)
+
+        staged_bytes = _dir_tree_size(pack_dir)
+        with self._staged_lock:
+            self._staged_bytes += staged_bytes
+        _status('PIPELINE', f"Chunk {chunk_index + 1} staged & ready "
+                            f"({staged_bytes / 1024**3:.1f} GB) — queued for tape.")
+        return {
+            'chunk_index':  chunk_index,
+            'fetch_dir':    fetch_dir,
+            'pack_dir':     pack_dir,
+            'metadata':     metadata,
+            'staged_bytes': staged_bytes,
+        }
+
+    def _discard_desc(self, desc):
+        """Drop a staged-but-unused chunk: clean its dirs and free its budget."""
+        self._cleanup_dir(desc['fetch_dir'])
+        self._cleanup_dir(desc['pack_dir'])
+        with self._staged_lock:
+            self._staged_bytes = max(0, self._staged_bytes - desc['staged_bytes'])
+
+    # ------------------------------------------------------------------
+    # Consumer: write a staged chunk to tape  (runs on the main thread)
+    # ------------------------------------------------------------------
+
+    def _write_chunk(self, session_id, desc, tape_label, eject_after):
+        chunk_index = desc['chunk_index']
+        self._consumer_chunk = chunk_index
+        pack_dir = desc['pack_dir']
+
         self.db.update_chunk_status(session_id, chunk_index, 'backing')
-        # Use _NoEjectBackup to keep tape mounted; eject only after final chunk.
+        # _NoEjectBackup keeps the tape mounted; eject only after the final chunk.
         backup_cls = LTOBackup if eject_after else _NoEjectBackup
         try:
-            backup_cls(self.db, self.cfg.ibm_eject_cmd).run(
+            backup_cls(self.db, self.cfg.ibm_eject_cmd,
+                       tape_priority=self.tape_priority,
+                       tape_affinity=self.tape_cores).run(
                 source=pack_dir,
                 tape_drive=self.cfg.lto_drive,
                 tape_label=tape_label,
-                packer_metadata=metadata,
+                packer_metadata=desc['metadata'],
             )
         except Exception as e:
+            if CANCEL.is_set():
+                # Robocopy was terminated by the stop request; leave the chunk
+                # non-'done' (resumable) and skip eject.
+                return False
             print(f"[REMOTE] Backup error: {e}")
             self.db.update_chunk_status(session_id, chunk_index, 'backup_failed')
             return False
 
+        if CANCEL.is_set():
+            return False
+
         self.db.update_chunk_status(session_id, chunk_index, 'done')
 
-        # --- FLUSH ---
-        print(f"[REMOTE] Flushing staged files for chunk {chunk_index + 1}...")
-        self._cleanup_dir(fetch_dir)
+        # --- FLUSH staged files for this chunk ---
+        _status('REMOTE', f"Flushing staged files for chunk {chunk_index + 1}...")
+        self._cleanup_dir(desc['fetch_dir'])   # already removed after packing
         self._cleanup_dir(pack_dir)
+        with self._staged_lock:
+            self._staged_bytes = max(0, self._staged_bytes - desc['staged_bytes'])
         return True
+
+    # ------------------------------------------------------------------
+    # Pipeline status heartbeat
+    # ------------------------------------------------------------------
+
+    def _start_pipeline_heartbeat(self, stop_evt, ready_q, total_chunks):
+        """Print a periodic line showing the producer staying ahead of the tape."""
+        def _beat():
+            while not stop_evt.wait(5):
+                with self._staged_lock:
+                    staged_gb = self._staged_bytes / 1024**3
+                prod_c = ('-' if self._producer_chunk is None
+                          else self._producer_chunk + 1)
+                cons_c = ('-' if self._consumer_chunk is None
+                          else self._consumer_chunk + 1)
+                _status('PIPELINE',
+                        f"queued={ready_q.qsize()}/{self.prefetch_ahead} | "
+                        f"staging={staged_gb:.0f}/"
+                        f"{self.staging_max_bytes / 1024**3:.0f} GB | "
+                        f"producer->chunk {prod_c}/{total_chunks} | "
+                        f"consumer->chunk {cons_c}/{total_chunks}")
+        threading.Thread(target=_beat, name='pipeline-heartbeat',
+                         daemon=True).start()
 
     # ------------------------------------------------------------------
     # Fetch helpers
@@ -2832,31 +3621,50 @@ class RemoteOrchestrator:
 
         if pending:
             pending_bytes = sum(row['file_size_bytes'] for row, _, _, _ in pending)
-            print(f"[REMOTE] Fetching chunk {chunk_index + 1}/{total_chunks}: "
-                  f"{len(pending)} file(s), {pending_bytes / 1024**3:.2f} GB")
+            _phase('FETCH', f"Remote -> PC | chunk {chunk_index + 1}/{total_chunks} | "
+                            f"{len(pending)} file(s), {pending_bytes / 1024**3:.2f} GB")
+            _status('SSH', f"Opening tar stream to "
+                           f"{self.remote_user}@{self.remote_host} "
+                           f"(cipher={self.ssh_cipher or 'default'}, "
+                           f"mbuffer={'on' if self.use_mbuffer else 'off'})")
+
+            fetch_stop = threading.Event()
+            self._start_fetch_monitor(fetch_stop, fetch_dir, pending_bytes)
 
             pending_by_base = defaultdict(list)
             for row, remote_base, rel, local_path in pending:
                 pending_by_base[remote_base].append((row, rel, local_path))
 
-            for remote_base, base_pending in pending_by_base.items():
-                ok, err = _remote_tar_fetch(
-                    self.remote_user,
-                    self.remote_host,
-                    remote_base,
-                    [rel for _, rel, _ in base_pending],
-                    fetch_dir,
-                    password=self.remote_password,
-                )
-                if not ok:
-                    print(f"[REMOTE] Tar fetch failed:\n{err}")
-                    for row, rel, _ in base_pending:
-                        self.db.update_manifest_row(
-                            row['manifest_id'],
-                            status='fetch_failed',
-                            error_msg=err[:500],
-                        )
-                    return False
+            try:
+                for remote_base, base_pending in pending_by_base.items():
+                    if CANCEL.is_set():
+                        return False
+                    ok, err = _remote_tar_fetch(
+                        self.remote_user,
+                        self.remote_host,
+                        remote_base,
+                        [rel for _, rel, _ in base_pending],
+                        fetch_dir,
+                        password=self.remote_password,
+                        cipher=self.ssh_cipher,
+                        use_mbuffer=self.use_mbuffer,
+                        mbuffer_size=self.mbuffer_size,
+                        fetch_cores=self.fetch_cores,
+                    )
+                    if not ok:
+                        if CANCEL.is_set():
+                            return False
+                        print(f"\n[REMOTE] Tar fetch failed:\n{err}")
+                        for row, rel, _ in base_pending:
+                            self.db.update_manifest_row(
+                                row['manifest_id'],
+                                status='fetch_failed',
+                                error_msg=err[:500],
+                            )
+                        return False
+            finally:
+                fetch_stop.set()
+                print()  # end the \r progress line
         else:
             print(f"[REMOTE] Chunk {chunk_index + 1}/{total_chunks}: "
                   "all files already fetched.")
@@ -2901,6 +3709,25 @@ class RemoteOrchestrator:
                                         local_rel_path=rel,
                                         error_msg=None)
         return True
+
+    def _start_fetch_monitor(self, stop_evt, fetch_dir, total_bytes):
+        """Live remote->PC throughput: watch the fetch dir grow on disk."""
+        def _mon():
+            prev_bytes = 0
+            prev_time  = time.time()
+            while not stop_evt.wait(2):
+                cur   = _dir_tree_size(fetch_dir)
+                now   = time.time()
+                dt    = now - prev_time
+                speed = ((cur - prev_bytes) / 1024**2) / dt if dt > 0 else 0
+                pct   = (cur / total_bytes * 100) if total_bytes else 0
+                sys.stdout.write(
+                    f"\r[FETCH] {min(pct, 100):.1f}% | {speed:.1f} MB/s | "
+                    f"{cur / 1024**3:.1f}/{total_bytes / 1024**3:.1f} GB   ")
+                sys.stdout.flush()
+                prev_bytes = cur
+                prev_time  = now
+        threading.Thread(target=_mon, name='fetch-monitor', daemon=True).start()
 
     # ------------------------------------------------------------------
     # Utility
@@ -3270,6 +4097,10 @@ def run_remote_archiver(cfg, db):
         return
 
     added_exclusion = _prepare_robocopy_exclusion()
+    reset_cancel()
+    install_cancel_handler()
+    print("[REMOTE] Press Ctrl+C at any time to stop safely "
+          "(the session is saved and can be resumed).")
     try:
         RemoteOrchestrator(cfg, db).run()
     except RuntimeError as e:
@@ -3277,6 +4108,12 @@ def run_remote_archiver(cfg, db):
     except KeyboardInterrupt:
         print("\n[REMOTE] Interrupted. Session state saved — re-run to resume.")
     finally:
+        # Make sure no fetch/tape child survives, restore CPU affinity and the
+        # default Ctrl+C behaviour, then drop the robocopy Defender exclusion.
+        _terminate_all_procs()
+        unpin_current_process()
+        uninstall_cancel_handler()
+        reset_cancel()
         if added_exclusion:
             _remove_robocopy_exclusion()
 
