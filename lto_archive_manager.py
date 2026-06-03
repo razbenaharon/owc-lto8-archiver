@@ -344,6 +344,31 @@ def _clean_config_path(value):
     return os.path.normpath(os.path.expandvars(os.path.expanduser(value)))
 
 
+def _clean_remote_path(value):
+    """Return a POSIX remote path from config text, tolerating optional quotes."""
+    value = (value or '').strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        value = value[1:-1]
+    value = value.replace('\\', '/').strip()
+    return posixpath.normpath(value) if value else ''
+
+
+def _config_list(value):
+    """Parse a newline/comma/semicolon config list without splitting spaces."""
+    value = (value or '').replace('\r', '\n')
+    items = []
+    for line in value.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = re.split(r'[;,]', line) if not line.startswith(('"', "'")) else [line]
+        for part in parts:
+            part = part.strip()
+            if part:
+                items.append(part)
+    return items
+
+
 def _load_env_file(path):
     """Parse a simple KEY=VALUE .env file into a dict.
 
@@ -1109,6 +1134,8 @@ class ConfigManager:
             'remote_user':      '',
             'remote_password':  '',
             'remote_path':      '',
+            'remote_selected_paths': '',
+            'confirm_before_backup': 'true',
             'staging_fill_pct': '0.80',
         }
         self.config['PERFORMANCE'] = {
@@ -1157,7 +1184,18 @@ class ConfigManager:
             value = value[1:-1]
         return value
     @property
-    def remote_path(self):      return self.config.get('REMOTE', 'remote_path', fallback='')
+    def remote_path(self):      return _clean_remote_path(self.config.get('REMOTE', 'remote_path', fallback=''))
+    @property
+    def remote_selected_paths(self):
+        paths = [_clean_remote_path(p)
+                 for p in _config_list(self.config.get('REMOTE', 'remote_selected_paths', fallback='', raw=True))]
+        return [p for p in paths if p]
+    @property
+    def remote_scan_paths(self):
+        return self.remote_selected_paths or ([self.remote_path] if self.remote_path else [])
+    @property
+    def confirm_before_backup(self):
+        return self.config.get('REMOTE', 'confirm_before_backup', fallback='true').strip().lower() in ('1', 'true', 'yes', 'on')
     @property
     def staging_fill_pct(self): return float(self.config.get('REMOTE', 'staging_fill_pct', fallback='0.80'))
 
@@ -3196,6 +3234,9 @@ class RemoteOrchestrator:
         self.remote_user  = cfg.remote_user
         self.remote_password = cfg.remote_password
         self.remote_path  = cfg.remote_path
+        self.remote_scan_paths = cfg.remote_scan_paths
+        self.remote_session_path = self._remote_session_key()
+        self.confirm_before_backup = cfg.confirm_before_backup
         self.staging_dir  = cfg.staging_dir
         self.fill_pct     = cfg.staging_fill_pct
 
@@ -3221,7 +3262,7 @@ class RemoteOrchestrator:
     def run(self):
         self._validate_config()
 
-        existing = self.db.get_active_remote_session(self.remote_host, self.remote_path)
+        existing = self.db.get_active_remote_session(self.remote_host, self.remote_session_path)
         if existing:
             pending = self.db.get_pending_chunks(existing['session_id'])
             total   = self.db.count_chunks(existing['session_id'])
@@ -3251,12 +3292,19 @@ class RemoteOrchestrator:
     def _validate_config(self):
         missing = [k for k in ('remote_host', 'remote_user', 'remote_path')
                    if not getattr(self.cfg, k)]
+        if not self.remote_scan_paths:
+            missing.append('remote_selected_paths')
         if missing:
             raise RuntimeError(
                 f"[REMOTE] Missing values in [REMOTE] config section: "
                 f"{', '.join(missing)}\n"
                 f"Edit config.ini and fill in remote_host, remote_user, remote_path."
             )
+
+    def _remote_session_key(self):
+        if not self.remote_scan_paths or self.remote_scan_paths == [self.remote_path]:
+            return self.remote_path
+        return self.remote_path + '\n' + '\n'.join(self.remote_scan_paths)
 
     def _start_new_session(self):
         self._cleanup_remote_staging_dirs()
@@ -3271,7 +3319,13 @@ class RemoteOrchestrator:
         session_label = f"REMOTE_{self.remote_host.split('.')[0]}_{ts}"
 
         print(f"\n[REMOTE] Session : {session_label}")
-        print(f"[REMOTE] Scanning {self.remote_user}@{self.remote_host}:{self.remote_path} ...")
+        print(f"[REMOTE] Base    : {self.remote_user}@{self.remote_host}:{self.remote_path}")
+        if self.remote_scan_paths == [self.remote_path]:
+            print(f"[REMOTE] Scanning {self.remote_path} ...")
+        else:
+            print("[REMOTE] Selected paths:")
+            for path in self.remote_scan_paths:
+                print(f"  - {path}")
 
         manifest = self._scan_remote()
         if not manifest:
@@ -3286,11 +3340,15 @@ class RemoteOrchestrator:
         print(f"[REMOTE] Split into {len(chunks)} chunk(s) "
               f"(staging budget: {self._chunk_budget() / 1024**3:.2f} GB each).")
 
+        if not self._confirm_start(tape_label, len(manifest), total_bytes, len(chunks)):
+            print("[REMOTE] Cancelled before creating backup session.")
+            return
+
         session_id = self.db.create_remote_session(
             session_label=session_label,
             remote_host=self.remote_host,
             remote_user=self.remote_user,
-            remote_path=self.remote_path,
+            remote_path=self.remote_session_path,
             tape_label=tape_label,
             staging_dir=self.staging_dir,
         )
@@ -3324,13 +3382,29 @@ class RemoteOrchestrator:
         label = input("Enter tape Volume Label manually (or Enter to cancel): ").strip()
         return label if label else None
 
+    def _confirm_start(self, tape_label, file_count, total_bytes, chunk_count):
+        if not self.confirm_before_backup:
+            return True
+        print("\n[REMOTE] Approval required before backup starts.")
+        print(f"  Host : {self.remote_user}@{self.remote_host}")
+        print(f"  Tape : {tape_label}")
+        print(f"  Base : {self.remote_path}")
+        print(f"  Files: {file_count} ({total_bytes / 1024**3:.2f} GB)")
+        print(f"  Plan : {chunk_count} chunk(s)")
+        print("  Paths:")
+        for path in self.remote_scan_paths:
+            print(f"    - {path}")
+        choice = input("Type 'yes' to start writing to tape: ").strip().lower()
+        return choice == 'yes'
+
     # ------------------------------------------------------------------
     # Remote scanning
     # ------------------------------------------------------------------
 
     def _scan_remote(self):
         """SSH find with -printf '%s %p\n' to get size + path for every file."""
-        find_cmd = f"find {shlex.quote(self.remote_path)} -type f -printf '%s %p\\n'"
+        quoted_paths = ' '.join(shlex.quote(path) for path in self.remote_scan_paths)
+        find_cmd = f"find {quoted_paths} -type f -printf '%s %p\\n'"
         result   = _ssh_run(
             self.remote_user,
             self.remote_host,
