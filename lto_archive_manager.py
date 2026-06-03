@@ -46,16 +46,60 @@ def _ts():
     return time.strftime('%H:%M:%S')
 
 
+_PRINT_LOCK = threading.Lock()
+_PROGRESS_ACTIVE = False
+
+
+def _fmt_eta(seconds):
+    if seconds is None or seconds < 0:
+        return "--:--"
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h:d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def _progress_line(text):
+    """Render a live progress line without fighting normal status output."""
+    global _PROGRESS_ACTIVE
+    with _PRINT_LOCK:
+        _PROGRESS_ACTIVE = True
+        sys.stdout.write("\r" + text + "   ")
+        sys.stdout.flush()
+
+
+def _progress_done():
+    """Terminate the current live progress line, if one is active."""
+    global _PROGRESS_ACTIVE
+    with _PRINT_LOCK:
+        if _PROGRESS_ACTIVE:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            _PROGRESS_ACTIVE = False
+
+
 def _phase(tag, msg):
     """Print a prominent phase-transition banner (e.g. SSH -> FETCH -> TAPE)."""
-    print(f"\n[{_ts()}] ===== {tag}: {msg} =====")
-    sys.stdout.flush()
+    global _PROGRESS_ACTIVE
+    with _PRINT_LOCK:
+        if _PROGRESS_ACTIVE:
+            sys.stdout.write("\n")
+            _PROGRESS_ACTIVE = False
+        print(f"\n[{_ts()}] ===== {tag}: {msg} =====")
+        sys.stdout.flush()
 
 
 def _status(tag, msg):
     """Print a timestamped one-line status update."""
-    print(f"[{_ts()}] [{tag}] {msg}")
-    sys.stdout.flush()
+    global _PROGRESS_ACTIVE
+    with _PRINT_LOCK:
+        if _PROGRESS_ACTIVE:
+            sys.stdout.write("\n")
+            _PROGRESS_ACTIVE = False
+        print(f"[{_ts()}] [{tag}] {msg}")
+        sys.stdout.flush()
 
 
 # --- Graceful cancellation (Ctrl+C) -------------------------------------------
@@ -421,8 +465,12 @@ def _robocopy_file(src, dst, display_name=None):
             delta_t = now - prev_time
             speed   = ((cur_size - prev_size) / 1024**2) / delta_t if delta_t > 0 else 0
             pct     = (cur_size / fsize * 100) if fsize else 100
-            sys.stdout.write(f"\r[COPYING] {disp} | {min(pct, 100):.1f}% | {speed:.1f} MB/s   ")
-            sys.stdout.flush()
+            remaining = max(0, fsize - cur_size)
+            eta = remaining / (speed * 1024**2) if speed > 0 else None
+            _progress_line(
+                f"[COPYING] {disp} | {min(pct, 100):.1f}% | "
+                f"{speed:.1f} MB/s | ETA {_fmt_eta(eta)}"
+            )
             prev_size = cur_size
             prev_time = now
 
@@ -434,6 +482,7 @@ def _robocopy_file(src, dst, display_name=None):
         unregister_proc(proc)
     stop_evt.set()
     t.join(timeout=2)
+    _progress_done()
 
     # robocopy exit codes < 8 indicate success (0=nothing done, 1=ok, 2-7=ok+extras)
     return proc.returncode < 8
@@ -1585,6 +1634,11 @@ class DatabaseManager:
                 "SELECT 1 FROM tapes WHERE volume_label = ?", (volume_label,)
             ).fetchone())
 
+    def get_tape(self, volume_label):
+        return self.conn.execute(
+            "SELECT * FROM tapes WHERE volume_label = ?", (volume_label,)
+        ).fetchone()
+
     def insert_file(self, file_name, original_path, file_size_bytes, file_hash,
                     tape_label, is_packed, container_name, stored_path,
                     local_session_id=None, local_chunk_index=None):
@@ -1956,6 +2010,7 @@ class LTOPacker:
                     zip_rel = rel.replace('\\', '/')
                     if current_zip_size + fsize > self.max_zip_size_gb * 1024**3 * 0.99:
                         zipf.close()
+                        _progress_done()
                         print(f"\n -> Sealed {bundle_prefix}_{zip_idx:03d}.zip ({files_in_current_zip} files)")
                         zip_idx += 1
                         zip_path = os.path.join(dest, f"{bundle_prefix}_{zip_idx:03d}.zip")
@@ -1988,13 +2043,12 @@ class LTOPacker:
                     })
 
                     if total_packed % 500 == 0:
-                        print(f"\r[PACKING] {total_packed} files packed...", end="", flush=True)
+                        _progress_line(f"[PACKING] {total_packed} files packed")
 
                 else:
                     dst_path = os.path.join(dest, rel)
                     disp = (file[:15] + '..' + file[-5:]) if len(file) > 22 else file
-                    sys.stdout.write(f"\r[HASHING] {disp}...   ")
-                    sys.stdout.flush()
+                    _progress_line(f"[HASHING] {disp}")
                     file_hash = _hash_file(src)
 
                     if not _robocopy_file(src, dst_path, display_name=file):
@@ -2012,11 +2066,13 @@ class LTOPacker:
                     })
 
             except Exception as e:
+                _progress_done()
                 print(f"\n[ERROR] {file}: {e}")
                 errors.append((src, e))
 
         if files_in_current_zip > 0:
             zipf.close()
+            _progress_done()
             print(f"\n -> Sealed {bundle_prefix}_{zip_idx:03d}.zip ({files_in_current_zip} files)")
         else:
             zipf.close()
@@ -2029,6 +2085,7 @@ class LTOPacker:
                 f"first failure: {errors[0][0]} ({errors[0][1]})"
             )
 
+        _progress_done()
         print(f"\n[PACKER] Sub-chunk done: {total_packed} packed | {total_loose} loose.")
         return metadata
 
@@ -2081,6 +2138,7 @@ class LTOPacker:
                         # Roll over to a new ZIP bundle if current one is full
                         if current_zip_size + fsize > self.max_zip_size_gb * 1024**3 * 0.99:
                             zipf.close()
+                            _progress_done()
                             print(f"\n -> Sealed Bundle_{zip_idx:03d}.zip ({files_in_current_zip} files)")
                             zip_idx += 1
                             zip_path = os.path.join(dest, f"Bundle_{zip_idx:03d}.zip")
@@ -2113,15 +2171,14 @@ class LTOPacker:
                         })
 
                         if total_packed % 500 == 0:
-                            print(f"\r[PACKING] {total_packed} files packed...", end="", flush=True)
+                            _progress_line(f"[PACKING] {total_packed} files packed")
 
                     else:
                         dst_path = os.path.join(dest, rel)
 
                         # Pre-hash from source while tape is idle.
                         disp = (file[:15] + '..' + file[-5:]) if len(file) > 22 else file
-                        sys.stdout.write(f"\r[HASHING] {disp}...   ")
-                        sys.stdout.flush()
+                        _progress_line(f"[HASHING] {disp}")
                         file_hash = _hash_file(src)
 
                         if not _robocopy_file(src, dst_path, display_name=file):
@@ -2139,16 +2196,19 @@ class LTOPacker:
                         })
 
                 except Exception as e:
+                    _progress_done()
                     print(f"\n[ERROR] {file}: {e}")
 
         if files_in_current_zip > 0:
             zipf.close()
+            _progress_done()
             print(f"\n -> Sealed Bundle_{zip_idx:03d}.zip ({files_in_current_zip} files)")
         else:
             zipf.close()
             if os.path.exists(zip_path) and os.path.getsize(zip_path) < 100:
                 os.remove(zip_path)
 
+        _progress_done()
         print(f"\n[PACKER] Offline phase done: {total_packed} packed into ZIPs | {total_loose} large files staged & pre-hashed.")
         return metadata
 
@@ -2288,8 +2348,7 @@ class LTOBackup:
                                 ):
                                     disp = ((file[:15] + '..' + file[-5:])
                                             if len(file) > 22 else file)
-                                    sys.stdout.write(f"\r[HASHING] {disp}...  ")
-                                    sys.stdout.flush()
+                                    _progress_line(f"[HASHING] {disp}")
                                     recovered_direct_existing.append({
                                         'file_name': file,
                                         'original_path': src,
@@ -2303,12 +2362,12 @@ class LTOBackup:
                     try:
                         fsize = os.path.getsize(src)
                         disp  = (file[:15] + '..' + file[-5:]) if len(file) > 22 else file
-                        sys.stdout.write(f"\r[HASHING] {disp}...  ")
-                        sys.stdout.flush()
+                        _progress_line(f"[HASHING] {disp}")
                         fhash = _hash_file(src)
                         hash_map[rel_path] = {'hash': fhash, 'fsize': fsize,
                                               'src': src, 'dst': dst}
                     except Exception as e:
+                        _progress_done()
                         print(f"\n[WARN] Cannot hash {file}: {e}")
 
         if packer_metadata is not None:
@@ -2323,8 +2382,9 @@ class LTOBackup:
         else:
             total_bytes = sum(v['fsize'] for v in hash_map.values())
 
-        print(f"\r[BACKUP] {len(hash_map)} loose file(s) hashed "
-              f"({total_bytes / 1024**3:.2f} GB to copy) | {skipped} already on tape.  ")
+        _progress_done()
+        print(f"[BACKUP] {len(hash_map)} loose file(s) hashed "
+              f"({total_bytes / 1024**3:.2f} GB to copy) | {skipped} already on tape.")
 
         # ---------------------------------------------------------------
         # Phase 2 — Single robocopy call: source directory → tape
@@ -2368,9 +2428,13 @@ class LTOBackup:
                 dt    = now - prev_time
                 speed = ((cur - prev_bytes) / 1024**2) / dt if dt > 0 else 0
                 pct   = (cur / total_bytes * 100) if total_bytes else 100
-                sys.stdout.write(
-                    f"\r[COPYING] {min(pct, 100):.1f}% | {speed:.1f} MB/s   ")
-                sys.stdout.flush()
+                remaining = max(0, total_bytes - cur)
+                eta = remaining / (speed * 1024**2) if speed > 0 else None
+                _progress_line(
+                    f"[COPYING] {min(pct, 100):.1f}% | {speed:.1f} MB/s | "
+                    f"{cur / 1024**3:.1f}/{total_bytes / 1024**3:.1f} GB | "
+                    f"ETA {_fmt_eta(eta)}"
+                )
                 prev_bytes = cur
                 prev_time  = now
 
@@ -2397,7 +2461,7 @@ class LTOBackup:
 
         stop_evt.set()
         mon.join(timeout=2)
-        print()  # end progress line
+        _progress_done()
 
         # If the user pressed Ctrl+C, robocopy was terminated mid-write. Skip the
         # DB commit and the eject so the chunk stays resumable and the tape is
@@ -2973,17 +3037,21 @@ class LocalOrchestrator:
             return None
 
         if not assigned:
-            if self.db.count_tape_file_records(tape_label) > 0:
-                print(f"[TAPE] '{tape_label}' already has indexed files. "
-                      "Insert a blank or freshly formatted tape.")
-                return None
-            if not self._tape_root_is_empty():
-                print(f"[TAPE] Mounted tape '{tape_label}' is not empty on disk. "
-                      "Insert a blank or freshly formatted tape.")
-                return None
+            root_empty = self._tape_root_is_empty()
+            record_count = self.db.count_tape_file_records(tape_label)
+
             if not self.db.tape_exists(tape_label):
+                if not root_empty:
+                    print(f"[TAPE] Mounted tape '{tape_label}' is not registered "
+                          "and is not empty. Register it first or use a blank tape.")
+                    return None
                 print(f"[TAPE] Registering fresh tape '{tape_label}'.")
                 self.db.register_tape(tape_label, 12288)
+            elif not root_empty or record_count > 0:
+                if not self._ensure_chunk_fits_tape(tape_label, entries):
+                    return None
+                print(f"[TAPE] Appending to registered tape '{tape_label}' "
+                      f"({record_count} indexed file record(s) already present).")
 
         return tape_label
 
@@ -2993,6 +3061,38 @@ class LocalOrchestrator:
         except OSError as e:
             print(f"[TAPE] Cannot inspect tape root: {e}")
             return False
+
+    def _ensure_chunk_fits_tape(self, tape_label, entries):
+        planned_bytes = sum(e['dir_size_bytes'] for e in entries)
+
+        try:
+            disk_free = shutil.disk_usage(self.cfg.lto_drive).free
+            if planned_bytes > disk_free:
+                print(f"[TAPE] '{tape_label}' does not have enough LTFS free "
+                      f"space for this chunk ({planned_bytes / 1024**3:.2f} GiB "
+                      f"needed, {disk_free / 1024**3:.2f} GiB free).")
+                return False
+        except OSError as e:
+            print(f"[TAPE] Cannot read LTFS free space: {e}")
+
+        tape = self.db.get_tape(tape_label)
+        if not tape:
+            print(f"[DB] Tape '{tape_label}' is not registered.")
+            return False
+
+        used_bytes = self.db.recalculate_tape_used_space(tape_label)
+        capacity_gb = tape['total_capacity']
+        if capacity_gb:
+            capacity_bytes = int(capacity_gb * 1024**3)
+            available_bytes = capacity_bytes - used_bytes
+            if planned_bytes > available_bytes:
+                print(f"[TAPE] '{tape_label}' does not have enough indexed "
+                      f"capacity for this chunk ({planned_bytes / 1024**3:.2f} "
+                      f"GiB needed, {max(0, available_bytes) / 1024**3:.2f} "
+                      "GiB available in DB).")
+                return False
+
+        return True
 
     def _collect_chunk_files(self, source_dir, entries):
         collected = []
@@ -3587,6 +3687,9 @@ class RemoteOrchestrator:
     def _start_pipeline_heartbeat(self, stop_evt, ready_q, total_chunks):
         """Print a periodic line showing the producer staying ahead of the tape."""
         def _beat():
+            last_msg = None
+            last_print = 0
+            quiet_interval = 30
             while not stop_evt.wait(5):
                 with self._staged_lock:
                     staged_gb = self._staged_bytes / 1024**3
@@ -3594,12 +3697,18 @@ class RemoteOrchestrator:
                           else self._producer_chunk + 1)
                 cons_c = ('-' if self._consumer_chunk is None
                           else self._consumer_chunk + 1)
-                _status('PIPELINE',
-                        f"queued={ready_q.qsize()}/{self.prefetch_ahead} | "
-                        f"staging={staged_gb:.0f}/"
-                        f"{self.staging_max_bytes / 1024**3:.0f} GB | "
-                        f"producer->chunk {prod_c}/{total_chunks} | "
-                        f"consumer->chunk {cons_c}/{total_chunks}")
+                msg = (
+                    f"queued={ready_q.qsize()}/{self.prefetch_ahead} | "
+                    f"staging={staged_gb:.0f}/"
+                    f"{self.staging_max_bytes / 1024**3:.0f} GB | "
+                    f"producer chunk {prod_c}/{total_chunks} | "
+                    f"tape chunk {cons_c}/{total_chunks}"
+                )
+                now = time.time()
+                if msg != last_msg or (now - last_print) >= quiet_interval:
+                    _status('PIPELINE', msg)
+                    last_msg = msg
+                    last_print = now
         threading.Thread(target=_beat, name='pipeline-heartbeat',
                          daemon=True).start()
 
@@ -3695,7 +3804,7 @@ class RemoteOrchestrator:
                         return False
             finally:
                 fetch_stop.set()
-                print()  # end the \r progress line
+                _progress_done()
         else:
             print(f"[REMOTE] Chunk {chunk_index + 1}/{total_chunks}: "
                   "all files already fetched.")
@@ -3752,10 +3861,13 @@ class RemoteOrchestrator:
                 dt    = now - prev_time
                 speed = ((cur - prev_bytes) / 1024**2) / dt if dt > 0 else 0
                 pct   = (cur / total_bytes * 100) if total_bytes else 0
-                sys.stdout.write(
-                    f"\r[FETCH] {min(pct, 100):.1f}% | {speed:.1f} MB/s | "
-                    f"{cur / 1024**3:.1f}/{total_bytes / 1024**3:.1f} GB   ")
-                sys.stdout.flush()
+                remaining = max(0, total_bytes - cur)
+                eta = remaining / (speed * 1024**2) if speed > 0 else None
+                _progress_line(
+                    f"[FETCH] {min(pct, 100):.1f}% | {speed:.1f} MB/s | "
+                    f"{cur / 1024**3:.1f}/{total_bytes / 1024**3:.1f} GB | "
+                    f"ETA {_fmt_eta(eta)}"
+                )
                 prev_bytes = cur
                 prev_time  = now
         threading.Thread(target=_mon, name='fetch-monitor', daemon=True).start()
