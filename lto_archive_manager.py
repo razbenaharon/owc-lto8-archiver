@@ -300,6 +300,31 @@ def _clean_config_path(value):
     return os.path.normpath(os.path.expandvars(os.path.expanduser(value)))
 
 
+def _load_env_file(path):
+    """Parse a simple KEY=VALUE .env file into a dict.
+
+    Keeps secrets (e.g. REMOTE_PASSWORD) out of the git-tracked config.ini.
+    Blank lines and '#' comments are ignored; an optional leading 'export ' and
+    surrounding quotes are stripped. Missing/unreadable files yield {}."""
+    data = {}
+    try:
+        with open(path, encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                if line.startswith('export '):
+                    line = line[len('export '):]
+                key, val = line.split('=', 1)
+                key, val = key.strip(), val.strip()
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                    val = val[1:-1]
+                data[key] = val
+    except OSError:
+        pass
+    return data
+
+
 def get_volume_label(drive_path):
     """Detect the volume label of a Windows drive (e.g. 'D:\\')."""
     try:
@@ -1012,6 +1037,9 @@ class ConfigManager:
 
         self.config.read(config_path, encoding='utf-8')
 
+        # Secrets live in a gitignored .env next to the app, never in config.ini.
+        self.env = _load_env_file(os.path.join(APP_DIR, '.env'))
+
     def _create_default(self):
         self.config['PATHS'] = {
             'source_dir':  os.path.join(APP_DIR, 'source'),
@@ -1071,8 +1099,11 @@ class ConfigManager:
     def remote_user(self):      return self.config.get('REMOTE', 'remote_user', fallback='')
     @property
     def remote_password(self):
-        value = self.config.get('REMOTE', 'remote_password', fallback='', raw=True)
-        value = value.strip()
+        # Priority: process env var > .env file > config.ini (kept empty in git).
+        value = (os.environ.get('REMOTE_PASSWORD')
+                 or self.env.get('REMOTE_PASSWORD')
+                 or self.config.get('REMOTE', 'remote_password', fallback='', raw=True))
+        value = (value or '').strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
             value = value[1:-1]
         return value

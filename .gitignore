@@ -10,3 +10,7 @@ __pycache__/
 source/
 staging/
 restored/
+
+# Secrets — real credentials live here, never commit them
+.env
+.env.local
