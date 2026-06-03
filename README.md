@@ -9,6 +9,7 @@ A Python CLI for archiving files to LTO tape using an OWC Mercury Pro LTO-8 driv
 - **Restore** — search by filename/wildcard, date range, original directory, or full backup session; restore individual files or entire sets
 - **Tape management** — format, register, check, and inspect tapes via IBM LTFS command-line tools
 - **Multi-tape support** — tracks multiple tapes; prompts you to swap tapes during restore when needed
+- **Remote archive** — fetch files from a remote SSH host into local staging, pack them, and stream them to LTO
 - **Database Inspector GUI** — standalone CustomTkinter app for browsing and editing the tape/file index without touching the CLI
 
 ## Requirements
@@ -17,6 +18,7 @@ A Python CLI for archiving files to LTO tape using an OWC Mercury Pro LTO-8 driv
 - Python 3.8+
 - [IBM LTFS SDE](https://www.ibm.com/support/pages/ibm-linear-tape-file-system-ltfs) installed to `C:\Program Files\IBM\LTFS\`
 - OWC Mercury Pro LTO-8 (or compatible LTFS-formatted LTO drive)
+- OpenSSH client tools for remote archive mode
 - `customtkinter` (required only for the DB Inspector GUI): `pip install customtkinter`
 
 The `Framework & Drivers` folder in this repo contains the installers used during setup:
@@ -44,6 +46,12 @@ ibm_eject_cmd = C:\Program Files\IBM\LTFS\LtfsCmdEject.exe
 [SETTINGS]
 zip_threshold_mb = 100   ; files smaller than this are packed into ZIPs
 max_zip_size_gb  = 100   ; maximum size per ZIP bundle
+
+[REMOTE]
+remote_host = example.host.local
+remote_user = archive-user
+remote_path = /path/to/remote/source
+staging_fill_pct = 0.80
 ```
 
 ## Usage
@@ -65,19 +73,27 @@ python db_inspector.py
 | 3 | **Tape Maintenance** — format, register, check, or inspect tapes |
 | 4 | **List Registered Tapes** — show all tapes with used/total space |
 | 5 | **Open config.ini** |
+| 6 | **Remote Archive** — fetch from a remote host and back up to LTO |
+| 7 | **Database Management** — edit or delete tape and file records |
 | 0 | Exit |
 
 ### Archive Workflow
 
-1. The analyzer scans your source folder and reports file-size distribution.
-2. You choose **AUTO-PILOT** or **DIRECT BACKUP**:
-   - **AUTO-PILOT** — files under `zip_threshold_mb` are packed into `Bundle_NNN.zip` archives in the staging directory; large files are staged as-is. The staged tree is then copied to tape.
-   - **DIRECT BACKUP** — files are copied from source to tape without packing.
-3. The backup runs in three phases:
-   - **Hash scan** — SHA-256 each file not already on tape at the same size.
-   - **Robocopy** — transfers the full directory tree to tape with live MB/s progress display (`/J` unbuffered I/O, `/R:3 /W:10` retry).
-   - **DB insert** — records every file (hash, size, tape label, container) to the SQLite index.
-4. After copying, a session summary is printed and the tape is ejected automatically via `LtfsCmdEject.exe`.
+1. The analyzer scans `source_dir`, reports file-size distribution, and builds a local multi-tape allocation plan.
+2. Files under `zip_threshold_mb` are packed into session-specific ZIP bundles; large files are staged as loose files.
+3. The app creates a resumable local session in SQLite. If a previous local session is active, you can resume it or abandon it.
+4. Before each chunk is written, the mounted tape label is detected and assigned to that chunk.
+5. New blank tapes are registered automatically. Registered non-empty LTFS tapes can also be used for append backups when both the LTFS free-space check and the database capacity check show enough room.
+6. Robocopy streams the staged batch to tape with `/J` unbuffered I/O, retry settings, live progress, and tuned priority/affinity when available.
+7. After copying, file records are written to SQLite, tape used-space is reconciled, and the tape is ejected automatically via `LtfsCmdEject.exe`.
+
+If a write is interrupted, re-run option 1 and choose **Resume from first incomplete chunk**. The app skips records that are already indexed for the same local session/chunk/tape.
+
+### Remote Archive Workflow
+
+Option 6 scans `remote_path` over SSH, splits the remote file list into staging-sized chunks, fetches each chunk to local staging, packs it, and writes it to the selected tape. Remote sessions are resumable; if a fetch or tape write fails, re-run option 6 and resume the active session.
+
+The remote pipeline can prefetch chunks ahead of the tape writer so the drive keeps streaming while network fetch and packing continue in the background. Tune `chunk_cap_gb`, `prefetch_chunks_ahead`, `staging_max_gb`, `robocopy_priority`, `cpu_affinity`, `ssh_cipher`, and `use_mbuffer` in the `[PERFORMANCE]` section.
 
 ### Retrieve Workflow
 
@@ -146,6 +162,12 @@ python db_inspector.py
 **`files_index`** — one row per file
 - `file_name`, `original_path`, `file_size_bytes`, `file_hash` (SHA-256)
 - `backup_date`, `tape_label`, `is_packed`, `container_name`, `stored_path`
+- `local_session_id`, `local_chunk_index`
+
+The CLI also creates session tables for resumable work:
+
+- **`local_sessions` / `local_chunks_manifest`** — local multi-tape plans and per-chunk status
+- **`remote_sessions` / `remote_manifest`** — remote archive sessions, fetched files, and per-chunk status
 
 ## Important
 
