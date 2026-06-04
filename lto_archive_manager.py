@@ -31,8 +31,23 @@ BUFFER_SIZE = 1024 * 1024 * 16  # 16 MB read buffer
 CONFIG_FILE  = "config.ini"
 LTFS_DIR     = r'C:\Program Files\IBM\LTFS'  # IBM LTFS tools must run from this directory
 APP_DIR      = os.path.dirname(os.path.abspath(__file__))
+BACKUP_LOG_DIR = os.path.join(APP_DIR, 'backup_logs')
 LOCAL_TAPE_BUDGET_BYTES = int(11.5 * 1000**4)
 ROOT_FILES_GROUP = "_ROOT_FILES"
+AUTO_PACK_FILE_RATIO = 0.30
+AUTO_PACK_MIN_SMALL_BYTES = 1 * 1024**3
+AUTO_PACK_MIN_SMALL_BYTE_RATIO = 0.01
+
+
+def _auto_pack_decision(total_files, total_bytes, small_files, small_bytes):
+    file_ratio = (small_files / total_files) if total_files else 0.0
+    byte_ratio = (small_bytes / total_bytes) if total_bytes else 0.0
+    meaningful_size = (
+        small_bytes >= AUTO_PACK_MIN_SMALL_BYTES or
+        byte_ratio >= AUTO_PACK_MIN_SMALL_BYTE_RATIO
+    )
+    should_pack = file_ratio > AUTO_PACK_FILE_RATIO and meaningful_size
+    return should_pack, file_ratio, byte_ratio
 
 
 # ==============================================================================
@@ -59,6 +74,40 @@ def _fmt_eta(seconds):
     if h:
         return f"{h:d}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
+
+
+def _fmt_bytes(num):
+    try:
+        value = float(num or 0)
+    except (TypeError, ValueError):
+        value = 0.0
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    for unit in units:
+        if abs(value) < 1024.0 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.2f} {unit}"
+        value /= 1024.0
+
+
+def _safe_log_token(value, default='item'):
+    text = str(value or '').strip()
+    if text:
+        text = os.path.basename(os.path.normpath(text))
+    text = re.sub(r'[^A-Za-z0-9._-]+', '_', text or default)
+    text = text.strip('._-')
+    return (text or default)[:80]
+
+
+def _unique_path(path):
+    if not os.path.exists(path):
+        return path
+    root, ext = os.path.splitext(path)
+    for idx in range(2, 1000):
+        candidate = f"{root}_{idx}{ext}"
+        if not os.path.exists(candidate):
+            return candidate
+    return f"{root}_{int(time.time() * 1000)}{ext}"
 
 
 def _progress_line(text):
@@ -693,7 +742,14 @@ def _ssh_run(remote_user, remote_host, command, capture=True, password=''):
             env = os.environ.copy()
             env['SSHPASS'] = password
             if capture:
-                return subprocess.run(ssh_cmd, capture_output=True, text=True, env=env)
+                return subprocess.run(
+                    ssh_cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    env=env,
+                )
             return subprocess.run(ssh_cmd, env=env)
         if _has_command('ssh'):
             ssh_cmd = [
@@ -712,6 +768,8 @@ def _ssh_run(remote_user, remote_host, command, capture=True, password=''):
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
                     text=True,
+                    encoding='utf-8',
+                    errors='replace',
                     env=env,
                 )
             return subprocess.run(ssh_cmd, stdin=subprocess.DEVNULL, env=env)
@@ -724,7 +782,13 @@ def _ssh_run(remote_user, remote_host, command, capture=True, password=''):
                 command,
             ]
             if capture:
-                return subprocess.run(ssh_cmd, capture_output=True, text=True)
+                return subprocess.run(
+                    ssh_cmd,
+                    capture_output=True,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                )
             return subprocess.run(ssh_cmd)
         return subprocess.CompletedProcess(
             args=['ssh'],
@@ -744,7 +808,13 @@ def _ssh_run(remote_user, remote_host, command, capture=True, password=''):
         command,
     ]
     if capture:
-        return subprocess.run(ssh_cmd, capture_output=True, text=True)
+        return subprocess.run(
+            ssh_cmd,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+        )
     return subprocess.run(ssh_cmd)
 
 
@@ -903,6 +973,53 @@ def _remote_fetch_base_and_rel(configured_remote_path, remote_fpath):
         raise ValueError(f"remote path outside base: {remote_fpath}")
 
     return base, _safe_remote_relpath(rel)
+
+
+# Characters and trailing forms that NTFS (and therefore the Windows system
+# bsdtar that extracts the fetch stream) cannot write verbatim. bsdtar does NOT
+# fail on these — it silently rewrites the name on extraction: each reserved
+# character becomes '_' and trailing dots/spaces are stripped per component.
+# We must reproduce that mapping exactly so the post-fetch existence/size check
+# looks for the file where bsdtar actually wrote it (e.g. a remote dir named
+# "26-06T16:07:40" lands on disk as "26-06T16_07_40").
+_WIN_RESERVED_TABLE = {ord(c): '_' for c in '<>:"|?*'}
+_WIN_RESERVED_TABLE.update({i: '_' for i in range(32)})  # ASCII control chars
+
+
+def _winsafe_extracted_rel(rel):
+    """Map a POSIX remote rel-path to the on-disk path bsdtar produces on
+    Windows. No-op for names that are already NTFS-legal, so chunks without
+    reserved characters are byte-for-byte unaffected. On non-Windows hosts the
+    extractor keeps names verbatim, so this is a pass-through there."""
+    if os.name != 'nt':
+        return rel
+    out = []
+    for part in rel.split('/'):
+        if not part:
+            continue
+        part = part.translate(_WIN_RESERVED_TABLE).rstrip(' .')
+        out.append(part or '_')
+    return '/'.join(out)
+
+
+def _disambiguate_local_rel(local_rel, claimed):
+    """Return a variant of local_rel whose case-folded form is not in `claimed`.
+
+    Two distinct remote names can sanitize to the same on-disk path (e.g.
+    "a:b" and "a?b" both become "a_b"); NTFS is also case-insensitive. When
+    that happens the second file would overwrite the first, so we insert a
+    "~N" tag before the extension of the final component until the full path
+    is unique. `claimed` holds the case-folded paths already taken."""
+    head, _, tail = local_rel.rpartition('/')
+    dot = tail.rfind('.')
+    stem, ext = (tail[:dot], tail[dot:]) if dot > 0 else (tail, '')
+    n = 1
+    while True:
+        cand_tail = f"{stem}~{n}{ext}"
+        cand = f"{head}/{cand_tail}" if head else cand_tail
+        if cand.casefold() not in claimed:
+            return cand
+        n += 1
 
 
 def _remote_tar_fetch(remote_user, remote_host, remote_base, rel_paths, local_dest_dir,
@@ -1120,6 +1237,7 @@ class ConfigManager:
             'staging_dir': os.path.join(APP_DIR, 'staging'),
             'restore_dir': os.path.join(APP_DIR, 'restored'),
             'db_path':     os.path.join(APP_DIR, 'lto_archive.db'),
+            'backup_log_dir': BACKUP_LOG_DIR,
         }
         self.config['HARDWARE'] = {
             'lto_drive':     r'D:\\',
@@ -1159,6 +1277,10 @@ class ConfigManager:
     def restore_dir(self):   return _clean_config_path(self.config['PATHS']['restore_dir'])
     @property
     def db_path(self):       return _clean_config_path(self.config['PATHS']['db_path'])
+    @property
+    def backup_log_dir(self):
+        return _clean_config_path(self.config.get('PATHS', 'backup_log_dir',
+                                                  fallback=BACKUP_LOG_DIR))
     @property
     def lto_drive(self):     return _clean_config_path(self.config['HARDWARE']['lto_drive'])
     @property
@@ -1310,6 +1432,8 @@ class DatabaseManager:
                 session_label TEXT    NOT NULL,
                 source_dir    TEXT    NOT NULL,
                 total_chunks  INTEGER NOT NULL,
+                backup_mode   TEXT NOT NULL DEFAULT 'auto'
+                    CHECK(backup_mode IN ('auto','direct','pack')),
                 created_at    DATETIME NOT NULL,
                 completed_at  DATETIME,
                 status        TEXT NOT NULL DEFAULT 'active'
@@ -1335,6 +1459,15 @@ class DatabaseManager:
                 ON files_index(local_session_id, local_chunk_index, tape_label);
         """)
         self.conn.commit()
+        try:
+            self.conn.execute(
+                """ALTER TABLE local_sessions
+                   ADD COLUMN backup_mode TEXT NOT NULL DEFAULT 'auto'
+                   CHECK(backup_mode IN ('auto','direct','pack'))"""
+            )
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
     def _init_remote_schema(self):
         """Create remote_sessions and remote_manifest tables if they don't exist.
@@ -1477,7 +1610,8 @@ class DatabaseManager:
             (session_id,)
         ).fetchone()[0]
 
-    def create_local_session(self, session_label, source_dir, chunks):
+    def create_local_session(self, session_label, source_dir, chunks,
+                             backup_mode='auto'):
         """Persist a local multi-tape allocation plan.
 
         chunks: list of lists containing allocation dicts with name/size_bytes.
@@ -1487,9 +1621,10 @@ class DatabaseManager:
             with self.conn:
                 cur = self.conn.execute(
                     """INSERT INTO local_sessions
-                       (session_label, source_dir, total_chunks, created_at, status)
-                       VALUES (?, ?, ?, ?, 'active')""",
-                    (session_label, source_dir, len(chunks), now)
+                       (session_label, source_dir, total_chunks, backup_mode,
+                        created_at, status)
+                       VALUES (?, ?, ?, ?, ?, 'active')""",
+                    (session_label, source_dir, len(chunks), backup_mode, now)
                 )
                 session_id = cur.lastrowid
                 rows = []
@@ -1871,8 +2006,9 @@ class LTOAnalyzer:
             "Huge (>1GB)":       0,
         }
         total_files = 0
-        total_size_mb = 0
+        total_size_bytes = 0
         files_under_threshold = 0
+        bytes_under_threshold = 0
 
         for root, _, files in os.walk(folder_path):
             for file in files:
@@ -1880,7 +2016,7 @@ class LTOAnalyzer:
                     size_bytes = os.path.getsize(os.path.join(root, file))
                     size_mb    = size_bytes / (1024 * 1024)
                     total_files   += 1
-                    total_size_mb += size_mb
+                    total_size_bytes += size_bytes
 
                     if   size_mb < 1:    bins["Tiny (<1MB)"] += 1
                     elif size_mb < 10:   bins["Small (1-10MB)"] += 1
@@ -1890,25 +2026,31 @@ class LTOAnalyzer:
 
                     if size_mb < threshold_mb:
                         files_under_threshold += 1
+                        bytes_under_threshold += size_bytes
                 except OSError:
                     pass
 
         print("-" * 60)
-        print(f"REPORT | Files: {total_files} | Total Size: {total_size_mb/1024:.2f} GB")
+        print(f"REPORT | Files: {total_files} | Total Size: {total_size_bytes/1024**3:.2f} GB")
         print("-" * 60)
         for cat, count in bins.items():
             pct = (count / total_files * 100) if total_files else 0
-            bar = "█" * max(int(pct / 2), 1 if count else 0)
+            bar = "#" * max(int(pct / 2), 1 if count else 0)
             print(f"{cat:20} : {count:6} ({pct:5.1f}%) | {bar}")
         print("-" * 60)
 
-        ratio = files_under_threshold / total_files if total_files else 0
-        if ratio > 0.3:
-            print(f">>> ANALYSIS: {ratio*100:.1f}% of files are under {threshold_mb:.0f} MB.")
+        should_pack, file_ratio, byte_ratio = _auto_pack_decision(
+            total_files, total_size_bytes, files_under_threshold, bytes_under_threshold
+        )
+        if should_pack:
+            print(f">>> ANALYSIS: {file_ratio*100:.1f}% of files are under {threshold_mb:.0f} MB "
+                  f"and they account for {byte_ratio*100:.2f}% of the data.")
             print(f">>> RECOMMENDATION: AUTO-PILOT (Pack files < {threshold_mb:.0f} MB)")
             return True
         else:
-            print(">>> RECOMMENDATION: DIRECT BACKUP (Most files are large)")
+            print(f">>> ANALYSIS: files under {threshold_mb:.0f} MB account for "
+                  f"{byte_ratio*100:.2f}% of the data.")
+            print(">>> RECOMMENDATION: DIRECT BACKUP (packing is not worth staging the large files)")
             return False
 
     def build_local_allocation_plan(self, source_dir,
@@ -2084,10 +2226,9 @@ class LTOPacker:
                         _progress_line(f"[PACKING] {total_packed} files packed")
 
                 else:
+                    # Large/loose files are not hashed — skipping the extra
+                    # full-file read keeps the tape from waiting on Python I/O.
                     dst_path = os.path.join(dest, rel)
-                    disp = (file[:15] + '..' + file[-5:]) if len(file) > 22 else file
-                    _progress_line(f"[HASHING] {disp}")
-                    file_hash = _hash_file(src)
 
                     if not _robocopy_file(src, dst_path, display_name=file):
                         raise RuntimeError(f"robocopy failed for: {src}")
@@ -2097,7 +2238,7 @@ class LTOPacker:
                         'file_name':       file,
                         'original_path':   src,
                         'file_size_bytes': fsize,
-                        'file_hash':       file_hash,
+                        'file_hash':       '',
                         'is_packed':       False,
                         'container_name':  None,
                         'stored_path':     rel,
@@ -2212,12 +2353,9 @@ class LTOPacker:
                             _progress_line(f"[PACKING] {total_packed} files packed")
 
                     else:
+                        # Large/loose files are not hashed — skipping the extra
+                        # full-file read keeps the tape from waiting on Python I/O.
                         dst_path = os.path.join(dest, rel)
-
-                        # Pre-hash from source while tape is idle.
-                        disp = (file[:15] + '..' + file[-5:]) if len(file) > 22 else file
-                        _progress_line(f"[HASHING] {disp}")
-                        file_hash = _hash_file(src)
 
                         if not _robocopy_file(src, dst_path, display_name=file):
                             raise RuntimeError(f"robocopy failed for: {src}")
@@ -2227,7 +2365,7 @@ class LTOPacker:
                             'file_name':       file,
                             'original_path':   src,
                             'file_size_bytes': fsize,
-                            'file_hash':       file_hash,
+                            'file_hash':       '',
                             'is_packed':       False,
                             'container_name':  None,
                             'stored_path':     rel,
@@ -2247,7 +2385,7 @@ class LTOPacker:
                 os.remove(zip_path)
 
         _progress_done()
-        print(f"\n[PACKER] Offline phase done: {total_packed} packed into ZIPs | {total_loose} large files staged & pre-hashed.")
+        print(f"\n[PACKER] Offline phase done: {total_packed} packed into ZIPs | {total_loose} large files staged (not hashed).")
         return metadata
 
 
@@ -2260,11 +2398,158 @@ class LTOPacker:
 
 class LTOBackup:
     def __init__(self, db: DatabaseManager, ibm_eject_cmd: str,
-                 tape_priority=None, tape_affinity=None):
+                 tape_priority=None, tape_affinity=None, log_dir=None):
         self.db            = db
         self.ibm_eject_cmd = ibm_eject_cmd
         self.tape_priority = tape_priority   # psutil priority class for robocopy
         self.tape_affinity = tape_affinity   # consumer (tape-writer) core set
+        self.log_dir       = log_dir or BACKUP_LOG_DIR
+
+    def _write_backup_log(self, details, packer_metadata, hash_map,
+                          recovered_direct_existing, skipped_existing,
+                          robocopy_cmd, robocopy_result):
+        """Write a reviewable text log for one completed tape-write step."""
+        try:
+            log_dir = os.path.abspath(self.log_dir or BACKUP_LOG_DIR)
+            os.makedirs(log_dir, exist_ok=True)
+
+            finished_at = details['finished_at']
+            source_token = _safe_log_token(details.get('source'), 'source')
+            tape_token = _safe_log_token(details.get('tape_label'), 'tape')
+            name_parts = [finished_at.strftime('%Y%m%d_%H%M%S'),
+                          tape_token, source_token]
+            if details.get('local_session_id') is not None:
+                name_parts.append(f"s{int(details['local_session_id']):04d}")
+            if details.get('local_chunk_index') is not None:
+                name_parts.append(f"c{int(details['local_chunk_index']) + 1:03d}")
+
+            log_path = _unique_path(os.path.join(log_dir, '_'.join(name_parts) + '.log'))
+            rc_sum = details.get('rc_sum') or {}
+            counts = details.get('record_counts') or {}
+            mode = 'staged/packed' if packer_metadata is not None else 'direct'
+
+            def cell(value):
+                text = '' if value is None else str(value)
+                return text.replace('\t', ' ').replace('\r', ' ').replace('\n', ' ')
+
+            def write_kv(f, key, value):
+                f.write(f"{key:<28}: {value}\n")
+
+            with open(log_path, 'w', encoding='utf-8', newline='\n') as f:
+                f.write("LTO Backup Log\n")
+                f.write("=" * 60 + "\n")
+                write_kv(f, "Status", details.get('status', 'completed'))
+                write_kv(f, "Started", details['started_at'].isoformat(timespec='seconds'))
+                write_kv(f, "Finished", finished_at.isoformat(timespec='seconds'))
+                write_kv(f, "Source", details.get('source'))
+                write_kv(f, "Tape label", details.get('tape_label'))
+                write_kv(f, "Tape drive", details.get('tape_drive'))
+                write_kv(f, "Tape root", details.get('tape_root'))
+                write_kv(f, "Backup mode", mode)
+                if details.get('local_session_id') is not None:
+                    write_kv(f, "Local session id", details.get('local_session_id'))
+                if details.get('local_chunk_index') is not None:
+                    write_kv(f, "Local chunk", int(details['local_chunk_index']) + 1)
+                write_kv(f, "Robocopy exit code", robocopy_result.returncode)
+                write_kv(f, "Robocopy command", subprocess.list2cmdline(robocopy_cmd))
+
+                f.write("\nSummary\n")
+                f.write("-" * 60 + "\n")
+                write_kv(f, "Total time", f"{details['total_time_seconds'] / 60:.1f} minutes")
+                write_kv(f, "Data copied", f"{_fmt_bytes(details['copied_bytes'])} ({details['copied_bytes']} bytes)")
+                write_kv(f, "Planned copy size", f"{_fmt_bytes(details['total_bytes'])} ({details['total_bytes']} bytes)")
+                write_kv(f, "Average speed", f"{rc_sum.get('speed_mbs', 0):.1f} MB/s")
+                write_kv(f, "Files copied", rc_sum.get('files_copied', 0))
+                write_kv(f, "Files skipped", rc_sum.get('files_skipped', 0) + details.get('skipped', 0))
+                write_kv(f, "Files failed", rc_sum.get('files_failed', 0))
+                if rc_sum.get('elapsed'):
+                    write_kv(f, "Robocopy time", rc_sum.get('elapsed'))
+                write_kv(f, "Loose files hashed", len(hash_map))
+                write_kv(f, "Already on tape", details.get('skipped', 0))
+                write_kv(f, "Tape used after backup", f"{_fmt_bytes(details['new_used'])} ({details['new_used']} bytes)")
+
+                if counts:
+                    f.write("\nDatabase Records\n")
+                    f.write("-" * 60 + "\n")
+                    for key in sorted(counts):
+                        write_kv(f, key.replace('_', ' ').title(), counts[key])
+
+                f.write("\nFile Manifest\n")
+                f.write("-" * 60 + "\n")
+                f.write("Status\tPacked\tSizeBytes\tSHA256\tOriginalPath\tTapePath\tContainer\tStoredPath\n")
+
+                if packer_metadata is None:
+                    for info in recovered_direct_existing:
+                        f.write('\t'.join(cell(v) for v in (
+                            'already_on_tape_recovered',
+                            'no',
+                            info.get('file_size_bytes'),
+                            info.get('file_hash'),
+                            info.get('original_path'),
+                            info.get('stored_path'),
+                            '',
+                            info.get('stored_path'),
+                        )) + "\n")
+                    for rel_path, info in hash_map.items():
+                        f.write('\t'.join(cell(v) for v in (
+                            'copied',
+                            'no',
+                            info.get('fsize'),
+                            info.get('hash'),
+                            info.get('src'),
+                            info.get('dst'),
+                            '',
+                            rel_path,
+                        )) + "\n")
+                    if details.get('skipped', 0) > len(recovered_direct_existing):
+                        f.write("# Skipped files already present in the DB are counted above but not expanded here.\n")
+                else:
+                    skipped_originals = {
+                        m.get('original_path')
+                        for _, m, _ in skipped_existing
+                        if isinstance(m, dict)
+                    }
+                    tape_root = details.get('tape_root')
+                    for m in packer_metadata or []:
+                        is_packed = bool(m.get('is_packed'))
+                        container = m.get('container_name') if is_packed else ''
+                        tape_path = (os.path.join(tape_root, container)
+                                     if is_packed and container
+                                     else os.path.join(tape_root, m.get('stored_path') or ''))
+                        if not is_packed and m.get('original_path') in skipped_originals:
+                            status = 'already_on_tape'
+                        elif is_packed:
+                            status = 'packed_file'
+                        else:
+                            status = 'copied'
+                        f.write('\t'.join(cell(v) for v in (
+                            status,
+                            'yes' if is_packed else 'no',
+                            m.get('file_size_bytes'),
+                            m.get('file_hash'),
+                            m.get('original_path'),
+                            tape_path,
+                            container,
+                            m.get('stored_path'),
+                        )) + "\n")
+
+                if robocopy_result.stdout:
+                    f.write("\nRobocopy Stdout\n")
+                    f.write("-" * 60 + "\n")
+                    f.write(robocopy_result.stdout)
+                    if not robocopy_result.stdout.endswith("\n"):
+                        f.write("\n")
+                if robocopy_result.stderr:
+                    f.write("\nRobocopy Stderr\n")
+                    f.write("-" * 60 + "\n")
+                    f.write(robocopy_result.stderr)
+                    if not robocopy_result.stderr.endswith("\n"):
+                        f.write("\n")
+
+            return log_path
+        except Exception as e:
+            print(f"[LOG] Warning: could not write backup log: {e}")
+            return None
 
     def eject_tape(self, tape_drive):
         print("\n" + "#" * 60)
@@ -2299,7 +2584,7 @@ class LTOBackup:
             list of dicts  — staged backup with full metadata (from LTOPacker).
                              Hashes already computed; live hashing is skipped.
             []             — staged backup, existing staging, no per-file metadata.
-            None           — direct backup from source directory; pre-hash here.
+            None           — direct backup from source directory (files not hashed).
         """
         print(f"\n[BACKUP] Starting... Tape: {tape_label} | Drive: {tape_drive}")
         if not _ensure_lto_drive_ready(tape_drive, prefix="[BACKUP]"):
@@ -2326,13 +2611,16 @@ class LTOBackup:
                 if not m['is_packed']:
                     meta_by_rel[m['stored_path']] = m
 
+        started_at = datetime.now()
         total_start = time.time()
+        record_counts = defaultdict(int)
 
         # ---------------------------------------------------------------
         # Phase 1 — Build hash_map *before* any tape I/O.
-        #   AUTO-PILOT : consume pre-computed hashes from packer_metadata.
-        #   DIRECT     : walk source_dir and hash every new/changed file
-        #                while the tape stays idle.
+        #   AUTO-PILOT : consume pre-computed hashes from packer_metadata
+        #                (packed small files only; loose large files unhashed).
+        #   DIRECT     : walk source_dir and stage every new/changed file
+        #                (no hashing) while the tape stays idle.
         # ---------------------------------------------------------------
         # hash_map: rel_path -> {'hash', 'fsize', 'src', 'dst'}
         hash_map = {}
@@ -2366,8 +2654,9 @@ class LTOBackup:
                     'dst':   dst,
                 }
         else:
-            # DIRECT path — pre-hash source files (tape idle).
-            print("[BACKUP] Pre-hashing source files (tape idle)...")
+            # DIRECT path — files are written loose to tape and not hashed;
+            # skipping the extra full-file read keeps the tape from waiting.
+            print("[BACKUP] Walking source files (no hashing)...")
             for root, _, files in os.walk(source):
                 rel_folder  = os.path.relpath(root, source)
                 dest_folder = os.path.join(tape_root, rel_folder)
@@ -2384,14 +2673,11 @@ class LTOBackup:
                                     local_session_id=local_session_id,
                                     local_chunk_index=local_chunk_index,
                                 ):
-                                    disp = ((file[:15] + '..' + file[-5:])
-                                            if len(file) > 22 else file)
-                                    _progress_line(f"[HASHING] {disp}")
                                     recovered_direct_existing.append({
                                         'file_name': file,
                                         'original_path': src,
                                         'file_size_bytes': os.path.getsize(src),
-                                        'file_hash': _hash_file(src),
+                                        'file_hash': '',
                                         'stored_path': dst,
                                     })
                                 continue
@@ -2399,14 +2685,11 @@ class LTOBackup:
                             pass
                     try:
                         fsize = os.path.getsize(src)
-                        disp  = (file[:15] + '..' + file[-5:]) if len(file) > 22 else file
-                        _progress_line(f"[HASHING] {disp}")
-                        fhash = _hash_file(src)
-                        hash_map[rel_path] = {'hash': fhash, 'fsize': fsize,
+                        hash_map[rel_path] = {'hash': '', 'fsize': fsize,
                                               'src': src, 'dst': dst}
                     except Exception as e:
                         _progress_done()
-                        print(f"\n[WARN] Cannot hash {file}: {e}")
+                        print(f"\n[WARN] Cannot stat {file}: {e}")
 
         if packer_metadata is not None:
             # Bundle ZIPs aren't in hash_map; walk staging to size the progress bar.
@@ -2421,7 +2704,7 @@ class LTOBackup:
             total_bytes = sum(v['fsize'] for v in hash_map.values())
 
         _progress_done()
-        print(f"[BACKUP] {len(hash_map)} loose file(s) hashed "
+        print(f"[BACKUP] {len(hash_map)} loose file(s) staged "
               f"({total_bytes / 1024**3:.2f} GB to copy) | {skipped} already on tape.")
 
         # ---------------------------------------------------------------
@@ -2520,7 +2803,7 @@ class LTOBackup:
             # Direct backup: every hashed file is a loose tape record
             recovered_count = 0
             for info in recovered_direct_existing:
-                if self.db.insert_file(
+                inserted = self.db.insert_file(
                     file_name=info['file_name'],
                     original_path=info['original_path'],
                     file_size_bytes=info['file_size_bytes'],
@@ -2529,12 +2812,16 @@ class LTOBackup:
                     container_name=None, stored_path=info['stored_path'],
                     local_session_id=local_session_id,
                     local_chunk_index=local_chunk_index,
-                ):
+                )
+                if inserted:
                     recovered_count += 1
+                    record_counts['direct_recovered_inserted'] += 1
+                else:
+                    record_counts['direct_recovered_updated'] += 1
             if recovered_count:
                 print(f"[DB] Recovered {recovered_count} existing tape file record(s).")
             for rel_path, info in hash_map.items():
-                self.db.insert_file(
+                inserted = self.db.insert_file(
                     file_name=os.path.basename(info['src']),
                     original_path=info['src'],
                     file_size_bytes=info['fsize'],
@@ -2544,6 +2831,10 @@ class LTOBackup:
                     local_session_id=local_session_id,
                     local_chunk_index=local_chunk_index,
                 )
+                if inserted:
+                    record_counts['loose_records_inserted'] += 1
+                else:
+                    record_counts['loose_records_updated'] += 1
 
         else:
             # Staged backup: loose large files + batch-insert packed-file records
@@ -2554,8 +2845,9 @@ class LTOBackup:
                     local_session_id=local_session_id,
                     local_chunk_index=local_chunk_index,
                 ):
+                    record_counts['loose_records_skipped_existing'] += 1
                     continue
-                if self.db.insert_file(
+                inserted = self.db.insert_file(
                     file_name=m['file_name'],
                     original_path=m['original_path'],
                     file_size_bytes=m['file_size_bytes'],
@@ -2566,8 +2858,12 @@ class LTOBackup:
                     stored_path=dst,
                     local_session_id=local_session_id,
                     local_chunk_index=local_chunk_index,
-                ):
+                )
+                if inserted:
                     recovered_count += 1
+                    record_counts['loose_recovered_inserted'] += 1
+                else:
+                    record_counts['loose_recovered_updated'] += 1
             for rel_path, info in hash_map.items():
                 file = os.path.basename(info['src'])
                 if file.startswith("Bundle_") and file.endswith(".zip"):
@@ -2579,8 +2875,9 @@ class LTOBackup:
                         local_session_id=local_session_id,
                         local_chunk_index=local_chunk_index,
                     ):
+                        record_counts['loose_records_skipped_existing'] += 1
                         continue
-                    self.db.insert_file(
+                    inserted = self.db.insert_file(
                         file_name=file,
                         original_path=m['original_path'],
                         file_size_bytes=info['fsize'],
@@ -2590,6 +2887,10 @@ class LTOBackup:
                         local_session_id=local_session_id,
                         local_chunk_index=local_chunk_index,
                     )
+                    if inserted:
+                        record_counts['loose_records_inserted'] += 1
+                    else:
+                        record_counts['loose_records_updated'] += 1
             print("[DB] Recording packed file entries...")
             packed_count = 0
             for m in packer_metadata:
@@ -2599,9 +2900,10 @@ class LTOBackup:
                         local_session_id=local_session_id,
                         local_chunk_index=local_chunk_index,
                     ):
+                        record_counts['packed_records_skipped_existing'] += 1
                         continue
                     tape_zip_path = os.path.join(tape_root, m['container_name'])
-                    self.db.insert_file(
+                    inserted = self.db.insert_file(
                         file_name=m['file_name'], original_path=m['original_path'],
                         file_size_bytes=m['file_size_bytes'],
                         file_hash=m.get('file_hash', ''),
@@ -2611,6 +2913,10 @@ class LTOBackup:
                         local_session_id=local_session_id,
                         local_chunk_index=local_chunk_index,
                     )
+                    if inserted:
+                        record_counts['packed_records_inserted'] += 1
+                    else:
+                        record_counts['packed_records_updated'] += 1
                     packed_count += 1
             if recovered_count:
                 print(f"[DB] Recovered {recovered_count} existing loose file record(s).")
@@ -2629,6 +2935,36 @@ class LTOBackup:
         # Phase 4 — Print Robocopy job summary
         # ---------------------------------------------------------------
         total_time = time.time() - total_start
+        finished_at = datetime.now()
+        log_status = 'completed'
+        if rc.returncode >= 8 or rc_sum.get('files_failed', 0):
+            log_status = 'completed_with_warnings'
+        log_path = self._write_backup_log(
+            {
+                'status': log_status,
+                'started_at': started_at,
+                'finished_at': finished_at,
+                'source': source,
+                'tape_drive': tape_drive,
+                'tape_label': tape_label,
+                'tape_root': tape_root,
+                'local_session_id': local_session_id,
+                'local_chunk_index': local_chunk_index,
+                'total_time_seconds': total_time,
+                'total_bytes': total_bytes,
+                'copied_bytes': copied_bytes,
+                'skipped': skipped,
+                'new_used': new_used,
+                'rc_sum': rc_sum,
+                'record_counts': dict(record_counts),
+            },
+            packer_metadata,
+            hash_map,
+            recovered_direct_existing,
+            skipped_existing,
+            robocopy_cmd,
+            rc,
+        )
         print("\n" + "=" * 60)
         print("BACKUP SESSION SUMMARY  [Robocopy]")
         print("=" * 60)
@@ -2641,6 +2977,8 @@ class LTOBackup:
         print(f"Files Failed    : {rc_sum['files_failed']}")
         if rc_sum['elapsed']:
             print(f"Robocopy Time   : {rc_sum['elapsed']}")
+        if log_path:
+            print(f"Backup Log      : {log_path}")
         print("-" * 60)
 
         self.eject_tape(tape_drive)
@@ -2919,6 +3257,7 @@ class LocalOrchestrator:
             print(f"\n[LOCAL] Found active session: {existing['session_label']}")
             print(f"        Created : {existing['created_at']}")
             print(f"        Progress: {done}/{existing['total_chunks']} chunks completed.")
+            print(f"        Mode    : {existing['backup_mode']}")
             print("1. Resume from first incomplete chunk")
             print("2. Abandon and start a fresh session")
             print("0. Cancel")
@@ -2935,7 +3274,12 @@ class LocalOrchestrator:
 
     def _start_new_session(self, source_dir):
         analyzer = LTOAnalyzer()
-        analyzer.analyze(source_dir, self.cfg.zip_threshold_mb)
+        recommended_pack = analyzer.analyze(source_dir, self.cfg.zip_threshold_mb)
+        backup_mode = self._choose_backup_mode(recommended_pack)
+        if backup_mode is None:
+            print("[ABORTED] Local session was not created.")
+            return
+
         chunks = analyzer.build_local_allocation_plan(source_dir)
         analyzer.render_allocation_plan(chunks)
         confirm = input("Create this local multi-tape session? Type YES to continue: ").strip()
@@ -2945,9 +3289,37 @@ class LocalOrchestrator:
 
         ts = datetime.now().strftime('%Y%m%d_%H%M%S')
         session_label = f"LOCAL_{os.path.basename(source_dir.rstrip(os.sep))}_{ts}"
-        session_id = self.db.create_local_session(session_label, source_dir, chunks)
-        print(f"[LOCAL] Session created: {session_label} (id {session_id})")
+        session_id = self.db.create_local_session(
+            session_label, source_dir, chunks, backup_mode=backup_mode
+        )
+        print(f"[LOCAL] Session created: {session_label} (id {session_id}, mode {backup_mode})")
         self._run_session(session_id)
+
+    def _choose_backup_mode(self, recommended_pack):
+        recommended = 'pack' if recommended_pack else 'direct'
+        labels = {
+            'direct': 'Direct backup',
+            'pack': 'AUTO-PILOT / staged packing',
+        }
+        choices = [recommended, 'direct' if recommended == 'pack' else 'pack']
+
+        print("\n[LOCAL] Choose backup mode:")
+        for idx, mode in enumerate(choices, 1):
+            suffix = " (Recommended)" if mode == recommended else ""
+            if mode == 'direct':
+                detail = "copy selected top-level folders directly to tape"
+            else:
+                detail = f"pack files < {self.cfg.zip_threshold_mb:.0f} MB and stage the batch"
+            print(f"{idx}. {labels[mode]}{suffix} - {detail}")
+        print("0. Cancel")
+
+        while True:
+            choice = input("Choose backup mode: ").strip()
+            if choice == '0':
+                return None
+            if choice in ('1', '2'):
+                return choices[int(choice) - 1]
+            print("[ERROR] Invalid selection.")
 
     def _run_session(self, session_id):
         session = self.db.get_local_session(session_id)
@@ -3001,6 +3373,18 @@ class LocalOrchestrator:
         self.db.update_local_chunk_status(session['session_id'], chunk_index, 'staged')
 
         files = self._collect_chunk_files(session['source_dir'], entries)
+        backup_mode = session['backup_mode'] if 'backup_mode' in session.keys() else 'auto'
+        if backup_mode == 'direct':
+            if self._can_direct_copy_entries(entries):
+                return self._process_direct_chunk(session, chunk_index, entries, tape_label)
+            print("[LOCAL] Direct mode cannot copy loose root-level files as a "
+                  "separate tape chunk; using staged packing for this chunk.")
+        elif backup_mode == 'auto':
+            if self._can_direct_copy_entries(entries) and not self._should_pack_chunk(files):
+                return self._process_direct_chunk(session, chunk_index, entries, tape_label)
+        else:
+            print("[LOCAL] AUTO-PILOT selected: staging and packing this chunk.")
+
         already = self.db.get_local_indexed_original_paths(
             session['session_id'], chunk_index, tape_label
         )
@@ -3034,7 +3418,11 @@ class LocalOrchestrator:
                     session['session_id'], chunk_index, tape_label,
                     batch_name, pack_dir
                 )
-                _NoEjectBackup(self.db, self.cfg.ibm_eject_cmd).run(
+                _NoEjectBackup(
+                    self.db,
+                    self.cfg.ibm_eject_cmd,
+                    log_dir=self.cfg.backup_log_dir,
+                ).run(
                     source=pack_dir,
                     tape_drive=self.cfg.lto_drive,
                     tape_label=tape_label,
@@ -3053,7 +3441,11 @@ class LocalOrchestrator:
                 self._cleanup_dir(pack_dir)
 
         self.db.update_local_chunk_status(session['session_id'], chunk_index, 'backed_up')
-        LTOBackup(self.db, self.cfg.ibm_eject_cmd).eject_tape(self.cfg.lto_drive)
+        LTOBackup(
+            self.db,
+            self.cfg.ibm_eject_cmd,
+            log_dir=self.cfg.backup_log_dir,
+        ).eject_tape(self.cfg.lto_drive)
         return True
 
     def _prepare_tape_for_chunk(self, session, chunk_index, entries):
@@ -3158,6 +3550,63 @@ class LocalOrchestrator:
             'rel': os.path.relpath(path, source_dir),
             'size': size,
         }
+
+    def _can_direct_copy_entries(self, entries):
+        return all(e['top_level_dir'] != ROOT_FILES_GROUP for e in entries)
+
+    def _should_pack_chunk(self, files):
+        total_files = len(files)
+        total_bytes = sum(f['size'] for f in files)
+        small_files = [
+            f for f in files
+            if (f['size'] / (1024 * 1024)) < self.cfg.zip_threshold_mb
+        ]
+        small_bytes = sum(f['size'] for f in small_files)
+        should_pack, file_ratio, byte_ratio = _auto_pack_decision(
+            total_files, total_bytes, len(small_files), small_bytes
+        )
+        if should_pack:
+            print(f"[LOCAL] AUTO-PILOT: packing {len(small_files)} small file(s) "
+                  f"({byte_ratio*100:.2f}% of chunk data).")
+        else:
+            print(f"[LOCAL] DIRECT: {len(small_files)} file(s) are under "
+                  f"{self.cfg.zip_threshold_mb:.0f} MB, but only "
+                  f"{byte_ratio*100:.2f}% of chunk data; skipping staging.")
+        return should_pack
+
+    def _process_direct_chunk(self, session, chunk_index, entries, tape_label):
+        print("[LOCAL] Direct chunk copy: selected top-level directories will be "
+              "copied from source to tape without staging large files.")
+        try:
+            for entry in sorted(entries, key=lambda e: e['top_level_dir'].lower()):
+                source = os.path.join(session['source_dir'], entry['top_level_dir'])
+                if not os.path.isdir(source):
+                    raise RuntimeError(f"Direct source directory not found: {source}")
+                print(f"\n[LOCAL] Direct backup: {entry['top_level_dir']} "
+                      f"({entry['dir_size_bytes'] / 1024**3:.2f} GiB)")
+                _NoEjectBackup(
+                    self.db,
+                    self.cfg.ibm_eject_cmd,
+                    log_dir=self.cfg.backup_log_dir,
+                ).run(
+                    source=source,
+                    tape_drive=self.cfg.lto_drive,
+                    tape_label=tape_label,
+                    packer_metadata=None,
+                    local_session_id=session['session_id'],
+                    local_chunk_index=chunk_index,
+                )
+        except Exception as e:
+            print(f"[LOCAL] Direct chunk failed: {e}")
+            return False
+
+        self.db.update_local_chunk_status(session['session_id'], chunk_index, 'backed_up')
+        LTOBackup(
+            self.db,
+            self.cfg.ibm_eject_cmd,
+            log_dir=self.cfg.backup_log_dir,
+        ).eject_tape(self.cfg.lto_drive)
+        return True
 
     def _make_batches(self, files):
         batches = []
@@ -3412,13 +3861,24 @@ class RemoteOrchestrator:
             capture=True,
             password=self.remote_password,
         )
-        if result.returncode != 0:
+        stdout = result.stdout or ''
+        stderr = (result.stderr or '').strip()
+        # `find` returns a non-zero exit (typically 1) when it cannot descend
+        # into some directories (e.g. "Permission denied"), even though it has
+        # still listed every file it *could* read. Only abort when SSH itself
+        # failed (exit 255) or nothing usable came back; otherwise warn and use
+        # the partial listing.
+        if result.returncode == 255 or (result.returncode != 0 and not stdout.strip()):
             raise RuntimeError(
-                f"[REMOTE] SSH scan failed (exit {result.returncode}):\n"
-                f"{result.stderr.strip()}"
+                f"[REMOTE] SSH scan failed (exit {result.returncode}):\n{stderr}"
+            )
+        if result.returncode != 0 and stderr:
+            print(
+                f"[REMOTE] Scan completed with warnings (find exit {result.returncode}); "
+                f"some paths were skipped:\n{stderr}"
             )
         manifest = []
-        for line in result.stdout.splitlines():
+        for line in stdout.splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -3726,7 +4186,8 @@ class RemoteOrchestrator:
         try:
             backup_cls(self.db, self.cfg.ibm_eject_cmd,
                        tape_priority=self.tape_priority,
-                       tape_affinity=self.tape_cores).run(
+                       tape_affinity=self.tape_cores,
+                       log_dir=self.cfg.backup_log_dir).run(
                 source=pack_dir,
                 tape_drive=self.cfg.lto_drive,
                 tape_label=tape_label,
@@ -3794,7 +4255,9 @@ class RemoteOrchestrator:
         os.makedirs(fetch_dir, exist_ok=True)
         total_chunks = self.db.count_chunks(session_id)
         records = []
-        pending = []
+        pending = []        # primary files: extracted at their sanitized path
+        collisions = []     # renamed files: fetched individually, then moved
+        claimed = {}        # case-folded local_rel -> remote rel that owns it
 
         for row in chunk_files:
             remote_fpath = row['remote_path']
@@ -3814,8 +4277,24 @@ class RemoteOrchestrator:
                 print(f"[REMOTE] Invalid remote path: {e}")
                 return False
 
-            local_path = os.path.join(fetch_dir, rel.replace('/', os.sep))
-            records.append((row, remote_base, rel, local_path))
+            # rel is the true remote path (sent verbatim to remote tar); the
+            # local copy lands under the name the Windows extractor can write.
+            local_rel = _winsafe_extracted_rel(rel)
+            key = local_rel.casefold()
+            collided = key in claimed
+            if collided:
+                # Two distinct remote names map to the same on-disk path —
+                # rename this one so neither file is silently overwritten.
+                clash_with = claimed[key]
+                local_rel  = _disambiguate_local_rel(local_rel, claimed)
+                key        = local_rel.casefold()
+                print(f"[REMOTE] Name collision: '{rel}' and '{clash_with}' map "
+                      f"to the same Windows path — fetching the former as "
+                      f"'{local_rel}'.")
+            claimed[key] = rel
+
+            local_path = os.path.join(fetch_dir, local_rel.replace('/', os.sep))
+            records.append((row, remote_base, rel, local_rel, local_path))
 
             # Skip if already fetched with matching size (resume support)
             if os.path.exists(local_path):
@@ -3823,7 +4302,7 @@ class RemoteOrchestrator:
                     if os.path.getsize(local_path) == fsize:
                         print(f"[REMOTE] Skip (already fetched): {rel}")
                         self.db.update_manifest_row(manifest_id, status='fetched',
-                                                    local_rel_path=rel,
+                                                    local_rel_path=local_rel,
                                                     error_msg=None)
                         continue
                     os.remove(local_path)  # partial file from interrupted run
@@ -3831,22 +4310,25 @@ class RemoteOrchestrator:
                     pass
 
             self.db.update_manifest_row(manifest_id, status='fetching')
-            pending.append((row, remote_base, rel, local_path))
+            (collisions if collided else pending).append(
+                (row, remote_base, rel, local_rel, local_path))
 
-        if pending:
-            pending_bytes = sum(row['file_size_bytes'] for row, _, _, _ in pending)
+        if pending or collisions:
+            todo_bytes = sum(row['file_size_bytes']
+                             for row, *_ in pending + collisions)
+            todo_count = len(pending) + len(collisions)
             _phase('FETCH', f"Remote -> PC | chunk {chunk_index + 1}/{total_chunks} | "
-                            f"{len(pending)} file(s), {pending_bytes / 1024**3:.2f} GB")
+                            f"{todo_count} file(s), {todo_bytes / 1024**3:.2f} GB")
             _status('SSH', f"Opening tar stream to "
                            f"{self.remote_user}@{self.remote_host} "
                            f"(cipher={self.ssh_cipher or 'default'}, "
                            f"mbuffer={'on' if self.use_mbuffer else 'off'})")
 
             fetch_stop = threading.Event()
-            self._start_fetch_monitor(fetch_stop, fetch_dir, pending_bytes)
+            self._start_fetch_monitor(fetch_stop, fetch_dir, todo_bytes)
 
             pending_by_base = defaultdict(list)
-            for row, remote_base, rel, local_path in pending:
+            for row, remote_base, rel, local_rel, local_path in pending:
                 pending_by_base[remote_base].append((row, rel, local_path))
 
             try:
@@ -3876,6 +4358,13 @@ class RemoteOrchestrator:
                                 error_msg=err[:500],
                             )
                         return False
+
+                # Renamed files can't ride the shared stream (bsdtar would
+                # extract them onto the primary's path), so fetch each alone
+                # into an isolated dir and move it to its disambiguated name.
+                if collisions and not self._fetch_collisions(
+                        collisions, fetch_dir):
+                    return False
             finally:
                 fetch_stop.set()
                 _progress_done()
@@ -3883,7 +4372,7 @@ class RemoteOrchestrator:
             print(f"[REMOTE] Chunk {chunk_index + 1}/{total_chunks}: "
                   "all files already fetched.")
 
-        for row, _, rel, local_path in records:
+        for row, _, rel, local_rel, local_path in records:
             fsize       = row['file_size_bytes']
             manifest_id = row['manifest_id']
             if not os.path.exists(local_path):
@@ -3920,9 +4409,69 @@ class RemoteOrchestrator:
                 return False
 
             self.db.update_manifest_row(manifest_id, status='fetched',
-                                        local_rel_path=rel,
+                                        local_rel_path=local_rel,
                                         error_msg=None)
         return True
+
+    def _fetch_collisions(self, collisions, fetch_dir):
+        """Fetch files whose sanitized name clashed with another file's.
+
+        Each is streamed alone into a private temp dir (where bsdtar writes it
+        at its natural sanitized path) and then moved to the disambiguated
+        local_path. Returns False on the first failure, leaving the row marked
+        fetch_failed for the caller to surface."""
+        collide_root = os.path.join(fetch_dir, '_collide')
+        try:
+            for row, remote_base, rel, _local_rel, local_path in collisions:
+                if CANCEL.is_set():
+                    return False
+                tmp = os.path.join(collide_root, str(row['manifest_id']))
+                shutil.rmtree(tmp, ignore_errors=True)
+                os.makedirs(tmp, exist_ok=True)
+
+                ok, err = _remote_tar_fetch(
+                    self.remote_user,
+                    self.remote_host,
+                    remote_base,
+                    [rel],
+                    tmp,
+                    password=self.remote_password,
+                    cipher=self.ssh_cipher,
+                    use_mbuffer=self.use_mbuffer,
+                    mbuffer_size=self.mbuffer_size,
+                    fetch_cores=self.fetch_cores,
+                )
+                if not ok:
+                    if CANCEL.is_set():
+                        return False
+                    print(f"\n[REMOTE] Tar fetch failed (renamed file):\n{err}")
+                    self.db.update_manifest_row(
+                        row['manifest_id'], status='fetch_failed',
+                        error_msg=err[:500])
+                    return False
+
+                # Alone in tmp, the file lands at its natural sanitized path.
+                natural = os.path.join(
+                    tmp, _winsafe_extracted_rel(rel).replace('/', os.sep))
+                if not os.path.exists(natural):
+                    print(f"[REMOTE] Missing after fetch (renamed file): {rel}")
+                    self.db.update_manifest_row(
+                        row['manifest_id'], status='fetch_failed',
+                        error_msg="missing after tar fetch")
+                    return False
+
+                os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                try:
+                    os.replace(natural, local_path)
+                except OSError as e:
+                    print(f"[REMOTE] Could not place renamed file {rel}: {e}")
+                    self.db.update_manifest_row(
+                        row['manifest_id'], status='fetch_failed',
+                        error_msg=f"move failed: {e}")
+                    return False
+            return True
+        finally:
+            shutil.rmtree(collide_root, ignore_errors=True)
 
     def _start_fetch_monitor(self, stop_evt, fetch_dir, total_bytes):
         """Live remote->PC throughput: watch the fetch dir grow on disk."""
