@@ -10,6 +10,8 @@ __pycache__/
 source/
 staging/
 restored/
+backup_logs/
+lto_archive.db
 
 # Secrets — real credentials live here, never commit them
 .env
