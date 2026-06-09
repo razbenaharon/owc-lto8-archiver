@@ -683,6 +683,259 @@ class FilesPanel(ctk.CTkFrame):
 
 
 # ==============================================================================
+# SESSIONS / MANIFESTS PANEL
+# ==============================================================================
+
+class SessionsPanel(ctk.CTkFrame):
+    def __init__(self, master, db, app):
+        super().__init__(master, fg_color="transparent")
+        self._db = db
+        self._app = app
+
+        tb = ctk.CTkFrame(self, fg_color="transparent")
+        tb.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+
+        self._btn_delete = ctk.CTkButton(
+            tb, text="Delete Selected Session", width=190, height=30,
+            state="disabled", fg_color="#7a1c1c", hover_color="#8f2020",
+            command=self._on_delete)
+        self._btn_vacuum = ctk.CTkButton(
+            tb, text="Compact DB", width=120, height=30,
+            command=self._on_vacuum)
+        self._btn_delete.pack(side="left", padx=(0, 8))
+        self._btn_vacuum.pack(side="left")
+
+        self._status_var = ctk.StringVar(value="")
+        ctk.CTkLabel(tb, textvariable=self._status_var,
+                     text_color="#a0a0a0").pack(side="left", padx=(12, 0))
+
+        tf = ctk.CTkFrame(self, fg_color="#212121")
+        tf.grid(row=1, column=0, sticky="nsew", padx=8, pady=(4, 8))
+        tf.grid_rowconfigure(0, weight=1)
+        tf.grid_columnconfigure(0, weight=1)
+
+        cols = ("kind", "session_id", "label", "status", "mode",
+                "created", "completed", "chunks", "manifest_rows",
+                "manifest_size", "file_records")
+        self._tree = ttk.Treeview(tf, columns=cols, show="headings",
+                                  selectmode="browse")
+
+        headings = {
+            "kind":          ("Type",           80,  "center"),
+            "session_id":    ("ID",             60,  "center"),
+            "label":         ("Session Label",  260, "w"),
+            "status":        ("Status",         95,  "center"),
+            "mode":          ("Mode",           85,  "center"),
+            "created":       ("Created",        155, "w"),
+            "completed":     ("Completed",      155, "w"),
+            "chunks":        ("Chunks",         70,  "center"),
+            "manifest_rows": ("Manifest Rows",  120, "e"),
+            "manifest_size": ("Manifest Size",  120, "e"),
+            "file_records":  ("File Records",   105, "e"),
+        }
+        for col, (heading, width, anchor) in headings.items():
+            self._tree.heading(col, text=heading)
+            self._tree.column(col, width=width, anchor=anchor,
+                              stretch=(col == "label"))
+
+        self._tree.tag_configure("odd",  background="#212121")
+        self._tree.tag_configure("even", background="#292929")
+
+        vsb = ctk.CTkScrollbar(tf, command=self._tree.yview)
+        hsb = ctk.CTkScrollbar(tf, orientation="horizontal",
+                                command=self._tree.xview)
+        self._tree.configure(yscrollcommand=vsb.set,
+                             xscrollcommand=hsb.set)
+        self._tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+
+        self._tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        self.grid_rowconfigure(1, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        self.refresh()
+
+    def _table_exists(self, name):
+        return self._db.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+            (name,)
+        ).fetchone() is not None
+
+    def _load_rows(self):
+        rows = []
+        if self._table_exists("local_sessions"):
+            local_rows = self._db.conn.execute("""
+                SELECT
+                    'local' AS kind,
+                    s.session_id,
+                    s.session_label,
+                    s.status,
+                    COALESCE(s.backup_mode, 'auto') AS mode,
+                    s.created_at,
+                    s.completed_at,
+                    s.total_chunks AS chunks,
+                    COALESCE((
+                        SELECT COUNT(*) FROM local_chunks_manifest m
+                        WHERE m.session_id = s.session_id
+                    ), 0) AS manifest_rows,
+                    COALESCE((
+                        SELECT SUM(dir_size_bytes) FROM local_chunks_manifest m
+                        WHERE m.session_id = s.session_id
+                    ), 0) AS manifest_bytes,
+                    COALESCE((
+                        SELECT COUNT(*) FROM files_index f
+                        WHERE f.local_session_id = s.session_id
+                    ), 0) AS file_records
+                FROM local_sessions s
+                ORDER BY s.session_id
+            """).fetchall()
+            rows.extend(dict(r) for r in local_rows)
+
+        if self._table_exists("remote_sessions"):
+            remote_rows = self._db.conn.execute("""
+                SELECT
+                    'remote' AS kind,
+                    s.session_id,
+                    s.session_label,
+                    s.status,
+                    '' AS mode,
+                    s.created_at,
+                    s.completed_at,
+                    s.chunk_count AS chunks,
+                    COALESCE((
+                        SELECT COUNT(*) FROM remote_manifest m
+                        WHERE m.session_id = s.session_id
+                    ), 0) AS manifest_rows,
+                    COALESCE((
+                        SELECT SUM(file_size_bytes) FROM remote_manifest m
+                        WHERE m.session_id = s.session_id
+                    ), 0) AS manifest_bytes,
+                    0 AS file_records
+                FROM remote_sessions s
+                ORDER BY s.session_id
+            """).fetchall()
+            rows.extend(dict(r) for r in remote_rows)
+
+        return sorted(rows, key=lambda r: (str(r["kind"]), int(r["session_id"])))
+
+    def refresh(self):
+        rows = self._load_rows()
+        self._tree.delete(*self._tree.get_children())
+
+        total_manifest_rows = 0
+        total_manifest_bytes = 0
+        for i, r in enumerate(rows):
+            total_manifest_rows += r["manifest_rows"] or 0
+            total_manifest_bytes += r["manifest_bytes"] or 0
+            tag = "odd" if i % 2 == 0 else "even"
+            iid = f"{r['kind']}:{r['session_id']}"
+            self._tree.insert("", "end", iid=iid, values=(
+                r["kind"],
+                r["session_id"],
+                r["session_label"],
+                r["status"],
+                r["mode"] or "",
+                (r["created_at"] or "")[:19],
+                (r["completed_at"] or "")[:19],
+                r["chunks"] if r["chunks"] is not None else "",
+                f"{r['manifest_rows']:,}",
+                _fmt_bytes(r["manifest_bytes"] or 0),
+                f"{r['file_records']:,}",
+            ), tags=(tag,))
+
+        self._status_var.set(
+            f"{len(rows):,} session(s), {total_manifest_rows:,} manifest row(s), "
+            f"{_fmt_bytes(total_manifest_bytes)} manifest data")
+        self._btn_delete.configure(state="disabled")
+
+    def _on_select(self, _event=None):
+        self._btn_delete.configure(
+            state="normal" if self._tree.selection() else "disabled")
+
+    def _selected_session(self):
+        sel = self._tree.selection()
+        if not sel:
+            return None, None
+        kind, session_id = sel[0].split(":", 1)
+        return kind, int(session_id)
+
+    def _session_summary(self, kind, session_id):
+        manifest_table = "local_chunks_manifest" if kind == "local" else "remote_manifest"
+        session_table = "local_sessions" if kind == "local" else "remote_sessions"
+        label_row = self._db.conn.execute(
+            f"SELECT session_label, status FROM {session_table} WHERE session_id = ?",
+            (session_id,)
+        ).fetchone()
+        count = self._db.conn.execute(
+            f"SELECT COUNT(*) FROM {manifest_table} WHERE session_id = ?",
+            (session_id,)
+        ).fetchone()[0]
+        return label_row, count
+
+    def _delete_session(self, kind, session_id):
+        manifest_table = "local_chunks_manifest" if kind == "local" else "remote_manifest"
+        session_table = "local_sessions" if kind == "local" else "remote_sessions"
+        with self._db.lock:
+            with self._db.conn:
+                self._db.conn.execute(
+                    f"DELETE FROM {manifest_table} WHERE session_id = ?",
+                    (session_id,)
+                )
+                cur = self._db.conn.execute(
+                    f"DELETE FROM {session_table} WHERE session_id = ?",
+                    (session_id,)
+                )
+                self._db._require_updated(
+                    cur, f"[DB] {kind.title()} session not found: {session_id}")
+
+    def _on_delete(self):
+        kind, session_id = self._selected_session()
+        if not kind:
+            return
+        label_row, manifest_count = self._session_summary(kind, session_id)
+        if not label_row:
+            self.refresh()
+            return
+        label, status = label_row["session_label"], label_row["status"]
+        if not messagebox.askyesno(
+                "Delete Session",
+                f"Delete {kind} session '{label}' (id {session_id})?\n\n"
+                f"Status: {status}\n"
+                f"Manifest rows to delete: {manifest_count:,}\n\n"
+                "Tape records and file index records will be kept. "
+                "Deleting an active session removes its resume state.",
+                parent=self.winfo_toplevel()):
+            return
+        try:
+            self._delete_session(kind, session_id)
+        except Exception as e:
+            messagebox.showerror(
+                "Delete Failed", str(e), parent=self.winfo_toplevel())
+            self.refresh()
+            return
+        self.refresh()
+
+    def _on_vacuum(self):
+        if not messagebox.askyesno(
+                "Compact Database",
+                "Run SQLite VACUUM to shrink the database file?\n\n"
+                "This can take a little while on large databases.",
+                parent=self.winfo_toplevel()):
+            return
+        try:
+            self._db.conn.execute("VACUUM")
+        except Exception as e:
+            messagebox.showerror(
+                "Compact Failed", str(e), parent=self.winfo_toplevel())
+            return
+        messagebox.showinfo(
+            "Done", "Database compacted.", parent=self.winfo_toplevel())
+        self.refresh()
+
+
+# ==============================================================================
 # MAIN APP
 # ==============================================================================
 
@@ -709,6 +962,7 @@ class DBInspectorApp(ctk.CTk):
         tabview.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
         tabview.add("Tapes")
         tabview.add("Files")
+        tabview.add("Sessions")
 
         tape_labels = [t["volume_label"] for t in db.list_tapes()]
 
@@ -718,10 +972,14 @@ class DBInspectorApp(ctk.CTk):
         self.files_panel = FilesPanel(tabview.tab("Files"), db, tape_labels)
         self.files_panel.pack(fill="both", expand=True)
 
+        self.sessions_panel = SessionsPanel(tabview.tab("Sessions"), db, self)
+        self.sessions_panel.pack(fill="both", expand=True)
+
     def refresh_all(self):
         self.tapes_panel.refresh()
         tape_labels = [t["volume_label"] for t in self._db.list_tapes()]
         self.files_panel.refresh(tape_labels)
+        self.sessions_panel.refresh()
 
 
 # ==============================================================================

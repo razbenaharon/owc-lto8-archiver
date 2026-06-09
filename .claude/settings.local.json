@@ -8,7 +8,10 @@
       "Bash(del _trace_path.py)",
       "Bash(python -c \"import ast; ast.parse\\(open\\('lto_archive_manager.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(git add *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "PowerShell(py -m py_compile lto_archive_manager.py)",
+      "PowerShell(if \\($?\\) { \"OK\" })",
+      "PowerShell($cmds = 'python3','python','py'; foreach \\($c in $cmds\\) { $p = Get-Command $c -ErrorAction SilentlyContinue; if \\($p\\) { \"$c -> $\\($p.Source\\)\" } })"
     ]
   }
 }
