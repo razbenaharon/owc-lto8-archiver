@@ -459,6 +459,8 @@ class TapesPanel(ctk.CTkFrame):
 # ==============================================================================
 
 class FilesPanel(ctk.CTkFrame):
+    FETCH_CAP = 100000
+
     def __init__(self, master, db, tape_labels):
         super().__init__(master, fg_color="transparent")
         self._db = db
@@ -512,27 +514,30 @@ class FilesPanel(ctk.CTkFrame):
         tf.grid_rowconfigure(0, weight=1)
         tf.grid_columnconfigure(0, weight=1)
 
-        cols = ("file_id", "file_name", "original_path",
-                "size", "tape_label", "backup_date", "is_packed")
-        self._tree = ttk.Treeview(tf, columns=cols, show="headings",
+        # Hierarchical folder browser (WinSCP-style): the directories that
+        # were backed up are shown as collapsible folders, and the individual
+        # files are revealed on demand when a folder is expanded.  Much easier
+        # to scan than a flat list of every single file.
+        cols = ("size", "items", "tape", "backup_date", "packed")
+        self._tree = ttk.Treeview(tf, columns=cols, show="tree headings",
                                   selectmode="extended")
 
+        self._tree.heading("#0", text="Folder / File")
+        self._tree.column("#0", width=520, anchor="w", stretch=True)
+
         headings = {
-            "file_id":       ("ID",           60,  "center"),
-            "file_name":     ("File Name",    220, "w"),
-            "original_path": ("Original Path", 340, "w"),
-            "size":          ("Size",          90,  "e"),
-            "tape_label":    ("Tape",          90,  "center"),
-            "backup_date":   ("Backup Date",  150,  "w"),
-            "is_packed":     ("Packed",        60,  "center"),
+            "size":        ("Size",         110, "e"),
+            "items":       ("Files",         80, "e"),
+            "tape":        ("Tape",         100, "center"),
+            "backup_date": ("Backup Date",  150, "w"),
+            "packed":      ("Packed",        70, "center"),
         }
         for col, (heading, width, anchor) in headings.items():
             self._tree.heading(col, text=heading)
-            self._tree.column(col, width=width, anchor=anchor,
-                              stretch=(col == "original_path"))
+            self._tree.column(col, width=width, anchor=anchor, stretch=False)
 
-        self._tree.tag_configure("odd",  background="#212121")
-        self._tree.tag_configure("even", background="#292929")
+        self._tree.tag_configure("dir",  foreground="#8ab4f8")
+        self._tree.tag_configure("file", foreground="#DCE4EE")
 
         vsb = ctk.CTkScrollbar(tf, command=self._tree.yview)
         hsb = ctk.CTkScrollbar(tf, orientation="horizontal",
@@ -544,23 +549,40 @@ class FilesPanel(ctk.CTkFrame):
         hsb.grid(row=1, column=0, sticky="ew")
 
         self._tree.bind("<<TreeviewSelect>>", self._on_select)
-        self._tree.bind("<Double-Button-1>",
-                        lambda _: self._on_view_details())
+        self._tree.bind("<<TreeviewOpen>>", self._on_open)
+        self._tree.bind("<Double-Button-1>", self._on_double)
+        self._tree.bind("<Button-3>", self._on_right_click)
+
+        # Right-click context menu (built per-row in _on_right_click).
+        self._menu = tk.Menu(self, tearoff=0)
+
+        # File rows are loaded lazily, keyed by their parent folder iid.
+        self._dir_files = {}
 
         # Toolbar
         tb2 = ctk.CTkFrame(self, fg_color="transparent")
         tb2.grid(row=2, column=0, sticky="ew", padx=8, pady=(4, 8))
 
+        self._btn_expand = ctk.CTkButton(
+            tb2, text="Expand All", width=110, height=30,
+            fg_color="#3a3a3a", hover_color="#4a4a4a",
+            command=self._expand_all)
+        self._btn_collapse = ctk.CTkButton(
+            tb2, text="Collapse All", width=120, height=30,
+            fg_color="#3a3a3a", hover_color="#4a4a4a",
+            command=self._collapse_all)
+        self._btn_details = ctk.CTkButton(
+            tb2, text="View Details", width=120, height=30,
+            state="disabled", command=self._on_view_details)
         self._btn_delete  = ctk.CTkButton(
             tb2, text="Delete Selected", width=145, height=30,
             state="disabled", fg_color="#7a1c1c", hover_color="#8f2020",
             command=self._on_delete)
-        self._btn_details = ctk.CTkButton(
-            tb2, text="View Details", width=120, height=30,
-            state="disabled", command=self._on_view_details)
 
-        self._btn_delete.pack(side="left", padx=(0, 8))
-        self._btn_details.pack(side="left")
+        self._btn_expand.pack(side="left", padx=(0, 6))
+        self._btn_collapse.pack(side="left", padx=(0, 16))
+        self._btn_details.pack(side="left", padx=(0, 8))
+        self._btn_delete.pack(side="left")
 
         self.grid_rowconfigure(1, weight=1)
         self.grid_columnconfigure(0, weight=1)
@@ -570,11 +592,19 @@ class FilesPanel(ctk.CTkFrame):
     # ------------------------------------------------------------------
 
     def _on_select(self, _event=None):
-        sel = self._tree.selection()
+        fids = self._selected_file_ids()
         self._btn_delete.configure(
-            state="normal" if sel else "disabled")
+            state="normal" if fids else "disabled")
         self._btn_details.configure(
-            state="normal" if len(sel) == 1 else "disabled")
+            state="normal" if len(fids) == 1 else "disabled")
+
+    def _selected_file_ids(self):
+        """File ids of the currently selected file rows (folders ignored)."""
+        ids = []
+        for iid in self._tree.selection():
+            if not iid.startswith(("D:", "P:")):
+                ids.append(int(iid))
+        return ids
 
     def _build_query(self):
         name      = self._name_var.get().strip()
@@ -596,25 +626,131 @@ class FilesPanel(ctk.CTkFrame):
         if date_to:
             sql += " AND backup_date <= ?"
             params.append(date_to + " 23:59:59")
-        sql += " ORDER BY backup_date DESC"
+        sql += " ORDER BY original_path, file_name"
         return sql, params
+
+    @staticmethod
+    def _split_dirs(path):
+        """Directory components of a file's original path."""
+        norm  = (path or "").replace("\\", "/")
+        parts = [p for p in norm.split("/") if p]
+        return parts[:-1] if parts else []
+
+    def _build_dir_tree(self, rows):
+        """Group file rows into a nested folder tree with rolled-up totals."""
+        root = {"children": {}, "files": [], "count": 0, "size": 0}
+        for r in rows:
+            size = r["file_size_bytes"] or 0
+            node = root
+            node["count"] += 1
+            node["size"]  += size
+            for part in self._split_dirs(r["original_path"]):
+                child = node["children"].get(part)
+                if child is None:
+                    child = {"children": {}, "files": [],
+                             "count": 0, "size": 0}
+                    node["children"][part] = child
+                node = child
+                node["count"] += 1
+                node["size"]  += size
+            node["files"].append(r)
+        return root
+
+    def _insert_file_row(self, parent, r):
+        size_s = _fmt_bytes(r["file_size_bytes"])
+        packed = "yes" if r["is_packed"] else "no"
+        date_s = (r["backup_date"] or "")[:19]
+        self._tree.insert(
+            parent, "end", iid=str(r["file_id"]),
+            text="📄  " + (r["file_name"] or ""),
+            values=(size_s, "", r["tape_label"], date_s, packed),
+            tags=("file",))
+
+    def _insert_children(self, parent_iid, node, prefix=""):
+        for name in sorted(node["children"], key=lambda s: s.lower()):
+            child = node["children"][name]
+            dir_path = prefix + name + "/"
+            iid = "D:" + dir_path
+            self._tree.insert(
+                parent_iid, "end", iid=iid, open=False,
+                text="📁  " + name,
+                values=(_fmt_bytes(child["size"]),
+                        f"{child['count']:,}", "", "", ""),
+                tags=("dir",))
+            self._insert_children(iid, child, dir_path)
+            if child["files"]:
+                self._dir_files[iid] = child["files"]
+                # Stub child so the expand arrow shows; replaced with the
+                # real file rows the first time the folder is opened.
+                self._tree.insert(iid, "end", iid="P:" + iid,
+                                  text="…", tags=("file",))
+        if parent_iid == "":
+            for r in node["files"]:
+                self._insert_file_row("", r)
+
+    def _populate_tree(self, root):
+        self._tree.delete(*self._tree.get_children())
+        self._dir_files = {}
+        self._insert_children("", root)
+
+    def _on_open(self, _event=None):
+        self._load_dir_files(self._tree.focus())
+
+    def _load_dir_files(self, iid):
+        if not iid or not iid.startswith("D:"):
+            return
+        stub = "P:" + iid
+        if self._tree.exists(stub):
+            self._tree.delete(stub)
+            for r in self._dir_files.get(iid, []):
+                self._insert_file_row(iid, r)
+
+    def _all_dir_iids(self):
+        result = []
+
+        def walk(parent):
+            for c in self._tree.get_children(parent):
+                if c.startswith("D:"):
+                    result.append(c)
+                    walk(c)
+
+        walk("")
+        return result
+
+    def _expand_all(self):
+        for iid in self._all_dir_iids():
+            self._load_dir_files(iid)
+            self._tree.item(iid, open=True)
+
+    def _collapse_all(self):
+        for iid in self._all_dir_iids():
+            self._tree.item(iid, open=False)
 
     def _on_search(self):
         sql, params = self._build_query()
-        rows  = self._db.conn.execute(sql, params).fetchall()
-        MAX   = 2000
-        self._populate(rows[:MAX])
-        total = len(rows)
-        shown = min(total, MAX)
+        rows   = self._db.conn.execute(sql, params).fetchall()
+        capped = len(rows) > self.FETCH_CAP
+        rows   = rows[:self.FETCH_CAP]
+
+        root = self._build_dir_tree(rows)
+        self._populate_tree(root)
+
+        total = root["count"]
         if total == 0:
             self._status_var.set("No records found.")
-        elif total > MAX:
-            self._status_var.set(
-                f"Showing first {shown:,} of {total:,} records"
-                f" — refine filters to see more")
-        else:
-            self._status_var.set(
-                f"Showing {shown:,} record{'s' if shown != 1 else ''}")
+            return
+
+        msg = (f"{total:,} file{'s' if total != 1 else ''} in "
+               f"{len(root['children']):,} top-level folder(s) · "
+               f"{_fmt_bytes(root['size'])} total")
+        if capped:
+            msg = (f"⚠ Showing first {self.FETCH_CAP:,} records "
+                   f"(more match — refine filters) · " + msg)
+        self._status_var.set(msg)
+
+        # When searching by name, reveal the matches automatically.
+        if self._name_var.get().strip() and total <= 1000:
+            self._expand_all()
 
     def _on_clear(self):
         self._name_var.set("")
@@ -623,31 +759,19 @@ class FilesPanel(ctk.CTkFrame):
         self._date_to_var.set("")
         self._on_search()
 
-    def _populate(self, rows):
-        self._tree.delete(*self._tree.get_children())
-        for i, r in enumerate(rows):
-            size_s = _fmt_bytes(r["file_size_bytes"])
-            packed = "yes" if r["is_packed"] else "no"
-            date_s = (r["backup_date"] or "")[:19]
-            tag    = "odd" if i % 2 == 0 else "even"
-            self._tree.insert("", "end", iid=str(r["file_id"]), values=(
-                r["file_id"], r["file_name"], r["original_path"],
-                size_s, r["tape_label"], date_s, packed
-            ), tags=(tag,))
-
     def _on_delete(self):
-        sel = self._tree.selection()
-        if not sel:
+        fids = self._selected_file_ids()
+        if not fids:
             return
         if not messagebox.askyesno(
                 "Confirm Delete",
-                f"Delete {len(sel)} file record(s)? This cannot be undone.",
+                f"Delete {len(fids)} file record(s)? This cannot be undone.",
                 parent=self.winfo_toplevel()):
             return
         missing = []
-        for iid in sel:
+        for fid in fids:
             try:
-                self._db.delete_file(int(iid))
+                self._db.delete_file(fid)
             except RuntimeError as e:
                 missing.append(str(e))
         self._on_search()
@@ -658,11 +782,53 @@ class FilesPanel(ctk.CTkFrame):
                 + "\n".join(missing[:5]),
                 parent=self.winfo_toplevel())
 
-    def _on_view_details(self):
-        sel = self._tree.selection()
-        if not sel:
+    def _on_double(self, _event=None):
+        iid = self._tree.focus()
+        if iid and not iid.startswith(("D:", "P:")):
+            self._on_view_details()
+
+    def _copy_to_clipboard(self, text):
+        self._tree.clipboard_clear()
+        self._tree.clipboard_append(text)
+
+    def _on_right_click(self, event):
+        iid = self._tree.identify_row(event.y)
+        if not iid or iid.startswith("P:"):
             return
-        rec = self._db.get_file_by_id(int(sel[0]))
+        # Right-clicking a row that isn't part of the current selection
+        # selects just that row, like a typical file manager.
+        if iid not in self._tree.selection():
+            self._tree.selection_set(iid)
+            self._tree.focus(iid)
+
+        self._menu.delete(0, "end")
+        if iid.startswith("D:"):
+            folder = iid[2:].rstrip("/")
+            self._menu.add_command(
+                label="Copy folder path",
+                command=lambda: self._copy_to_clipboard(folder))
+        else:
+            rec = self._db.get_file_by_id(int(iid))
+            if not rec:
+                self._on_search()
+                return
+            path = rec["original_path"] or ""
+            self._menu.add_command(
+                label="Copy path",
+                command=lambda: self._copy_to_clipboard(path))
+            self._menu.add_command(
+                label="Copy file name",
+                command=lambda: self._copy_to_clipboard(rec["file_name"] or ""))
+            self._menu.add_separator()
+            self._menu.add_command(
+                label="View details", command=self._on_view_details)
+        self._menu.tk_popup(event.x_root, event.y_root)
+
+    def _on_view_details(self):
+        fids = self._selected_file_ids()
+        if len(fids) != 1:
+            return
+        rec = self._db.get_file_by_id(fids[0])
         if rec:
             FileDetailDialog(self, rec)
         else:
