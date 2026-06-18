@@ -158,10 +158,23 @@ _PROCS = set()                    # live child Popen objects we may need to kill
 # RLock (not Lock): the SIGINT handler runs in the main thread and may fire while
 # that thread is already inside register/unregister, so it must be re-entrant.
 _PROCS_LOCK = threading.RLock()
+_TAPE_IO_LOCK = threading.RLock()
 _SIGNAL_INSTALLED = False
 _PREV_SIGINT = None
 _PREV_SIGBREAK = None
 _PERF_WARNED = False
+
+
+def _acquire_tape_io_lock(reason):
+    """Serialize in-process LTFS reads/writes so robocopy owns the tape alone."""
+    if _TAPE_IO_LOCK.acquire(blocking=False):
+        return
+    _status('TAPE', f"Waiting for exclusive tape access: {reason}")
+    _TAPE_IO_LOCK.acquire()
+
+
+def _release_tape_io_lock():
+    _TAPE_IO_LOCK.release()
 
 
 def register_proc(proc):
@@ -445,19 +458,23 @@ def _load_env_file(path):
 
 def get_volume_label(drive_path):
     """Detect the volume label of a Windows drive (e.g. 'D:\\')."""
+    _acquire_tape_io_lock(f"read volume label {drive_path}")
     try:
-        drive_letter = drive_path.rstrip(":\\/")
-        result = subprocess.run(
-            ['vol', f'{drive_letter}:'],
-            capture_output=True, text=True, shell=True
-        )
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if line.lower().startswith('volume in drive') and ' is ' in line:
-                return line.rsplit(' is ', 1)[-1].strip()
-    except Exception:
-        pass
-    return None
+        try:
+            drive_letter = drive_path.rstrip(":\\/")
+            result = subprocess.run(
+                ['vol', f'{drive_letter}:'],
+                capture_output=True, text=True, shell=True
+            )
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if line.lower().startswith('volume in drive') and ' is ' in line:
+                    return line.rsplit(' is ', 1)[-1].strip()
+        except Exception:
+            pass
+        return None
+    finally:
+        _release_tape_io_lock()
 
 
 def _hash_file(path):
@@ -1171,7 +1188,7 @@ def _ltfs_drive_status(drive_path):
     return None, output, None
 
 
-def _ensure_lto_drive_ready(tape_drive, prefix="[TAPE]"):
+def _ensure_lto_drive_ready_unlocked(tape_drive, prefix="[TAPE]"):
     """Check that the configured LTFS drive is mounted and writable enough to use."""
     status, output, error = _ltfs_drive_status(tape_drive)
     if error:
@@ -1210,6 +1227,14 @@ def _ensure_lto_drive_ready(tape_drive, prefix="[TAPE]"):
         return False
 
     return True
+
+
+def _ensure_lto_drive_ready(tape_drive, prefix="[TAPE]"):
+    _acquire_tape_io_lock(f"check drive readiness {tape_drive}")
+    try:
+        return _ensure_lto_drive_ready_unlocked(tape_drive, prefix=prefix)
+    finally:
+        _release_tape_io_lock()
 
 
 # ==============================================================================
@@ -1259,6 +1284,7 @@ class ConfigManager:
         self.config['PERFORMANCE'] = {
             'chunk_cap_gb':          '100',
             'prefetch_chunks_ahead': '2',
+            'eject_after_pack':      'off',
             'staging_max_gb':        '350',
             'robocopy_priority':     'high',
             'cpu_affinity':          'auto',
@@ -1328,6 +1354,16 @@ class ConfigManager:
     @property
     def prefetch_chunks_ahead(self):
         return max(1, int(float(self.config.get('PERFORMANCE', 'prefetch_chunks_ahead', fallback='2'))))
+    @property
+    def eject_after_pack(self):
+        raw = self.config.get('PERFORMANCE', 'eject_after_pack', fallback='off').strip().lower()
+        if raw in ('', 'off', 'none', 'false', 'no'):
+            return None
+        try:
+            value = int(float(raw))
+        except ValueError:
+            return None
+        return value if value >= 0 else None
     @property
     def staging_max_gb(self):
         return float(self.config.get('PERFORMANCE', 'staging_max_gb', fallback='350'))
@@ -2551,7 +2587,7 @@ class LTOBackup:
             print(f"[LOG] Warning: could not write backup log: {e}")
             return None
 
-    def eject_tape(self, tape_drive):
+    def _legacy_eject_tape_unlocked(self, tape_drive):
         print("\n" + "#" * 60)
         print("[LTO] FINALIZING: Ejecting tape...")
         print("[LTO] PLEASE WAIT — this can take 1-2 minutes.")
@@ -2574,9 +2610,32 @@ class LTOBackup:
         except FileNotFoundError:
             print(f"[ERROR] LtfsCmdEject.exe not found in: {LTFS_DIR}")
 
+    def eject_tape(self, tape_drive):
+        _acquire_tape_io_lock(f"eject {tape_drive}")
+        try:
+            return self._legacy_eject_tape_unlocked(tape_drive)
+        finally:
+            _release_tape_io_lock()
+
     def run(self, source, tape_drive, tape_label, packer_metadata=None,
             exclude_file_paths=None, exclude_dir_paths=None,
             local_session_id=None, local_chunk_index=None):
+        _acquire_tape_io_lock(f"backup write to {tape_drive}")
+        try:
+            return self._run_locked(
+                source, tape_drive, tape_label,
+                packer_metadata=packer_metadata,
+                exclude_file_paths=exclude_file_paths,
+                exclude_dir_paths=exclude_dir_paths,
+                local_session_id=local_session_id,
+                local_chunk_index=local_chunk_index,
+            )
+        finally:
+            _release_tape_io_lock()
+
+    def _run_locked(self, source, tape_drive, tape_label, packer_metadata=None,
+                    exclude_file_paths=None, exclude_dir_paths=None,
+                    local_session_id=None, local_chunk_index=None):
         """
         Copy files from source to tape and commit to the database.
 
@@ -2740,24 +2799,13 @@ class LTOBackup:
         stop_evt = threading.Event()
 
         def _monitor():
-            prev_bytes = 0
-            prev_time  = time.time()
-            while not stop_evt.is_set():
-                time.sleep(2)  # walking the LTFS tree is not free; don't hammer it
-                cur   = max(0, _dir_size(tape_root) - initial_tape_bytes)
-                now   = time.time()
-                dt    = now - prev_time
-                speed = ((cur - prev_bytes) / 1024**2) / dt if dt > 0 else 0
-                pct   = (cur / total_bytes * 100) if total_bytes else 100
-                remaining = max(0, total_bytes - cur)
-                eta = remaining / (speed * 1024**2) if speed > 0 else None
+            start_time = time.time()
+            while not stop_evt.wait(15):
+                elapsed = time.time() - start_time
                 _progress_line(
-                    f"[COPYING] {min(pct, 100):.1f}% | {speed:.1f} MB/s | "
-                    f"{cur / 1024**3:.1f}/{total_bytes / 1024**3:.1f} GB | "
-                    f"ETA {_fmt_eta(eta)}"
+                    f"[COPYING] robocopy active | elapsed {_fmt_eta(elapsed)} | "
+                    f"chunk {total_bytes / 1024**3:.1f} GB"
                 )
-                prev_bytes = cur
-                prev_time  = now
 
         mon = threading.Thread(target=_monitor, daemon=True)
         mon.start()
@@ -2791,6 +2839,54 @@ class LTOBackup:
             raise RuntimeError("tape write cancelled by user")
 
         rc_sum = _parse_robocopy_summary(rc.stdout)
+
+        rc_output = (rc.stdout or '') + '\n' + (rc.stderr or '')
+        critical_robocopy_failure = (
+            rc.returncode >= 8 or
+            rc_sum.get('files_failed', 0) > 0 or
+            'ERROR ' in rc_output or
+            'RETRY LIMIT EXCEEDED' in rc_output
+        )
+        if critical_robocopy_failure:
+            copied_bytes = rc_sum.get('bytes_copied', 0)
+            if copied_bytes <= 0:
+                copied_bytes = max(0, _dir_size(tape_root) - initial_tape_bytes)
+            new_used = self.db.recalculate_tape_used_space(tape_label)
+            log_path = self._write_backup_log(
+                {
+                    'status': 'failed_critical',
+                    'started_at': started_at,
+                    'finished_at': datetime.now(),
+                    'source': source,
+                    'tape_drive': tape_drive,
+                    'tape_label': tape_label,
+                    'tape_root': tape_root,
+                    'local_session_id': local_session_id,
+                    'local_chunk_index': local_chunk_index,
+                    'total_time_seconds': time.time() - total_start,
+                    'total_bytes': total_bytes,
+                    'copied_bytes': copied_bytes,
+                    'skipped': skipped,
+                    'new_used': new_used,
+                    'rc_sum': rc_sum,
+                    'record_counts': {},
+                },
+                packer_metadata,
+                hash_map,
+                recovered_direct_existing,
+                skipped_existing,
+                robocopy_cmd,
+                rc,
+            )
+            msg = (
+                f"CRITICAL: robocopy failed with exit code {rc.returncode}; "
+                f"{rc_sum.get('files_failed', 0)} file(s) failed. "
+                "No file records were committed to the database."
+            )
+            if log_path:
+                msg += f" Log: {log_path}"
+            print(f"[ERROR] {msg}")
+            raise RuntimeError(msg)
 
         if rc.returncode >= 8:
             print(f"[WARN] Robocopy finished with exit code {rc.returncode} "
@@ -3144,7 +3240,12 @@ class LTORetriever:
         src = record['stored_path']
         dst = self._unique_dest(record['file_name'])
         print(f"\n[RESTORE] Copying loose file: {record['file_name']}")
-        if _robocopy_file(src, dst):
+        _acquire_tape_io_lock(f"restore {record['file_name']}")
+        try:
+            ok = _robocopy_file(src, dst)
+        finally:
+            _release_tape_io_lock()
+        if ok:
             print(f"[RESTORE] Saved to: {dst}")
             _verify_restored_hash(dst, record)
         else:
@@ -3159,7 +3260,12 @@ class LTORetriever:
         print(f"[RESTORE] Step 1/3: Copying ZIP from tape to staging...")
 
         os.makedirs(self.staging_dir, exist_ok=True)
-        if not _robocopy_file(tape_zip_path, local_zip):
+        _acquire_tape_io_lock(f"restore {os.path.basename(tape_zip_path)}")
+        try:
+            ok = _robocopy_file(tape_zip_path, local_zip)
+        finally:
+            _release_tape_io_lock()
+        if not ok:
             print(f"[ERROR] Could not copy ZIP from tape: robocopy error")
             return
 
@@ -3192,7 +3298,12 @@ class LTORetriever:
         local_zip = os.path.join(self.staging_dir, os.path.basename(tape_zip_path))
         print(f"\n[RESTORE] Copying {os.path.basename(tape_zip_path)} from tape to staging...")
         os.makedirs(self.staging_dir, exist_ok=True)
-        if not _robocopy_file(tape_zip_path, local_zip):
+        _acquire_tape_io_lock(f"restore {os.path.basename(tape_zip_path)}")
+        try:
+            ok = _robocopy_file(tape_zip_path, local_zip)
+        finally:
+            _release_tape_io_lock()
+        if not ok:
             print(f"[ERROR] Could not copy ZIP from tape: robocopy error")
             return
         print(f"[RESTORE] Extracting {len(records)} file(s)...")
@@ -3486,15 +3597,20 @@ class LocalOrchestrator:
         return tape_label
 
     def _tape_root_is_empty(self):
+        _acquire_tape_io_lock(f"inspect tape root {self.cfg.lto_drive}")
         try:
-            return len(os.listdir(self.cfg.lto_drive)) == 0
-        except OSError as e:
-            print(f"[TAPE] Cannot inspect tape root: {e}")
-            return False
+            try:
+                return len(os.listdir(self.cfg.lto_drive)) == 0
+            except OSError as e:
+                print(f"[TAPE] Cannot inspect tape root: {e}")
+                return False
+        finally:
+            _release_tape_io_lock()
 
     def _ensure_chunk_fits_tape(self, tape_label, entries):
         planned_bytes = sum(e['dir_size_bytes'] for e in entries)
 
+        _acquire_tape_io_lock(f"read free space {self.cfg.lto_drive}")
         try:
             disk_free = shutil.disk_usage(self.cfg.lto_drive).free
             if planned_bytes > disk_free:
@@ -3504,6 +3620,8 @@ class LocalOrchestrator:
                 return False
         except OSError as e:
             print(f"[TAPE] Cannot read LTFS free space: {e}")
+        finally:
+            _release_tape_io_lock()
 
         tape = self.db.get_tape(tape_label)
         if not tape:
@@ -3693,6 +3811,7 @@ class RemoteOrchestrator:
         self.chunk_cap_bytes   = int(cfg.chunk_cap_gb * 1024**3)
         self.staging_max_bytes = int(cfg.staging_max_gb * 1024**3)
         self.prefetch_ahead    = cfg.prefetch_chunks_ahead
+        self.eject_after_pack  = cfg.eject_after_pack
         self.ssh_cipher        = cfg.ssh_cipher
         self.use_mbuffer       = cfg.use_mbuffer
         self.mbuffer_size      = cfg.mbuffer_size
@@ -3727,8 +3846,10 @@ class RemoteOrchestrator:
                 self._run_session(existing['session_id'])
                 return
             elif choice == '2':
-                self.db.update_remote_session(existing['session_id'], status='abandoned')
-                print(f"[REMOTE] Abandoned session: {existing['session_label']}")
+                print("[REMOTE] Starting a fresh-session scan. The current session "
+                      "will remain resumable until the replacement is approved.")
+                self._start_new_session(replacing_session=existing)
+                return
             else:
                 return
 
@@ -3755,7 +3876,7 @@ class RemoteOrchestrator:
             return self.remote_path
         return self.remote_path + '\n' + '\n'.join(self.remote_scan_paths)
 
-    def _start_new_session(self):
+    def _start_new_session(self, replacing_session=None):
         self._cleanup_remote_staging_dirs()
 
         tape_label = self._resolve_tape_label()
@@ -3790,8 +3911,20 @@ class RemoteOrchestrator:
               f"(staging budget: {self._chunk_budget() / 1024**3:.2f} GB each).")
 
         if not self._confirm_start(tape_label, len(manifest), total_bytes, len(chunks)):
-            print("[REMOTE] Cancelled before creating backup session.")
+            if replacing_session:
+                print("[REMOTE] Cancelled before creating backup session. "
+                      f"Previous session remains resumable: "
+                      f"{replacing_session['session_label']}")
+            else:
+                print("[REMOTE] Cancelled before creating backup session.")
             return
+
+        if replacing_session:
+            self.db.update_remote_session(
+                replacing_session['session_id'],
+                status='abandoned',
+            )
+            print(f"[REMOTE] Abandoned session: {replacing_session['session_label']}")
 
         session_id = self.db.create_remote_session(
             session_label=session_label,
@@ -4037,6 +4170,21 @@ class RemoteOrchestrator:
                     failed = True
                     break
                 completed += 1
+                if (self.eject_after_pack is not None and
+                        ci == self.eject_after_pack and
+                        ci != last_chunk):
+                    stop_pipeline.set()
+                    _status('REMOTE',
+                            f"Checkpoint reached after pack {ci:03d}; "
+                            "ejecting tape and saving session.")
+                    LTOBackup(
+                        self.db,
+                        self.cfg.ibm_eject_cmd,
+                        log_dir=self.cfg.backup_log_dir,
+                    ).eject_tape(self.cfg.lto_drive)
+                    print("\n[REMOTE] Checkpoint complete. Session saved - "
+                          "re-run option 6 to resume from the next pack.")
+                    return
         finally:
             stop_pipeline.set()
             hb_stop.set()
@@ -4610,6 +4758,7 @@ class TapeManager:
         print(f"\n[FORMAT] Running: cd /d \"{LTFS_DIR}\" && LtfsCmdFormat.exe {drive_letter} /N:{label}")
         print("[FORMAT] This may take several minutes...")
 
+        _acquire_tape_io_lock(f"format {self.tape_drive}")
         try:
             result = subprocess.run(cmd, check=True, text=True, capture_output=True,
                                     cwd=LTFS_DIR)
@@ -4634,6 +4783,8 @@ class TapeManager:
             self._print_invalid_medium_hint("Format", output)
         except FileNotFoundError:
             print(f"[ERROR] LtfsCmdFormat.exe not found in: {LTFS_DIR}")
+        finally:
+            _release_tape_io_lock()
 
     def register_tape(self):
         label = input("Volume label of tape to register: ").strip()
@@ -4651,6 +4802,7 @@ class TapeManager:
         print(f"\n[CHECK] Running: LtfsCmdCheck.exe {drive_letter}")
         self._print_drive_status("[CHECK]")
         print("[CHECK] This may take several minutes...")
+        _acquire_tape_io_lock(f"check {self.tape_drive}")
         try:
             result = subprocess.run(cmd, text=True, capture_output=True, cwd=LTFS_DIR)
             output = (result.stdout or '') + (result.stderr or '')
@@ -4663,6 +4815,8 @@ class TapeManager:
                 self._print_invalid_medium_hint("Check", output)
         except FileNotFoundError:
             print(f"[ERROR] LtfsCmdCheck.exe not found in: {LTFS_DIR}")
+        finally:
+            _release_tape_io_lock()
 
     def tape_info(self):
         """Run LtfsCmdDrives.exe to display connected tape drives and status."""
@@ -4678,7 +4832,7 @@ class TapeManager:
         except FileNotFoundError:
             print(f"[ERROR] LtfsCmdDrives.exe not found in: {LTFS_DIR}")
 
-    def eject_tape(self):
+    def _legacy_eject_tape_unlocked(self):
         """Run LtfsCmdEject.exe to safely eject the tape."""
         drive_arg = self.tape_drive.rstrip(":\\")
         exe       = self.ibm_eject_cmd or os.path.join(LTFS_DIR, 'LtfsCmdEject.exe')
@@ -4699,6 +4853,32 @@ class TapeManager:
             print(f"Try manually: cd /d \"{LTFS_DIR}\" && LtfsCmdEject.exe {drive_arg}")
         except FileNotFoundError:
             print(f"[ERROR] LtfsCmdEject.exe not found in: {LTFS_DIR}")
+
+
+    def eject_tape(self):
+        """Run LtfsCmdEject.exe to safely eject the tape."""
+        drive_arg = self.tape_drive.rstrip(":\\")
+        exe       = self.ibm_eject_cmd or os.path.join(LTFS_DIR, 'LtfsCmdEject.exe')
+        exe_dir   = os.path.dirname(exe) or LTFS_DIR
+        cmd       = [exe, drive_arg]
+        print("\n" + "#" * 60)
+        print("[LTO] Ejecting tape...")
+        print("[LTO] PLEASE WAIT - this can take 1-2 minutes.")
+        print("#" * 60)
+        _acquire_tape_io_lock(f"eject {self.tape_drive}")
+        try:
+            result = subprocess.run(cmd, check=True, text=True, capture_output=True,
+                                    cwd=exe_dir)
+            print("[LTO] Tape ejected successfully!")
+            if result.stdout:
+                print(result.stdout)
+        except subprocess.CalledProcessError as e:
+            print(f"[ERROR] Eject failed: {e.stderr}")
+            print(f"Try manually: cd /d \"{LTFS_DIR}\" && LtfsCmdEject.exe {drive_arg}")
+        except FileNotFoundError:
+            print(f"[ERROR] LtfsCmdEject.exe not found in: {LTFS_DIR}")
+        finally:
+            _release_tape_io_lock()
 
 
 # ==============================================================================
