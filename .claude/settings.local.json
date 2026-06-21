@@ -11,7 +11,10 @@
       "Bash(git commit -m ' *)",
       "PowerShell(py -m py_compile lto_archive_manager.py)",
       "PowerShell(if \\($?\\) { \"OK\" })",
-      "PowerShell($cmds = 'python3','python','py'; foreach \\($c in $cmds\\) { $p = Get-Command $c -ErrorAction SilentlyContinue; if \\($p\\) { \"$c -> $\\($p.Source\\)\" } })"
+      "PowerShell($cmds = 'python3','python','py'; foreach \\($c in $cmds\\) { $p = Get-Command $c -ErrorAction SilentlyContinue; if \\($p\\) { \"$c -> $\\($p.Source\\)\" } })",
+      "PowerShell(python -c \"import lto_archive_manager as m; p = m.generate_backup_summary\\('backup_logs'\\); print\\('WROTE:', p\\)\")",
+      "PowerShell(python _tmp_test_summary.py)",
+      "PowerShell(git -c core.quotepath=false diff --stat)"
     ]
   }
 }
