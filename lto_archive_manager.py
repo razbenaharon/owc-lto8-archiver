@@ -32,6 +32,13 @@ CONFIG_FILE  = "config.ini"
 LTFS_DIR     = r'C:\Program Files\IBM\LTFS'  # IBM LTFS tools must run from this directory
 APP_DIR      = os.path.dirname(os.path.abspath(__file__))
 BACKUP_LOG_DIR = os.path.join(APP_DIR, 'backup_logs')
+# Surfaced to the operator at the start of every tape-write run. Internal tape
+# I/O is serialized (see _acquire_tape_io_lock), but external processes are not.
+LTFS_WRITE_WARNING = (
+    "During archive writes, avoid browsing the LTFS drive or starting separate "
+    "copy jobs. Internal tape access is serialized, but external processes can "
+    "still degrade tape throughput."
+)
 LOCAL_TAPE_BUDGET_BYTES = int(11.5 * 1000**4)
 ROOT_FILES_GROUP = "_ROOT_FILES"
 AUTO_PACK_FILE_RATIO = 0.30
@@ -90,6 +97,21 @@ def _fmt_bytes(num):
         value /= 1024.0
 
 
+def _speed_str(num_bytes, seconds, with_rate=False):
+    """Human throughput like '220.4 MiB/s'; with_rate also appends GiB/h."""
+    try:
+        seconds = float(seconds or 0)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    if seconds <= 0:
+        return "n/a"
+    mib_s = (float(num_bytes or 0) / 1024**2) / seconds
+    if not with_rate:
+        return f"{mib_s:.1f} MiB/s"
+    gib_h = (float(num_bytes or 0) / 1024**3) / (seconds / 3600)
+    return f"{mib_s:.1f} MiB/s | {gib_h:.1f} GiB/h"
+
+
 def _safe_log_token(value, default='item'):
     text = str(value or '').strip()
     if text:
@@ -108,6 +130,45 @@ def _unique_path(path):
         if not os.path.exists(candidate):
             return candidate
     return f"{root}_{int(time.time() * 1000)}{ext}"
+
+
+def _write_source_missing_only_log(log_dir, session_id, chunk_index,
+                                   tape_label, missing_files):
+    """Write an audit log for a chunk with no remaining source files."""
+    try:
+        log_dir = os.path.abspath(log_dir or BACKUP_LOG_DIR)
+        os.makedirs(log_dir, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        tape_token = _safe_log_token(tape_label, 'tape')
+        name = (f"{timestamp}_{tape_token}_pack_{chunk_index:03d}"
+                "_source_missing.log")
+        log_path = _unique_path(os.path.join(log_dir, name))
+
+        def cell(value):
+            text = '' if value is None else str(value)
+            return text.replace('\t', ' ').replace('\r', ' ').replace('\n', ' ')
+
+        with open(log_path, 'w', encoding='utf-8', newline='\n') as f:
+            f.write("Remote Source-Missing Log\n")
+            f.write("=" * 60 + "\n")
+            f.write(f"Session id                  : {session_id}\n")
+            f.write(f"Chunk                       : {chunk_index + 1}\n")
+            f.write(f"Tape label                  : {tape_label}\n")
+            f.write("Status                      : completed_without_tape_write\n")
+            f.write(f"Source-missing files skipped: {len(missing_files)}\n")
+            f.write("\nSource-Missing Files Skipped\n")
+            f.write("-" * 60 + "\n")
+            f.write("manifest_id\tremote_path\tsize\n")
+            for item in missing_files:
+                f.write('\t'.join(cell(value) for value in (
+                    item.get('manifest_id'),
+                    item.get('remote_path'),
+                    item.get('file_size_bytes'),
+                )) + "\n")
+        return log_path
+    except Exception as e:
+        print(f"[LOG] Warning: could not write source-missing log: {e}")
+        return None
 
 
 def _progress_line(text):
@@ -698,6 +759,155 @@ def _dir_tree_size(path):
     return total
 
 
+def _parse_backup_log(path):
+    """Parse a per-pack backup .log into a flat {key: value} dict.
+
+    Reads only the header + Summary + Database Records sections and stops at the
+    File Manifest table (large, and every row contains colons). Returns None if
+    the file is not a recognizable backup log. Keys use the labels written by
+    LTOBackup._write_backup_log (e.g. 'Total time', 'Data copied')."""
+    fields = {}
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                if line.startswith('File Manifest'):
+                    break
+                key, sep, val = line.partition(':')
+                if not sep:
+                    continue
+                key = key.strip()
+                if key and key not in fields:
+                    fields[key] = val.strip()
+    except OSError:
+        return None
+    return fields if 'Total time' in fields else None
+
+
+def _summarize_log(name, fields):
+    """Build one cross-pack summary-table row from parsed log fields."""
+    def num(text):
+        m = re.search(r'[-+]?\d*\.?\d+', text or '')
+        return float(m.group()) if m else None
+
+    def bytes_of(text):
+        m = re.search(r'\((\d+)\s*bytes\)', text or '')
+        return int(m.group(1)) if m else None
+
+    total_min  = num(fields.get('Total time'))                 # "387.3 minutes"
+    data_label = (fields.get('Data copied') or '').split('(')[0].strip()
+    data_bytes = bytes_of(fields.get('Data copied'))
+    avg_speed  = fields.get('Average speed') or ''             # "220.4 MB/s"
+    robo       = (fields.get('Robocopy time') or '').strip()
+
+    window, sort_time = '', name
+    try:
+        ds = datetime.fromisoformat(fields['Started'])
+        de = datetime.fromisoformat(fields['Finished'])
+        window = f"{ds.strftime('%b %d %H:%M')} → {de.strftime('%b %d %H:%M')}"
+        sort_time = de.isoformat()
+    except (KeyError, ValueError):
+        pass
+
+    total_txt = f"{total_min:.1f} min ({total_min / 60:.1f} h)" if total_min else ''
+
+    robo_short = robo[2:] if robo.startswith('0:') else robo
+    tape_txt = avg_speed + (f" ({robo_short})" if robo_short else '')
+
+    e2e_txt = ''
+    if data_bytes and total_min:
+        e2e_txt = f"~{(data_bytes / 1024**3) / (total_min / 60):.1f} GiB/h"
+
+    rec = fields.get('Packed Records Inserted')
+    if rec is None:
+        total = sum(int(v) for k, v in fields.items()
+                    if k.endswith('Inserted') and v.strip().isdigit())
+        rec = str(total) if total else ''
+    try:
+        records_txt = f"{int(str(rec).strip()):,}" if str(rec).strip() else ''
+    except ValueError:
+        records_txt = str(rec)
+
+    m = re.search(r'pack[_-]?(\d+)', name, re.IGNORECASE)
+    if m:
+        pack, sort_pack = m.group(1), (0, int(m.group(1)))
+    else:
+        pack, sort_pack = os.path.splitext(name)[0], (1, 0)
+
+    return {
+        'pack': pack, 'window': window, 'total': total_txt, 'data': data_label,
+        'tape': tape_txt, 'e2e': e2e_txt, 'records': records_txt,
+        'fetch': fields.get('Fetch speed (remote->PC)') or '',
+        'dbsync': fields.get('DB sync time') or '',
+        'sort_pack': sort_pack, 'sort_time': sort_time,
+    }
+
+
+def generate_backup_summary(log_dir=None, output_name='SUMMARY.md'):
+    """(Re)write a Markdown table summarizing every per-pack log in log_dir.
+
+    Returns the output path, or None if no logs could be summarized. Never
+    raises on a single malformed log — it is skipped."""
+    log_dir = os.path.abspath(log_dir or BACKUP_LOG_DIR)
+    try:
+        names = [n for n in os.listdir(log_dir) if n.lower().endswith('.log')]
+    except OSError:
+        return None
+
+    rows = []
+    for name in names:
+        fields = _parse_backup_log(os.path.join(log_dir, name))
+        if not fields:
+            continue
+        try:
+            rows.append(_summarize_log(name, fields))
+        except Exception:
+            continue
+    if not rows:
+        return None
+
+    rows.sort(key=lambda r: (r['sort_pack'], r['sort_time']))
+    have_fetch  = any(r['fetch'] for r in rows)
+    have_dbsync = any(r['dbsync'] for r in rows)
+
+    headers = ['Pack', 'Window', 'Total job time', 'Data copied',
+               'Tape-write speed¹', 'End-to-end speed²', 'Records']
+    if have_fetch:
+        headers.append('Fetch speed³')
+    if have_dbsync:
+        headers.append('DB sync')
+
+    out = ['# LTO Backup Summary', '',
+           f'_Generated {datetime.now().strftime("%Y-%m-%d %H:%M")} from '
+           f'{len(rows)} log(s) in `{log_dir}`._', '',
+           '| ' + ' | '.join(headers) + ' |',
+           '|' + '|'.join('---' for _ in headers) + '|']
+    for r in rows:
+        cells = [r['pack'], r['window'], r['total'], r['data'],
+                 r['tape'], r['e2e'], r['records']]
+        if have_fetch:
+            cells.append(r['fetch'])
+        if have_dbsync:
+            cells.append(r['dbsync'])
+        out.append('| ' + ' | '.join(cells) + ' |')
+    out += ['',
+            '¹ Tape-write speed = data ÷ robocopy time (raw LTO write); '
+            'value in parens is robocopy duration.',
+            '² End-to-end speed = data ÷ total job time (covers fetch, '
+            'pack, DB sync, and tape write).']
+    if have_fetch:
+        out.append('³ Fetch speed = remote→PC throughput over SSH '
+                   '("internet speed").')
+    out.append('')
+
+    out_path = os.path.join(log_dir, output_name)
+    try:
+        with open(out_path, 'w', encoding='utf-8', newline='\n') as f:
+            f.write('\n'.join(out))
+    except OSError:
+        return None
+    return out_path
+
+
 def _has_command(name):
     return shutil.which(name) is not None
 
@@ -1070,7 +1280,12 @@ def _remote_tar_fetch(remote_user, remote_host, remote_base, rel_paths, local_de
         return False, str(e)
 
     # -b 512 -> 256 KiB records: fewer syscalls than tar's tiny default block.
-    tar_core = f"tar -C {shlex.quote(remote_base)} -b 512 -cf - --null -T -"
+    # Missing inputs are reported on stderr but do not abort the stream; the
+    # caller verifies every expected local file and records exact omissions.
+    tar_core = (
+        f"tar -C {shlex.quote(remote_base)} -b 512 "
+        "--ignore-failed-read -cf - --null -T -"
+    )
     if use_mbuffer:
         # Use mbuffer only if it exists on the remote; otherwise fall back to a
         # plain tar so a missing binary never fails the fetch. stdin (the NUL
@@ -1164,6 +1379,21 @@ def _remote_tar_fetch(remote_user, remote_host, remote_base, rel_paths, local_de
         if tar_rc != 0:
             parts.append(f"local tar exit {tar_rc}: {tar_err_text}")
         return False, '\n'.join(parts)
+
+    # --ignore-failed-read also suppresses nonzero exits for permission/read
+    # warnings. Only a genuinely missing input is recoverable; all other GNU
+    # tar warnings remain fatal. Non-tar SSH diagnostics retain their previous
+    # behavior and are ignored when the SSH process itself succeeded.
+    tar_diagnostics = [
+        line for line in ssh_err_text.splitlines()
+        if line.startswith('tar: ')
+    ]
+    fatal_warnings = [
+        line for line in tar_diagnostics
+        if not line.endswith('Warning: Cannot stat: No such file or directory')
+    ]
+    if fatal_warnings:
+        return False, "remote tar warning:\n" + '\n'.join(fatal_warnings)
     return True, ''
 
 
@@ -1397,7 +1627,12 @@ class DatabaseManager:
             # check_same_thread=False: the streaming pipeline updates the DB from
             # both the producer (fetch/pack) thread and the consumer (tape) thread.
             # self.lock serialises every write so the shared connection stays safe.
-            self.conn = sqlite3.connect(db_path, check_same_thread=False)
+            self.conn = sqlite3.connect(
+                db_path,
+                check_same_thread=False,
+                timeout=60,
+            )
+            self.conn.execute("PRAGMA busy_timeout = 60000")
         except (OSError, sqlite3.Error) as e:
             raise RuntimeError(
                 f"[DB] Cannot open database at: {db_path}\n"
@@ -1419,6 +1654,35 @@ class DatabaseManager:
         change does not exist. Callers pass a '[DB] ... not found' message."""
         if cur.rowcount == 0:
             raise RuntimeError(message)
+
+    def _commit_write(self, operation, description, attempts=5):
+        """Run one write transaction, retrying transient SQLite lock errors."""
+        for attempt in range(1, attempts + 1):
+            with self.lock:
+                try:
+                    result = operation()
+                    self.conn.commit()
+                    return result
+                except sqlite3.OperationalError as e:
+                    self.conn.rollback()
+                    locked = 'locked' in str(e).lower() or 'busy' in str(e).lower()
+                    if not locked or attempt == attempts:
+                        raise
+            wait_s = min(5, attempt)
+            print(f"[DB] Database busy during {description}; retrying in "
+                  f"{wait_s}s ({attempt}/{attempts})...")
+            time.sleep(wait_s)
+
+    def _update_manifest_batches(self, sql, params, description,
+                                 batch_size=5000):
+        """Apply large manifest updates without one commit per source file."""
+        params = list(params)
+        for offset in range(0, len(params), batch_size):
+            batch = params[offset:offset + batch_size]
+            self._commit_write(
+                lambda batch=batch: self.conn.executemany(sql, batch),
+                description,
+            )
 
     def _init_schema(self):
         self.conn.executescript("""
@@ -1537,7 +1801,8 @@ class DatabaseManager:
                 status          TEXT NOT NULL DEFAULT 'pending'
                     CHECK(status IN (
                         'pending','fetching','fetched','packing','packed',
-                        'backing','backed','done','fetch_failed','backup_failed'
+                        'backing','backed','done','source_missing',
+                        'fetch_failed','backup_failed'
                     )),
                 chunk_status    TEXT NOT NULL DEFAULT 'pending'
                     CHECK(chunk_status IN (
@@ -1551,6 +1816,106 @@ class DatabaseManager:
                 ON remote_manifest(session_id, chunk_index);
         """)
         self.conn.commit()
+
+        self._migrate_remote_manifest_source_missing()
+
+    def _migrate_remote_manifest_source_missing(self):
+        """Allow source_missing in databases created by older versions.
+
+        SQLite cannot alter a CHECK constraint in place, so rebuild the table
+        transactionally while preserving manifest IDs and all session state.
+        If an older migration attempt was interrupted after the table rename,
+        resume from the preserved remote_manifest_legacy table.
+        """
+        row = self.conn.execute(
+            """SELECT sql FROM sqlite_master
+               WHERE type = 'table' AND name = 'remote_manifest'"""
+        ).fetchone()
+        legacy_exists = self.conn.execute(
+            """SELECT 1 FROM sqlite_master
+               WHERE type = 'table' AND name = 'remote_manifest_legacy'"""
+        ).fetchone() is not None
+        if not row:
+            return
+        needs_schema_migration = 'source_missing' not in (row[0] or '')
+        if not needs_schema_migration and not legacy_exists:
+            return
+
+        action = "Recovering" if legacy_exists else "Migrating"
+        print(f"[DB] {action} remote manifest for source-missing file support...")
+        with self.lock:
+            try:
+                # Explicit BEGIN is required before DDL; otherwise an interrupt
+                # between ALTER TABLE and the first INSERT can leave an empty new
+                # table beside the still-intact legacy table.
+                self.conn.execute("BEGIN IMMEDIATE")
+                if not legacy_exists:
+                    self.conn.execute(
+                        "ALTER TABLE remote_manifest "
+                        "RENAME TO remote_manifest_legacy"
+                    )
+                    self.conn.execute("""
+                        CREATE TABLE remote_manifest (
+                            manifest_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                            session_id      INTEGER NOT NULL
+                                REFERENCES remote_sessions(session_id),
+                            chunk_index     INTEGER NOT NULL,
+                            remote_path     TEXT    NOT NULL,
+                            file_name       TEXT    NOT NULL,
+                            file_size_bytes INTEGER NOT NULL,
+                            local_rel_path  TEXT,
+                            status          TEXT NOT NULL DEFAULT 'pending'
+                                CHECK(status IN (
+                                    'pending','fetching','fetched','packing','packed',
+                                    'backing','backed','done','source_missing',
+                                    'fetch_failed','backup_failed'
+                                )),
+                            chunk_status    TEXT NOT NULL DEFAULT 'pending'
+                                CHECK(chunk_status IN (
+                                    'pending','fetching','packing','backing','done',
+                                    'fetch_failed','backup_failed'
+                                )),
+                            error_msg       TEXT,
+                            updated_at      DATETIME
+                        )
+                    """)
+
+                legacy_count = self.conn.execute(
+                    "SELECT COUNT(*) FROM remote_manifest_legacy"
+                ).fetchone()[0]
+                self.conn.execute("""
+                    INSERT OR IGNORE INTO remote_manifest (
+                        manifest_id, session_id, chunk_index, remote_path,
+                        file_name, file_size_bytes, local_rel_path, status,
+                        chunk_status, error_msg, updated_at
+                    )
+                    SELECT manifest_id, session_id, chunk_index, remote_path,
+                           file_name, file_size_bytes, local_rel_path, status,
+                           chunk_status, error_msg, updated_at
+                    FROM remote_manifest_legacy
+                """)
+                restored_count = self.conn.execute(
+                    "SELECT COUNT(*) FROM remote_manifest"
+                ).fetchone()[0]
+                if restored_count != legacy_count:
+                    raise RuntimeError(
+                        "[DB] Remote manifest migration count mismatch: "
+                        f"legacy={legacy_count}, restored={restored_count}"
+                    )
+
+                self.conn.execute(
+                    "DROP INDEX IF EXISTS idx_remote_manifest_session_chunk"
+                )
+                self.conn.execute("DROP TABLE remote_manifest_legacy")
+                self.conn.execute("""
+                    CREATE INDEX idx_remote_manifest_session_chunk
+                        ON remote_manifest(session_id, chunk_index)
+                """)
+                self.conn.commit()
+            except BaseException:
+                self.conn.rollback()
+                raise
+        print("[DB] Remote manifest migration complete.")
 
     def create_remote_session(self, session_label, remote_host, remote_user,
                                remote_path, tape_label, staging_dir):
@@ -1611,25 +1976,61 @@ class DatabaseManager:
         kwargs['updated_at'] = datetime.now().isoformat()
         sets = ', '.join(f"{k} = ?" for k in kwargs)
         vals = list(kwargs.values()) + [manifest_id]
-        with self.lock:
-            cur = self.conn.execute(
+        cur = self._commit_write(
+            lambda: self.conn.execute(
                 f"UPDATE remote_manifest SET {sets} WHERE manifest_id = ?", vals
-            )
-            self._require_updated(cur, f"[DB] Remote manifest row not found: {manifest_id}")
-            self.conn.commit()
+            ),
+            f"manifest row {manifest_id} update",
+        )
+        self._require_updated(cur, f"[DB] Remote manifest row not found: {manifest_id}")
+
+    def update_manifest_rows_fetching(self, manifest_ids):
+        now = datetime.now().isoformat()
+        self._update_manifest_batches(
+            """UPDATE remote_manifest
+               SET status = 'fetching', error_msg = NULL, updated_at = ?
+               WHERE manifest_id = ?""",
+            ((now, manifest_id) for manifest_id in manifest_ids),
+            "manifest fetching-status batch",
+        )
+
+    def update_manifest_rows_fetched(self, rows):
+        """rows contains (local_rel_path, manifest_id) pairs."""
+        now = datetime.now().isoformat()
+        self._update_manifest_batches(
+            """UPDATE remote_manifest
+               SET status = 'fetched', local_rel_path = ?, error_msg = NULL,
+                   updated_at = ?
+               WHERE manifest_id = ?""",
+            ((local_rel_path, now, manifest_id)
+             for local_rel_path, manifest_id in rows),
+            "manifest fetched-status batch",
+        )
+
+    def update_manifest_rows_fetch_failed(self, manifest_ids, error_msg):
+        now = datetime.now().isoformat()
+        error_msg = (error_msg or '')[:500]
+        self._update_manifest_batches(
+            """UPDATE remote_manifest
+               SET status = 'fetch_failed', error_msg = ?, updated_at = ?
+               WHERE manifest_id = ?""",
+            ((error_msg, now, manifest_id) for manifest_id in manifest_ids),
+            "manifest fetch-failure batch",
+        )
 
     def update_chunk_status(self, session_id, chunk_index, status):
-        with self.lock:
-            cur = self.conn.execute(
+        cur = self._commit_write(
+            lambda: self.conn.execute(
                 """UPDATE remote_manifest SET chunk_status = ?, updated_at = ?
                    WHERE session_id = ? AND chunk_index = ?""",
                 (status, datetime.now().isoformat(), session_id, chunk_index)
-            )
-            self._require_updated(
-                cur,
-                f"[DB] Remote chunk not found: session {session_id}, chunk {chunk_index}"
-            )
-            self.conn.commit()
+            ),
+            f"chunk {chunk_index + 1} status update",
+        )
+        self._require_updated(
+            cur,
+            f"[DB] Remote chunk not found: session {session_id}, chunk {chunk_index}"
+        )
 
     def get_pending_chunks(self, session_id):
         rows = self.conn.execute(
@@ -2462,6 +2863,7 @@ class LTOBackup:
             log_path = _unique_path(os.path.join(log_dir, '_'.join(name_parts) + '.log'))
             rc_sum = details.get('rc_sum') or {}
             counts = details.get('record_counts') or {}
+            source_missing_files = details.get('source_missing_files') or []
             mode = 'staged/packed' if packer_metadata is not None else 'direct'
 
             def cell(value):
@@ -2502,13 +2904,52 @@ class LTOBackup:
                     write_kv(f, "Robocopy time", rc_sum.get('elapsed'))
                 write_kv(f, "Loose files hashed", len(hash_map))
                 write_kv(f, "Already on tape", details.get('skipped', 0))
+                write_kv(f, "Source-missing files skipped",
+                         len(source_missing_files))
                 write_kv(f, "Tape used after backup", f"{_fmt_bytes(details['new_used'])} ({details['new_used']} bytes)")
+
+                # Per-phase timing & throughput. Present only for the staged/packed
+                # pipeline (omitted for direct/local backups). Fetch and pack run
+                # in the producer and overlap the *previous* chunk's tape write, so
+                # these phases need not sum to Total time.
+                fetch_s = details.get('fetch_seconds')
+                if fetch_s is not None:
+                    fetch_b = details.get('fetch_bytes') or 0
+                    write_kv(f, "Fetch time", f"{fetch_s / 60:.1f} minutes")
+                    write_kv(f, "Fetched data", f"{_fmt_bytes(fetch_b)} ({fetch_b} bytes)")
+                    write_kv(f, "Fetch speed (remote->PC)", _speed_str(fetch_b, fetch_s))
+                pack_s = details.get('pack_seconds')
+                if pack_s is not None:
+                    pack_b = details.get('pack_bytes') or 0
+                    write_kv(f, "Pack time", f"{pack_s / 60:.1f} minutes")
+                    write_kv(f, "Pack speed", _speed_str(pack_b, pack_s))
+                db_s = details.get('db_sync_seconds')
+                if db_s is not None:
+                    write_kv(f, "DB sync time", f"{db_s / 60:.1f} minutes")
+                total_secs = details.get('total_time_seconds')
+                if total_secs:
+                    write_kv(f, "End-to-end speed",
+                             _speed_str(details.get('copied_bytes'), total_secs, with_rate=True))
+                if fetch_s is not None or pack_s is not None:
+                    f.write("  (fetch/pack overlap the previous chunk's tape write; "
+                            "phases need not sum to Total time)\n")
 
                 if counts:
                     f.write("\nDatabase Records\n")
                     f.write("-" * 60 + "\n")
                     for key in sorted(counts):
                         write_kv(f, key.replace('_', ' ').title(), counts[key])
+
+                if source_missing_files:
+                    f.write("\nSource-Missing Files Skipped\n")
+                    f.write("-" * 60 + "\n")
+                    f.write("manifest_id\tremote_path\tsize\n")
+                    for item in source_missing_files:
+                        f.write('\t'.join(cell(value) for value in (
+                            item.get('manifest_id'),
+                            item.get('remote_path'),
+                            item.get('file_size_bytes'),
+                        )) + "\n")
 
                 f.write("\nFile Manifest\n")
                 f.write("-" * 60 + "\n")
@@ -2619,7 +3060,8 @@ class LTOBackup:
 
     def run(self, source, tape_drive, tape_label, packer_metadata=None,
             exclude_file_paths=None, exclude_dir_paths=None,
-            local_session_id=None, local_chunk_index=None):
+            local_session_id=None, local_chunk_index=None, stage_stats=None):
+        print(f"[WARNING] {LTFS_WRITE_WARNING}")
         _acquire_tape_io_lock(f"backup write to {tape_drive}")
         try:
             return self._run_locked(
@@ -2629,13 +3071,15 @@ class LTOBackup:
                 exclude_dir_paths=exclude_dir_paths,
                 local_session_id=local_session_id,
                 local_chunk_index=local_chunk_index,
+                stage_stats=stage_stats,
             )
         finally:
             _release_tape_io_lock()
 
     def _run_locked(self, source, tape_drive, tape_label, packer_metadata=None,
                     exclude_file_paths=None, exclude_dir_paths=None,
-                    local_session_id=None, local_chunk_index=None):
+                    local_session_id=None, local_chunk_index=None,
+                    stage_stats=None):
         """
         Copy files from source to tape and commit to the database.
 
@@ -2870,6 +3314,8 @@ class LTOBackup:
                     'new_used': new_used,
                     'rc_sum': rc_sum,
                     'record_counts': {},
+                    'source_missing_files':
+                        (stage_stats or {}).get('source_missing_files', []),
                 },
                 packer_metadata,
                 hash_map,
@@ -2895,6 +3341,7 @@ class LTOBackup:
         # ---------------------------------------------------------------
         # Phase 3 — DB inserts (only files that were hashed / new this run)
         # ---------------------------------------------------------------
+        db_sync_start = time.perf_counter()
         if packer_metadata is None:
             # Direct backup: every hashed file is a loose tape record
             recovered_count = 0
@@ -3018,6 +3465,8 @@ class LTOBackup:
                 print(f"[DB] Recovered {recovered_count} existing loose file record(s).")
             print(f"[DB] {packed_count} packed file record(s) synchronized.")
 
+        db_sync_seconds = time.perf_counter() - db_sync_start
+
         # The robocopy summary parser is English-only; on a localized console
         # it yields 0 bytes. Fall back to the measured growth of the tape
         # directory so used-space accounting still works.
@@ -3053,6 +3502,13 @@ class LTOBackup:
                 'new_used': new_used,
                 'rc_sum': rc_sum,
                 'record_counts': dict(record_counts),
+                'db_sync_seconds': db_sync_seconds,
+                'fetch_seconds': (stage_stats or {}).get('fetch_seconds'),
+                'fetch_bytes':   (stage_stats or {}).get('fetch_bytes'),
+                'pack_seconds':  (stage_stats or {}).get('pack_seconds'),
+                'pack_bytes':    (stage_stats or {}).get('pack_bytes'),
+                'source_missing_files':
+                    (stage_stats or {}).get('source_missing_files', []),
             },
             packer_metadata,
             hash_map,
@@ -3061,6 +3517,12 @@ class LTOBackup:
             robocopy_cmd,
             rc,
         )
+        try:
+            summary_path = generate_backup_summary(self.log_dir or BACKUP_LOG_DIR)
+            if summary_path:
+                print(f"[REPORT] Backup summary updated: {summary_path}")
+        except Exception as e:
+            print(f"[REPORT] Could not update backup summary: {e}")
         print("\n" + "=" * 60)
         print("BACKUP SESSION SUMMARY  [Robocopy]")
         print("=" * 60)
@@ -3070,6 +3532,8 @@ class LTOBackup:
         print(f"Avg Speed       : {rc_sum['speed_mbs']:.1f} MB/s")
         print(f"Files Copied    : {rc_sum['files_copied']}")
         print(f"Files Skipped   : {rc_sum['files_skipped'] + skipped}")
+        print(f"Source Missing  : "
+              f"{len((stage_stats or {}).get('source_missing_files', []))}")
         print(f"Files Failed    : {rc_sum['files_failed']}")
         if rc_sum['elapsed']:
             print(f"Robocopy Time   : {rc_sum['elapsed']}")
@@ -4107,6 +4571,7 @@ class RemoteOrchestrator:
                            f"({done_count}/{total_chunks} already done) | prefetch "
                            f"{self.prefetch_ahead} ahead | staging cap "
                            f"{self.staging_max_bytes / 1024**3:.0f} GB")
+        print(f"[WARNING] {LTFS_WRITE_WARNING}")
 
         chunk_files_map = {ci: self.db.get_chunk_files(session_id, ci)
                            for ci in pending_chunks}
@@ -4256,7 +4721,11 @@ class RemoteOrchestrator:
 
         # --- FETCH (remote -> PC) ---
         self.db.update_chunk_status(session_id, chunk_index, 'fetching')
-        if not self._fetch_chunk(session_id, chunk_index, chunk_files, fetch_dir):
+        fetch_start = time.perf_counter()
+        fetch_ok, source_missing_files, fetched_file_count = self._fetch_chunk(
+            session_id, chunk_index, chunk_files, fetch_dir
+        )
+        if not fetch_ok:
             if not CANCEL.is_set():
                 self.db.update_chunk_status(session_id, chunk_index, 'fetch_failed')
             self._cleanup_dir(fetch_dir)
@@ -4264,6 +4733,27 @@ class RemoteOrchestrator:
         if CANCEL.is_set():
             self._cleanup_dir(fetch_dir)
             return None
+        fetch_seconds = time.perf_counter() - fetch_start
+        fetch_bytes   = _dir_tree_size(fetch_dir)   # raw remote->PC payload
+
+        if fetched_file_count == 0:
+            self._cleanup_dir(fetch_dir)
+            self._cleanup_dir(pack_dir)
+            _status('REMOTE', f"Chunk {chunk_index + 1}: all source files are "
+                               "missing; no tape write is required.")
+            return {
+                'chunk_index': chunk_index,
+                'fetch_dir': fetch_dir,
+                'pack_dir': pack_dir,
+                'metadata': [],
+                'staged_bytes': 0,
+                'fetch_seconds': fetch_seconds,
+                'fetch_bytes': fetch_bytes,
+                'pack_seconds': 0,
+                'pack_bytes': 0,
+                'source_missing_files': source_missing_files,
+                'skip_tape': True,
+            }
 
         # --- PACK (small files -> ZIP, large files staged loose) ---
         self.db.update_chunk_status(session_id, chunk_index, 'packing')
@@ -4272,6 +4762,7 @@ class RemoteOrchestrator:
         self._cleanup_dir(pack_dir)
         _phase('PACK', f"Packing chunk {chunk_index + 1}: "
                        f"small files -> ZIP, large files staged loose")
+        pack_start = time.perf_counter()
         try:
             metadata = LTOPacker(self.cfg.max_zip_size_gb).run(
                 source=fetch_dir,
@@ -4295,6 +4786,8 @@ class RemoteOrchestrator:
             self._cleanup_dir(pack_dir)
             return None
 
+        pack_seconds = time.perf_counter() - pack_start
+
         # Free the raw fetched copy now that packing is done — this halves the
         # per-chunk staging footprint so the prefetch buffer stays under the cap.
         self._cleanup_dir(fetch_dir)
@@ -4305,11 +4798,20 @@ class RemoteOrchestrator:
         _status('PIPELINE', f"Chunk {chunk_index + 1} staged & ready "
                             f"({staged_bytes / 1024**3:.1f} GB) — queued for tape.")
         return {
-            'chunk_index':  chunk_index,
-            'fetch_dir':    fetch_dir,
-            'pack_dir':     pack_dir,
-            'metadata':     metadata,
-            'staged_bytes': staged_bytes,
+            'chunk_index':   chunk_index,
+            'fetch_dir':     fetch_dir,
+            'pack_dir':      pack_dir,
+            'metadata':      metadata,
+            'staged_bytes':  staged_bytes,
+            # Per-phase producer timings, surfaced in the per-pack log. Fetch and
+            # pack overlap the *previous* chunk's tape write, so they need not sum
+            # to the consumer-measured Total time.
+            'fetch_seconds': fetch_seconds,
+            'fetch_bytes':   fetch_bytes,
+            'pack_seconds':  pack_seconds,
+            'pack_bytes':    staged_bytes,
+            'source_missing_files': source_missing_files,
+            'skip_tape': False,
         }
 
     def _discard_desc(self, desc):
@@ -4328,6 +4830,27 @@ class RemoteOrchestrator:
         self._consumer_chunk = chunk_index
         pack_dir = desc['pack_dir']
 
+        if desc.get('skip_tape'):
+            log_path = _write_source_missing_only_log(
+                self.cfg.backup_log_dir,
+                session_id,
+                chunk_index,
+                tape_label,
+                desc.get('source_missing_files') or [],
+            )
+            self.db.update_chunk_status(session_id, chunk_index, 'done')
+            self._cleanup_dir(desc['fetch_dir'])
+            self._cleanup_dir(pack_dir)
+            if log_path:
+                print(f"[REMOTE] Source-missing log: {log_path}")
+            if eject_after:
+                LTOBackup(
+                    self.db,
+                    self.cfg.ibm_eject_cmd,
+                    log_dir=self.cfg.backup_log_dir,
+                ).eject_tape(self.cfg.lto_drive)
+            return True
+
         self.db.update_chunk_status(session_id, chunk_index, 'backing')
         # _NoEjectBackup keeps the tape mounted; eject only after the final chunk.
         backup_cls = LTOBackup if eject_after else _NoEjectBackup
@@ -4340,6 +4863,7 @@ class RemoteOrchestrator:
                 tape_drive=self.cfg.lto_drive,
                 tape_label=tape_label,
                 packer_metadata=desc['metadata'],
+                stage_stats=desc,
             )
         except Exception as e:
             if CANCEL.is_set():
@@ -4402,15 +4926,27 @@ class RemoteOrchestrator:
     def _fetch_chunk(self, session_id, chunk_index, chunk_files, fetch_dir):
         os.makedirs(fetch_dir, exist_ok=True)
         total_chunks = self.db.count_chunks(session_id)
+        source_missing_files = []
+        fetched_file_count = 0
         records = []
         pending = []        # primary files: extracted at their sanitized path
         collisions = []     # renamed files: fetched individually, then moved
         claimed = {}        # case-folded local_rel -> remote rel that owns it
+        fetching_ids = []
 
         for row in chunk_files:
             remote_fpath = row['remote_path']
             fsize        = row['file_size_bytes']
             manifest_id  = row['manifest_id']
+
+            if row['status'] == 'source_missing':
+                source_missing_files.append({
+                    'manifest_id': manifest_id,
+                    'remote_path': remote_fpath,
+                    'file_size_bytes': fsize,
+                })
+                print(f"[REMOTE] Skip (source already missing): {remote_fpath}")
+                continue
 
             try:
                 remote_base, rel = _remote_fetch_base_and_rel(
@@ -4423,7 +4959,7 @@ class RemoteOrchestrator:
                     error_msg=str(e),
                 )
                 print(f"[REMOTE] Invalid remote path: {e}")
-                return False
+                return False, source_missing_files, fetched_file_count
 
             # rel is the true remote path (sent verbatim to remote tar); the
             # local copy lands under the name the Windows extractor can write.
@@ -4449,17 +4985,16 @@ class RemoteOrchestrator:
                 try:
                     if os.path.getsize(local_path) == fsize:
                         print(f"[REMOTE] Skip (already fetched): {rel}")
-                        self.db.update_manifest_row(manifest_id, status='fetched',
-                                                    local_rel_path=local_rel,
-                                                    error_msg=None)
                         continue
                     os.remove(local_path)  # partial file from interrupted run
                 except OSError:
                     pass
 
-            self.db.update_manifest_row(manifest_id, status='fetching')
+            fetching_ids.append(manifest_id)
             (collisions if collided else pending).append(
                 (row, remote_base, rel, local_rel, local_path))
+
+        self.db.update_manifest_rows_fetching(fetching_ids)
 
         if pending or collisions:
             todo_bytes = sum(row['file_size_bytes']
@@ -4482,7 +5017,7 @@ class RemoteOrchestrator:
             try:
                 for remote_base, base_pending in pending_by_base.items():
                     if CANCEL.is_set():
-                        return False
+                        return False, source_missing_files, fetched_file_count
                     ok, err = _remote_tar_fetch(
                         self.remote_user,
                         self.remote_host,
@@ -4497,22 +5032,20 @@ class RemoteOrchestrator:
                     )
                     if not ok:
                         if CANCEL.is_set():
-                            return False
+                            return False, source_missing_files, fetched_file_count
                         print(f"\n[REMOTE] Tar fetch failed:\n{err}")
-                        for row, rel, _ in base_pending:
-                            self.db.update_manifest_row(
-                                row['manifest_id'],
-                                status='fetch_failed',
-                                error_msg=err[:500],
-                            )
-                        return False
+                        self.db.update_manifest_rows_fetch_failed(
+                            (row['manifest_id'] for row, _, _ in base_pending),
+                            err,
+                        )
+                        return False, source_missing_files, fetched_file_count
 
                 # Renamed files can't ride the shared stream (bsdtar would
                 # extract them onto the primary's path), so fetch each alone
                 # into an isolated dir and move it to its disambiguated name.
                 if collisions and not self._fetch_collisions(
-                        collisions, fetch_dir):
-                    return False
+                        collisions, fetch_dir, source_missing_files):
+                    return False, source_missing_files, fetched_file_count
             finally:
                 fetch_stop.set()
                 _progress_done()
@@ -4520,17 +5053,31 @@ class RemoteOrchestrator:
             print(f"[REMOTE] Chunk {chunk_index + 1}/{total_chunks}: "
                   "all files already fetched.")
 
+        source_missing_ids = {
+            item['manifest_id'] for item in source_missing_files
+        }
+        fetched_updates = []
         for row, _, rel, local_rel, local_path in records:
             fsize       = row['file_size_bytes']
             manifest_id = row['manifest_id']
+            if manifest_id in source_missing_ids:
+                continue
             if not os.path.exists(local_path):
-                print(f"[REMOTE] Missing after fetch: {rel}")
+                detail = {
+                    'manifest_id': manifest_id,
+                    'remote_path': row['remote_path'],
+                    'file_size_bytes': fsize,
+                }
+                source_missing_files.append(detail)
+                source_missing_ids.add(manifest_id)
+                print(f"[REMOTE] Source missing; skipped: {row['remote_path']}")
                 self.db.update_manifest_row(
                     manifest_id,
-                    status='fetch_failed',
+                    status='source_missing',
+                    local_rel_path=None,
                     error_msg="missing after tar fetch",
                 )
-                return False
+                continue
 
             try:
                 actual = os.path.getsize(local_path)
@@ -4540,7 +5087,7 @@ class RemoteOrchestrator:
                     status='fetch_failed',
                     error_msg=f"stat failed: {e}",
                 )
-                return False
+                return False, source_missing_files, fetched_file_count
 
             if actual != fsize:
                 print(f"[REMOTE] Size mismatch for {rel}: "
@@ -4554,20 +5101,20 @@ class RemoteOrchestrator:
                     status='fetch_failed',
                     error_msg=f"size mismatch: expected {fsize}, got {actual}",
                 )
-                return False
+                return False, source_missing_files, fetched_file_count
 
-            self.db.update_manifest_row(manifest_id, status='fetched',
-                                        local_rel_path=local_rel,
-                                        error_msg=None)
-        return True
+            fetched_updates.append((local_rel, manifest_id))
+        self.db.update_manifest_rows_fetched(fetched_updates)
+        fetched_file_count = len(fetched_updates)
+        return True, source_missing_files, fetched_file_count
 
-    def _fetch_collisions(self, collisions, fetch_dir):
+    def _fetch_collisions(self, collisions, fetch_dir, source_missing_files):
         """Fetch files whose sanitized name clashed with another file's.
 
         Each is streamed alone into a private temp dir (where bsdtar writes it
         at its natural sanitized path) and then moved to the disambiguated
-        local_path. Returns False on the first failure, leaving the row marked
-        fetch_failed for the caller to surface."""
+        local_path. Missing sources are accumulated and skipped; other failures
+        leave the row marked fetch_failed for the caller to surface."""
         collide_root = os.path.join(fetch_dir, '_collide')
         try:
             for row, remote_base, rel, _local_rel, local_path in collisions:
@@ -4602,11 +5149,18 @@ class RemoteOrchestrator:
                 natural = os.path.join(
                     tmp, _winsafe_extracted_rel(rel).replace('/', os.sep))
                 if not os.path.exists(natural):
-                    print(f"[REMOTE] Missing after fetch (renamed file): {rel}")
+                    detail = {
+                        'manifest_id': row['manifest_id'],
+                        'remote_path': row['remote_path'],
+                        'file_size_bytes': row['file_size_bytes'],
+                    }
+                    source_missing_files.append(detail)
+                    print(f"[REMOTE] Source missing; skipped: {row['remote_path']}")
                     self.db.update_manifest_row(
-                        row['manifest_id'], status='fetch_failed',
+                        row['manifest_id'], status='source_missing',
+                        local_rel_path=None,
                         error_msg="missing after tar fetch")
-                    return False
+                    continue
 
                 os.makedirs(os.path.dirname(local_path), exist_ok=True)
                 try:
@@ -5236,6 +5790,7 @@ def main():
         print("  5. Open config.ini")
         print("  6. Remote Archive — Fetch from remote host & backup to LTO")
         print("  7. Database Management — Edit / delete tape & file records")
+        print("  8. Backup Summary — Regenerate backup_logs/SUMMARY.md report")
         print("  0. Exit")
         print("-" * 60)
 
@@ -5310,6 +5865,13 @@ def main():
 
         elif choice == '7':
             _db_management_menu(db)
+
+        elif choice == '8':
+            path = generate_backup_summary(cfg.backup_log_dir)
+            if path:
+                print(f"[REPORT] Backup summary written: {path}")
+            else:
+                print("[REPORT] No backup logs found to summarize.")
 
         elif choice == '0':
             print("Goodbye.")
