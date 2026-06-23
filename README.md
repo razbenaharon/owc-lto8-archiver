@@ -21,16 +21,21 @@ A Python CLI for archiving files to LTO tape using an OWC Mercury Pro LTO-8 driv
 - OpenSSH client tools for remote archive mode
 - `customtkinter` (required only for the DB Inspector GUI): `pip install customtkinter`
 
-The `Framework & Drivers` folder in this repo contains the installers used during setup:
-- `IBM_LTFS_SDE_2.4.8.1.10519_x64.exe`
-- ThunderLink SH-3128 HBA driver + release notes
-- Visual C++ redistributable and .NET 4.0 (LTFS dependencies)
+These installers are **not** bundled in this repository (they are proprietary). Download
+them from the vendors and, if you wish, keep them in a local `Framework & Drivers\`
+folder (gitignored):
+
+- IBM LTFS SDE — from IBM support (link above)
+- ThunderLink SH-3128 HBA driver + release notes — from ATTO
+- Visual C++ redistributable and .NET Framework 4.0 — from Microsoft (LTFS dependencies)
 
 ## Setup
 
-1. Install IBM LTFS SDE and the HBA driver from `Framework & Drivers\`.
+1. Install IBM LTFS SDE and the HBA driver (download links above).
 2. Format a tape and mount it so it appears as a drive letter (e.g. `E:\`).
-3. Run the script once to generate a default `config.ini`, then edit it:
+3. Copy `config.example.ini` to `config.ini` and edit it (your `config.ini` is
+   gitignored). For remote archive, also copy `.env.example` to `.env` and set
+   `REMOTE_PASSWORD` there. Key fields:
 
 ```ini
 [PATHS]
