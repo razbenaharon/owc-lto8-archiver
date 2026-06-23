@@ -11,7 +11,13 @@ source/
 staging/
 restored/
 backup_logs/
-lto_archive.db
+lto_archive*.db
+
+# Local config — contains host/user/paths. Use config.example.ini as template.
+config.ini
+
+# Vendor drivers/installers — proprietary, not redistributed (see README).
+Framework & Drivers/
 
 # Secrets — real credentials live here, never commit them
 .env
