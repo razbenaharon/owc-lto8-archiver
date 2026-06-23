@@ -7,9 +7,15 @@ in a local SQLite database.
 
 ## Project Structure & Module Organization
 
-- `lto_archive_manager.py` — main CLI: local archive, remote archive, restore, tape
-  maintenance, packing, database updates, and the backup-summary report.
-- `db_inspector.py` — GUI database inspector/editor.
+- `run.py` — root runner for the main CLI (chdir to the project root, then
+  `src.cli.main()`).
+- `inspect_db.py` — root runner for the GUI database inspector.
+- `src/` — internal package holding the application code, split into modules with
+  strictly downward dependencies: `constants` → `runtime` → `paths` →
+  `reporting`/`config`/`db` → `robocopy`/`remote_transport` → `ltfs` → `packer`
+  → `backup`/`retriever` → `orchestrators` → `cli`; `src/db_inspector.py` holds
+  the GUI. Data files (`config.ini`, `.env`, `lto_archive.db`, `backup_logs/`)
+  stay in the project root; `src/constants.py` anchors paths to `PROJECT_ROOT`.
 - `config.ini` — local paths, tape drive settings, remote archive settings, and
   performance tuning. `.env` stores secrets (e.g. `remote_password`); keep it
   untracked and use `.env.example` as the template.
@@ -21,9 +27,9 @@ in a local SQLite database.
 
 ```powershell
 python -m pip install -r requirements.txt          # set up / update the environment
-python -m py_compile lto_archive_manager.py db_inspector.py   # syntax check before handoff
-python lto_archive_manager.py                       # run the main application
-python db_inspector.py                              # run the database inspector
+python -m py_compile src/*.py run.py inspect_db.py  # syntax check before handoff
+python run.py                                        # run the main application
+python inspect_db.py                                # run the database inspector
 ```
 
 ## Coding Style & Naming Conventions
@@ -81,7 +87,7 @@ Use concise, imperative commit messages, optionally prefixed `fix:`, `feat:`,
 `refactor:`, or `chore:` (e.g. `fix: handle Windows-illegal chars in remote fetch
 paths + collision guard`). PRs should state: purpose, risk level, commands run,
 hardware/manual verification if relevant, and any database/config changes. For
-`db_inspector.py` UI changes, include a screenshot or short behavior description.
+`src/db_inspector.py` UI changes, include a screenshot or short behavior description.
 
 ## Security & Operations Notes
 
@@ -90,5 +96,6 @@ hardware/manual verification if relevant, and any database/config changes. For
 - **During archive writes, avoid browsing the LTFS drive or starting separate copy
   jobs.** Internal tape access is serialized (`_acquire_tape_io_lock`), but external
   processes can still degrade tape throughput. This is enforced as guidance only —
-  it is printed as a `[WARNING]` (`LTFS_WRITE_WARNING`) at the start of every
-  tape-write run and at remote-pipeline start.
+  it is printed as a `[WARNING]` (`LTFS_WRITE_WARNING`, defined in
+  `src/constants.py`) at the start of every tape-write run and at remote-pipeline
+  start.
