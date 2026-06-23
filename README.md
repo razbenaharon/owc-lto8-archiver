@@ -58,10 +58,10 @@ staging_fill_pct = 0.80
 
 ```
 # CLI (no extra dependencies)
-python lto_archive_manager.py
+python run.py
 
 # Database Inspector GUI (requires customtkinter)
-python db_inspector.py
+python inspect_db.py
 ```
 
 ### Main Menu
@@ -137,10 +137,10 @@ When restoring multiple files from the same ZIP bundle, the bundle is copied fro
 
 ## Database Inspector GUI
 
-`db_inspector.py` is a standalone dark-theme GUI (CustomTkinter) for browsing and editing the SQLite archive index without using the CLI.
+`inspect_db.py` launches a dark-theme GUI (CustomTkinter), implemented in `src/db_inspector.py`, for browsing and editing the SQLite archive index without using the CLI.
 
 ```
-python db_inspector.py
+python inspect_db.py
 ```
 
 **Tapes tab** — lists all registered tapes with capacity bars and file counts. Select a tape to enable:

@@ -1141,21 +1141,3 @@ class DBInspectorApp(ctk.CTk):
 # ==============================================================================
 # ENTRY POINT
 # ==============================================================================
-
-if __name__ == "__main__":
-    os.chdir(os.path.dirname(os.path.abspath(__file__)))
-
-    from lto_archive_manager import ConfigManager, DatabaseManager
-
-    cfg = ConfigManager()
-    db  = DatabaseManager(cfg.db_path)
-
-    ctk.set_appearance_mode("dark")
-    ctk.set_default_color_theme("dark-blue")
-    ctk.set_widget_scaling(1.25)
-
-    app = DBInspectorApp(db, cfg.db_path)
-    try:
-        app.mainloop()
-    finally:
-        db.close()
