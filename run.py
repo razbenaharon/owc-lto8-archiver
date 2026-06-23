@@ -15,9 +15,25 @@ os.chdir(PROJECT_ROOT)
 
 from src.cli import main
 
+
+def _run_maintenance():
+    from src.config import ConfigManager
+    from src.maintenance import DatabaseOptimizer, inspect_legacy_database
+
+    cfg = ConfigManager()
+    dry_run = '--dry-run' in sys.argv
+    if dry_run:
+        import json
+        print(json.dumps(inspect_legacy_database(cfg.db_path), indent=2))
+        return
+    DatabaseOptimizer(cfg.db_path).run()
+
 if __name__ == "__main__":
     try:
-        main()
+        if '--optimize-db' in sys.argv:
+            _run_maintenance()
+        else:
+            main()
     except RuntimeError as e:
         print(f"\n{e}")
     except KeyboardInterrupt:

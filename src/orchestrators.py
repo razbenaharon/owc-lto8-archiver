@@ -25,7 +25,8 @@ except ImportError:  # optional dependency — priority/affinity degrade gracefu
     psutil = None
 
 from .backup import LTOBackup, _NoEjectBackup
-from .constants import LTFS_WRITE_WARNING, ROOT_FILES_GROUP, _auto_pack_decision
+from .constants import (LOCAL_TAPE_BUDGET_BYTES, LTFS_WRITE_WARNING,
+                        ROOT_FILES_GROUP, _auto_pack_decision)
 from .db import _apply_canonical_remote_paths
 from .ltfs import _ensure_lto_drive_ready, get_volume_label
 from .packer import LTOAnalyzer, LTOPacker
@@ -77,8 +78,16 @@ class LocalOrchestrator:
             print("[ABORTED] Local session was not created.")
             return
 
-        chunks = analyzer.build_local_allocation_plan(source_dir)
-        analyzer.render_allocation_plan(chunks)
+        plan = self._mounted_tape_plan_context()
+        chunks = analyzer.build_local_allocation_plan(
+            source_dir,
+            first_tape_budget_bytes=plan['available_bytes'],
+        )
+        analyzer.render_allocation_plan(
+            chunks,
+            first_tape_used_bytes=plan['used_bytes'],
+            first_tape_label=plan['tape_label'],
+        )
         confirm = input("Create this local multi-tape session? Type YES to continue: ").strip()
         if confirm != 'YES':
             print("[ABORTED] Local session was not created.")
@@ -91,6 +100,49 @@ class LocalOrchestrator:
         )
         print(f"[LOCAL] Session created: {session_label} (id {session_id}, mode {backup_mode})")
         self._run_session(session_id)
+
+    def _mounted_tape_plan_context(self):
+        """Return the first-tape budget after reconciling DB occupancy."""
+        tape_label = get_volume_label(self.cfg.lto_drive)
+        if not tape_label:
+            print("[TAPE] No mounted volume label detected; the plan assumes the "
+                  "first tape has the full 11.5 TB safety budget.")
+            return {
+                'tape_label': None,
+                'used_bytes': 0,
+                'available_bytes': LOCAL_TAPE_BUDGET_BYTES,
+            }
+
+        tape = self.db.get_tape(tape_label)
+        if not tape:
+            print(f"[TAPE] Mounted tape '{tape_label}' has no DB record; the plan "
+                  "treats it as a fresh tape. A non-empty unregistered tape will "
+                  "still be rejected before writing.")
+            return {
+                'tape_label': tape_label,
+                'used_bytes': 0,
+                'available_bytes': LOCAL_TAPE_BUDGET_BYTES,
+            }
+
+        used_bytes = self.db.recalculate_tape_used_space(tape_label)
+        capacity_bytes = LOCAL_TAPE_BUDGET_BYTES
+        if tape['total_capacity']:
+            capacity_bytes = min(
+                capacity_bytes, int(tape['total_capacity'] * 1024**3))
+        available_bytes = max(0, capacity_bytes - used_bytes)
+        print(f"[TAPE] Mounted '{tape_label}': DB occupied "
+              f"{used_bytes / 1024**4:.2f} TiB; safe remaining "
+              f"{available_bytes / 1024**4:.2f} TiB.")
+        if available_bytes <= 0:
+            raise RuntimeError(
+                f"[TAPE] Mounted tape '{tape_label}' has no capacity remaining "
+                "under the 11.5 TB safety budget."
+            )
+        return {
+            'tape_label': tape_label,
+            'used_bytes': used_bytes,
+            'available_bytes': available_bytes,
+        }
 
     def _choose_backup_mode(self, recommended_pack):
         recommended = 'pack' if recommended_pack else 'direct'
@@ -228,6 +280,7 @@ class LocalOrchestrator:
                     exclude_dir_paths=exclude_dirs,
                     local_session_id=session['session_id'],
                     local_chunk_index=chunk_index,
+                    tape_parent_dir=self._session_tape_dir(session),
                 )
                 already.update(m['original_path'] for m in metadata)
             except Exception as e:
@@ -275,10 +328,10 @@ class LocalOrchestrator:
                 print(f"[TAPE] Registering fresh tape '{tape_label}'.")
                 self.db.register_tape(tape_label, 12288)
             elif not root_empty or record_count > 0:
-                if not self._ensure_chunk_fits_tape(tape_label, entries):
-                    return None
                 print(f"[TAPE] Appending to registered tape '{tape_label}' "
                       f"({record_count} indexed file record(s) already present).")
+            if not self._ensure_chunk_fits_tape(tape_label, entries):
+                return None
 
         return tape_label
 
@@ -303,10 +356,11 @@ class LocalOrchestrator:
         try:
             disk_free = shutil.disk_usage(self.cfg.lto_drive).free
             if planned_bytes > disk_free:
-                print(f"[TAPE] '{tape_label}' does not have enough LTFS free "
-                      f"space for this chunk ({planned_bytes / 1024**3:.2f} GiB "
-                      f"needed, {disk_free / 1024**3:.2f} GiB free).")
-                return False
+                print(f"[TAPE] Warning: LTFS reports less free space than the "
+                      f"planned chunk ({planned_bytes / 1024**3:.2f} GiB needed, "
+                      f"{disk_free / 1024**3:.2f} GiB reported). The DB safety "
+                      "budget remains authoritative because LTFS compression "
+                      "makes this figure advisory.")
         except OSError as e:
             print(f"[TAPE] Cannot read LTFS free space: {e}")
         finally:
@@ -318,16 +372,17 @@ class LocalOrchestrator:
             return False
 
         used_bytes = self.db.recalculate_tape_used_space(tape_label)
-        capacity_gb = tape['total_capacity']
-        if capacity_gb:
-            capacity_bytes = int(capacity_gb * 1024**3)
-            available_bytes = capacity_bytes - used_bytes
-            if planned_bytes > available_bytes:
-                print(f"[TAPE] '{tape_label}' does not have enough indexed "
-                      f"capacity for this chunk ({planned_bytes / 1024**3:.2f} "
-                      f"GiB needed, {max(0, available_bytes) / 1024**3:.2f} "
-                      "GiB available in DB).")
-                return False
+        capacity_bytes = LOCAL_TAPE_BUDGET_BYTES
+        if tape['total_capacity']:
+            capacity_bytes = min(
+                capacity_bytes, int(tape['total_capacity'] * 1024**3))
+        available_bytes = capacity_bytes - used_bytes
+        if planned_bytes > available_bytes:
+            print(f"[TAPE] '{tape_label}' does not have enough indexed "
+                  f"capacity for this chunk ({planned_bytes / 1024**3:.2f} "
+                  f"GiB needed, {max(0, available_bytes) / 1024**3:.2f} "
+                  "GiB available in DB).")
+            return False
 
         return True
 
@@ -402,6 +457,7 @@ class LocalOrchestrator:
                     packer_metadata=None,
                     local_session_id=session['session_id'],
                     local_chunk_index=chunk_index,
+                    tape_parent_dir=self._session_tape_dir(session),
                 )
         except Exception as e:
             print(f"[LOCAL] Direct chunk failed: {e}")
@@ -416,18 +472,28 @@ class LocalOrchestrator:
         return True
 
     def _make_batches(self, files):
+        target_budget, usable_bytes, free_bytes = self._staging_limits()
         batches = []
         current = []
         current_size = 0
         for entry in files:
-            budget = self._staging_budget()
-            if entry['size'] > budget:
+            if entry['size'] > usable_bytes:
                 raise RuntimeError(
-                    f"File exceeds current staging budget "
-                    f"({entry['size'] / 1024**3:.2f} GiB > {budget / 1024**3:.2f} GiB): "
+                    f"File cannot fit safely in local staging "
+                    f"({entry['size'] / 1024**3:.2f} GiB file; "
+                    f"{usable_bytes / 1024**3:.2f} GiB usable): "
                     f"{entry['path']}"
                 )
-            if current and current_size + entry['size'] > budget:
+            if entry['size'] > target_budget:
+                if current:
+                    batches.append(current)
+                    current = []
+                    current_size = 0
+                batches.append([entry])
+                print(f"[LOCAL] Large file gets a dedicated staging chunk: "
+                      f"{entry['size'] / 1024**3:.2f} GiB - {entry['rel']}")
+                continue
+            if current and current_size + entry['size'] > target_budget:
                 batches.append(current)
                 current = []
                 current_size = 0
@@ -435,19 +501,39 @@ class LocalOrchestrator:
             current_size += entry['size']
         if current:
             batches.append(current)
+        print(f"[LOCAL] Staging: {free_bytes / 1024**3:.1f} GiB free; "
+              f"{target_budget / 1024**3:.1f} GiB batch budget; "
+              f"{len(batches)} sequential chunk(s).")
         return batches
 
-    def _staging_budget(self):
+    def _staging_limits(self):
         os.makedirs(self.staging_dir, exist_ok=True)
         free = shutil.disk_usage(self.staging_dir).free
-        return max(1, int(free * self.fill_pct))
+        reserve = 20 * 1024**3
+        usable = min(int(free * self.fill_pct), max(0, free - reserve))
+        # Local staging is sequential. Unlike the SSH producer/consumer
+        # pipeline, it does not benefit from small network-friendly chunks.
+        configured_cap = int(self.cfg.staging_max_gb * 1024**3)
+        target = min(usable, configured_cap)
+        if target <= 0:
+            raise RuntimeError(
+                f"Not enough free staging space in '{self.staging_dir}'. "
+                f"Free: {free / 1024**3:.2f} GiB; required reserve: 20 GiB."
+            )
+        return target, usable, free
 
     def _batch_name(self, session_id, chunk_index, batch_index):
         return f"_local_s{session_id:04d}_c{chunk_index + 1:03d}_b{batch_index + 1:03d}"
 
+    def _session_tape_dir(self, session):
+        return session['session_label']
+
     def _build_resume_excludes(self, session_id, chunk_index, tape_label,
                                batch_name, pack_dir):
-        tape_batch_root = os.path.abspath(os.path.join(self.cfg.lto_drive, batch_name))
+        session = self.db.get_local_session(session_id)
+        tape_batch_root = os.path.abspath(os.path.join(
+            self.cfg.lto_drive, self._session_tape_dir(session), batch_name
+        ))
         exclude_files = []
         for tape_path in self.db.get_local_written_tape_paths(session_id, chunk_index, tape_label):
             try:
@@ -1053,8 +1139,14 @@ class RemoteOrchestrator:
         canonical_count = _apply_canonical_remote_paths(
             metadata, self.db.get_chunk_files(session_id, chunk_index))
         if canonical_count != len(metadata):
-            _status('DB', f"Canonical source paths mapped for {canonical_count:,}/"
-                          f"{len(metadata):,} staged file(s).")
+            self.db.update_chunk_status(session_id, chunk_index, 'fetch_failed')
+            self._cleanup_dir(fetch_dir)
+            self._cleanup_dir(pack_dir)
+            raise RuntimeError(
+                "[DB] Refusing to index temporary staging paths: canonical "
+                f"SOURCE paths mapped for only {canonical_count:,}/"
+                f"{len(metadata):,} staged file(s)."
+            )
 
         pack_seconds = time.perf_counter() - pack_start
 
@@ -1225,6 +1317,7 @@ class RemoteOrchestrator:
             except ValueError as e:
                 self.db.update_manifest_row(
                     manifest_id,
+                    session_id=session_id,
                     status='fetch_failed',
                     error_msg=str(e),
                 )
@@ -1264,7 +1357,7 @@ class RemoteOrchestrator:
             (collisions if collided else pending).append(
                 (row, remote_base, rel, local_rel, local_path))
 
-        self.db.update_manifest_rows_fetching(fetching_ids)
+        self.db.update_manifest_rows_fetching(fetching_ids, session_id=session_id)
 
         if pending or collisions:
             todo_bytes = sum(row['file_size_bytes']
@@ -1307,6 +1400,7 @@ class RemoteOrchestrator:
                         self.db.update_manifest_rows_fetch_failed(
                             (row['manifest_id'] for row, _, _ in base_pending),
                             err,
+                            session_id=session_id,
                         )
                         return False, source_missing_files, fetched_file_count
 
@@ -1314,7 +1408,7 @@ class RemoteOrchestrator:
                 # extract them onto the primary's path), so fetch each alone
                 # into an isolated dir and move it to its disambiguated name.
                 if collisions and not self._fetch_collisions(
-                        collisions, fetch_dir, source_missing_files):
+                        session_id, collisions, fetch_dir, source_missing_files):
                     return False, source_missing_files, fetched_file_count
             finally:
                 fetch_stop.set()
@@ -1351,7 +1445,8 @@ class RemoteOrchestrator:
                            f"Target: {local_path}")
                     print(f"\n[REMOTE] {msg}")
                     self.db.update_manifest_row(
-                        manifest_id, status='fetch_failed', error_msg=msg[:500])
+                        manifest_id, session_id=session_id,
+                        status='fetch_failed', error_msg=msg[:500])
                     return False, source_missing_files, fetched_file_count
                 detail = {
                     'manifest_id': manifest_id,
@@ -1363,6 +1458,7 @@ class RemoteOrchestrator:
                 print(f"[REMOTE] Source missing; skipped: {row['remote_path']}")
                 self.db.update_manifest_row(
                     manifest_id,
+                    session_id=session_id,
                     status='source_missing',
                     local_rel_path=None,
                     error_msg="missing after tar fetch",
@@ -1374,6 +1470,7 @@ class RemoteOrchestrator:
             except OSError as e:
                 self.db.update_manifest_row(
                     manifest_id,
+                    session_id=session_id,
                     status='fetch_failed',
                     error_msg=f"stat failed: {e}",
                 )
@@ -1388,17 +1485,20 @@ class RemoteOrchestrator:
                     pass
                 self.db.update_manifest_row(
                     manifest_id,
+                    session_id=session_id,
                     status='fetch_failed',
                     error_msg=f"size mismatch: expected {fsize}, got {actual}",
                 )
                 return False, source_missing_files, fetched_file_count
 
             fetched_updates.append((local_rel, manifest_id))
-        self.db.update_manifest_rows_fetched(fetched_updates)
+        self.db.update_manifest_rows_fetched(
+            fetched_updates, session_id=session_id)
         fetched_file_count = len(fetched_updates)
         return True, source_missing_files, fetched_file_count
 
-    def _fetch_collisions(self, collisions, fetch_dir, source_missing_files):
+    def _fetch_collisions(self, session_id, collisions, fetch_dir,
+                          source_missing_files):
         """Fetch files whose sanitized name clashed with another file's.
 
         Each is streamed alone into a private temp dir (where bsdtar writes it
@@ -1431,7 +1531,8 @@ class RemoteOrchestrator:
                         return False
                     print(f"\n[REMOTE] Tar fetch failed (renamed file):\n{err}")
                     self.db.update_manifest_row(
-                        row['manifest_id'], status='fetch_failed',
+                        row['manifest_id'], session_id=session_id,
+                        status='fetch_failed',
                         error_msg=err[:500])
                     return False
 
@@ -1454,7 +1555,8 @@ class RemoteOrchestrator:
                                f"could not be written locally ({reason}).")
                         print(f"\n[REMOTE] {msg}")
                         self.db.update_manifest_row(
-                            row['manifest_id'], status='fetch_failed',
+                            row['manifest_id'], session_id=session_id,
+                            status='fetch_failed',
                             error_msg=msg[:500])
                         return False
                     detail = {
@@ -1465,7 +1567,8 @@ class RemoteOrchestrator:
                     source_missing_files.append(detail)
                     print(f"[REMOTE] Source missing; skipped: {row['remote_path']}")
                     self.db.update_manifest_row(
-                        row['manifest_id'], status='source_missing',
+                        row['manifest_id'], session_id=session_id,
+                        status='source_missing',
                         local_rel_path=None,
                         error_msg="missing after tar fetch")
                     continue
@@ -1476,7 +1579,8 @@ class RemoteOrchestrator:
                 except OSError as e:
                     print(f"[REMOTE] Could not place renamed file {rel}: {e}")
                     self.db.update_manifest_row(
-                        row['manifest_id'], status='fetch_failed',
+                        row['manifest_id'], session_id=session_id,
+                        status='fetch_failed',
                         error_msg=f"move failed: {e}")
                     return False
             return True

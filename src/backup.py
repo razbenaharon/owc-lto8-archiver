@@ -33,6 +33,18 @@ from .robocopy import _parse_robocopy_summary, _run_robocopy_tuned
 from .runtime import CANCEL, _acquire_tape_io_lock, _fmt_bytes, _fmt_eta, _phase, _progress_done, _progress_line, _release_tape_io_lock, _speed_str
 
 
+def _tape_destination_root(source, tape_drive, tape_parent_dir=None):
+    """Resolve a write root, optionally nested below a session directory."""
+    if not tape_parent_dir:
+        return os.path.join(tape_drive, os.path.basename(source))
+
+    parent = os.path.normpath(tape_parent_dir)
+    if (os.path.isabs(parent) or os.path.splitdrive(parent)[0] or
+            parent == '..' or parent.startswith('..' + os.sep)):
+        raise RuntimeError(f"Unsafe tape parent directory: {tape_parent_dir}")
+    return os.path.join(tape_drive, parent, os.path.basename(source))
+
+
 class LTOBackup:
     def __init__(self, db: DatabaseManager, ibm_eject_cmd: str,
                  tape_priority=None, tape_affinity=None, log_dir=None):
@@ -260,7 +272,8 @@ class LTOBackup:
 
     def run(self, source, tape_drive, tape_label, packer_metadata=None,
             exclude_file_paths=None, exclude_dir_paths=None,
-            local_session_id=None, local_chunk_index=None, stage_stats=None):
+            local_session_id=None, local_chunk_index=None, stage_stats=None,
+            tape_parent_dir=None):
         print(f"[WARNING] {LTFS_WRITE_WARNING}")
         _acquire_tape_io_lock(f"backup write to {tape_drive}")
         try:
@@ -272,6 +285,7 @@ class LTOBackup:
                 local_session_id=local_session_id,
                 local_chunk_index=local_chunk_index,
                 stage_stats=stage_stats,
+                tape_parent_dir=tape_parent_dir,
             )
         finally:
             _release_tape_io_lock()
@@ -279,7 +293,7 @@ class LTOBackup:
     def _run_locked(self, source, tape_drive, tape_label, packer_metadata=None,
                     exclude_file_paths=None, exclude_dir_paths=None,
                     local_session_id=None, local_chunk_index=None,
-                    stage_stats=None):
+                    stage_stats=None, tape_parent_dir=None):
         """
         Copy files from source to tape and commit to the database.
 
@@ -304,7 +318,8 @@ class LTOBackup:
 
         exclude_file_paths = exclude_file_paths or []
         exclude_dir_paths  = exclude_dir_paths or []
-        tape_root = os.path.join(tape_drive, os.path.basename(source))
+        tape_root = _tape_destination_root(
+            source, tape_drive, tape_parent_dir=tape_parent_dir)
         os.makedirs(tape_root, exist_ok=True)
 
         # Build lookup: staging-relative-path -> metadata dict (loose large files only)
@@ -540,10 +555,12 @@ class LTOBackup:
         db_sync_start = time.perf_counter()
 
         def catalog_record(file_name, original_path, file_size_bytes, file_hash,
-                           is_packed, container_name, stored_path):
+                           is_packed, container_name, stored_path,
+                           canonical_source_path=None):
             return {
                 'file_name': file_name,
-                'original_path': original_path,
+                'original_path': canonical_source_path or original_path,
+                'canonical_source_path': canonical_source_path,
                 'file_size_bytes': file_size_bytes,
                 'file_hash': file_hash,
                 'tape_label': tape_label,
@@ -582,7 +599,8 @@ class LTOBackup:
             recovered_stats = self.db.bulk_upsert_files(
                 (catalog_record(
                     m['file_name'], m['original_path'], m['file_size_bytes'],
-                    m.get('file_hash', ''), False, None, dst)
+                    m.get('file_hash', ''), False, None, dst,
+                    m.get('canonical_source_path'))
                  for _, m, dst in skipped_existing),
                 update_existing=False,
             )
@@ -599,7 +617,8 @@ class LTOBackup:
                     if m:
                         yield catalog_record(
                             file, m['original_path'], info['fsize'], info['hash'],
-                            False, None, info['dst'])
+                            False, None, info['dst'],
+                            m.get('canonical_source_path'))
 
             loose_stats = self.db.bulk_upsert_files(
                 loose_staged_records(), update_existing=False)
@@ -612,7 +631,7 @@ class LTOBackup:
                     m['file_name'], m['original_path'], m['file_size_bytes'],
                     m.get('file_hash', ''), True,
                     os.path.join(tape_root, m['container_name']),
-                    m['stored_path'])
+                    m['stored_path'], m.get('canonical_source_path'))
                  for m in packer_metadata if m['is_packed']),
                 update_existing=False,
             )
