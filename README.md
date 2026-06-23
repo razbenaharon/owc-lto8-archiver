@@ -2,6 +2,8 @@
 
 A Python CLI for archiving files to LTO tape using an OWC Mercury Pro LTO-8 drive and IBM LTFS on Windows.
 
+Licensed under the [MIT License](LICENSE) — © 2026 Raz Ben Aharon. Free to use, modify, and distribute with attribution.
+
 ## Features
 
 - **Smart packing** — small files (under a configurable threshold) are bundled into ZIP archives to minimize tape fragmentation; large files are copied directly
@@ -177,3 +179,9 @@ The CLI also creates session tables for resumable work:
 ## Important
 
 **Run the script as Administrator.** Windows Defender exclusions are added automatically during both archive and retrieval operations (covering the LTO drive, staging directory, and restore directory) and require elevated privileges. Exclusions are removed automatically when each operation completes.
+
+## License
+
+Copyright © 2026 Raz Ben Aharon.
+
+Released under the [MIT License](LICENSE). You are free to use, copy, modify, and distribute this software, including for commercial purposes, provided the copyright notice and license text are retained.
