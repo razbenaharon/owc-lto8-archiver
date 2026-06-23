@@ -611,23 +611,12 @@ class FilesPanel(ctk.CTkFrame):
         tape      = self._tape_var.get()
         date_from = self._date_from_var.get().strip()
         date_to   = self._date_to_var.get().strip()
-
-        sql    = "SELECT * FROM files_index WHERE 1=1"
-        params = []
-        if name:
-            sql += " AND file_name LIKE ?"
-            params.append(f"%{name}%")
-        if tape and tape != "All":
-            sql += " AND tape_label = ?"
-            params.append(tape)
-        if date_from:
-            sql += " AND backup_date >= ?"
-            params.append(date_from)
-        if date_to:
-            sql += " AND backup_date <= ?"
-            params.append(date_to + " 23:59:59")
-        sql += " ORDER BY original_path, file_name"
-        return sql, params
+        return {
+            'name_query': name or None,
+            'tape_label': tape if tape and tape != "All" else None,
+            'date_from': date_from or None,
+            'date_to': date_to or None,
+        }
 
     @staticmethod
     def _split_dirs(path):
@@ -727,8 +716,9 @@ class FilesPanel(ctk.CTkFrame):
             self._tree.item(iid, open=False)
 
     def _on_search(self):
-        sql, params = self._build_query()
-        rows   = self._db.conn.execute(sql, params).fetchall()
+        filters = self._build_query()
+        rows = self._db.search_catalog(
+            **filters, limit=self.FETCH_CAP + 1)
         capped = len(rows) > self.FETCH_CAP
         rows   = rows[:self.FETCH_CAP]
 
