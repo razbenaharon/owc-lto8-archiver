@@ -39,11 +39,21 @@ LTFS_WRITE_WARNING = (
     "copy jobs. Internal tape access is serialized, but external processes can "
     "still degrade tape throughput."
 )
-LOCAL_TAPE_BUDGET_BYTES = int(11.5 * 1000**4)
+# Per-tape planning budget for the local bin-packer. LTFS reports a free-space
+# figure (shutil.disk_usage(...).free) that depends on hardware compression and
+# is therefore only ADVISORY — this budget, not the live probe, is the real
+# guard against overfilling a tape. Expressed on a single binary basis (TiB)
+# with an explicit headroom margin. The result is kept at/below the previous
+# 11.5 TB budget so the planner only ever rejects MORE, never accepts more than
+# before.
+TAPE_PLAN_NOMINAL_BYTES = 11 * 1024**4          # 11 TiB nominal (binary basis)
+TAPE_PLAN_HEADROOM = 0.95                        # leave 5% for LTFS overhead
+LOCAL_TAPE_BUDGET_BYTES = int(TAPE_PLAN_NOMINAL_BYTES * TAPE_PLAN_HEADROOM)
 ROOT_FILES_GROUP = "_ROOT_FILES"
 AUTO_PACK_FILE_RATIO = 0.30
 AUTO_PACK_MIN_SMALL_BYTES = 1 * 1024**3
 AUTO_PACK_MIN_SMALL_BYTE_RATIO = 0.01
+DB_UPSERT_BATCH_SIZE = 10_000
 
 
 def _auto_pack_decision(total_files, total_bytes, small_files, small_bytes):
@@ -548,6 +558,58 @@ def _hash_file(path):
                 break
             hasher.update(buf)
     return hasher.hexdigest()
+
+
+def _hash_to_blob(value):
+    """Return a compact 32-byte SHA-256 value, or None when no hash exists."""
+    if not value:
+        return None
+    if isinstance(value, memoryview):
+        value = value.tobytes()
+    if isinstance(value, bytes):
+        return value if len(value) == 32 else None
+    try:
+        raw = bytes.fromhex(str(value))
+    except ValueError:
+        return None
+    return raw if len(raw) == 32 else None
+
+
+def _derived_file_name(stored_path, original_path=None):
+    """Derive a display/restore name without storing it once per DB row."""
+    path = stored_path or original_path or ''
+    return os.path.basename(str(path).replace('/', os.sep))
+
+
+def _file_record_key(original_path, tape_label, local_session_id=None,
+                     local_chunk_index=None):
+    """Stable compact key for NULL-safe file-record upserts."""
+    digest = hashlib.sha256()
+    for value in (original_path or '', tape_label or '',
+                  -1 if local_session_id is None else local_session_id,
+                  -1 if local_chunk_index is None else local_chunk_index):
+        raw = str(value).encode('utf-8', errors='surrogatepass')
+        digest.update(len(raw).to_bytes(8, 'big'))
+        digest.update(raw)
+    return digest.digest()
+
+
+def _apply_canonical_remote_paths(metadata, manifest_rows):
+    """Replace temporary staging paths with durable remote source paths."""
+    remote_by_local = {}
+    for row in manifest_rows:
+        local_rel = row['local_rel_path']
+        remote_path = row['remote_path']
+        if local_rel and remote_path:
+            remote_by_local[str(local_rel).replace('\\', '/')] = remote_path
+    replaced = 0
+    for item in metadata:
+        stored = str(item.get('stored_path') or '').replace('\\', '/')
+        canonical = remote_by_local.get(stored)
+        if canonical:
+            item['original_path'] = canonical
+            replaced += 1
+    return replaced
 
 
 def _verify_restored_hash(local_path, record):
@@ -1229,6 +1291,59 @@ def _winsafe_extracted_rel(rel):
     return '/'.join(out)
 
 
+# The legacy Win32 MAX_PATH. A target whose absolute path reaches this length
+# cannot be created by a process that is not long-path aware (the bundled
+# Windows bsdtar that extracts the fetch stream is not), so a file there can be
+# silently dropped during extraction. M1 turns that into a loud, resumable error
+# instead of a silent source_missing.
+_LEGACY_PATH_LIMIT = 260
+
+# Reserved DOS device names. NTFS refuses to create a file/dir whose stem (the
+# part before the first dot) is one of these — and an extractor may instead
+# write to the actual device, discarding the data. Detected and surfaced loudly.
+_WIN_RESERVED_NAMES = {
+    'CON', 'PRN', 'AUX', 'NUL',
+    *(f'COM{i}' for i in range(1, 10)),
+    *(f'LPT{i}' for i in range(1, 10)),
+}
+
+
+def _long(path):
+    r"""Return a Windows extended-length (\\?\) form of an absolute path so
+    Python filesystem calls can exceed the legacy MAX_PATH limit. No-op on
+    non-Windows, on already-prefixed paths, and when path is empty."""
+    if os.name != 'nt' or not path:
+        return path
+    if path.startswith('\\\\?\\') or path.startswith('\\??\\'):
+        return path
+    abspath = os.path.abspath(path)
+    if abspath.startswith('\\\\'):          # UNC: \\server\share -> \\?\UNC\...
+        return '\\\\?\\UNC\\' + abspath[2:]
+    return '\\\\?\\' + abspath
+
+
+def _reserved_name_component(rel):
+    """Return the first path component that is a reserved DOS device name
+    (e.g. 'NUL', 'con.txt'), or None. Windows-only; pass-through elsewhere."""
+    if os.name != 'nt':
+        return None
+    for part in (rel or '').replace('\\', '/').split('/'):
+        if not part:
+            continue
+        stem = part.split('.', 1)[0].rstrip(' ').upper()
+        if stem in _WIN_RESERVED_NAMES:
+            return part
+    return None
+
+
+def _exceeds_legacy_path_limit(path):
+    """True when path's absolute form reaches the legacy MAX_PATH limit on
+    Windows (i.e. a non-long-path-aware extractor cannot write it)."""
+    if os.name != 'nt' or not path:
+        return False
+    return len(os.path.abspath(path)) >= _LEGACY_PATH_LIMIT
+
+
 def _disambiguate_local_rel(local_rel, claimed):
     """Return a variant of local_rel whose case-folded form is not in `claimed`.
 
@@ -1633,6 +1748,7 @@ class DatabaseManager:
                 timeout=60,
             )
             self.conn.execute("PRAGMA busy_timeout = 60000")
+            self.conn.execute("PRAGMA foreign_keys = ON")
         except (OSError, sqlite3.Error) as e:
             raise RuntimeError(
                 f"[DB] Cannot open database at: {db_path}\n"
@@ -1642,6 +1758,7 @@ class DatabaseManager:
             ) from e
         self.conn.row_factory = sqlite3.Row
         self.lock = threading.RLock()
+        self._bundle_cache = {}
         self._init_schema()
         self._init_remote_schema()
         self._init_local_schema()
@@ -1706,6 +1823,14 @@ class DatabaseManager:
                 stored_path     TEXT,
                 FOREIGN KEY (tape_label) REFERENCES tapes(volume_label)
             );
+            CREATE TABLE IF NOT EXISTS archive_bundles (
+                bundle_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+                tape_label  TEXT NOT NULL
+                    REFERENCES tapes(volume_label)
+                    ON UPDATE CASCADE ON DELETE CASCADE,
+                tape_path   TEXT NOT NULL,
+                UNIQUE(tape_label, tape_path)
+            );
         """)
         self.conn.commit()
         # Migrate existing DB: add used_space if missing
@@ -1717,12 +1842,33 @@ class DatabaseManager:
         for column, col_type in (
             ('local_session_id', 'INTEGER'),
             ('local_chunk_index', 'INTEGER'),
+            ('bundle_id', 'INTEGER REFERENCES archive_bundles(bundle_id)'),
+            ('file_hash_blob', 'BLOB'),
+            ('record_key', 'BLOB'),
         ):
             try:
                 self.conn.execute(f"ALTER TABLE files_index ADD COLUMN {column} {col_type}")
                 self.conn.commit()
             except sqlite3.OperationalError:
                 pass  # column already exists
+        # The expression index is the permanent form of the live rescue index.
+        # It accelerates legacy rows whose record_key has not yet been populated.
+        # New rows use the compact partial-unique record_key index for SQL upserts.
+        self.conn.executescript("""
+            CREATE INDEX IF NOT EXISTS idx_files_dedup_expr
+                ON files_index(
+                    COALESCE(original_path, ''),
+                    COALESCE(tape_label, ''),
+                    COALESCE(local_session_id, -1),
+                    COALESCE(local_chunk_index, -1)
+                );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_files_record_key
+                ON files_index(record_key)
+                WHERE record_key IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_files_bundle_id
+                ON files_index(bundle_id);
+        """)
+        self.conn.commit()
 
     def _init_local_schema(self):
         """Create local multi-tape session tables if they don't exist."""
@@ -1944,12 +2090,20 @@ class DatabaseManager:
             self.conn.commit()
 
     def get_active_remote_session(self, remote_host, remote_path):
-        return self.conn.execute(
-            """SELECT * FROM remote_sessions
-               WHERE remote_host = ? AND remote_path = ? AND status = 'active'
-               ORDER BY session_id DESC LIMIT 1""",
-            (remote_host, remote_path)
-        ).fetchone()
+        with self.lock:
+            return self.conn.execute(
+                """SELECT * FROM remote_sessions
+                   WHERE remote_host = ? AND remote_path = ? AND status = 'active'
+                   ORDER BY session_id DESC LIMIT 1""",
+                (remote_host, remote_path)
+            ).fetchone()
+
+    def get_remote_session(self, session_id):
+        with self.lock:
+            return self.conn.execute(
+                "SELECT * FROM remote_sessions WHERE session_id = ?",
+                (session_id,)
+            ).fetchone()
 
     def insert_remote_manifest_batch(self, session_id, rows):
         """rows: list of (chunk_index, remote_path, file_name, file_size_bytes)"""
@@ -1965,12 +2119,13 @@ class DatabaseManager:
             self.conn.commit()
 
     def get_chunk_files(self, session_id, chunk_index):
-        return self.conn.execute(
-            """SELECT * FROM remote_manifest
-               WHERE session_id = ? AND chunk_index = ?
-               ORDER BY manifest_id""",
-            (session_id, chunk_index)
-        ).fetchall()
+        with self.lock:
+            return self.conn.execute(
+                """SELECT * FROM remote_manifest
+                   WHERE session_id = ? AND chunk_index = ?
+                   ORDER BY manifest_id""",
+                (session_id, chunk_index)
+            ).fetchall()
 
     def update_manifest_row(self, manifest_id, **kwargs):
         kwargs['updated_at'] = datetime.now().isoformat()
@@ -2033,19 +2188,21 @@ class DatabaseManager:
         )
 
     def get_pending_chunks(self, session_id):
-        rows = self.conn.execute(
-            """SELECT DISTINCT chunk_index FROM remote_manifest
-               WHERE session_id = ? AND chunk_status NOT IN ('done')
-               ORDER BY chunk_index""",
-            (session_id,)
-        ).fetchall()
+        with self.lock:
+            rows = self.conn.execute(
+                """SELECT DISTINCT chunk_index FROM remote_manifest
+                   WHERE session_id = ? AND chunk_status NOT IN ('done')
+                   ORDER BY chunk_index""",
+                (session_id,)
+            ).fetchall()
         return [r[0] for r in rows]
 
     def count_chunks(self, session_id):
-        return self.conn.execute(
-            "SELECT COUNT(DISTINCT chunk_index) FROM remote_manifest WHERE session_id = ?",
-            (session_id,)
-        ).fetchone()[0]
+        with self.lock:
+            return self.conn.execute(
+                "SELECT COUNT(DISTINCT chunk_index) FROM remote_manifest WHERE session_id = ?",
+                (session_id,)
+            ).fetchone()[0]
 
     def create_local_session(self, session_label, source_dir, chunks,
                              backup_mode='auto'):
@@ -2093,36 +2250,40 @@ class DatabaseManager:
             self.conn.commit()
 
     def get_active_local_session(self, source_dir):
-        return self.conn.execute(
-            """SELECT * FROM local_sessions
-               WHERE source_dir = ? AND status = 'active'
-               ORDER BY session_id DESC LIMIT 1""",
-            (source_dir,)
-        ).fetchone()
+        with self.lock:
+            return self.conn.execute(
+                """SELECT * FROM local_sessions
+                   WHERE source_dir = ? AND status = 'active'
+                   ORDER BY session_id DESC LIMIT 1""",
+                (source_dir,)
+            ).fetchone()
 
     def get_local_session(self, session_id):
-        return self.conn.execute(
-            "SELECT * FROM local_sessions WHERE session_id = ?", (session_id,)
-        ).fetchone()
+        with self.lock:
+            return self.conn.execute(
+                "SELECT * FROM local_sessions WHERE session_id = ?", (session_id,)
+            ).fetchone()
 
     def get_local_pending_chunks(self, session_id):
-        rows = self.conn.execute(
-            """SELECT chunk_index FROM local_chunks_manifest
-               WHERE session_id = ?
-               GROUP BY chunk_index
-               HAVING SUM(CASE WHEN status != 'backed_up' THEN 1 ELSE 0 END) > 0
-               ORDER BY chunk_index""",
-            (session_id,)
-        ).fetchall()
+        with self.lock:
+            rows = self.conn.execute(
+                """SELECT chunk_index FROM local_chunks_manifest
+                   WHERE session_id = ?
+                   GROUP BY chunk_index
+                   HAVING SUM(CASE WHEN status != 'backed_up' THEN 1 ELSE 0 END) > 0
+                   ORDER BY chunk_index""",
+                (session_id,)
+            ).fetchall()
         return [r[0] for r in rows]
 
     def get_local_chunk_entries(self, session_id, chunk_index):
-        return self.conn.execute(
-            """SELECT * FROM local_chunks_manifest
-               WHERE session_id = ? AND chunk_index = ?
-               ORDER BY manifest_id""",
-            (session_id, chunk_index)
-        ).fetchall()
+        with self.lock:
+            return self.conn.execute(
+                """SELECT * FROM local_chunks_manifest
+                   WHERE session_id = ? AND chunk_index = ?
+                   ORDER BY manifest_id""",
+                (session_id, chunk_index)
+            ).fetchall()
 
     def assign_local_chunk_tape(self, session_id, chunk_index, tape_label):
         now = datetime.now().isoformat()
@@ -2177,36 +2338,245 @@ class DatabaseManager:
             self.conn.commit()
 
     def count_tape_file_records(self, tape_label):
-        return self.conn.execute(
-            "SELECT COUNT(*) FROM files_index WHERE tape_label = ?",
-            (tape_label,)
-        ).fetchone()[0]
+        with self.lock:
+            return self.conn.execute(
+                "SELECT COUNT(*) FROM files_index WHERE tape_label = ?",
+                (tape_label,)
+            ).fetchone()[0]
+
+    @staticmethod
+    def _hydrate_file_row(row):
+        """Expose normalized and legacy catalog rows through the old API shape."""
+        if row is None:
+            return None
+        item = dict(row)
+        if not item.get('file_name'):
+            item['file_name'] = _derived_file_name(
+                item.get('stored_path'), item.get('original_path'))
+        if not item.get('file_hash') and item.get('file_hash_blob'):
+            item['file_hash'] = bytes(item['file_hash_blob']).hex()
+        if not item.get('container_name'):
+            item['container_name'] = item.get('bundle_tape_path')
+        return item
+
+    @staticmethod
+    def _catalog_select():
+        return """SELECT f.*, b.tape_path AS bundle_tape_path
+                  FROM files_index AS f
+                  LEFT JOIN archive_bundles AS b ON b.bundle_id = f.bundle_id"""
+
+    def _catalog_rows(self, where='', params=(), order_by=''):
+        sql = self._catalog_select()
+        if where:
+            sql += ' WHERE ' + where
+        if order_by:
+            sql += ' ORDER BY ' + order_by
+        with self.lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        return [self._hydrate_file_row(row) for row in rows]
+
+    def _existing_record_keys(self, keys):
+        if not keys:
+            return set()
+        placeholders = ','.join('?' for _ in keys)
+        rows = self.conn.execute(
+            f"SELECT record_key FROM files_index WHERE record_key IN ({placeholders})",
+            list(keys),
+        ).fetchall()
+        return {bytes(row[0]) for row in rows if row[0] is not None}
+
+    def _bulk_upsert_batch(self, records, update_existing):
+        """Upsert one batch inside the caller's transaction."""
+        bundle_paths = {
+            (record['tape_label'], record.get('container_name'))
+            for record in records
+            if record.get('is_packed') and record.get('container_name')
+        }
+        self.conn.executemany(
+            """INSERT INTO archive_bundles(tape_label, tape_path)
+               VALUES (?, ?)
+               ON CONFLICT(tape_label, tape_path) DO NOTHING""",
+            bundle_paths,
+        )
+        bundle_ids = {}
+        for tape_label, tape_path in bundle_paths:
+            row = self.conn.execute(
+                """SELECT bundle_id FROM archive_bundles
+                   WHERE tape_label = ? AND tape_path = ?""",
+                (tape_label, tape_path),
+            ).fetchone()
+            bundle_ids[(tape_label, tape_path)] = row['bundle_id']
+
+        normalized_by_key = {}
+        legacy_lookup = {}
+        for record in records:
+            original_path = record.get('original_path') or ''
+            tape_label = record.get('tape_label') or ''
+            session_id = record.get('local_session_id')
+            chunk_index = record.get('local_chunk_index')
+            key = _file_record_key(
+                original_path, tape_label, session_id, chunk_index)
+            container = record.get('container_name')
+            bundle_id = bundle_ids.get((tape_label, container))
+            normalized_by_key[key] = (
+                None,  # file_name is derived from stored_path on reads
+                original_path,
+                record.get('file_size_bytes'),
+                None,  # text hashes are legacy-only
+                _hash_to_blob(record.get('file_hash')),
+                record.get('backup_date') or datetime.now().isoformat(),
+                tape_label,
+                bool(record.get('is_packed')),
+                None if bundle_id is not None else container,
+                record.get('stored_path'),
+                session_id,
+                chunk_index,
+                bundle_id,
+                key,
+            )
+            legacy_lookup[key] = (
+                key, original_path, tape_label, session_id, chunk_index)
+
+        existing = self._existing_record_keys(normalized_by_key)
+        # Adopt matching pre-normalization rows lazily. The permanent rescue
+        # expression index makes these lookups fast without rewriting the DB.
+        adoption_rows = [legacy_lookup[key] for key in normalized_by_key
+                         if key not in existing]
+        if adoption_rows:
+            self.conn.executemany(
+                """UPDATE files_index AS target
+                   SET record_key = ?
+                   WHERE target.file_id = (
+                       SELECT legacy.file_id FROM files_index AS legacy
+                       WHERE COALESCE(legacy.original_path, '') = COALESCE(?, '')
+                         AND COALESCE(legacy.tape_label, '') = COALESCE(?, '')
+                         AND COALESCE(legacy.local_session_id, -1) = COALESCE(?, -1)
+                         AND COALESCE(legacy.local_chunk_index, -1) = COALESCE(?, -1)
+                       ORDER BY legacy.file_id LIMIT 1
+                   )
+                     AND target.record_key IS NULL""",
+                adoption_rows,
+            )
+            existing = self._existing_record_keys(normalized_by_key)
+
+        columns = """file_name, original_path, file_size_bytes, file_hash,
+                     file_hash_blob, backup_date, tape_label, is_packed,
+                     container_name, stored_path, local_session_id,
+                     local_chunk_index, bundle_id, record_key"""
+        values = list(normalized_by_key.values())
+        if update_existing:
+            self.conn.executemany(
+                f"""INSERT INTO files_index({columns})
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(record_key) WHERE record_key IS NOT NULL DO UPDATE SET
+                        file_name = excluded.file_name,
+                        original_path = excluded.original_path,
+                        file_size_bytes = excluded.file_size_bytes,
+                        file_hash = excluded.file_hash,
+                        file_hash_blob = excluded.file_hash_blob,
+                        backup_date = excluded.backup_date,
+                        tape_label = excluded.tape_label,
+                        is_packed = excluded.is_packed,
+                        container_name = excluded.container_name,
+                        stored_path = excluded.stored_path,
+                        local_session_id = excluded.local_session_id,
+                        local_chunk_index = excluded.local_chunk_index,
+                        bundle_id = excluded.bundle_id""",
+                values,
+            )
+            return {
+                'inserted': len(values) - len(existing),
+                'updated': len(existing),
+                'skipped': 0,
+            }
+
+        self.conn.executemany(
+            f"""INSERT INTO files_index({columns})
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(record_key) WHERE record_key IS NOT NULL DO NOTHING""",
+            values,
+        )
+        return {
+            'inserted': len(values) - len(existing),
+            'updated': 0,
+            'skipped': len(existing),
+        }
+
+    def bulk_upsert_files(self, records, batch_size=DB_UPSERT_BATCH_SIZE,
+                          update_existing=True):
+        """Commit file records in bounded transactions instead of per row."""
+        totals = {'inserted': 0, 'updated': 0, 'skipped': 0}
+        batch = []
+        registered = set()
+
+        def flush(items):
+            if not items:
+                return
+            labels = {item.get('tape_label') for item in items}
+            missing = []
+            for label in labels - registered:
+                if not self.conn.execute(
+                        "SELECT 1 FROM tapes WHERE volume_label = ?", (label,)
+                ).fetchone():
+                    missing.append(label)
+                else:
+                    registered.add(label)
+            if missing:
+                raise RuntimeError(
+                    f"[DB] Cannot index files for unregistered tape(s): {missing}")
+            stats = self._commit_write(
+                lambda: self._bulk_upsert_batch(items, update_existing),
+                f"file catalog batch ({len(items):,} rows)",
+            )
+            for key in totals:
+                totals[key] += stats[key]
+
+        for record in records:
+            if CANCEL.is_set():
+                raise RuntimeError("file catalog sync cancelled")
+            batch.append(record)
+            if len(batch) >= max(1, batch_size):
+                flush(batch)
+                batch = []
+        flush(batch)
+        return totals
 
     def get_local_indexed_original_paths(self, session_id, chunk_index, tape_label):
-        rows = self.conn.execute(
-            """SELECT original_path FROM files_index
-               WHERE local_session_id = ?
-                 AND local_chunk_index = ?
-                 AND tape_label = ?""",
-            (session_id, chunk_index, tape_label)
-        ).fetchall()
+        with self.lock:
+            rows = self.conn.execute(
+                """SELECT original_path FROM files_index
+                   WHERE local_session_id = ?
+                     AND local_chunk_index = ?
+                     AND tape_label = ?""",
+                (session_id, chunk_index, tape_label)
+            ).fetchall()
         return {r[0] for r in rows}
 
     def get_local_written_tape_paths(self, session_id, chunk_index, tape_label):
-        rows = self.conn.execute(
-            """SELECT DISTINCT COALESCE(container_name, stored_path) AS tape_path
-               FROM files_index
-               WHERE local_session_id = ?
-                 AND local_chunk_index = ?
-                 AND tape_label = ?
-                 AND COALESCE(container_name, stored_path) IS NOT NULL""",
-            (session_id, chunk_index, tape_label)
-        ).fetchall()
+        with self.lock:
+            rows = self.conn.execute(
+                """SELECT DISTINCT COALESCE(f.container_name, b.tape_path,
+                                             f.stored_path) AS tape_path
+                   FROM files_index AS f
+                   LEFT JOIN archive_bundles AS b ON b.bundle_id = f.bundle_id
+                   WHERE f.local_session_id = ?
+                     AND f.local_chunk_index = ?
+                     AND f.tape_label = ?
+                     AND COALESCE(f.container_name, b.tape_path,
+                                  f.stored_path) IS NOT NULL""",
+                (session_id, chunk_index, tape_label)
+            ).fetchall()
         return [r['tape_path'] for r in rows if r['tape_path']]
 
     def file_record_exists(self, original_path, tape_label, local_session_id=None,
                            local_chunk_index=None):
         with self.lock:
+            key = _file_record_key(original_path, tape_label,
+                                   local_session_id, local_chunk_index)
+            if self.conn.execute(
+                    "SELECT 1 FROM files_index WHERE record_key = ?", (key,)
+            ).fetchone():
+                return True
             return bool(self.conn.execute(
                 """SELECT 1 FROM files_index
                    WHERE COALESCE(original_path, '') = COALESCE(?, '')
@@ -2233,6 +2603,8 @@ class DatabaseManager:
     def delete_tape(self, volume_label):
         with self.lock:
             self.conn.execute("DELETE FROM files_index WHERE tape_label = ?", (volume_label,))
+            self.conn.execute("DELETE FROM archive_bundles WHERE tape_label = ?",
+                              (volume_label,))
             cur = self.conn.execute("DELETE FROM tapes WHERE volume_label = ?", (volume_label,))
             self._require_updated(cur, f"[DB] Tape not found: {volume_label}")
             self.conn.commit()
@@ -2245,120 +2617,91 @@ class DatabaseManager:
             ).fetchone())
 
     def get_tape(self, volume_label):
-        return self.conn.execute(
-            "SELECT * FROM tapes WHERE volume_label = ?", (volume_label,)
-        ).fetchone()
+        with self.lock:
+            return self.conn.execute(
+                "SELECT * FROM tapes WHERE volume_label = ?", (volume_label,)
+            ).fetchone()
 
     def insert_file(self, file_name, original_path, file_size_bytes, file_hash,
                     tape_label, is_packed, container_name, stored_path,
                     local_session_id=None, local_chunk_index=None):
-        with self.lock:
-            if not self.conn.execute(
-                "SELECT 1 FROM tapes WHERE volume_label = ?", (tape_label,)
-            ).fetchone():
-                raise RuntimeError(
-                    f"[DB] Cannot index file for unregistered tape: {tape_label}"
-                )
-
-            now = datetime.now().isoformat()
-            existing = self.conn.execute(
-                """SELECT file_id FROM files_index
-                   WHERE COALESCE(original_path, '') = COALESCE(?, '')
-                     AND COALESCE(tape_label, '') = COALESCE(?, '')
-                     AND COALESCE(local_session_id, -1) = COALESCE(?, -1)
-                     AND COALESCE(local_chunk_index, -1) = COALESCE(?, -1)""",
-                (original_path, tape_label, local_session_id, local_chunk_index)
-            ).fetchone()
-
-            if existing:
-                self.conn.execute(
-                    """UPDATE files_index
-                       SET file_name = ?,
-                           file_size_bytes = ?,
-                           file_hash = ?,
-                           backup_date = ?,
-                           is_packed = ?,
-                           container_name = ?,
-                           stored_path = ?
-                       WHERE file_id = ?""",
-                    (file_name, file_size_bytes, file_hash, now, is_packed,
-                     container_name, stored_path, existing['file_id'])
-                )
-                self.conn.commit()
-                return False
-
-            self.conn.execute(
-                """INSERT INTO files_index
-                   (file_name, original_path, file_size_bytes, file_hash, backup_date,
-                    tape_label, is_packed, container_name, stored_path,
-                    local_session_id, local_chunk_index)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (file_name, original_path, file_size_bytes, file_hash, now,
-                 tape_label, is_packed, container_name, stored_path,
-                 local_session_id, local_chunk_index)
-            )
-            self.conn.commit()
-            return True
+        stats = self.bulk_upsert_files([{
+            'file_name': file_name,
+            'original_path': original_path,
+            'file_size_bytes': file_size_bytes,
+            'file_hash': file_hash,
+            'tape_label': tape_label,
+            'is_packed': is_packed,
+            'container_name': container_name,
+            'stored_path': stored_path,
+            'local_session_id': local_session_id,
+            'local_chunk_index': local_chunk_index,
+        }])
+        return bool(stats['inserted'])
 
     def search_files(self, name_query=None, date_from=None, date_to=None):
-        sql    = "SELECT * FROM files_index WHERE 1=1"
+        return self.search_catalog(name_query=name_query,
+                                   date_from=date_from, date_to=date_to)
+
+    def search_catalog(self, name_query=None, tape_label=None,
+                       date_from=None, date_to=None, limit=None):
+        where = ["1=1"]
         params = []
         if name_query:
-            sql += " AND file_name LIKE ?"
+            where.append("COALESCE(f.file_name, f.stored_path) LIKE ?")
             pattern = name_query.replace('*', '%').replace('?', '_')
             if '%' not in pattern and '_' not in pattern:
                 pattern = f'%{pattern}%'
             params.append(pattern)
         if date_from:
-            sql += " AND DATE(backup_date) >= ?"
+            where.append("DATE(f.backup_date) >= ?")
             params.append(date_from)
         if date_to:
-            sql += " AND DATE(backup_date) <= ?"
+            where.append("DATE(f.backup_date) <= ?")
             params.append(date_to)
-        sql += " ORDER BY backup_date DESC"
-        return self.conn.execute(sql, params).fetchall()
+        if tape_label:
+            where.append("f.tape_label = ?")
+            params.append(tape_label)
+        order = 'f.original_path, COALESCE(f.file_name, f.stored_path)'
+        sql = self._catalog_select() + ' WHERE ' + ' AND '.join(where)
+        sql += ' ORDER BY ' + order
+        if limit is not None:
+            sql += ' LIMIT ?'
+            params.append(int(limit))
+        with self.lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        return [self._hydrate_file_row(row) for row in rows]
 
     def get_file_by_id(self, file_id):
-        return self.conn.execute(
-            "SELECT * FROM files_index WHERE file_id = ?", (file_id,)
-        ).fetchone()
+        rows = self._catalog_rows("f.file_id = ?", (file_id,))
+        return rows[0] if rows else None
 
     def search_by_directory(self, dir_path):
         pattern = dir_path.rstrip('/\\') + '%'
-        return self.conn.execute(
-            "SELECT * FROM files_index WHERE original_path LIKE ? ORDER BY original_path",
-            (pattern,)
-        ).fetchall()
+        return self._catalog_rows("f.original_path LIKE ?", (pattern,),
+                                  'f.original_path')
 
     def list_backup_sessions(self):
-        return self.conn.execute("""
-            SELECT DATE(backup_date) as session_date, tape_label,
-                   COUNT(*)          as file_count,
-                   SUM(file_size_bytes) as total_bytes
-            FROM files_index
-            GROUP BY DATE(backup_date), tape_label
-            ORDER BY session_date DESC
-        """).fetchall()
+        with self.lock:
+            return self.conn.execute("""
+                SELECT DATE(backup_date) as session_date, tape_label,
+                       COUNT(*)          as file_count,
+                       SUM(file_size_bytes) as total_bytes
+                FROM files_index
+                GROUP BY DATE(backup_date), tape_label
+                ORDER BY session_date DESC
+            """).fetchall()
 
     def search_by_session(self, session_date, tape_label):
-        return self.conn.execute(
-            "SELECT * FROM files_index WHERE DATE(backup_date) = ? AND tape_label = ? ORDER BY original_path",
-            (session_date, tape_label)
-        ).fetchall()
-
-    def update_tape_used_space(self, volume_label, bytes_added):
-        with self.lock:
-            cur = self.conn.execute(
-                "UPDATE tapes SET used_space = COALESCE(used_space, 0) + ? WHERE volume_label = ?",
-                (bytes_added, volume_label)
-            )
-            self._require_updated(cur, f"[DB] Tape not found: {volume_label}")
-            self.conn.commit()
+        return self._catalog_rows(
+            "DATE(f.backup_date) = ? AND f.tape_label = ?",
+            (session_date, tape_label), 'f.original_path')
 
     def list_tapes(self):
-        return self.conn.execute(
-            "SELECT * FROM tapes ORDER BY date_formatted DESC"
-        ).fetchall()
+        with self.lock:
+            return self.conn.execute(
+                "SELECT * FROM tapes ORDER BY date_formatted DESC"
+            ).fetchall()
 
     def delete_file(self, file_id):
         with self.lock:
@@ -2378,6 +2721,16 @@ class DatabaseManager:
                 self._require_updated(cur, f"[DB] Tape not found: {old_label}")
                 self.conn.execute(
                     "UPDATE files_index SET tape_label = ? WHERE tape_label = ?",
+                    (new_label, old_label)
+                )
+                # tape_label participates in record_key; clear keys so a later
+                # bulk upsert can lazily rebuild them with the new label.
+                self.conn.execute(
+                    "UPDATE files_index SET record_key = NULL WHERE tape_label = ?",
+                    (new_label,)
+                )
+                self.conn.execute(
+                    "UPDATE archive_bundles SET tape_label = ? WHERE tape_label = ?",
                     (new_label, old_label)
                 )
                 self.conn.commit()
@@ -2419,6 +2772,8 @@ class DatabaseManager:
                 raise RuntimeError(f"[DB] Tape not found: {volume_label}")
             cur = self.conn.execute("DELETE FROM files_index WHERE tape_label = ?", (volume_label,))
             removed = cur.rowcount
+            self.conn.execute("DELETE FROM archive_bundles WHERE tape_label = ?",
+                              (volume_label,))
             self.conn.execute("UPDATE tapes SET used_space = 0 WHERE volume_label = ?", (volume_label,))
             self.conn.commit()
             print(f"[DB] Removed {removed} file record(s) for tape '{volume_label}' (tape entry kept).")
@@ -3334,136 +3689,95 @@ class LTOBackup:
             print(f"[ERROR] {msg}")
             raise RuntimeError(msg)
 
-        if rc.returncode >= 8:
-            print(f"[WARN] Robocopy finished with exit code {rc.returncode} "
-                  f"— check for errors above.")
-
         # ---------------------------------------------------------------
         # Phase 3 — DB inserts (only files that were hashed / new this run)
         # ---------------------------------------------------------------
         db_sync_start = time.perf_counter()
+
+        def catalog_record(file_name, original_path, file_size_bytes, file_hash,
+                           is_packed, container_name, stored_path):
+            return {
+                'file_name': file_name,
+                'original_path': original_path,
+                'file_size_bytes': file_size_bytes,
+                'file_hash': file_hash,
+                'tape_label': tape_label,
+                'is_packed': is_packed,
+                'container_name': container_name,
+                'stored_path': stored_path,
+                'local_session_id': local_session_id,
+                'local_chunk_index': local_chunk_index,
+            }
+
         if packer_metadata is None:
-            # Direct backup: every hashed file is a loose tape record
-            recovered_count = 0
-            for info in recovered_direct_existing:
-                inserted = self.db.insert_file(
-                    file_name=info['file_name'],
-                    original_path=info['original_path'],
-                    file_size_bytes=info['file_size_bytes'],
-                    file_hash=info['file_hash'],
-                    tape_label=tape_label, is_packed=False,
-                    container_name=None, stored_path=info['stored_path'],
-                    local_session_id=local_session_id,
-                    local_chunk_index=local_chunk_index,
-                )
-                if inserted:
-                    recovered_count += 1
-                    record_counts['direct_recovered_inserted'] += 1
-                else:
-                    record_counts['direct_recovered_updated'] += 1
+            recovered_stats = self.db.bulk_upsert_files(
+                (catalog_record(
+                    info['file_name'], info['original_path'],
+                    info['file_size_bytes'], info['file_hash'], False, None,
+                    info['stored_path'])
+                 for info in recovered_direct_existing),
+            )
+            recovered_count = recovered_stats['inserted']
+            record_counts['direct_recovered_inserted'] += recovered_stats['inserted']
+            record_counts['direct_recovered_updated'] += recovered_stats['updated']
             if recovered_count:
                 print(f"[DB] Recovered {recovered_count} existing tape file record(s).")
-            for rel_path, info in hash_map.items():
-                inserted = self.db.insert_file(
-                    file_name=os.path.basename(info['src']),
-                    original_path=info['src'],
-                    file_size_bytes=info['fsize'],
-                    file_hash=info['hash'],
-                    tape_label=tape_label, is_packed=False,
-                    container_name=None, stored_path=info['dst'],
-                    local_session_id=local_session_id,
-                    local_chunk_index=local_chunk_index,
-                )
-                if inserted:
-                    record_counts['loose_records_inserted'] += 1
-                else:
-                    record_counts['loose_records_updated'] += 1
+            loose_stats = self.db.bulk_upsert_files(
+                (catalog_record(
+                    os.path.basename(info['src']), info['src'], info['fsize'],
+                    info['hash'], False, None, info['dst'])
+                 for info in hash_map.values()),
+            )
+            record_counts['loose_records_inserted'] += loose_stats['inserted']
+            record_counts['loose_records_updated'] += loose_stats['updated']
 
         else:
-            # Staged backup: loose large files + batch-insert packed-file records
-            recovered_count = 0
-            for rel_path, m, dst in skipped_existing:
-                if self.db.file_record_exists(
-                    m['original_path'], tape_label,
-                    local_session_id=local_session_id,
-                    local_chunk_index=local_chunk_index,
-                ):
-                    record_counts['loose_records_skipped_existing'] += 1
-                    continue
-                inserted = self.db.insert_file(
-                    file_name=m['file_name'],
-                    original_path=m['original_path'],
-                    file_size_bytes=m['file_size_bytes'],
-                    file_hash=m.get('file_hash', ''),
-                    tape_label=tape_label,
-                    is_packed=False,
-                    container_name=None,
-                    stored_path=dst,
-                    local_session_id=local_session_id,
-                    local_chunk_index=local_chunk_index,
-                )
-                if inserted:
-                    recovered_count += 1
-                    record_counts['loose_recovered_inserted'] += 1
-                else:
-                    record_counts['loose_recovered_updated'] += 1
-            for rel_path, info in hash_map.items():
-                file = os.path.basename(info['src'])
-                if file.startswith("Bundle_") and file.endswith(".zip"):
-                    continue  # bundle records handled below
-                if rel_path in meta_by_rel:
-                    m = meta_by_rel[rel_path]
-                    if self.db.file_record_exists(
-                        m['original_path'], tape_label,
-                        local_session_id=local_session_id,
-                        local_chunk_index=local_chunk_index,
-                    ):
-                        record_counts['loose_records_skipped_existing'] += 1
+            # Preserve resume semantics while batching all indexed lookups and
+            # writes into bounded transactions.
+            recovered_stats = self.db.bulk_upsert_files(
+                (catalog_record(
+                    m['file_name'], m['original_path'], m['file_size_bytes'],
+                    m.get('file_hash', ''), False, None, dst)
+                 for _, m, dst in skipped_existing),
+                update_existing=False,
+            )
+            recovered_count = recovered_stats['inserted']
+            record_counts['loose_recovered_inserted'] += recovered_stats['inserted']
+            record_counts['loose_records_skipped_existing'] += recovered_stats['skipped']
+
+            def loose_staged_records():
+                for rel_path, info in hash_map.items():
+                    file = os.path.basename(info['src'])
+                    if file.startswith("Bundle_") and file.endswith(".zip"):
                         continue
-                    inserted = self.db.insert_file(
-                        file_name=file,
-                        original_path=m['original_path'],
-                        file_size_bytes=info['fsize'],
-                        file_hash=info['hash'],
-                        tape_label=tape_label, is_packed=False,
-                        container_name=None, stored_path=info['dst'],
-                        local_session_id=local_session_id,
-                        local_chunk_index=local_chunk_index,
-                    )
-                    if inserted:
-                        record_counts['loose_records_inserted'] += 1
-                    else:
-                        record_counts['loose_records_updated'] += 1
-            print("[DB] Recording packed file entries...")
-            packed_count = 0
-            for m in packer_metadata:
-                if m['is_packed']:
-                    if self.db.file_record_exists(
-                        m['original_path'], tape_label,
-                        local_session_id=local_session_id,
-                        local_chunk_index=local_chunk_index,
-                    ):
-                        record_counts['packed_records_skipped_existing'] += 1
-                        continue
-                    tape_zip_path = os.path.join(tape_root, m['container_name'])
-                    inserted = self.db.insert_file(
-                        file_name=m['file_name'], original_path=m['original_path'],
-                        file_size_bytes=m['file_size_bytes'],
-                        file_hash=m.get('file_hash', ''),
-                        tape_label=tape_label, is_packed=True,
-                        container_name=tape_zip_path,
-                        stored_path=m['stored_path'],
-                        local_session_id=local_session_id,
-                        local_chunk_index=local_chunk_index,
-                    )
-                    if inserted:
-                        record_counts['packed_records_inserted'] += 1
-                    else:
-                        record_counts['packed_records_updated'] += 1
-                    packed_count += 1
+                    m = meta_by_rel.get(rel_path)
+                    if m:
+                        yield catalog_record(
+                            file, m['original_path'], info['fsize'], info['hash'],
+                            False, None, info['dst'])
+
+            loose_stats = self.db.bulk_upsert_files(
+                loose_staged_records(), update_existing=False)
+            record_counts['loose_records_inserted'] += loose_stats['inserted']
+            record_counts['loose_records_skipped_existing'] += loose_stats['skipped']
+
+            print("[DB] Recording packed file entries in transaction batches...")
+            packed_stats = self.db.bulk_upsert_files(
+                (catalog_record(
+                    m['file_name'], m['original_path'], m['file_size_bytes'],
+                    m.get('file_hash', ''), True,
+                    os.path.join(tape_root, m['container_name']),
+                    m['stored_path'])
+                 for m in packer_metadata if m['is_packed']),
+                update_existing=False,
+            )
+            packed_count = packed_stats['inserted']
+            record_counts['packed_records_inserted'] += packed_stats['inserted']
+            record_counts['packed_records_skipped_existing'] += packed_stats['skipped']
             if recovered_count:
                 print(f"[DB] Recovered {recovered_count} existing loose file record(s).")
-            print(f"[DB] {packed_count} packed file record(s) synchronized.")
+            print(f"[DB] {packed_count} packed file record(s) inserted; "
+                  f"{packed_stats['skipped']} already indexed.")
 
         db_sync_seconds = time.perf_counter() - db_sync_start
 
@@ -3481,9 +3795,10 @@ class LTOBackup:
         # ---------------------------------------------------------------
         total_time = time.time() - total_start
         finished_at = datetime.now()
+        # Reaching here means robocopy did not fail critically: returncode < 8
+        # and files_failed == 0 both raised earlier, so the status is always
+        # 'completed' (the old 'completed_with_warnings' branch was unreachable).
         log_status = 'completed'
-        if rc.returncode >= 8 or rc_sum.get('files_failed', 0):
-            log_status = 'completed_with_warnings'
         log_path = self._write_backup_log(
             {
                 'status': log_status,
@@ -3715,6 +4030,30 @@ class LTORetriever:
         else:
             print(f"[ERROR] Restore failed: robocopy error")
 
+    @staticmethod
+    def _resolve_zip_entry(zip_names, stored_in_zip, file_name):
+        """Choose which ZIP entry to extract for a catalog record.
+
+        Prefer the exact stored_path. Only fall back to a basename match when it
+        is UNIQUE in the ZIP (returning a warning); refuse an ambiguous basename
+        so a wrong same-named entry is never extracted. Returns
+        (entry_name, warning, error) — entry_name is None when error is set."""
+        if stored_in_zip and stored_in_zip in zip_names:
+            return stored_in_zip, None, None
+        base_matches = [n for n in zip_names
+                        if os.path.basename(n) == file_name]
+        if len(base_matches) == 1:
+            warn = (f"exact stored path '{stored_in_zip}' not in ZIP; using the "
+                    f"unique basename match '{base_matches[0]}'.")
+            return base_matches[0], warn, None
+        if not base_matches:
+            return None, None, (f"'{file_name}' not found inside ZIP "
+                                f"(stored path: {stored_in_zip}).")
+        return None, None, (f"'{file_name}' is ambiguous inside ZIP "
+                            f"({len(base_matches)} entries share this name) and "
+                            f"the stored path '{stored_in_zip}' is absent — "
+                            "refusing to guess.")
+
     def _restore_packed(self, record):
         tape_zip_path = record['container_name']   # full path of ZIP on tape
         stored_in_zip = record['stored_path']       # relative path inside the ZIP
@@ -3737,14 +4076,14 @@ class LTORetriever:
         dst = self._unique_dest(record['file_name'])
         try:
             with zipfile.ZipFile(local_zip, 'r') as zf:
-                candidates = [n for n in zf.namelist()
-                              if n == stored_in_zip
-                              or os.path.basename(n) == record['file_name']]
-                if not candidates:
-                    print(f"[ERROR] '{record['file_name']}' not found inside ZIP.")
-                    print(f"        Searched stored path: {stored_in_zip}")
+                entry, warn, err = self._resolve_zip_entry(
+                    zf.namelist(), stored_in_zip, record['file_name'])
+                if err:
+                    print(f"[ERROR] {err}")
                     return
-                with zf.open(candidates[0]) as zf_src, open(dst, 'wb') as out:
+                if warn:
+                    print(f"[WARN] {warn}")
+                with zf.open(entry) as zf_src, open(dst, 'wb') as out:
                     shutil.copyfileobj(zf_src, out)
             print(f"[RESTORE] Saved to: {dst}")
             _verify_restored_hash(dst, record)
@@ -3777,14 +4116,15 @@ class LTORetriever:
                 for record in records:
                     stored_in_zip = record['stored_path']
                     dst = self._unique_dest(record['file_name'])
-                    candidates = [n for n in zip_names
-                                  if n == stored_in_zip
-                                  or os.path.basename(n) == record['file_name']]
-                    if not candidates:
-                        print(f"[ERROR] '{record['file_name']}' not found in ZIP.")
+                    entry, warn, err = self._resolve_zip_entry(
+                        zip_names, stored_in_zip, record['file_name'])
+                    if err:
+                        print(f"[ERROR] {err}")
                         continue
+                    if warn:
+                        print(f"[WARN] {warn}")
                     try:
-                        with zf.open(candidates[0]) as zf_src, open(dst, 'wb') as out:
+                        with zf.open(entry) as zf_src, open(dst, 'wb') as out:
                             shutil.copyfileobj(zf_src, out)
                         print(f"[OK] {record['file_name']}")
                         _verify_restored_hash(dst, record)
@@ -4074,6 +4414,9 @@ class LocalOrchestrator:
     def _ensure_chunk_fits_tape(self, tape_label, entries):
         planned_bytes = sum(e['dir_size_bytes'] for e in entries)
 
+        # The LTFS free-space figure is advisory only (it varies with hardware
+        # compression); LOCAL_TAPE_BUDGET_BYTES is the authoritative guard. This
+        # probe is a best-effort early-out, so a read failure is non-fatal.
         _acquire_tape_io_lock(f"read free space {self.cfg.lto_drive}")
         try:
             disk_free = shutil.disk_usage(self.cfg.lto_drive).free
@@ -4335,6 +4678,27 @@ class RemoteOrchestrator:
                 f"Edit config.ini and fill in remote_host, remote_user, remote_path."
             )
 
+        # M2: every selected scan path must equal remote_path or be a
+        # posix-descendant of it — the same precondition the per-file fetch
+        # resolver (_remote_fetch_base_and_rel) enforces. Reject a misconfigured
+        # path up front with a clear message instead of failing mid-fetch.
+        root = posixpath.normpath((self.remote_path or '').replace('\\', '/').strip())
+        outside = []
+        for raw in self.remote_scan_paths:
+            p = posixpath.normpath((raw or '').replace('\\', '/').strip())
+            if root == '/' or p == root or p.startswith(root.rstrip('/') + '/'):
+                continue
+            outside.append(raw)
+        if outside:
+            raise RuntimeError(
+                "[REMOTE] These remote_selected_paths are not under "
+                f"remote_path ({self.remote_path}):\n  "
+                + "\n  ".join(outside)
+                + "\nEach selected path must equal remote_path or be a "
+                "subdirectory of it. Fix [REMOTE] remote_selected_paths in "
+                "config.ini."
+            )
+
     def _remote_session_key(self):
         if not self.remote_scan_paths or self.remote_scan_paths == [self.remote_path]:
             return self.remote_path
@@ -4348,6 +4712,12 @@ class RemoteOrchestrator:
             return
         if not _ensure_lto_drive_ready(self.cfg.lto_drive):
             return
+
+        if self.db.tape_exists(tape_label) and \
+                self.db.count_tape_file_records(tape_label) > 0:
+            print(f"[REMOTE] NOTE: tape '{tape_label}' already holds archived "
+                  "data. A new session appends its own directory set to the "
+                  "tape; existing data is not overwritten.")
 
         ts            = datetime.now().strftime('%Y%m%d_%H%M%S')
         session_label = f"REMOTE_{self.remote_host.split('.')[0]}_{ts}"
@@ -4448,9 +4818,12 @@ class RemoteOrchestrator:
     # ------------------------------------------------------------------
 
     def _scan_remote(self):
-        """SSH find with -printf '%s %p\n' to get size + path for every file."""
+        """SSH find with -printf '%s %p\0' to get size + path for every file.
+
+        NUL-delimited records survive filenames containing spaces or newlines;
+        only the size token is parsed, the path is never stripped."""
         quoted_paths = ' '.join(shlex.quote(path) for path in self.remote_scan_paths)
-        find_cmd = f"find {quoted_paths} -type f -printf '%s %p\\n'"
+        find_cmd = f"find {quoted_paths} -type f -printf '%s %p\\0'"
         result   = _ssh_run(
             self.remote_user,
             self.remote_host,
@@ -4475,15 +4848,17 @@ class RemoteOrchestrator:
                 f"some paths were skipped:\n{stderr}"
             )
         manifest = []
-        for line in stdout.splitlines():
-            line = line.strip()
-            if not line:
+        for record in stdout.split('\0'):
+            if not record:
                 continue
-            parts = line.split(' ', 1)
+            parts = record.split(' ', 1)
             if len(parts) != 2:
                 continue
+            size_s, path = parts
+            # int() tolerates a leading newline on the size token; the path is
+            # left verbatim so names with spaces/newlines survive intact.
             try:
-                manifest.append((parts[1].strip(), int(parts[0])))
+                manifest.append((path, int(size_s)))
             except ValueError:
                 continue
         return manifest
@@ -4536,9 +4911,7 @@ class RemoteOrchestrator:
         (the consumer) keeps robocopy streaming to the LTO drive. The staging
         footprint is capped (backpressure) so the disk never overruns, and the
         tape never starves on the network (no shoe-shining)."""
-        session_row    = self.db.conn.execute(
-            "SELECT * FROM remote_sessions WHERE session_id = ?", (session_id,)
-        ).fetchone()
+        session_row    = self.db.get_remote_session(session_id)
         tape_label     = session_row['tape_label']
         pending_chunks = self.db.get_pending_chunks(session_id)
         total_chunks   = self.db.count_chunks(session_id)
@@ -4716,8 +5089,14 @@ class RemoteOrchestrator:
     def _stage_chunk(self, session_id, chunk_index, chunk_files):
         """Fetch then pack one chunk. Returns a ready-descriptor or None."""
         self._producer_chunk = chunk_index
-        fetch_dir = os.path.join(self.staging_dir, f"_fetch_{chunk_index:03d}")
-        pack_dir  = os.path.join(self.staging_dir, f"_pack_{chunk_index:03d}")
+        # The session id is embedded so the on-tape root (basename(pack_dir),
+        # see LTOBackup._run_locked) is unique per session — two sessions on the
+        # same tape never collide on '_pack_NNN'. Resuming a session reuses the
+        # same deterministic names, so robocopy still same-size-skips.
+        fetch_dir = os.path.join(
+            self.staging_dir, f"_fetch_s{session_id:04d}_{chunk_index:03d}")
+        pack_dir  = os.path.join(
+            self.staging_dir, f"_pack_s{session_id:04d}_{chunk_index:03d}")
 
         # --- FETCH (remote -> PC) ---
         self.db.update_chunk_status(session_id, chunk_index, 'fetching')
@@ -4785,6 +5164,15 @@ class RemoteOrchestrator:
             self._cleanup_dir(fetch_dir)
             self._cleanup_dir(pack_dir)
             return None
+
+        # LTOPacker necessarily sees temporary Windows staging paths. Replace
+        # them before logging/indexing with the durable canonical remote paths
+        # persisted in the remote manifest.
+        canonical_count = _apply_canonical_remote_paths(
+            metadata, self.db.get_chunk_files(session_id, chunk_index))
+        if canonical_count != len(metadata):
+            _status('DB', f"Canonical source paths mapped for {canonical_count:,}/"
+                          f"{len(metadata):,} staged file(s).")
 
         pack_seconds = time.perf_counter() - pack_start
 
@@ -4924,7 +5312,7 @@ class RemoteOrchestrator:
     # ------------------------------------------------------------------
 
     def _fetch_chunk(self, session_id, chunk_index, chunk_files, fetch_dir):
-        os.makedirs(fetch_dir, exist_ok=True)
+        os.makedirs(_long(fetch_dir), exist_ok=True)
         total_chunks = self.db.count_chunks(session_id)
         source_missing_files = []
         fetched_file_count = 0
@@ -4981,12 +5369,12 @@ class RemoteOrchestrator:
             records.append((row, remote_base, rel, local_rel, local_path))
 
             # Skip if already fetched with matching size (resume support)
-            if os.path.exists(local_path):
+            if os.path.exists(_long(local_path)):
                 try:
-                    if os.path.getsize(local_path) == fsize:
+                    if os.path.getsize(_long(local_path)) == fsize:
                         print(f"[REMOTE] Skip (already fetched): {rel}")
                         continue
-                    os.remove(local_path)  # partial file from interrupted run
+                    os.remove(_long(local_path))  # partial from interrupted run
                 except OSError:
                     pass
 
@@ -5062,7 +5450,27 @@ class RemoteOrchestrator:
             manifest_id = row['manifest_id']
             if manifest_id in source_missing_ids:
                 continue
-            if not os.path.exists(local_path):
+            if not os.path.exists(_long(local_path)):
+                # An absent file is normally a genuine remote omission (the
+                # remote tar emitted a tolerated "Cannot stat"). But if the
+                # local target is unwritable by the non-long-path-aware
+                # extractor — a reserved device name or an over-MAX_PATH target
+                # — the absence is a LOCAL drop we must not record as
+                # source_missing. Fail the chunk loudly; it stays resumable.
+                reserved = _reserved_name_component(local_rel)
+                too_long = _exceeds_legacy_path_limit(local_path)
+                if reserved or too_long:
+                    reason = (f"reserved Windows device name '{reserved}'"
+                              if reserved else
+                              f"target exceeds the {_LEGACY_PATH_LIMIT}-char "
+                              "Windows path limit")
+                    msg = (f"refusing to skip '{row['remote_path']}': it could "
+                           f"not be written locally ({reason}). "
+                           f"Target: {local_path}")
+                    print(f"\n[REMOTE] {msg}")
+                    self.db.update_manifest_row(
+                        manifest_id, status='fetch_failed', error_msg=msg[:500])
+                    return False, source_missing_files, fetched_file_count
                 detail = {
                     'manifest_id': manifest_id,
                     'remote_path': row['remote_path'],
@@ -5080,7 +5488,7 @@ class RemoteOrchestrator:
                 continue
 
             try:
-                actual = os.path.getsize(local_path)
+                actual = os.path.getsize(_long(local_path))
             except OSError as e:
                 self.db.update_manifest_row(
                     manifest_id,
@@ -5093,7 +5501,7 @@ class RemoteOrchestrator:
                 print(f"[REMOTE] Size mismatch for {rel}: "
                       f"expected {fsize} B, got {actual} B")
                 try:
-                    os.remove(local_path)
+                    os.remove(_long(local_path))
                 except OSError:
                     pass
                 self.db.update_manifest_row(
@@ -5121,8 +5529,8 @@ class RemoteOrchestrator:
                 if CANCEL.is_set():
                     return False
                 tmp = os.path.join(collide_root, str(row['manifest_id']))
-                shutil.rmtree(tmp, ignore_errors=True)
-                os.makedirs(tmp, exist_ok=True)
+                shutil.rmtree(_long(tmp), ignore_errors=True)
+                os.makedirs(_long(tmp), exist_ok=True)
 
                 ok, err = _remote_tar_fetch(
                     self.remote_user,
@@ -5148,7 +5556,25 @@ class RemoteOrchestrator:
                 # Alone in tmp, the file lands at its natural sanitized path.
                 natural = os.path.join(
                     tmp, _winsafe_extracted_rel(rel).replace('/', os.sep))
-                if not os.path.exists(natural):
+                if not os.path.exists(_long(natural)):
+                    # As in _fetch_chunk: a reserved-name or over-MAX_PATH
+                    # target is a local write failure, not a remote omission —
+                    # surface it loudly (resumable) instead of source_missing.
+                    reserved = _reserved_name_component(_local_rel)
+                    too_long = (_exceeds_legacy_path_limit(natural)
+                                or _exceeds_legacy_path_limit(local_path))
+                    if reserved or too_long:
+                        reason = (f"reserved Windows device name '{reserved}'"
+                                  if reserved else
+                                  f"target exceeds the {_LEGACY_PATH_LIMIT}-char "
+                                  "Windows path limit")
+                        msg = (f"refusing to skip '{row['remote_path']}': it "
+                               f"could not be written locally ({reason}).")
+                        print(f"\n[REMOTE] {msg}")
+                        self.db.update_manifest_row(
+                            row['manifest_id'], status='fetch_failed',
+                            error_msg=msg[:500])
+                        return False
                     detail = {
                         'manifest_id': row['manifest_id'],
                         'remote_path': row['remote_path'],
@@ -5162,9 +5588,9 @@ class RemoteOrchestrator:
                         error_msg="missing after tar fetch")
                     continue
 
-                os.makedirs(os.path.dirname(local_path), exist_ok=True)
+                os.makedirs(_long(os.path.dirname(local_path)), exist_ok=True)
                 try:
-                    os.replace(natural, local_path)
+                    os.replace(_long(natural), _long(local_path))
                 except OSError as e:
                     print(f"[REMOTE] Could not place renamed file {rel}: {e}")
                     self.db.update_manifest_row(
@@ -5173,7 +5599,7 @@ class RemoteOrchestrator:
                     return False
             return True
         finally:
-            shutil.rmtree(collide_root, ignore_errors=True)
+            shutil.rmtree(_long(collide_root), ignore_errors=True)
 
     def _start_fetch_monitor(self, stop_evt, fetch_dir, total_bytes):
         """Live remote->PC throughput: watch the fetch dir grow on disk."""
@@ -5220,9 +5646,9 @@ class RemoteOrchestrator:
             self._cleanup_dir(path)
 
     def _cleanup_dir(self, path):
-        if os.path.exists(path):
+        if os.path.exists(_long(path)):
             try:
-                shutil.rmtree(path)
+                shutil.rmtree(_long(path))
                 print(f"[REMOTE] Cleaned: {path}")
             except OSError as e:
                 print(f"[REMOTE] Warning — could not clean {path}: {e}")
@@ -5577,9 +6003,24 @@ def _prepare_robocopy_exclusion():
 
 def run_archiver(cfg: ConfigManager, db: DatabaseManager):
     added_exclusion = _prepare_robocopy_exclusion()
+    reset_cancel()
+    install_cancel_handler()
+    print("[LOCAL] Press Ctrl+C at any time to stop safely "
+          "(the session is saved and can be resumed).")
     try:
         LocalOrchestrator(cfg, db).run()
+    except RuntimeError as e:
+        print(str(e))
+    except KeyboardInterrupt:
+        print("\n[LOCAL] Interrupted. Session state saved — re-run to resume.")
     finally:
+        # Mirror run_remote_archiver: make sure no robocopy child survives,
+        # restore CPU affinity and default Ctrl+C behaviour, then drop the
+        # robocopy Defender exclusion.
+        _terminate_all_procs()
+        unpin_current_process()
+        uninstall_cancel_handler()
+        reset_cancel()
         if added_exclusion:
             _remove_robocopy_exclusion()
 
