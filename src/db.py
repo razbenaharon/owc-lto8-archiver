@@ -28,6 +28,8 @@ from .constants import CONFIG_FILE, DB_UPSERT_BATCH_SIZE
 from .paths import _clean_config_path
 from .runtime import CANCEL
 
+SCHEMA_VERSION = 2
+
 
 def _hash_to_blob(value):
     """Return a compact 32-byte SHA-256 value, or None when no hash exists."""
@@ -64,18 +66,30 @@ def _file_record_key(original_path, tape_label, local_session_id=None,
 
 
 def _apply_canonical_remote_paths(metadata, manifest_rows):
-    """Replace temporary staging paths with durable remote source paths."""
+    """Attach durable remote SOURCE paths to staging-produced metadata.
+
+    ``stored_path`` remains the staging/tape-relative path.  The canonical
+    source is carried separately so callers never have to infer identity from
+    a temporary ``_fetch_*`` directory.
+    """
     remote_by_local = {}
     for row in manifest_rows:
         local_rel = row['local_rel_path']
         remote_path = row['remote_path']
         if local_rel and remote_path:
-            remote_by_local[str(local_rel).replace('\\', '/')] = remote_path
+            key = str(local_rel).replace('\\', '/')
+            previous = remote_by_local.setdefault(key, remote_path)
+            if previous != remote_path:
+                raise RuntimeError(
+                    "[DB] Ambiguous canonical source mapping for staged path "
+                    f"'{key}': '{previous}' and '{remote_path}'"
+                )
     replaced = 0
     for item in metadata:
         stored = str(item.get('stored_path') or '').replace('\\', '/')
         canonical = remote_by_local.get(stored)
         if canonical:
+            item['canonical_source_path'] = canonical
             item['original_path'] = canonical
             replaced += 1
     return replaced
@@ -84,6 +98,13 @@ def _apply_canonical_remote_paths(metadata, manifest_rows):
 class DatabaseManager:
     def __init__(self, db_path):
         db_path = _clean_config_path(db_path)
+        self.db_path = os.path.abspath(db_path)
+        maintenance_lock = os.path.abspath(db_path) + '.maintenance.lock'
+        if os.path.exists(maintenance_lock):
+            raise RuntimeError(
+                "[DB] Database optimization is in progress; archive and "
+                "inspector access is temporarily disabled."
+            )
         db_dir = os.path.dirname(os.path.abspath(db_path))
         try:
             os.makedirs(db_dir, exist_ok=True)
@@ -179,6 +200,16 @@ class DatabaseManager:
                 tape_path   TEXT NOT NULL,
                 UNIQUE(tape_label, tape_path)
             );
+            CREATE TABLE IF NOT EXISTS archive_runs (
+                run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_label TEXT NOT NULL,
+                tape_label TEXT NOT NULL REFERENCES tapes(volume_label),
+                session_kind TEXT NOT NULL DEFAULT 'legacy',
+                session_id INTEGER,
+                started_at DATETIME NOT NULL,
+                completed_at DATETIME,
+                UNIQUE(run_label, tape_label)
+            );
         """)
         self.conn.commit()
         # Migrate existing DB: add used_space if missing
@@ -193,28 +224,29 @@ class DatabaseManager:
             ('bundle_id', 'INTEGER REFERENCES archive_bundles(bundle_id)'),
             ('file_hash_blob', 'BLOB'),
             ('record_key', 'BLOB'),
+            ('archive_run_id', 'INTEGER REFERENCES archive_runs(run_id)'),
         ):
             try:
                 self.conn.execute(f"ALTER TABLE files_index ADD COLUMN {column} {col_type}")
                 self.conn.commit()
             except sqlite3.OperationalError:
                 pass  # column already exists
-        # The expression index is the permanent form of the live rescue index.
-        # It accelerates legacy rows whose record_key has not yet been populated.
-        # New rows use the compact partial-unique record_key index for SQL upserts.
+        if self.conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+            self.conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_files_dedup_expr
+                    ON files_index(
+                        COALESCE(original_path, ''),
+                        COALESCE(tape_label, ''),
+                        COALESCE(local_session_id, -1),
+                        COALESCE(local_chunk_index, -1)
+                    )
+            """)
         self.conn.executescript("""
-            CREATE INDEX IF NOT EXISTS idx_files_dedup_expr
-                ON files_index(
-                    COALESCE(original_path, ''),
-                    COALESCE(tape_label, ''),
-                    COALESCE(local_session_id, -1),
-                    COALESCE(local_chunk_index, -1)
-                );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_files_record_key
                 ON files_index(record_key)
                 WHERE record_key IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_files_bundle_id
-                ON files_index(bundle_id);
+                ON files_index(bundle_id) WHERE bundle_id IS NOT NULL;
         """)
         self.conn.commit()
 
@@ -250,7 +282,8 @@ class DatabaseManager:
             CREATE INDEX IF NOT EXISTS idx_local_manifest_session_chunk
                 ON local_chunks_manifest(session_id, chunk_index);
             CREATE INDEX IF NOT EXISTS idx_files_local_session_chunk
-                ON files_index(local_session_id, local_chunk_index, tape_label);
+                ON files_index(local_session_id, local_chunk_index, tape_label)
+                WHERE local_session_id IS NOT NULL;
         """)
         self.conn.commit()
         try:
@@ -266,6 +299,17 @@ class DatabaseManager:
     def _init_remote_schema(self):
         """Create remote_sessions and remote_manifest tables if they don't exist.
         Safe to call on existing databases — uses CREATE TABLE IF NOT EXISTS."""
+        version = self.conn.execute("PRAGMA user_version").fetchone()[0]
+        legacy = self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='remote_manifest'"
+        ).fetchone()
+        if version >= SCHEMA_VERSION or not legacy:
+            self._init_remote_schema_v2()
+            if not legacy and version < SCHEMA_VERSION:
+                self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                self.conn.commit()
+            return
+
         self.conn.executescript("""
             CREATE TABLE IF NOT EXISTS remote_sessions (
                 session_id    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -312,6 +356,88 @@ class DatabaseManager:
         self.conn.commit()
 
         self._migrate_remote_manifest_source_missing()
+
+    def _init_remote_schema_v2(self):
+        """Create normalized remote snapshot, plan, chunk, and state tables."""
+        self.conn.executescript("""
+            CREATE TABLE IF NOT EXISTS remote_sessions (
+                session_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_label TEXT NOT NULL,
+                remote_host TEXT NOT NULL,
+                remote_user TEXT NOT NULL,
+                remote_path TEXT NOT NULL,
+                tape_label TEXT NOT NULL,
+                staging_dir TEXT NOT NULL,
+                total_files INTEGER DEFAULT 0,
+                total_bytes INTEGER DEFAULT 0,
+                chunk_count INTEGER DEFAULT 0,
+                plan_id INTEGER REFERENCES remote_plans(plan_id),
+                created_at DATETIME NOT NULL,
+                completed_at DATETIME,
+                status TEXT NOT NULL DEFAULT 'active'
+                    CHECK(status IN ('active','completed','abandoned'))
+            );
+            CREATE TABLE IF NOT EXISTS remote_snapshots (
+                snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                remote_host TEXT NOT NULL,
+                remote_path TEXT NOT NULL,
+                fingerprint BLOB NOT NULL UNIQUE,
+                total_files INTEGER NOT NULL,
+                total_bytes INTEGER NOT NULL,
+                created_at DATETIME NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS remote_snapshot_files (
+                snapshot_file_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_id INTEGER NOT NULL REFERENCES remote_snapshots(snapshot_id)
+                    ON DELETE CASCADE,
+                remote_path TEXT NOT NULL,
+                file_size_bytes INTEGER NOT NULL,
+                UNIQUE(snapshot_id, remote_path)
+            );
+            CREATE TABLE IF NOT EXISTS remote_plans (
+                plan_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                snapshot_id INTEGER NOT NULL REFERENCES remote_snapshots(snapshot_id)
+                    ON DELETE CASCADE,
+                fingerprint BLOB NOT NULL UNIQUE,
+                chunk_count INTEGER NOT NULL,
+                created_at DATETIME NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS remote_plan_files (
+                plan_file_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                plan_id INTEGER NOT NULL REFERENCES remote_plans(plan_id)
+                    ON DELETE CASCADE,
+                snapshot_file_id INTEGER NOT NULL
+                    REFERENCES remote_snapshot_files(snapshot_file_id),
+                chunk_index INTEGER NOT NULL,
+                ordinal INTEGER NOT NULL,
+                UNIQUE(plan_id, snapshot_file_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_remote_plan_chunk
+                ON remote_plan_files(plan_id, chunk_index, ordinal);
+            CREATE TABLE IF NOT EXISTS remote_chunks (
+                session_id INTEGER NOT NULL REFERENCES remote_sessions(session_id)
+                    ON DELETE CASCADE,
+                chunk_index INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                error_msg TEXT,
+                updated_at DATETIME,
+                PRIMARY KEY(session_id, chunk_index)
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS remote_file_state (
+                session_id INTEGER NOT NULL REFERENCES remote_sessions(session_id)
+                    ON DELETE CASCADE,
+                plan_file_id INTEGER NOT NULL REFERENCES remote_plan_files(plan_file_id),
+                status TEXT,
+                local_rel_path TEXT,
+                error_msg TEXT,
+                updated_at DATETIME,
+                PRIMARY KEY(session_id, plan_file_id)
+            ) WITHOUT ROWID;
+        """)
+        self.conn.commit()
+
+    def _uses_remote_v2(self):
+        return self.conn.execute("PRAGMA user_version").fetchone()[0] >= SCHEMA_VERSION
 
     def _migrate_remote_manifest_source_missing(self):
         """Allow source_missing in databases created by older versions.
@@ -455,6 +581,8 @@ class DatabaseManager:
 
     def insert_remote_manifest_batch(self, session_id, rows):
         """rows: list of (chunk_index, remote_path, file_name, file_size_bytes)"""
+        if self._uses_remote_v2():
+            return self._insert_remote_plan_v2(session_id, list(rows))
         with self.lock:
             self.conn.executemany(
                 """INSERT INTO remote_manifest
@@ -466,7 +594,128 @@ class DatabaseManager:
             )
             self.conn.commit()
 
+    def _insert_remote_plan_v2(self, session_id, rows):
+        """Persist a canonical snapshot and reusable chunk plan."""
+        session = self.get_remote_session(session_id)
+        if not session:
+            raise RuntimeError(f"[DB] Remote session not found: {session_id}")
+        by_path = {}
+        for chunk_index, remote_path, _file_name, size in rows:
+            canonical = str(remote_path).replace('\\', '/')
+            if not canonical.startswith('/'):
+                raise RuntimeError(
+                    f"[DB] Non-canonical remote SOURCE path: {remote_path}")
+            previous = by_path.setdefault(canonical, int(size))
+            if previous != int(size):
+                raise RuntimeError(
+                    f"[DB] Conflicting sizes for remote SOURCE path: {canonical}")
+        if len(by_path) != len(rows):
+            raise RuntimeError("[DB] Duplicate canonical paths in remote snapshot")
+
+        snapshot_hash = hashlib.sha256()
+        for identity in (session['remote_host'], session['remote_path']):
+            raw = str(identity).encode('utf-8', errors='surrogatepass')
+            snapshot_hash.update(len(raw).to_bytes(8, 'big'))
+            snapshot_hash.update(raw)
+        for path, size in sorted(by_path.items()):
+            raw = path.encode('utf-8', errors='surrogatepass')
+            snapshot_hash.update(len(raw).to_bytes(8, 'big'))
+            snapshot_hash.update(raw)
+            snapshot_hash.update(size.to_bytes(8, 'big', signed=False))
+        fingerprint = snapshot_hash.digest()
+        plan_hash = hashlib.sha256(fingerprint)
+        for chunk_index, remote_path, _file_name, size in rows:
+            raw = str(remote_path).encode('utf-8', errors='surrogatepass')
+            plan_hash.update(int(chunk_index).to_bytes(4, 'big'))
+            plan_hash.update(len(raw).to_bytes(8, 'big'))
+            plan_hash.update(raw)
+            plan_hash.update(int(size).to_bytes(8, 'big'))
+        plan_fingerprint = plan_hash.digest()
+        now = datetime.now().isoformat()
+
+        with self.lock:
+            with self.conn:
+                self.conn.execute(
+                    """INSERT INTO remote_snapshots
+                       (remote_host,remote_path,fingerprint,total_files,total_bytes,created_at)
+                       VALUES (?,?,?,?,?,?) ON CONFLICT(fingerprint) DO NOTHING""",
+                    (session['remote_host'], session['remote_path'], fingerprint,
+                     len(rows), sum(int(r[3]) for r in rows), now),
+                )
+                snapshot_id = self.conn.execute(
+                    "SELECT snapshot_id FROM remote_snapshots WHERE fingerprint=?",
+                    (fingerprint,),
+                ).fetchone()[0]
+                existing = self.conn.execute(
+                    "SELECT COUNT(*) FROM remote_snapshot_files WHERE snapshot_id=?",
+                    (snapshot_id,),
+                ).fetchone()[0]
+                if not existing:
+                    self.conn.executemany(
+                        """INSERT INTO remote_snapshot_files
+                           (snapshot_id,remote_path,file_size_bytes) VALUES (?,?,?)""",
+                        ((snapshot_id, path, size) for path, size in by_path.items()),
+                    )
+                self.conn.execute(
+                    """INSERT INTO remote_plans
+                       (snapshot_id,fingerprint,chunk_count,created_at)
+                       VALUES (?,?,?,?) ON CONFLICT(fingerprint) DO NOTHING""",
+                    (snapshot_id, plan_fingerprint,
+                     len({int(r[0]) for r in rows}), now),
+                )
+                plan_id = self.conn.execute(
+                    "SELECT plan_id FROM remote_plans WHERE fingerprint=?",
+                    (plan_fingerprint,),
+                ).fetchone()[0]
+                existing = self.conn.execute(
+                    "SELECT COUNT(*) FROM remote_plan_files WHERE plan_id=?",
+                    (plan_id,),
+                ).fetchone()[0]
+                if not existing:
+                    ids = dict(self.conn.execute(
+                        "SELECT remote_path,snapshot_file_id FROM remote_snapshot_files "
+                        "WHERE snapshot_id=?", (snapshot_id,)).fetchall())
+                    self.conn.executemany(
+                        """INSERT INTO remote_plan_files
+                           (plan_id,snapshot_file_id,chunk_index,ordinal)
+                           VALUES (?,?,?,?)""",
+                        ((plan_id, ids[str(r[1])], int(r[0]), ordinal)
+                         for ordinal, r in enumerate(rows)),
+                    )
+                self.conn.execute(
+                    "UPDATE remote_sessions SET plan_id=? WHERE session_id=?",
+                    (plan_id, session_id),
+                )
+                self.conn.executemany(
+                    """INSERT INTO remote_chunks(session_id,chunk_index,status,updated_at)
+                       VALUES (?,?,'pending',?) ON CONFLICT DO NOTHING""",
+                    ((session_id, ci, now) for ci in sorted({int(r[0]) for r in rows})),
+                )
+        return plan_id
+
     def get_chunk_files(self, session_id, chunk_index):
+        if self._uses_remote_v2():
+            with self.lock:
+                return self.conn.execute(
+                    """SELECT pf.plan_file_id AS manifest_id,
+                              sf.remote_path, sf.file_size_bytes,
+                              st.local_rel_path,
+                              COALESCE(st.status,
+                                CASE WHEN c.status='done' THEN 'fetched' ELSE 'pending' END
+                              ) AS status,
+                              st.error_msg, st.updated_at
+                       FROM remote_sessions s
+                       JOIN remote_plan_files pf ON pf.plan_id=s.plan_id
+                       JOIN remote_snapshot_files sf
+                         ON sf.snapshot_file_id=pf.snapshot_file_id
+                       JOIN remote_chunks c ON c.session_id=s.session_id
+                         AND c.chunk_index=pf.chunk_index
+                       LEFT JOIN remote_file_state st ON st.session_id=s.session_id
+                         AND st.plan_file_id=pf.plan_file_id
+                       WHERE s.session_id=? AND pf.chunk_index=?
+                       ORDER BY pf.ordinal""",
+                    (session_id, chunk_index),
+                ).fetchall()
         with self.lock:
             return self.conn.execute(
                 """SELECT * FROM remote_manifest
@@ -475,7 +724,11 @@ class DatabaseManager:
                 (session_id, chunk_index)
             ).fetchall()
 
-    def update_manifest_row(self, manifest_id, **kwargs):
+    def update_manifest_row(self, manifest_id, session_id=None, **kwargs):
+        if self._uses_remote_v2():
+            if session_id is None:
+                raise RuntimeError("[DB] session_id required for normalized remote state")
+            return self._upsert_remote_file_state(session_id, manifest_id, kwargs)
         kwargs['updated_at'] = datetime.now().isoformat()
         sets = ', '.join(f"{k} = ?" for k in kwargs)
         vals = list(kwargs.values()) + [manifest_id]
@@ -487,7 +740,48 @@ class DatabaseManager:
         )
         self._require_updated(cur, f"[DB] Remote manifest row not found: {manifest_id}")
 
-    def update_manifest_rows_fetching(self, manifest_ids):
+    def _upsert_remote_file_state(self, session_id, plan_file_id, values):
+        allowed = {'status', 'local_rel_path', 'error_msg'}
+        unknown = set(values) - allowed
+        if unknown:
+            raise RuntimeError(f"[DB] Invalid remote state field(s): {sorted(unknown)}")
+        current = self.conn.execute(
+            "SELECT * FROM remote_file_state WHERE session_id=? AND plan_file_id=?",
+            (session_id, plan_file_id),
+        ).fetchone()
+        merged = {key: (current[key] if current else None)
+                  for key in ('status','local_rel_path','error_msg')}
+        merged.update(values)
+        self._commit_write(
+            lambda: self.conn.execute(
+                """INSERT INTO remote_file_state
+                   (session_id,plan_file_id,status,local_rel_path,error_msg,updated_at)
+                   VALUES (?,?,?,?,?,?)
+                   ON CONFLICT(session_id,plan_file_id) DO UPDATE SET
+                     status=excluded.status,local_rel_path=excluded.local_rel_path,
+                     error_msg=excluded.error_msg,updated_at=excluded.updated_at""",
+                (session_id, plan_file_id, merged['status'],
+                 merged['local_rel_path'], merged['error_msg'],
+                 datetime.now().isoformat()),
+            ),
+            f"normalized remote file {plan_file_id} update",
+        )
+
+    def update_manifest_rows_fetching(self, manifest_ids, session_id=None):
+        manifest_ids = list(manifest_ids)
+        if self._uses_remote_v2():
+            if session_id is None:
+                raise RuntimeError("[DB] session_id required for normalized remote state")
+            now = datetime.now().isoformat()
+            return self._update_manifest_batches(
+                """INSERT INTO remote_file_state
+                   (session_id,plan_file_id,status,error_msg,updated_at)
+                   VALUES (?,?,'fetching',NULL,?)
+                   ON CONFLICT(session_id,plan_file_id) DO UPDATE SET
+                     status='fetching',error_msg=NULL,updated_at=excluded.updated_at""",
+                ((session_id, manifest_id, now) for manifest_id in manifest_ids),
+                "normalized manifest fetching-status batch",
+            )
         now = datetime.now().isoformat()
         self._update_manifest_batches(
             """UPDATE remote_manifest
@@ -497,8 +791,24 @@ class DatabaseManager:
             "manifest fetching-status batch",
         )
 
-    def update_manifest_rows_fetched(self, rows):
+    def update_manifest_rows_fetched(self, rows, session_id=None):
         """rows contains (local_rel_path, manifest_id) pairs."""
+        rows = list(rows)
+        if self._uses_remote_v2():
+            if session_id is None:
+                raise RuntimeError("[DB] session_id required for normalized remote state")
+            now = datetime.now().isoformat()
+            return self._update_manifest_batches(
+                """INSERT INTO remote_file_state
+                   (session_id,plan_file_id,status,local_rel_path,error_msg,updated_at)
+                   VALUES (?,?,'fetched',?,NULL,?)
+                   ON CONFLICT(session_id,plan_file_id) DO UPDATE SET
+                     status='fetched',local_rel_path=excluded.local_rel_path,
+                     error_msg=NULL,updated_at=excluded.updated_at""",
+                ((session_id, manifest_id, local_rel_path, now)
+                 for local_rel_path, manifest_id in rows),
+                "normalized manifest fetched-status batch",
+            )
         now = datetime.now().isoformat()
         self._update_manifest_batches(
             """UPDATE remote_manifest
@@ -510,7 +820,25 @@ class DatabaseManager:
             "manifest fetched-status batch",
         )
 
-    def update_manifest_rows_fetch_failed(self, manifest_ids, error_msg):
+    def update_manifest_rows_fetch_failed(self, manifest_ids, error_msg,
+                                          session_id=None):
+        manifest_ids = list(manifest_ids)
+        if self._uses_remote_v2():
+            if session_id is None:
+                raise RuntimeError("[DB] session_id required for normalized remote state")
+            now = datetime.now().isoformat()
+            error_msg = (error_msg or '')[:500]
+            return self._update_manifest_batches(
+                """INSERT INTO remote_file_state
+                   (session_id,plan_file_id,status,error_msg,updated_at)
+                   VALUES (?,?,'fetch_failed',?,?)
+                   ON CONFLICT(session_id,plan_file_id) DO UPDATE SET
+                     status='fetch_failed',error_msg=excluded.error_msg,
+                     updated_at=excluded.updated_at""",
+                ((session_id, manifest_id, error_msg, now)
+                 for manifest_id in manifest_ids),
+                "normalized manifest fetch-failure batch",
+            )
         now = datetime.now().isoformat()
         error_msg = (error_msg or '')[:500]
         self._update_manifest_batches(
@@ -522,6 +850,31 @@ class DatabaseManager:
         )
 
     def update_chunk_status(self, session_id, chunk_index, status):
+        if self._uses_remote_v2():
+            cur = self._commit_write(
+                lambda: self.conn.execute(
+                    """UPDATE remote_chunks SET status=?,updated_at=?
+                       WHERE session_id=? AND chunk_index=?""",
+                    (status, datetime.now().isoformat(), session_id, chunk_index),
+                ),
+                f"normalized chunk {chunk_index + 1} status update",
+            )
+            self._require_updated(
+                cur, f"[DB] Remote chunk not found: session {session_id}, chunk {chunk_index}")
+            if status == 'done':
+                self._commit_write(
+                    lambda: self.conn.execute(
+                        """DELETE FROM remote_file_state
+                           WHERE session_id=? AND plan_file_id IN (
+                             SELECT plan_file_id FROM remote_plan_files pf
+                             JOIN remote_sessions s ON s.plan_id=pf.plan_id
+                             WHERE s.session_id=? AND pf.chunk_index=?
+                           ) AND COALESCE(status,'') != 'source_missing'""",
+                        (session_id, session_id, chunk_index),
+                    ),
+                    f"normalized chunk {chunk_index + 1} transient-state cleanup",
+                )
+            return
         cur = self._commit_write(
             lambda: self.conn.execute(
                 """UPDATE remote_manifest SET chunk_status = ?, updated_at = ?
@@ -536,6 +889,14 @@ class DatabaseManager:
         )
 
     def get_pending_chunks(self, session_id):
+        if self._uses_remote_v2():
+            with self.lock:
+                rows = self.conn.execute(
+                    """SELECT chunk_index FROM remote_chunks
+                       WHERE session_id=? AND status!='done' ORDER BY chunk_index""",
+                    (session_id,),
+                ).fetchall()
+            return [r[0] for r in rows]
         with self.lock:
             rows = self.conn.execute(
                 """SELECT DISTINCT chunk_index FROM remote_manifest
@@ -546,6 +907,12 @@ class DatabaseManager:
         return [r[0] for r in rows]
 
     def count_chunks(self, session_id):
+        if self._uses_remote_v2():
+            with self.lock:
+                return self.conn.execute(
+                    "SELECT COUNT(*) FROM remote_chunks WHERE session_id=?",
+                    (session_id,),
+                ).fetchone()[0]
         with self.lock:
             return self.conn.execute(
                 "SELECT COUNT(DISTINCT chunk_index) FROM remote_manifest WHERE session_id = ?",
@@ -698,6 +1065,8 @@ class DatabaseManager:
         if row is None:
             return None
         item = dict(row)
+        if not item.get('backup_date'):
+            item['backup_date'] = item.get('run_started_at')
         if not item.get('file_name'):
             item['file_name'] = _derived_file_name(
                 item.get('stored_path'), item.get('original_path'))
@@ -709,9 +1078,11 @@ class DatabaseManager:
 
     @staticmethod
     def _catalog_select():
-        return """SELECT f.*, b.tape_path AS bundle_tape_path
+        return """SELECT f.*, b.tape_path AS bundle_tape_path,
+                         r.started_at AS run_started_at
                   FROM files_index AS f
-                  LEFT JOIN archive_bundles AS b ON b.bundle_id = f.bundle_id"""
+                  LEFT JOIN archive_bundles AS b ON b.bundle_id = f.bundle_id
+                  LEFT JOIN archive_runs AS r ON r.run_id = f.archive_run_id"""
 
     def _catalog_rows(self, where='', params=(), order_by=''):
         sql = self._catalog_select()
@@ -755,10 +1126,44 @@ class DatabaseManager:
             ).fetchone()
             bundle_ids[(tape_label, tape_path)] = row['bundle_id']
 
+        batch_now = datetime.now().isoformat()
+        run_specs = {}
+        for record in records:
+            if record.get('archive_run_id') is not None:
+                continue
+            backup_date = record.get('backup_date') or batch_now
+            tape_label = record.get('tape_label') or ''
+            run_label = f"{str(backup_date)[:10]}:{tape_label}"
+            kind = 'local' if record.get('local_session_id') is not None else 'remote'
+            run_specs[(run_label, tape_label)] = (
+                run_label, tape_label, kind, record.get('local_session_id'),
+                backup_date, backup_date)
+        self.conn.executemany(
+            """INSERT INTO archive_runs
+               (run_label,tape_label,session_kind,session_id,started_at,completed_at)
+               VALUES (?,?,?,?,?,?)
+               ON CONFLICT(run_label,tape_label) DO NOTHING""",
+            run_specs.values(),
+        )
+        run_ids = {
+            key: self.conn.execute(
+                "SELECT run_id FROM archive_runs WHERE run_label=? AND tape_label=?",
+                key).fetchone()['run_id']
+            for key in run_specs
+        }
+
         normalized_by_key = {}
         legacy_lookup = {}
         for record in records:
-            original_path = record.get('original_path') or ''
+            canonical = record.get('canonical_source_path')
+            if canonical is not None:
+                canonical = str(canonical)
+                if not canonical.startswith('/') or '\\' in canonical:
+                    raise RuntimeError(
+                        "[DB] Remote catalog records require an absolute POSIX "
+                        f"canonical SOURCE path, got: {canonical}"
+                    )
+            original_path = canonical or record.get('original_path') or ''
             tape_label = record.get('tape_label') or ''
             session_id = record.get('local_session_id')
             chunk_index = record.get('local_chunk_index')
@@ -766,13 +1171,17 @@ class DatabaseManager:
                 original_path, tape_label, session_id, chunk_index)
             container = record.get('container_name')
             bundle_id = bundle_ids.get((tape_label, container))
+            backup_date = record.get('backup_date') or batch_now
+            run_label = f"{str(backup_date)[:10]}:{tape_label}"
+            archive_run_id = (record.get('archive_run_id') or
+                              run_ids[(run_label, tape_label)])
             normalized_by_key[key] = (
                 None,  # file_name is derived from stored_path on reads
                 original_path,
                 record.get('file_size_bytes'),
                 None,  # text hashes are legacy-only
                 _hash_to_blob(record.get('file_hash')),
-                record.get('backup_date') or datetime.now().isoformat(),
+                None,  # timestamp is normalized through archive_runs
                 tape_label,
                 bool(record.get('is_packed')),
                 None if bundle_id is not None else container,
@@ -781,6 +1190,7 @@ class DatabaseManager:
                 chunk_index,
                 bundle_id,
                 key,
+                archive_run_id,
             )
             legacy_lookup[key] = (
                 key, original_path, tape_label, session_id, chunk_index)
@@ -810,12 +1220,12 @@ class DatabaseManager:
         columns = """file_name, original_path, file_size_bytes, file_hash,
                      file_hash_blob, backup_date, tape_label, is_packed,
                      container_name, stored_path, local_session_id,
-                     local_chunk_index, bundle_id, record_key"""
+                     local_chunk_index, bundle_id, record_key, archive_run_id"""
         values = list(normalized_by_key.values())
         if update_existing:
             self.conn.executemany(
                 f"""INSERT INTO files_index({columns})
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(record_key) WHERE record_key IS NOT NULL DO UPDATE SET
                         file_name = excluded.file_name,
                         original_path = excluded.original_path,
@@ -829,7 +1239,8 @@ class DatabaseManager:
                         stored_path = excluded.stored_path,
                         local_session_id = excluded.local_session_id,
                         local_chunk_index = excluded.local_chunk_index,
-                        bundle_id = excluded.bundle_id""",
+                        bundle_id = excluded.bundle_id,
+                        archive_run_id = excluded.archive_run_id""",
                 values,
             )
             return {
@@ -840,7 +1251,7 @@ class DatabaseManager:
 
         self.conn.executemany(
             f"""INSERT INTO files_index({columns})
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(record_key) WHERE record_key IS NOT NULL DO NOTHING""",
             values,
         )
@@ -953,6 +1364,8 @@ class DatabaseManager:
             self.conn.execute("DELETE FROM files_index WHERE tape_label = ?", (volume_label,))
             self.conn.execute("DELETE FROM archive_bundles WHERE tape_label = ?",
                               (volume_label,))
+            self.conn.execute("DELETE FROM archive_runs WHERE tape_label = ?",
+                              (volume_label,))
             cur = self.conn.execute("DELETE FROM tapes WHERE volume_label = ?", (volume_label,))
             self._require_updated(cur, f"[DB] Tape not found: {volume_label}")
             self.conn.commit()
@@ -1002,10 +1415,10 @@ class DatabaseManager:
                 pattern = f'%{pattern}%'
             params.append(pattern)
         if date_from:
-            where.append("DATE(f.backup_date) >= ?")
+            where.append("DATE(COALESCE(f.backup_date,r.started_at)) >= ?")
             params.append(date_from)
         if date_to:
-            where.append("DATE(f.backup_date) <= ?")
+            where.append("DATE(COALESCE(f.backup_date,r.started_at)) <= ?")
             params.append(date_to)
         if tape_label:
             where.append("f.tape_label = ?")
@@ -1032,17 +1445,18 @@ class DatabaseManager:
     def list_backup_sessions(self):
         with self.lock:
             return self.conn.execute("""
-                SELECT DATE(backup_date) as session_date, tape_label,
-                       COUNT(*)          as file_count,
-                       SUM(file_size_bytes) as total_bytes
-                FROM files_index
-                GROUP BY DATE(backup_date), tape_label
+                SELECT DATE(COALESCE(f.backup_date,r.started_at)) AS session_date,
+                       f.tape_label, COUNT(*) AS file_count,
+                       SUM(f.file_size_bytes) AS total_bytes
+                FROM files_index f
+                LEFT JOIN archive_runs r ON r.run_id=f.archive_run_id
+                GROUP BY DATE(COALESCE(f.backup_date,r.started_at)), f.tape_label
                 ORDER BY session_date DESC
             """).fetchall()
 
     def search_by_session(self, session_date, tape_label):
         return self._catalog_rows(
-            "DATE(f.backup_date) = ? AND f.tape_label = ?",
+            "DATE(COALESCE(f.backup_date,r.started_at)) = ? AND f.tape_label = ?",
             (session_date, tape_label), 'f.original_path')
 
     def list_tapes(self):
@@ -1071,14 +1485,25 @@ class DatabaseManager:
                     "UPDATE files_index SET tape_label = ? WHERE tape_label = ?",
                     (new_label, old_label)
                 )
-                # tape_label participates in record_key; clear keys so a later
-                # bulk upsert can lazily rebuild them with the new label.
-                self.conn.execute(
-                    "UPDATE files_index SET record_key = NULL WHERE tape_label = ?",
-                    (new_label,)
+                rows = self.conn.execute(
+                    """SELECT file_id,original_path,local_session_id,local_chunk_index
+                       FROM files_index WHERE tape_label=?""", (new_label,))
+                self.conn.executemany(
+                    "UPDATE files_index SET record_key=? WHERE file_id=?",
+                    ((_file_record_key(r['original_path'], new_label,
+                                       r['local_session_id'], r['local_chunk_index']),
+                      r['file_id']) for r in rows),
                 )
                 self.conn.execute(
                     "UPDATE archive_bundles SET tape_label = ? WHERE tape_label = ?",
+                    (new_label, old_label)
+                )
+                self.conn.execute(
+                    "UPDATE archive_runs SET tape_label = ? WHERE tape_label = ?",
+                    (new_label, old_label)
+                )
+                self.conn.execute(
+                    "UPDATE remote_sessions SET tape_label = ? WHERE tape_label = ?",
                     (new_label, old_label)
                 )
                 self.conn.commit()
@@ -1122,9 +1547,159 @@ class DatabaseManager:
             removed = cur.rowcount
             self.conn.execute("DELETE FROM archive_bundles WHERE tape_label = ?",
                               (volume_label,))
+            self.conn.execute("DELETE FROM archive_runs WHERE tape_label = ?",
+                              (volume_label,))
             self.conn.execute("UPDATE tapes SET used_space = 0 WHERE volume_label = ?", (volume_label,))
             self.conn.commit()
             print(f"[DB] Removed {removed} file record(s) for tape '{volume_label}' (tape entry kept).")
+
+    def get_unreferenced_remote_data_summary(self):
+        """Describe normalized remote data not reachable from any session."""
+        with self.lock:
+            tables = {row[0] for row in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            required = {
+                'remote_sessions', 'remote_snapshots', 'remote_snapshot_files',
+                'remote_plans', 'remote_plan_files',
+            }
+            if not required.issubset(tables):
+                return {
+                    'supported': False, 'active_sessions': 0,
+                    'plans': 0, 'plan_files': 0,
+                    'snapshots': 0, 'snapshot_files': 0,
+                }
+            return dict(self.conn.execute("""
+                SELECT
+                  1 AS supported,
+                  (SELECT COUNT(*) FROM remote_sessions
+                   WHERE status='active') AS active_sessions,
+                  (SELECT COUNT(*) FROM remote_plans p
+                   WHERE NOT EXISTS (
+                     SELECT 1 FROM remote_sessions s WHERE s.plan_id=p.plan_id
+                   )) AS plans,
+                  (SELECT COUNT(*) FROM remote_plan_files pf
+                   WHERE EXISTS (
+                     SELECT 1 FROM remote_plans p
+                     WHERE p.plan_id=pf.plan_id AND NOT EXISTS (
+                       SELECT 1 FROM remote_sessions s WHERE s.plan_id=p.plan_id
+                     )
+                   )) AS plan_files,
+                  (SELECT COUNT(*) FROM remote_snapshots sn
+                   WHERE NOT EXISTS (
+                     SELECT 1 FROM remote_plans p
+                     JOIN remote_sessions s ON s.plan_id=p.plan_id
+                     WHERE p.snapshot_id=sn.snapshot_id
+                   )) AS snapshots,
+                  (SELECT COUNT(*) FROM remote_snapshot_files sf
+                   WHERE EXISTS (
+                     SELECT 1 FROM remote_snapshots sn
+                     WHERE sn.snapshot_id=sf.snapshot_id AND NOT EXISTS (
+                       SELECT 1 FROM remote_plans p
+                       JOIN remote_sessions s ON s.plan_id=p.plan_id
+                       WHERE p.snapshot_id=sn.snapshot_id
+                     )
+                   )) AS snapshot_files
+            """).fetchone())
+
+    def _permanent_catalog_signature(self):
+        """Small invariant fingerprint for tables cleanup must never change."""
+        return tuple(self.conn.execute("""
+            SELECT
+              (SELECT COUNT(*) FROM files_index),
+              (SELECT COALESCE(SUM(file_size_bytes),0) FROM files_index),
+              (SELECT COALESCE(SUM(file_id),0) FROM files_index),
+              (SELECT COUNT(record_key) FROM files_index),
+              (SELECT COUNT(*) FROM tapes),
+              (SELECT COALESCE(SUM(tape_id),0) FROM tapes),
+              (SELECT COALESCE(SUM(used_space),0) FROM tapes),
+              (SELECT COUNT(*) FROM archive_bundles),
+              (SELECT COALESCE(SUM(bundle_id),0) FROM archive_bundles),
+              (SELECT COUNT(*) FROM archive_runs),
+              (SELECT COALESCE(SUM(run_id),0) FROM archive_runs)
+        """).fetchone())
+
+    def cleanup_unreferenced_remote_data(self, compact=False):
+        """Delete only plans/snapshots unreachable from every remote session.
+
+        Permanent tape catalog tables are fingerprinted before and after the
+        transaction.  Any unexpected catalog change rolls the entire cleanup
+        back.  Active sessions block cleanup even when their own data would not
+        match the orphan predicates.
+        """
+        before_bytes = os.path.getsize(self.db_path)
+        with self.lock:
+            summary = self.get_unreferenced_remote_data_summary()
+            if not summary['supported']:
+                raise RuntimeError(
+                    "[DB] Normalized remote session storage is not available; "
+                    "run Optimize & Migrate first.")
+            if summary['active_sessions']:
+                raise RuntimeError(
+                    "[DB] Refusing session-data cleanup while remote sessions "
+                    "are active.")
+            catalog_before = self._permanent_catalog_signature()
+            session_before = tuple(self.conn.execute(
+                "SELECT COUNT(*),COALESCE(SUM(session_id),0) FROM remote_sessions"
+            ).fetchone())
+            try:
+                self.conn.execute("BEGIN IMMEDIATE")
+                active = self.conn.execute(
+                    "SELECT COUNT(*) FROM remote_sessions WHERE status='active'"
+                ).fetchone()[0]
+                if active:
+                    raise RuntimeError(
+                        "[DB] A remote session became active; cleanup cancelled.")
+                plan_cur = self.conn.execute("""
+                    DELETE FROM remote_plans AS p
+                    WHERE NOT EXISTS (
+                      SELECT 1 FROM remote_sessions s WHERE s.plan_id=p.plan_id
+                    )
+                """)
+                snapshot_cur = self.conn.execute("""
+                    DELETE FROM remote_snapshots AS sn
+                    WHERE NOT EXISTS (
+                      SELECT 1 FROM remote_plans p
+                      WHERE p.snapshot_id=sn.snapshot_id
+                    )
+                """)
+                catalog_after = self._permanent_catalog_signature()
+                session_after = tuple(self.conn.execute(
+                    "SELECT COUNT(*),COALESCE(SUM(session_id),0) FROM remote_sessions"
+                ).fetchone())
+                if catalog_after != catalog_before:
+                    raise RuntimeError(
+                        "[DB] Permanent tape catalog invariant changed; cleanup rolled back.")
+                if session_after != session_before:
+                    raise RuntimeError(
+                        "[DB] Remote session rows changed; cleanup rolled back.")
+                fk_rows = self.conn.execute('PRAGMA foreign_key_check').fetchall()
+                if fk_rows:
+                    raise RuntimeError(
+                        f"[DB] Cleanup produced {len(fk_rows)} foreign-key violation(s).")
+                self.conn.commit()
+            except BaseException:
+                self.conn.rollback()
+                raise
+
+            result = {
+                'plans_deleted': plan_cur.rowcount,
+                'plan_files_deleted': summary['plan_files'],
+                'snapshots_deleted': snapshot_cur.rowcount,
+                'snapshot_files_deleted': summary['snapshot_files'],
+                'catalog_files_preserved': catalog_before[0],
+                'before_bytes': before_bytes,
+            }
+            if compact:
+                self.conn.execute('VACUUM')
+            result['after_bytes'] = os.path.getsize(self.db_path)
+            result['reclaimed_bytes'] = before_bytes - result['after_bytes']
+            result['quick_check'] = self.conn.execute(
+                'PRAGMA quick_check').fetchone()[0]
+            result['foreign_key_violations'] = len(
+                self.conn.execute('PRAGMA foreign_key_check').fetchall())
+            if result['quick_check'] != 'ok' or result['foreign_key_violations']:
+                raise RuntimeError('[DB] Post-cleanup validation failed.')
+            return result
 
     def close(self):
         self.conn.close()

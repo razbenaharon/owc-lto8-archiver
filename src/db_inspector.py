@@ -1,5 +1,6 @@
 import os
 import sys
+import subprocess
 import tkinter as tk
 from tkinter import ttk, messagebox
 try:
@@ -856,9 +857,14 @@ class SessionsPanel(ctk.CTkFrame):
             state="disabled", fg_color="#7a1c1c", hover_color="#8f2020",
             command=self._on_delete)
         self._btn_vacuum = ctk.CTkButton(
-            tb, text="Compact DB", width=120, height=30,
+            tb, text="Optimize & Migrate", width=170, height=30,
             command=self._on_vacuum)
+        self._btn_cleanup = ctk.CTkButton(
+            tb, text="Clean Unused Session Data", width=210, height=30,
+            fg_color="#7a4d1c", hover_color="#936024",
+            command=self._on_cleanup)
         self._btn_delete.pack(side="left", padx=(0, 8))
+        self._btn_cleanup.pack(side="left", padx=(0, 8))
         self._btn_vacuum.pack(side="left")
 
         self._status_var = ctk.StringVar(value="")
@@ -950,7 +956,8 @@ class SessionsPanel(ctk.CTkFrame):
             rows.extend(dict(r) for r in local_rows)
 
         if self._table_exists("remote_sessions"):
-            remote_rows = self._db.conn.execute("""
+            if self._table_exists("remote_manifest"):
+                remote_rows = self._db.conn.execute("""
                 SELECT
                     'remote' AS kind,
                     s.session_id,
@@ -971,7 +978,21 @@ class SessionsPanel(ctk.CTkFrame):
                     0 AS file_records
                 FROM remote_sessions s
                 ORDER BY s.session_id
-            """).fetchall()
+                """).fetchall()
+            else:
+                remote_rows = self._db.conn.execute("""
+                    SELECT 'remote' AS kind,s.session_id,s.session_label,s.status,
+                           '' AS mode,s.created_at,s.completed_at,s.chunk_count AS chunks,
+                           COALESCE((SELECT COUNT(*) FROM remote_plan_files pf
+                                     WHERE pf.plan_id=s.plan_id),0) AS manifest_rows,
+                           COALESCE((SELECT SUM(sf.file_size_bytes)
+                                     FROM remote_plan_files pf
+                                     JOIN remote_snapshot_files sf
+                                       ON sf.snapshot_file_id=pf.snapshot_file_id
+                                     WHERE pf.plan_id=s.plan_id),0) AS manifest_bytes,
+                           0 AS file_records
+                    FROM remote_sessions s ORDER BY s.session_id
+                """).fetchall()
             rows.extend(dict(r) for r in remote_rows)
 
         return sorted(rows, key=lambda r: (str(r["kind"]), int(r["session_id"])))
@@ -1004,6 +1025,11 @@ class SessionsPanel(ctk.CTkFrame):
         self._status_var.set(
             f"{len(rows):,} session(s), {total_manifest_rows:,} manifest row(s), "
             f"{_fmt_bytes(total_manifest_bytes)} manifest data")
+        cleanup = self._db.get_unreferenced_remote_data_summary()
+        cleanup_available = bool(cleanup.get('plans') or cleanup.get('snapshots'))
+        self._btn_cleanup.configure(
+            state="normal" if cleanup_available and not cleanup.get('active_sessions')
+            else "disabled")
         self._btn_delete.configure(state="disabled")
 
     def _on_select(self, _event=None):
@@ -1018,27 +1044,36 @@ class SessionsPanel(ctk.CTkFrame):
         return kind, int(session_id)
 
     def _session_summary(self, kind, session_id):
-        manifest_table = "local_chunks_manifest" if kind == "local" else "remote_manifest"
         session_table = "local_sessions" if kind == "local" else "remote_sessions"
         label_row = self._db.conn.execute(
             f"SELECT session_label, status FROM {session_table} WHERE session_id = ?",
             (session_id,)
         ).fetchone()
-        count = self._db.conn.execute(
-            f"SELECT COUNT(*) FROM {manifest_table} WHERE session_id = ?",
-            (session_id,)
-        ).fetchone()[0]
+        if kind == 'remote' and not self._table_exists('remote_manifest'):
+            count = self._db.conn.execute(
+                """SELECT COUNT(*) FROM remote_plan_files pf
+                   JOIN remote_sessions s ON s.plan_id=pf.plan_id
+                   WHERE s.session_id=?""", (session_id,)).fetchone()[0]
+        else:
+            manifest_table = ("local_chunks_manifest" if kind == "local"
+                              else "remote_manifest")
+            count = self._db.conn.execute(
+                f"SELECT COUNT(*) FROM {manifest_table} WHERE session_id = ?",
+                (session_id,)).fetchone()[0]
         return label_row, count
 
     def _delete_session(self, kind, session_id):
-        manifest_table = "local_chunks_manifest" if kind == "local" else "remote_manifest"
         session_table = "local_sessions" if kind == "local" else "remote_sessions"
         with self._db.lock:
             with self._db.conn:
-                self._db.conn.execute(
-                    f"DELETE FROM {manifest_table} WHERE session_id = ?",
-                    (session_id,)
-                )
+                if kind == 'local':
+                    self._db.conn.execute(
+                        "DELETE FROM local_chunks_manifest WHERE session_id=?",
+                        (session_id,))
+                elif self._table_exists('remote_manifest'):
+                    self._db.conn.execute(
+                        "DELETE FROM remote_manifest WHERE session_id=?",
+                        (session_id,))
                 cur = self._db.conn.execute(
                     f"DELETE FROM {session_table} WHERE session_id = ?",
                     (session_id,)
@@ -1075,20 +1110,67 @@ class SessionsPanel(ctk.CTkFrame):
 
     def _on_vacuum(self):
         if not messagebox.askyesno(
-                "Compact Database",
-                "Run SQLite VACUUM to shrink the database file?\n\n"
-                "This can take a little while on large databases.",
+                "Optimize and Migrate Database",
+                "Close the inspector and launch the guarded database-v2 "
+                "optimizer?\n\nIt repairs canonical SOURCE paths, removes "
+                "abandoned remote sessions, normalizes the catalog, validates "
+                "a compact copy, and only then replaces the database.\n\n"
+                "Do not run archive jobs until it finishes.",
                 parent=self.winfo_toplevel()):
             return
         try:
-            self._db.conn.execute("VACUUM")
+            self._db.close()
+            root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            kwargs = {'cwd': root}
+            if os.name == 'nt':
+                kwargs['creationflags'] = subprocess.CREATE_NEW_CONSOLE
+            subprocess.Popen(
+                [sys.executable, os.path.join(root, 'run.py'), '--optimize-db'],
+                **kwargs)
         except Exception as e:
             messagebox.showerror(
-                "Compact Failed", str(e), parent=self.winfo_toplevel())
+                "Optimizer Launch Failed", str(e), parent=self.winfo_toplevel())
             return
-        messagebox.showinfo(
-            "Done", "Database compacted.", parent=self.winfo_toplevel())
-        self.refresh()
+        self.winfo_toplevel().destroy()
+
+    def _on_cleanup(self):
+        summary = self._db.get_unreferenced_remote_data_summary()
+        if summary.get('active_sessions'):
+            messagebox.showerror(
+                "Cleanup Blocked",
+                "A remote session is active. Finish or abandon it before cleanup.",
+                parent=self.winfo_toplevel())
+            return
+        if not summary.get('plans') and not summary.get('snapshots'):
+            messagebox.showinfo(
+                "Nothing to Clean", "No unused session data was found.",
+                parent=self.winfo_toplevel())
+            return
+        if not messagebox.askyesno(
+                "Clean Unused Session Data",
+                "Delete only remote plans and snapshots referenced by no session?\n\n"
+                f"Plans: {summary['plans']:,}\n"
+                f"Plan mappings: {summary['plan_files']:,}\n"
+                f"Snapshots: {summary['snapshots']:,}\n"
+                f"Snapshot files: {summary['snapshot_files']:,}\n\n"
+                "PERMANENT TAPE CATALOG RECORDS WILL BE PRESERVED.\n\n"
+                "The inspector will close and SQLite will compact after cleanup.",
+                parent=self.winfo_toplevel()):
+            return
+        try:
+            self._db.close()
+            root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            kwargs = {'cwd': root}
+            if os.name == 'nt':
+                kwargs['creationflags'] = subprocess.CREATE_NEW_CONSOLE
+            subprocess.Popen(
+                [sys.executable, os.path.join(root, 'inspect_db.py'),
+                 '--cleanup-session-data', '--yes'], **kwargs)
+        except Exception as exc:
+            messagebox.showerror(
+                "Cleanup Launch Failed", str(exc), parent=self.winfo_toplevel())
+            return
+        self.winfo_toplevel().destroy()
 
 
 # ==============================================================================

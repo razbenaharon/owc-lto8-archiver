@@ -89,7 +89,8 @@ class LTOAnalyzer:
             return False
 
     def build_local_allocation_plan(self, source_dir,
-                                    budget_bytes=LOCAL_TAPE_BUDGET_BYTES):
+                                    budget_bytes=LOCAL_TAPE_BUDGET_BYTES,
+                                    first_tape_budget_bytes=None):
         print(f"\n[ANALYZER] Building local multi-tape plan: {source_dir}")
         if not os.path.isdir(source_dir):
             raise RuntimeError(f"[ANALYZER] Source directory not found: {source_dir}")
@@ -144,33 +145,63 @@ class LTOAnalyzer:
                     f"        {entry['name']} ({entry['size_bytes'] / 1000**4:.2f} TB)"
                 )
 
-        chunks = self._bin_pack_top_level(entries, budget_bytes)
+        if first_tape_budget_bytes is not None and not any(
+                entry['size_bytes'] <= first_tape_budget_bytes
+                for entry in entries):
+            raise RuntimeError(
+                "[TAPE] The mounted tape's remaining DB capacity cannot fit any "
+                "top-level source directory. Mount a tape with more free capacity "
+                "and create the session again."
+            )
+
+        chunks = self._bin_pack_top_level(
+            entries, budget_bytes,
+            first_tape_budget_bytes=first_tape_budget_bytes,
+        )
         print(f"[ANALYZER] Files: {total_files} | Total: {total_bytes / 1024**4:.2f} TiB")
         return chunks
 
-    def _bin_pack_top_level(self, entries, budget_bytes):
+    def _bin_pack_top_level(self, entries, budget_bytes,
+                            first_tape_budget_bytes=None):
         chunks = []
+        capacities = []
+        if first_tape_budget_bytes is not None:
+            chunks.append([])
+            capacities.append(max(0, first_tape_budget_bytes))
         for entry in sorted(entries, key=lambda e: (-e['size_bytes'], e['name'].lower())):
             placed = False
-            for chunk in chunks:
+            for chunk, capacity in zip(chunks, capacities):
                 used = sum(e['size_bytes'] for e in chunk)
-                if used + entry['size_bytes'] <= budget_bytes:
+                if used + entry['size_bytes'] <= capacity:
                     chunk.append(entry)
                     placed = True
                     break
             if not placed:
                 chunks.append([entry])
-        return chunks
+                capacities.append(budget_bytes)
+        return [chunk for chunk in chunks if chunk]
 
     def render_allocation_plan(self, chunks,
-                               budget_bytes=LOCAL_TAPE_BUDGET_BYTES):
+                               budget_bytes=LOCAL_TAPE_BUDGET_BYTES,
+                               first_tape_used_bytes=0,
+                               first_tape_label=None):
         print("\n" + "=" * 60)
         print("LOCAL MULTI-TAPE ALLOCATION PLAN")
         print("=" * 60)
         for idx, chunk in enumerate(chunks, 1):
-            used = sum(e['size_bytes'] for e in chunk)
-            pct = (used / budget_bytes * 100) if budget_bytes else 0
-            print(f"Tape {idx}: {used / 1024**4:.2f} TiB ({pct:.1f}% of 11.5 TB budget)")
+            planned = sum(e['size_bytes'] for e in chunk)
+            occupied = first_tape_used_bytes if idx == 1 else 0
+            resulting = occupied + planned
+            pct = (resulting / budget_bytes * 100) if budget_bytes else 0
+            label = f" ({first_tape_label})" if idx == 1 and first_tape_label else ""
+            if occupied:
+                print(f"Tape {idx}{label}: {planned / 1024**4:.2f} TiB planned | "
+                      f"DB occupied {occupied / 1024**4:.2f} TiB | "
+                      f"after archive {resulting / 1024**4:.2f} TiB "
+                      f"({pct:.1f}% of 11.5 TB budget)")
+            else:
+                print(f"Tape {idx}{label}: {planned / 1024**4:.2f} TiB "
+                      f"({pct:.1f}% of 11.5 TB budget)")
             for entry in sorted(chunk, key=lambda e: e['name'].lower()):
                 print(f"  - {entry['name']}  {entry['size_bytes'] / 1024**3:.2f} GiB")
         print("-" * 60)
