@@ -18,9 +18,21 @@ from src.cli import main
 
 def _run_maintenance():
     from src.config import ConfigManager
-    from src.maintenance import DatabaseOptimizer, inspect_legacy_database
+    from src.maintenance import (
+        CatalogV3Optimizer,
+        DatabaseOptimizer,
+        inspect_catalog_database,
+        inspect_legacy_database,
+    )
 
     cfg = ConfigManager()
+    if '--catalog-v3-preflight' in sys.argv:
+        import json
+        print(json.dumps(inspect_catalog_database(cfg.db_path), indent=2))
+        return
+    if '--catalog-v3-migrate' in sys.argv:
+        CatalogV3Optimizer(cfg.db_path).run()
+        return
     dry_run = '--dry-run' in sys.argv
     if dry_run:
         import json
@@ -30,7 +42,9 @@ def _run_maintenance():
 
 if __name__ == "__main__":
     try:
-        if '--optimize-db' in sys.argv:
+        if any(arg in sys.argv for arg in (
+                '--optimize-db', '--catalog-v3-preflight',
+                '--catalog-v3-migrate')):
             _run_maintenance()
         else:
             main()
