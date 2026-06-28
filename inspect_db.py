@@ -1,6 +1,6 @@
 """Root runner — launch the SQLite database inspector GUI.
 
-Mirrors run.py's path anchoring: the GUI code lives in src/db_inspector.py and
+Mirrors run.py's path anchoring: the GUI code lives in src/db_inspector_qt.py and
 the database lives in the project root, so we chdir to the root before reading
 config.ini / the DB.
 """
@@ -45,15 +45,9 @@ if __name__ == "__main__":
             db.close()
         sys.exit(0)
 
-    import customtkinter as ctk
-    from src.db_inspector import DBInspectorApp
+    from src.db_inspector_qt import run_qt_inspector
 
-    ctk.set_appearance_mode("dark")
-    ctk.set_default_color_theme("dark-blue")
-    ctk.set_widget_scaling(1.25)
-
-    app = DBInspectorApp(db, cfg.db_path)
     try:
-        app.mainloop()
+        raise SystemExit(run_qt_inspector(db, cfg.db_path))
     finally:
         db.close()

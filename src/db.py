@@ -25,6 +25,10 @@ except ImportError:  # optional dependency — priority/affinity degrade gracefu
     psutil = None
 
 from .constants import CONFIG_FILE, DB_UPSERT_BATCH_SIZE
+from .catalog_v3 import (
+    catalog_v3_available,
+    catalog_values_for_file,
+)
 from .paths import _clean_config_path
 from .runtime import CANCEL
 
@@ -1152,6 +1156,8 @@ class DatabaseManager:
             for key in run_specs
         }
 
+        has_catalog_v3 = catalog_v3_available(self.conn)
+        catalog_dir_cache = {}
         normalized_by_key = {}
         legacy_lookup = {}
         for record in records:
@@ -1175,7 +1181,7 @@ class DatabaseManager:
             run_label = f"{str(backup_date)[:10]}:{tape_label}"
             archive_run_id = (record.get('archive_run_id') or
                               run_ids[(run_label, tape_label)])
-            normalized_by_key[key] = (
+            values = [
                 None,  # file_name is derived from stored_path on reads
                 original_path,
                 record.get('file_size_bytes'),
@@ -1191,7 +1197,18 @@ class DatabaseManager:
                 bundle_id,
                 key,
                 archive_run_id,
-            )
+            ]
+            if has_catalog_v3:
+                row = {
+                    'tape_label': tape_label,
+                    'original_path': original_path,
+                    'stored_path': record.get('stored_path'),
+                    'backup_date': backup_date,
+                    'run_started_at': backup_date,
+                }
+                values.extend(catalog_values_for_file(
+                    self.conn, row, catalog_dir_cache))
+            normalized_by_key[key] = tuple(values)
             legacy_lookup[key] = (
                 key, original_path, tape_label, session_id, chunk_index)
 
@@ -1221,13 +1238,8 @@ class DatabaseManager:
                      file_hash_blob, backup_date, tape_label, is_packed,
                      container_name, stored_path, local_session_id,
                      local_chunk_index, bundle_id, record_key, archive_run_id"""
-        values = list(normalized_by_key.values())
-        if update_existing:
-            self.conn.executemany(
-                f"""INSERT INTO files_index({columns})
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(record_key) WHERE record_key IS NOT NULL DO UPDATE SET
-                        file_name = excluded.file_name,
+        placeholders = "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
+        update_sets = """file_name = excluded.file_name,
                         original_path = excluded.original_path,
                         file_size_bytes = excluded.file_size_bytes,
                         file_hash = excluded.file_hash,
@@ -1240,7 +1252,21 @@ class DatabaseManager:
                         local_session_id = excluded.local_session_id,
                         local_chunk_index = excluded.local_chunk_index,
                         bundle_id = excluded.bundle_id,
-                        archive_run_id = excluded.archive_run_id""",
+                        archive_run_id = excluded.archive_run_id"""
+        if has_catalog_v3:
+            columns += ", directory_id, catalog_name, catalog_backup_date"
+            placeholders += ", ?, ?, ?"
+            update_sets += """,
+                        directory_id = excluded.directory_id,
+                        catalog_name = excluded.catalog_name,
+                        catalog_backup_date = excluded.catalog_backup_date"""
+        values = list(normalized_by_key.values())
+        if update_existing:
+            self.conn.executemany(
+                f"""INSERT INTO files_index({columns})
+                    VALUES ({placeholders})
+                    ON CONFLICT(record_key) WHERE record_key IS NOT NULL DO UPDATE SET
+                        {update_sets}""",
                 values,
             )
             return {
@@ -1251,7 +1277,7 @@ class DatabaseManager:
 
         self.conn.executemany(
             f"""INSERT INTO files_index({columns})
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES ({placeholders})
                 ON CONFLICT(record_key) WHERE record_key IS NOT NULL DO NOTHING""",
             values,
         )
@@ -1358,6 +1384,51 @@ class DatabaseManager:
             except sqlite3.IntegrityError:
                 print(f"[DB] Tape '{volume_label}' is already in the database.")
                 return False
+
+    def _prune_empty_catalog_directories(self, tape_label, directory_id=None):
+        if not catalog_v3_available(self.conn):
+            return
+        if directory_id is not None:
+            current = directory_id
+            while current is not None:
+                row = self.conn.execute(
+                    """SELECT directory_id,parent_id FROM catalog_directories
+                       WHERE directory_id=? AND tape_label=?""",
+                    (current, tape_label),
+                ).fetchone()
+                if not row:
+                    break
+                has_files = self.conn.execute(
+                    "SELECT 1 FROM files_index WHERE directory_id=? LIMIT 1",
+                    (current,),
+                ).fetchone()
+                has_children = self.conn.execute(
+                    "SELECT 1 FROM catalog_directories WHERE parent_id=? LIMIT 1",
+                    (current,),
+                ).fetchone()
+                if has_files or has_children:
+                    break
+                self.conn.execute(
+                    "DELETE FROM catalog_directories WHERE directory_id=?",
+                    (current,),
+                )
+                current = row['parent_id']
+            return
+
+        while True:
+            cur = self.conn.execute(
+                """DELETE FROM catalog_directories
+                   WHERE tape_label=?
+                     AND NOT EXISTS (
+                         SELECT 1 FROM files_index f
+                         WHERE f.directory_id=catalog_directories.directory_id)
+                     AND NOT EXISTS (
+                         SELECT 1 FROM catalog_directories child
+                         WHERE child.parent_id=catalog_directories.directory_id)""",
+                (tape_label,),
+            )
+            if cur.rowcount == 0:
+                break
 
     def delete_tape(self, volume_label):
         with self.lock:
@@ -1467,8 +1538,15 @@ class DatabaseManager:
 
     def delete_file(self, file_id):
         with self.lock:
+            row = self.conn.execute(
+                "SELECT tape_label,directory_id FROM files_index WHERE file_id = ?",
+                (file_id,),
+            ).fetchone() if catalog_v3_available(self.conn) else None
             cur = self.conn.execute("DELETE FROM files_index WHERE file_id = ?", (file_id,))
             self._require_updated(cur, f"[DB] File record not found: {file_id}")
+            if row:
+                self._prune_empty_catalog_directories(
+                    row['tape_label'], row['directory_id'])
             self.conn.commit()
 
     def rename_tape(self, old_label, new_label):
@@ -1549,6 +1627,7 @@ class DatabaseManager:
                               (volume_label,))
             self.conn.execute("DELETE FROM archive_runs WHERE tape_label = ?",
                               (volume_label,))
+            self._prune_empty_catalog_directories(volume_label)
             self.conn.execute("UPDATE tapes SET used_space = 0 WHERE volume_label = ?", (volume_label,))
             self.conn.commit()
             print(f"[DB] Removed {removed} file record(s) for tape '{volume_label}' (tape entry kept).")

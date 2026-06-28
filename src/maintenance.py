@@ -8,6 +8,14 @@ import sqlite3
 import time
 from datetime import datetime
 
+from .catalog_v3 import (
+    CATALOG_MIGRATION_NAME,
+    CATALOG_SCHEMA_VERSION,
+    catalog_v3_available,
+    catalog_values_for_file,
+    ensure_catalog_schema,
+    free_space_report,
+)
 from .db import SCHEMA_VERSION, _file_record_key, _hash_to_blob
 
 
@@ -63,6 +71,113 @@ def inspect_legacy_database(db_path, source_root='/strg/E/shared-data'):
     return report
 
 
+def _query_plan(conn, sql, params=()):
+    return [tuple(row) for row in conn.execute('EXPLAIN QUERY PLAN ' + sql, params)]
+
+
+def _fts5_available(conn):
+    try:
+        options = [row[0] for row in conn.execute('PRAGMA compile_options')]
+    except sqlite3.Error:
+        return False
+    return any('ENABLE_FTS5' in option for option in options)
+
+
+def inspect_catalog_database(db_path):
+    """Return a read-only v3 catalog-browser preflight report."""
+    db_path = os.path.abspath(db_path)
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        tables = {row['name'] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        columns = {
+            row['name'] for row in conn.execute('PRAGMA table_info(files_index)')
+        } if 'files_index' in tables else set()
+        tapes = [dict(row) for row in conn.execute(
+            "SELECT volume_label,total_capacity,used_space FROM tapes "
+            "ORDER BY volume_label"
+        )] if 'tapes' in tables else []
+        first_tape = tapes[0]['volume_label'] if tapes else None
+        current_tape_plan = None
+        current_name_plan = None
+        if first_tape:
+            current_tape_plan = _query_plan(conn, """
+                SELECT f.file_id
+                FROM files_index f
+                LEFT JOIN archive_runs r ON r.run_id=f.archive_run_id
+                WHERE f.tape_label=?
+                ORDER BY f.original_path, COALESCE(f.file_name, f.stored_path)
+                LIMIT 251
+            """, (first_tape,))
+            current_name_plan = _query_plan(conn, """
+                SELECT f.file_id
+                FROM files_index f
+                LEFT JOIN archive_runs r ON r.run_id=f.archive_run_id
+                WHERE COALESCE(f.file_name, f.stored_path) LIKE ?
+                ORDER BY f.original_path, COALESCE(f.file_name, f.stored_path)
+                LIMIT 251
+            """, ('%jpg%',))
+
+        v3 = catalog_v3_available(conn)
+        expected_v3_plan = None
+        if v3:
+            directory = conn.execute(
+                "SELECT directory_id FROM catalog_directories ORDER BY directory_id LIMIT 1"
+            ).fetchone()
+            if directory:
+                expected_v3_plan = _query_plan(conn, """
+                    SELECT f.file_id
+                    FROM files_index f
+                    WHERE f.directory_id=?
+                      AND (f.catalog_name > ? OR
+                           (f.catalog_name = ? AND f.file_id > ?))
+                    ORDER BY f.catalog_name, f.file_id
+                    LIMIT 251
+                """, (directory['directory_id'], '', '', 0))
+
+        report = {
+            'database': db_path,
+            'is_workspace_lto_archive_db':
+                os.path.basename(db_path).lower() == 'lto_archive.db',
+            'user_version': conn.execute('PRAGMA user_version').fetchone()[0],
+            'catalog_v3_available': v3,
+            'tables': sorted(tables),
+            'files_index_columns': sorted(columns),
+            'row_counts': {},
+            'tapes': tapes,
+            'quick_check': conn.execute('PRAGMA quick_check').fetchone()[0],
+            'foreign_key_violations':
+                len(conn.execute('PRAGMA foreign_key_check').fetchall()),
+            'sqlite_version': sqlite3.sqlite_version,
+            'fts5_available': _fts5_available(conn),
+            'free_space': free_space_report(db_path),
+            'current_query_plans': {
+                'tape_ordered_page': current_tape_plan,
+                'name_contains_page': current_name_plan,
+            },
+            'expected_v3_query_plan': expected_v3_plan,
+            'notes': [
+                'lto_archive.db is runtime data and must remain gitignored.',
+                'Preflight is read-only; migration uses copy-and-swap with rollback.',
+            ],
+        }
+        for table in (
+                'files_index', 'catalog_directories', 'files_index_fts',
+                'archive_bundles', 'archive_runs', 'remote_sessions',
+                'remote_snapshots', 'remote_plans', 'remote_chunks',
+                'remote_file_state'):
+            if table in tables:
+                try:
+                    report['row_counts'][table] = conn.execute(
+                        f'SELECT COUNT(*) FROM {table}').fetchone()[0]
+                except sqlite3.Error as exc:
+                    report['row_counts'][table] = f'ERROR: {exc}'
+        return report
+    finally:
+        conn.close()
+
+
 class DatabaseOptimizer:
     """Build and validate an optimized copy before atomically installing it."""
 
@@ -109,9 +224,12 @@ class DatabaseOptimizer:
         conn.commit()
 
     def _done(self, conn, phase):
-        return conn.execute(
-            'SELECT 1 FROM schema_migrations WHERE name=?', (phase,)
-        ).fetchone() is not None
+        try:
+            return conn.execute(
+                'SELECT 1 FROM schema_migrations WHERE name=?', (phase,)
+            ).fetchone() is not None
+        except sqlite3.OperationalError:
+            return False
 
     def _prepare(self, conn):
         conn.execute("""CREATE TABLE IF NOT EXISTS schema_migrations(
@@ -468,3 +586,284 @@ class DatabaseOptimizer:
             conn.execute(sql)
         finally:
             conn.close()
+
+
+class CatalogV3Optimizer:
+    """Build catalog-browser indexes in a copy, then atomically install it."""
+
+    def __init__(self, db_path, progress=print, batch_size=5000):
+        self.db_path = os.path.abspath(db_path)
+        self.progress = progress or (lambda _message: None)
+        self.batch_size = max(1, int(batch_size))
+        self.started = datetime.now()
+        stamp = self.started.strftime('%Y%m%d_%H%M%S')
+        self.work_path = self.db_path + f'.catalog_v3_{stamp}.work'
+        self.compact_path = self.db_path + f'.catalog_v3_{stamp}.compact'
+        self.rollback_path = self.db_path + f'.pre_catalog_v3_{stamp}.bak'
+        self.lock_path = self.db_path + '.maintenance.lock'
+        self.stats = {'started_at': self.started.isoformat(), 'phases': {}}
+
+    def _phase(self, name, function):
+        start = time.perf_counter()
+        self.progress(f"[CATALOG-V3] {name}...")
+        result = function()
+        self.stats['phases'][name] = round(time.perf_counter() - start, 3)
+        return result
+
+    def _connect(self, path):
+        conn = sqlite3.connect(path, timeout=60)
+        conn.row_factory = sqlite3.Row
+        conn.execute('PRAGMA foreign_keys=ON')
+        conn.execute('PRAGMA busy_timeout=60000')
+        return conn
+
+    def _checkpoint(self, conn, phase):
+        conn.execute("""CREATE TABLE IF NOT EXISTS schema_migrations(
+            name TEXT PRIMARY KEY, completed_at DATETIME NOT NULL)""")
+        conn.execute(
+            """INSERT INTO schema_migrations(name,completed_at)
+               VALUES (?,?) ON CONFLICT(name) DO UPDATE SET
+               completed_at=excluded.completed_at""",
+            (phase, datetime.now().isoformat()),
+        )
+        conn.commit()
+
+    def _done(self, conn, phase):
+        try:
+            return conn.execute(
+                'SELECT 1 FROM schema_migrations WHERE name=?', (phase,)
+            ).fetchone() is not None
+        except sqlite3.OperationalError:
+            return False
+
+    def _copy_database(self):
+        source = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        target = sqlite3.connect(self.work_path)
+        try:
+            source.backup(target, pages=8192)
+        finally:
+            target.close()
+            source.close()
+
+    def _drop_fts_triggers(self, conn):
+        conn.executescript("""
+            DROP TRIGGER IF EXISTS files_index_catalog_fts_ai;
+            DROP TRIGGER IF EXISTS files_index_catalog_fts_ad;
+            DROP TRIGGER IF EXISTS files_index_catalog_fts_au;
+        """)
+
+    def _apply_catalog_v3(self, conn):
+        if self._done(conn, CATALOG_MIGRATION_NAME) and catalog_v3_available(conn):
+            self.stats['already_current'] = True
+            return
+        user_version = conn.execute('PRAGMA user_version').fetchone()[0]
+        legacy_remote = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='remote_manifest'"
+        ).fetchone()
+        if user_version < SCHEMA_VERSION or legacy_remote:
+            raise RuntimeError(
+                "[DB] Run the existing v2 optimizer before catalog-v3 migration.")
+        ensure_catalog_schema(conn)
+        self._drop_fts_triggers(conn)
+        conn.commit()
+
+        total = conn.execute('SELECT COUNT(*) FROM files_index').fetchone()[0]
+        self.stats['files'] = total
+        cache = {}
+        last_file_id = 0
+        processed = 0
+        while True:
+            rows = conn.execute(
+                """SELECT f.file_id, f.tape_label, f.original_path, f.stored_path,
+                          f.backup_date, r.started_at AS run_started_at
+                   FROM files_index f
+                   LEFT JOIN archive_runs r ON r.run_id=f.archive_run_id
+                   WHERE f.file_id > ?
+                   ORDER BY f.file_id
+                   LIMIT ?""",
+                (last_file_id, self.batch_size),
+            ).fetchall()
+            if not rows:
+                break
+            updates = []
+            for row in rows:
+                directory_id, name, backup_date = catalog_values_for_file(
+                    conn, row, cache)
+                updates.append((directory_id, name, backup_date, row['file_id']))
+                last_file_id = row['file_id']
+            conn.executemany(
+                """UPDATE files_index
+                   SET directory_id=?, catalog_name=?, catalog_backup_date=?
+                   WHERE file_id=?""",
+                updates,
+            )
+            conn.commit()
+            processed += len(rows)
+            if processed % (self.batch_size * 20) == 0 or processed == total:
+                self.progress(
+                    f"[CATALOG-V3] indexed {processed:,}/{total:,} file rows")
+
+        conn.execute("INSERT INTO files_index_fts(files_index_fts) VALUES ('rebuild')")
+        conn.execute(f'PRAGMA user_version={CATALOG_SCHEMA_VERSION}')
+        self._checkpoint(conn, CATALOG_MIGRATION_NAME)
+        ensure_catalog_schema(conn)
+        conn.execute('ANALYZE')
+        conn.commit()
+        self.stats['directories'] = conn.execute(
+            'SELECT COUNT(*) FROM catalog_directories').fetchone()[0]
+        self.stats['fts_rows'] = conn.execute(
+            'SELECT COUNT(*) FROM files_index_fts').fetchone()[0]
+
+    def _validate(self, path):
+        conn = self._connect(path)
+        try:
+            result = {
+                'quick_check': conn.execute('PRAGMA quick_check').fetchone()[0],
+                'foreign_key_violations':
+                    len(conn.execute('PRAGMA foreign_key_check').fetchall()),
+                'files': conn.execute('SELECT COUNT(*) FROM files_index').fetchone()[0],
+                'catalog_names': conn.execute(
+                    "SELECT COUNT(*) FROM files_index WHERE COALESCE(catalog_name,'') != ''"
+                ).fetchone()[0],
+                'directories': conn.execute(
+                    'SELECT COUNT(*) FROM catalog_directories').fetchone()[0],
+                'fts_rows': conn.execute(
+                    'SELECT COUNT(*) FROM files_index_fts').fetchone()[0],
+                'user_version': conn.execute('PRAGMA user_version').fetchone()[0],
+                'migration_recorded': self._done(conn, CATALOG_MIGRATION_NAME),
+            }
+        finally:
+            conn.close()
+        expected = {
+            'quick_check': 'ok',
+            'foreign_key_violations': 0,
+            'user_version': CATALOG_SCHEMA_VERSION,
+            'migration_recorded': True,
+        }
+        for key, value in expected.items():
+            if result[key] != value:
+                raise RuntimeError(f"catalog-v3 validation failed: {key}={result[key]!r}")
+        if result['catalog_names'] != result['files']:
+            raise RuntimeError(
+                "catalog-v3 validation failed: not every file has catalog_name")
+        if result['fts_rows'] != result['files']:
+            raise RuntimeError(
+                "catalog-v3 validation failed: FTS row count does not match files")
+        return result
+
+    def _catalog_signature(self, path):
+        conn = self._connect(path)
+        try:
+            return {
+                'files': conn.execute(
+                    'SELECT COUNT(*) FROM files_index').fetchone()[0],
+                'file_bytes': conn.execute(
+                    'SELECT COALESCE(SUM(file_size_bytes),0) FROM files_index'
+                ).fetchone()[0],
+                'file_id_sum': conn.execute(
+                    'SELECT COALESCE(SUM(file_id),0) FROM files_index'
+                ).fetchone()[0],
+                'record_keys': conn.execute(
+                    'SELECT COUNT(record_key) FROM files_index').fetchone()[0],
+                'tapes': [dict(row) for row in conn.execute(
+                    """SELECT volume_label,total_capacity,used_space
+                       FROM tapes ORDER BY volume_label""")],
+                'archive_bundles': conn.execute(
+                    'SELECT COUNT(*) FROM archive_bundles').fetchone()[0],
+                'archive_runs': conn.execute(
+                    'SELECT COUNT(*) FROM archive_runs').fetchone()[0],
+            }
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _require_same_catalog(before, after, label):
+        keys = ('files', 'file_bytes', 'file_id_sum', 'record_keys',
+                'tapes', 'archive_bundles', 'archive_runs')
+        mismatches = {
+            key: (before[key], after[key])
+            for key in keys
+            if before[key] != after[key]
+        }
+        if mismatches:
+            raise RuntimeError(
+                f"catalog-v3 validation failed: {label} changed permanent "
+                f"catalog data: {mismatches!r}")
+
+    def _vacuum(self, sql):
+        conn = self._connect(self.work_path)
+        try:
+            conn.execute(sql)
+        finally:
+            conn.close()
+
+    def run(self):
+        if os.path.exists(self.lock_path):
+            raise RuntimeError(f"maintenance lock already exists: {self.lock_path}")
+        before_stat = os.stat(self.db_path)
+        source_signature = self._catalog_signature(self.db_path)
+        required = os.path.getsize(self.db_path) * 3 + 1024**3
+        if shutil.disk_usage(os.path.dirname(self.db_path)).free < required:
+            raise RuntimeError('insufficient free disk for safe catalog-v3 migration')
+        with open(self.lock_path, 'x', encoding='utf-8') as lock:
+            lock.write(str(os.getpid()))
+        try:
+            self._phase('copy source database', self._copy_database)
+            conn = self._connect(self.work_path)
+            try:
+                self._phase('build catalog directory and search indexes',
+                            lambda: self._apply_catalog_v3(conn))
+            finally:
+                conn.close()
+            self._phase('validate catalog-v3 working copy',
+                        lambda: self._validate(self.work_path))
+            self._phase('compare working-copy catalog invariants',
+                        lambda: self._require_same_catalog(
+                            source_signature,
+                            self._catalog_signature(self.work_path),
+                            'working copy'))
+            compact_sql = "VACUUM INTO '" + self.compact_path.replace("'", "''") + "'"
+            self._phase('compact catalog-v3 copy', lambda: self._vacuum(compact_sql))
+            self._phase('validate compact copy', lambda: self._validate(self.compact_path))
+            self._phase('compare compact-copy catalog invariants',
+                        lambda: self._require_same_catalog(
+                            source_signature,
+                            self._catalog_signature(self.compact_path),
+                            'compact copy'))
+            current_stat = os.stat(self.db_path)
+            if (current_stat.st_size, current_stat.st_mtime_ns) != (
+                    before_stat.st_size, before_stat.st_mtime_ns):
+                raise RuntimeError('source database changed during migration; refusing swap')
+            os.replace(self.db_path, self.rollback_path)
+            try:
+                os.replace(self.compact_path, self.db_path)
+                final_validation = self._validate(self.db_path)
+            except BaseException:
+                if os.path.exists(self.db_path):
+                    os.remove(self.db_path)
+                os.replace(self.rollback_path, self.db_path)
+                raise
+            final_signature = self._catalog_signature(self.db_path)
+            self._require_same_catalog(source_signature, final_signature,
+                                       'installed database')
+            self.stats['validation'] = final_validation
+            self.stats['catalog_signature'] = final_signature
+            self.stats['before_bytes'] = before_stat.st_size
+            self.stats['after_bytes'] = os.path.getsize(self.db_path)
+            self.stats['reduction_pct'] = round(
+                (1 - self.stats['after_bytes'] / before_stat.st_size) * 100, 2)
+            report_dir = os.path.join(os.path.dirname(self.db_path), 'backup_logs')
+            os.makedirs(report_dir, exist_ok=True)
+            report_path = os.path.join(
+                report_dir, self.started.strftime('DB_CATALOG_V3_%Y%m%d_%H%M%S.json'))
+            with open(report_path, 'w', encoding='utf-8') as report_file:
+                json.dump(self.stats, report_file, indent=2)
+            self.stats['report_path'] = report_path
+            os.remove(self.rollback_path)
+            if os.path.exists(self.work_path):
+                os.remove(self.work_path)
+            self.progress(json.dumps(self.stats, indent=2))
+            return self.stats
+        finally:
+            if os.path.exists(self.lock_path):
+                os.remove(self.lock_path)

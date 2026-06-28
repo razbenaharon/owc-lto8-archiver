@@ -13,8 +13,8 @@ in a local SQLite database.
 - `src/` — internal package holding the application code, split into modules with
   strictly downward dependencies: `constants` → `runtime` → `paths` →
   `reporting`/`config`/`db` → `robocopy`/`remote_transport` → `ltfs` → `packer`
-  → `backup`/`retriever` → `orchestrators` → `cli`; `src/db_inspector.py` holds
-  the GUI. Data files (`config.ini`, `.env`, `lto_archive.db`, `backup_logs/`)
+  → `backup`/`retriever` → `orchestrators` → `cli`; `src/db_inspector_qt.py`
+  holds the GUI. Data files (`config.ini`, `.env`, `lto_archive.db`, `backup_logs/`)
   stay in the project root; `src/constants.py` anchors paths to `PROJECT_ROOT`.
 - `config.ini` — local paths, tape drive settings, remote archive settings, and
   performance tuning. `.env` stores secrets (e.g. `remote_password`); keep it
@@ -87,7 +87,7 @@ Use concise, imperative commit messages, optionally prefixed `fix:`, `feat:`,
 `refactor:`, or `chore:` (e.g. `fix: handle Windows-illegal chars in remote fetch
 paths + collision guard`). PRs should state: purpose, risk level, commands run,
 hardware/manual verification if relevant, and any database/config changes. For
-`src/db_inspector.py` UI changes, include a screenshot or short behavior description.
+`src/db_inspector_qt.py` UI changes, include a screenshot or short behavior description.
 
 ## Security & Operations Notes
 

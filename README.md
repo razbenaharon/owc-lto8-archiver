@@ -12,7 +12,7 @@ Licensed under the [MIT License](LICENSE) — © 2026 Raz Ben Aharon. Free to us
 - **Tape management** — format, register, check, and inspect tapes via IBM LTFS command-line tools
 - **Multi-tape support** — tracks multiple tapes; prompts you to swap tapes during restore when needed
 - **Remote archive** — fetch files from a remote SSH host into local staging, pack them, and stream them to LTO
-- **Database Inspector GUI** — standalone CustomTkinter app for browsing and editing the tape/file index without touching the CLI
+- **Database Inspector GUI** — standalone PySide6 app for lazy browsing, searching, and managing the tape/file index without touching the CLI
 
 ## Requirements
 
@@ -21,7 +21,7 @@ Licensed under the [MIT License](LICENSE) — © 2026 Raz Ben Aharon. Free to us
 - [IBM LTFS SDE](https://www.ibm.com/support/pages/ibm-linear-tape-file-system-ltfs) installed to `C:\Program Files\IBM\LTFS\`
 - OWC Mercury Pro LTO-8 (or compatible LTFS-formatted LTO drive)
 - OpenSSH client tools for remote archive mode
-- `customtkinter` (required only for the DB Inspector GUI): `pip install customtkinter`
+- `PySide6` (required only for the DB Inspector GUI): `pip install PySide6`
 
 These installers are **not** bundled in this repository (they are proprietary). Download
 them from the vendors and, if you wish, keep them in a local `Framework & Drivers\`
@@ -67,7 +67,7 @@ staging_fill_pct = 0.80
 # CLI (no extra dependencies)
 python run.py
 
-# Database Inspector GUI (requires customtkinter)
+# Database Inspector GUI (requires PySide6)
 python inspect_db.py
 ```
 
@@ -144,7 +144,7 @@ When restoring multiple files from the same ZIP bundle, the bundle is copied fro
 
 ## Database Inspector GUI
 
-`inspect_db.py` launches a dark-theme GUI (CustomTkinter), implemented in `src/db_inspector.py`, for browsing and editing the SQLite archive index without using the CLI.
+`inspect_db.py` launches a PySide6 GUI, implemented in `src/db_inspector_qt.py`, for lazy browsing, FTS search, and management of the SQLite archive index without using the CLI.
 
 ```
 python inspect_db.py
@@ -157,11 +157,29 @@ python inspect_db.py
 - **Wipe File Records** — delete all file records for the tape (tape entry kept); type the label to confirm
 - **Delete Tape** — permanently remove the tape and all its file records; type the label to confirm
 
-**Files tab** — searchable view of the `files_index` table. Filter by name fragment, tape label, and date range. Select one or more rows to **Delete Selected** or double-click a row to open a **View Details** panel showing all fields (including the full SHA-256 hash).
+**Files tab** — lazy tape/directory browser backed by catalog-v3 indexes. Select one or more rows to **Delete Selected** or double-click a row to open a **View Details** panel showing all fields (including the full SHA-256 hash).
+
+**Search tab** — FTS5 substring search over catalog names and original paths, with bounded result pages.
+
+**Manage tab** — tape and session management actions, including rename, capacity, recalculation, wipe/delete, and unused session-data cleanup.
+
+Large catalogs can be prepared for the lazy inspector rewrite with the guarded
+catalog-v3 maintenance path:
+
+```
+python run.py --catalog-v3-preflight   # read-only report for lto_archive.db
+python run.py --catalog-v3-migrate     # copy-and-swap migration with rollback
+```
+
+The preflight report includes the real configured database path, size, row
+counts, tape labels, SQLite/FTS5 support, free-space estimate, integrity checks,
+and current query plans. The migration adds directory and FTS indexes for bounded
+inspector browsing without committing `lto_archive.db` to source control.
 
 ## Database Schema
 
-`lto_archive.db` (SQLite) contains two tables:
+`lto_archive.db` (SQLite) contains the permanent archive catalog plus normalized
+session tables. The database is runtime data and remains gitignored.
 
 **`tapes`** — one row per tape
 - `volume_label`, `date_formatted`, `total_capacity`, `used_space`
@@ -170,11 +188,15 @@ python inspect_db.py
 - `file_name`, `original_path`, `file_size_bytes`, `file_hash` (SHA-256)
 - `backup_date`, `tape_label`, `is_packed`, `container_name`, `stored_path`
 - `local_session_id`, `local_chunk_index`
+- v2 databases may normalize names, dates, hashes, and bundle paths through
+  `archive_runs`, `archive_bundles`, and hydrated read helpers.
+- catalog-v3 databases additionally contain `directory_id`, `catalog_name`, and
+  `catalog_backup_date`, plus `catalog_directories` and `files_index_fts`.
 
 The CLI also creates session tables for resumable work:
 
 - **`local_sessions` / `local_chunks_manifest`** — local multi-tape plans and per-chunk status
-- **`remote_sessions` / `remote_manifest`** — remote archive sessions, fetched files, and per-chunk status
+- **`remote_sessions` / `remote_snapshots` / `remote_plans` / `remote_chunks` / `remote_file_state`** — normalized remote archive sessions, reusable source snapshots, plans, and per-file exception state
 
 ## Important
 

@@ -8,4 +8,4 @@
 # NOTE: for the remote fetch buffer, install `mbuffer` on the REMOTE Linux host
 # (e.g. `apt install mbuffer`). It is invoked there, not on this Windows PC.
 psutil>=5.9
-customtkinter>=5.2
+PySide6>=6.7
