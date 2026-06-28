@@ -187,6 +187,11 @@ class TapeManager:
         old_label = get_volume_label(self.tape_drive)
         if old_label:
             print(f"[INFO] Current tape label detected: {old_label}")
+            manual_old_label = None
+        else:
+            manual_old_label = input(
+                "Existing DB label to clear after format (optional, Enter to skip): "
+            ).strip() or None
 
         label = input("New Volume Label (e.g. Scalpelab_Tape_X): ").strip()
         if not label:
@@ -208,17 +213,10 @@ class TapeManager:
             if result.stdout:
                 print(result.stdout)
 
-            labels_to_delete = []
-            for existing_label in (old_label, label):
-                if existing_label and existing_label not in labels_to_delete:
-                    labels_to_delete.append(existing_label)
-            for existing_label in labels_to_delete:
-                if self.db.tape_exists(existing_label):
-                    self.db.delete_tape(existing_label)
-
             cap      = input("Tape capacity in GB (default 12288 for 12 TB, Enter to skip): ").strip()
             capacity = int(cap) if cap.isdigit() else 12288
-            self.db.register_tape(label, capacity)
+            self.db.replace_formatted_tape(
+                label, capacity, previous_labels=[old_label, manual_old_label])
         except subprocess.CalledProcessError as e:
             output = ((e.stdout or '') + (e.stderr or '')).strip()
             print(f"[ERROR] LtfsCmdFormat.exe failed:\n{output}")

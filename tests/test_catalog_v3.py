@@ -131,6 +131,45 @@ class CatalogV3Tests(unittest.TestCase):
             with InspectorRepository(path) as repo:
                 self.assertEqual(repo.search_catalog_fts('gamma', limit=5)['rows'], [])
 
+    def test_replace_formatted_tape_clears_catalog_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'archive.db')
+            self._make_v2_database(path)
+            CatalogV3Optimizer(path, progress=lambda _msg: None).run()
+
+            db = DatabaseManager(path)
+            try:
+                self.assertTrue(db.replace_formatted_tape(
+                    'Tape_A', 123, previous_labels=['Tape_A']))
+            finally:
+                db.close()
+
+            conn = sqlite3.connect(path)
+            try:
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM tapes WHERE volume_label='Tape_A'"
+                ).fetchone()[0], 1)
+                self.assertEqual(conn.execute(
+                    "SELECT used_space FROM tapes WHERE volume_label='Tape_A'"
+                ).fetchone()[0], 0)
+                self.assertEqual(conn.execute(
+                    "SELECT total_capacity FROM tapes WHERE volume_label='Tape_A'"
+                ).fetchone()[0], 123)
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM files_index WHERE tape_label='Tape_A'"
+                ).fetchone()[0], 0)
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM archive_bundles WHERE tape_label='Tape_A'"
+                ).fetchone()[0], 0)
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM archive_runs WHERE tape_label='Tape_A'"
+                ).fetchone()[0], 0)
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM catalog_directories WHERE tape_label='Tape_A'"
+                ).fetchone()[0], 0)
+            finally:
+                conn.close()
+
 
 if __name__ == '__main__':
     unittest.main()
