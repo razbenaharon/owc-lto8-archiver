@@ -1385,6 +1385,70 @@ class DatabaseManager:
                 print(f"[DB] Tape '{volume_label}' is already in the database.")
                 return False
 
+    def _delete_tape_records_unlocked(self, volume_label):
+        stats = {}
+        cur = self.conn.execute(
+            "DELETE FROM files_index WHERE tape_label = ?", (volume_label,))
+        stats['file_records'] = cur.rowcount
+        cur = self.conn.execute(
+            "DELETE FROM archive_bundles WHERE tape_label = ?",
+            (volume_label,))
+        stats['bundles'] = cur.rowcount
+        cur = self.conn.execute(
+            "DELETE FROM archive_runs WHERE tape_label = ?",
+            (volume_label,))
+        stats['runs'] = cur.rowcount
+        if catalog_v3_available(self.conn):
+            cur = self.conn.execute(
+                "DELETE FROM catalog_directories WHERE tape_label = ?",
+                (volume_label,))
+            stats['directories'] = cur.rowcount
+        else:
+            stats['directories'] = 0
+        return stats
+
+    def replace_formatted_tape(self, volume_label, capacity_gb=None,
+                               previous_labels=None):
+        """Remove stale DB records for a formatted tape and register it fresh."""
+        labels_to_clear = []
+        for label in list(previous_labels or []) + [volume_label]:
+            label = (label or '').strip()
+            if label and label not in labels_to_clear:
+                labels_to_clear.append(label)
+
+        with self.lock:
+            try:
+                self.conn.execute("BEGIN")
+                removed = {}
+                for label in labels_to_clear:
+                    stats = self._delete_tape_records_unlocked(label)
+                    cur = self.conn.execute(
+                        "DELETE FROM tapes WHERE volume_label = ?", (label,))
+                    if cur.rowcount or any(stats.values()):
+                        removed[label] = stats
+                self.conn.execute(
+                    """INSERT INTO tapes
+                       (volume_label, date_formatted, total_capacity, used_space)
+                       VALUES (?, ?, ?, 0)""",
+                    (volume_label, datetime.now().isoformat(), capacity_gb),
+                )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+
+        if removed:
+            for label, stats in removed.items():
+                print(
+                    f"[DB] Cleared formatted tape '{label}': "
+                    f"{stats['file_records']} file record(s), "
+                    f"{stats['bundles']} bundle(s), {stats['runs']} run(s)."
+                )
+        else:
+            print("[DB] No existing tape records matched the formatted tape.")
+        print(f"[DB] Tape '{volume_label}' registered fresh with 0 used bytes.")
+        return True
+
     def _prune_empty_catalog_directories(self, tape_label, directory_id=None):
         if not catalog_v3_available(self.conn):
             return
@@ -1432,14 +1496,16 @@ class DatabaseManager:
 
     def delete_tape(self, volume_label):
         with self.lock:
-            self.conn.execute("DELETE FROM files_index WHERE tape_label = ?", (volume_label,))
-            self.conn.execute("DELETE FROM archive_bundles WHERE tape_label = ?",
-                              (volume_label,))
-            self.conn.execute("DELETE FROM archive_runs WHERE tape_label = ?",
-                              (volume_label,))
-            cur = self.conn.execute("DELETE FROM tapes WHERE volume_label = ?", (volume_label,))
-            self._require_updated(cur, f"[DB] Tape not found: {volume_label}")
-            self.conn.commit()
+            try:
+                self.conn.execute("BEGIN")
+                self._delete_tape_records_unlocked(volume_label)
+                cur = self.conn.execute(
+                    "DELETE FROM tapes WHERE volume_label = ?", (volume_label,))
+                self._require_updated(cur, f"[DB] Tape not found: {volume_label}")
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
             print(f"[DB] Tape '{volume_label}' and its file records removed from database.")
 
     def tape_exists(self, volume_label):
