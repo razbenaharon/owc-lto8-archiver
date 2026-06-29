@@ -19,7 +19,8 @@ from .catalog_v3 import (
 from .db import SCHEMA_VERSION, _file_record_key, _hash_to_blob
 
 
-_STAGING_COMPONENT = re.compile(r"^_fetch(?:_s\d+)?_\d+$", re.IGNORECASE)
+_STAGING_COMPONENT = re.compile(r"^_fetch(?:_s(?P<session>\d+))?_\d+$",
+                                re.IGNORECASE)
 
 
 def _staging_relative(path):
@@ -33,6 +34,20 @@ def _staging_relative(path):
     for index, part in enumerate(parts):
         if _STAGING_COMPONENT.fullmatch(part) and index + 1 < len(parts):
             return "/".join(parts[index + 1:])
+    return None
+
+
+def _staging_session_id(path):
+    """Return the session id encoded in _fetch_sNNNN_NNN paths, if present."""
+    if not path:
+        return None
+    value = str(path)
+    if not re.match(r"^[A-Za-z]:[\\/]", value):
+        return None
+    for part in re.split(r"[\\/]", value):
+        match = _STAGING_COMPONENT.fullmatch(part)
+        if match and match.group('session'):
+            return int(match.group('session'))
     return None
 
 
@@ -206,6 +221,8 @@ class DatabaseOptimizer:
         conn.execute('PRAGMA foreign_keys=ON')
         conn.execute('PRAGMA busy_timeout=60000')
         conn.create_function('staging_rel', 1, _staging_relative, deterministic=True)
+        conn.create_function('staging_session', 1, _staging_session_id,
+                             deterministic=True)
         conn.create_function(
             'fallback_canonical', 2, _fallback_canonical, deterministic=True)
         conn.create_function(
@@ -259,36 +276,69 @@ class DatabaseOptimizer:
         phase = 'v2_canonical_paths'
         if self._done(conn, phase):
             return
-        conn.execute('DROP TABLE IF EXISTS migration_path_map')
-        conn.execute("""CREATE TABLE migration_path_map(
+        conn.execute('DROP TABLE IF EXISTS migration_path_map_session')
+        conn.execute('DROP TABLE IF EXISTS migration_path_map_tape')
+        conn.execute("""CREATE TABLE migration_path_map_session(
+            session_id INTEGER NOT NULL,
+            local_rel_path TEXT NOT NULL,
+            remote_path TEXT NOT NULL,
+            PRIMARY KEY(session_id,local_rel_path)) WITHOUT ROWID""")
+        conn.execute("""CREATE TABLE migration_path_map_tape(
             tape_label TEXT NOT NULL,
             local_rel_path TEXT NOT NULL,
             remote_path TEXT NOT NULL,
             PRIMARY KEY(tape_label,local_rel_path)) WITHOUT ROWID""")
         ambiguous = conn.execute("""
             SELECT COUNT(*) FROM (
-              SELECT s.tape_label,m.local_rel_path
-              FROM remote_manifest m JOIN remote_sessions s USING(session_id)
-              WHERE m.session_id IN (4,5,6) AND m.local_rel_path IS NOT NULL
-              GROUP BY s.tape_label,m.local_rel_path
+              SELECT m.session_id,m.local_rel_path
+              FROM remote_manifest m
+              WHERE m.local_rel_path IS NOT NULL
+              GROUP BY m.session_id,m.local_rel_path
               HAVING COUNT(DISTINCT m.remote_path)>1)
         """).fetchone()[0]
         if ambiguous:
             raise RuntimeError(f"{ambiguous} ambiguous manifest path mappings")
         conn.execute("""
-            INSERT INTO migration_path_map(tape_label,local_rel_path,remote_path)
+            INSERT INTO migration_path_map_session(session_id,local_rel_path,remote_path)
+            SELECT m.session_id,m.local_rel_path,MIN(m.remote_path)
+            FROM remote_manifest m
+            WHERE m.local_rel_path IS NOT NULL
+            GROUP BY m.session_id,m.local_rel_path
+        """)
+        conn.execute("""
+            INSERT INTO migration_path_map_tape(tape_label,local_rel_path,remote_path)
             SELECT s.tape_label,m.local_rel_path,MIN(m.remote_path)
             FROM remote_manifest m JOIN remote_sessions s USING(session_id)
-            WHERE m.session_id IN (4,5,6) AND m.local_rel_path IS NOT NULL
+            WHERE m.local_rel_path IS NOT NULL
             GROUP BY s.tape_label,m.local_rel_path
+            HAVING COUNT(DISTINCT m.remote_path)=1
         """)
+        ambiguous_fallback = conn.execute("""
+            SELECT COUNT(*)
+            FROM files_index f
+            WHERE staging_rel(f.original_path) IS NOT NULL
+              AND staging_session(f.original_path) IS NULL
+              AND (
+                SELECT COUNT(DISTINCT m.remote_path)
+                FROM remote_manifest m JOIN remote_sessions s USING(session_id)
+                WHERE s.tape_label=f.tape_label
+                  AND m.local_rel_path=staging_rel(f.original_path)
+              ) > 1
+        """).fetchone()[0]
+        if ambiguous_fallback:
+            raise RuntimeError(
+                f"{ambiguous_fallback} staging path(s) need ambiguous "
+                "legacy tape-level fallback mappings")
         before = conn.execute(
             'SELECT COUNT(*) FROM files_index WHERE staging_rel(original_path) IS NOT NULL'
         ).fetchone()[0]
         conn.execute("""
             UPDATE files_index AS f
             SET original_path=COALESCE(
-              (SELECT remote_path FROM migration_path_map p
+              (SELECT remote_path FROM migration_path_map_session p
+               WHERE p.session_id=staging_session(f.original_path)
+                 AND p.local_rel_path=staging_rel(f.original_path)),
+              (SELECT remote_path FROM migration_path_map_tape p
                WHERE p.tape_label=f.tape_label
                  AND p.local_rel_path=staging_rel(f.original_path)),
               fallback_canonical(f.original_path,?))
@@ -314,42 +364,14 @@ class DatabaseOptimizer:
             raise RuntimeError(
                 f"canonicalization produced {duplicates} duplicate catalog rows")
         self.stats['canonical_paths_repaired'] = before
-        conn.execute('DROP TABLE migration_path_map')
+        conn.execute('DROP TABLE migration_path_map_session')
+        conn.execute('DROP TABLE migration_path_map_tape')
         self._checkpoint(conn, phase)
 
     def _create_remote_v2(self, conn):
         phase = 'v2_remote_storage'
         if self._done(conn, phase):
             return
-        session = conn.execute(
-            'SELECT * FROM remote_sessions WHERE session_id=6').fetchone()
-        if not session:
-            raise RuntimeError('remote session 6 is missing')
-
-        snapshot_hash = hashlib.sha256()
-        for identity in (session['remote_host'], session['remote_path']):
-            raw = str(identity).encode('utf-8', errors='surrogatepass')
-            snapshot_hash.update(len(raw).to_bytes(8, 'big'))
-            snapshot_hash.update(raw)
-        for row in conn.execute("""SELECT remote_path,file_size_bytes
-                                    FROM remote_manifest WHERE session_id=6
-                                    ORDER BY remote_path"""):
-            raw = row['remote_path'].encode('utf-8', errors='surrogatepass')
-            snapshot_hash.update(len(raw).to_bytes(8, 'big'))
-            snapshot_hash.update(raw)
-            snapshot_hash.update(int(row['file_size_bytes']).to_bytes(8, 'big'))
-        snapshot_fp = snapshot_hash.digest()
-        plan_hash = hashlib.sha256(snapshot_fp)
-        for row in conn.execute("""SELECT chunk_index,remote_path,file_size_bytes
-                                    FROM remote_manifest WHERE session_id=6
-                                    ORDER BY manifest_id"""):
-            raw = row['remote_path'].encode('utf-8', errors='surrogatepass')
-            plan_hash.update(int(row['chunk_index']).to_bytes(4, 'big'))
-            plan_hash.update(len(raw).to_bytes(8, 'big'))
-            plan_hash.update(raw)
-            plan_hash.update(int(row['file_size_bytes']).to_bytes(8, 'big'))
-        plan_fp = plan_hash.digest()
-
         conn.execute('PRAGMA foreign_keys=OFF')
         conn.execute('ALTER TABLE remote_sessions RENAME TO remote_sessions_legacy')
         conn.executescript("""
@@ -391,45 +413,123 @@ class DatabaseOptimizer:
               PRIMARY KEY(session_id,plan_file_id)) WITHOUT ROWID;
         """)
         now = datetime.now().isoformat()
-        cur = conn.execute("""INSERT INTO remote_snapshots
-            (remote_host,remote_path,fingerprint,total_files,total_bytes,created_at)
-            VALUES (?,?,?,?,?,?)""",
-            (session['remote_host'],session['remote_path'],snapshot_fp,
-             session['total_files'],session['total_bytes'],now))
-        snapshot_id = cur.lastrowid
-        conn.execute("""INSERT INTO remote_snapshot_files(snapshot_id,remote_path,file_size_bytes)
-            SELECT ?,remote_path,file_size_bytes FROM remote_manifest WHERE session_id=6""",
-            (snapshot_id,))
-        cur = conn.execute("""INSERT INTO remote_plans
-            (snapshot_id,fingerprint,chunk_count,created_at) VALUES (?,?,?,?)""",
-            (snapshot_id,plan_fp,session['chunk_count'],now))
-        plan_id = cur.lastrowid
-        conn.execute("""INSERT INTO remote_plan_files
-            (plan_id,snapshot_file_id,chunk_index,ordinal)
-            SELECT ?,sf.snapshot_file_id,m.chunk_index,m.manifest_id
-            FROM remote_manifest m JOIN remote_snapshot_files sf
-              ON sf.snapshot_id=? AND sf.remote_path=m.remote_path
-            WHERE m.session_id=6""", (plan_id,snapshot_id))
-        conn.execute("""INSERT INTO remote_sessions
-            (session_id,session_label,remote_host,remote_user,remote_path,tape_label,
-             staging_dir,total_files,total_bytes,chunk_count,plan_id,created_at,completed_at,status)
-            SELECT session_id,session_label,remote_host,remote_user,remote_path,tape_label,
-                   staging_dir,total_files,total_bytes,chunk_count,?,created_at,completed_at,status
-            FROM remote_sessions_legacy WHERE session_id=6""", (plan_id,))
-        conn.execute("""INSERT INTO remote_chunks(session_id,chunk_index,status,updated_at)
-            SELECT 6,chunk_index,
-                   CASE WHEN MIN(chunk_status)='done' AND MAX(chunk_status)='done'
-                        THEN 'done' ELSE MAX(chunk_status) END,
-                   MAX(updated_at)
-            FROM remote_manifest WHERE session_id=6 GROUP BY chunk_index""")
-        conn.execute("""INSERT INTO remote_file_state
-            (session_id,plan_file_id,status,local_rel_path,error_msg,updated_at)
-            SELECT 6,pf.plan_file_id,'source_missing',NULL,m.error_msg,m.updated_at
-            FROM remote_manifest m
-            JOIN remote_snapshot_files sf ON sf.snapshot_id=? AND sf.remote_path=m.remote_path
-            JOIN remote_plan_files pf ON pf.plan_id=? AND pf.snapshot_file_id=sf.snapshot_file_id
-            WHERE m.session_id=6 AND m.status='source_missing'""",
-            (snapshot_id,plan_id))
+        sessions = conn.execute(
+            "SELECT * FROM remote_sessions_legacy ORDER BY session_id"
+        ).fetchall()
+        for session in sessions:
+            session_id = session['session_id']
+            manifest_by_path = conn.execute("""
+                SELECT remote_path,file_size_bytes
+                FROM remote_manifest
+                WHERE session_id=?
+                ORDER BY remote_path
+            """, (session_id,)).fetchall()
+            manifest_by_order = conn.execute("""
+                SELECT manifest_id,chunk_index,remote_path,file_size_bytes
+                FROM remote_manifest
+                WHERE session_id=?
+                ORDER BY manifest_id
+            """, (session_id,)).fetchall()
+
+            snapshot_hash = hashlib.sha256()
+            for identity in (session['remote_host'], session['remote_path']):
+                raw = str(identity).encode('utf-8', errors='surrogatepass')
+                snapshot_hash.update(len(raw).to_bytes(8, 'big'))
+                snapshot_hash.update(raw)
+            for row in manifest_by_path:
+                raw = row['remote_path'].encode('utf-8', errors='surrogatepass')
+                snapshot_hash.update(len(raw).to_bytes(8, 'big'))
+                snapshot_hash.update(raw)
+                snapshot_hash.update(
+                    int(row['file_size_bytes']).to_bytes(8, 'big'))
+            snapshot_fp = snapshot_hash.digest()
+
+            plan_hash = hashlib.sha256(snapshot_fp)
+            for row in manifest_by_order:
+                raw = row['remote_path'].encode('utf-8', errors='surrogatepass')
+                plan_hash.update(int(row['chunk_index']).to_bytes(4, 'big'))
+                plan_hash.update(len(raw).to_bytes(8, 'big'))
+                plan_hash.update(raw)
+                plan_hash.update(int(row['file_size_bytes']).to_bytes(8, 'big'))
+            plan_fp = plan_hash.digest()
+
+            conn.execute("""INSERT INTO remote_snapshots
+                (remote_host,remote_path,fingerprint,total_files,total_bytes,created_at)
+                VALUES (?,?,?,?,?,?) ON CONFLICT(fingerprint) DO NOTHING""",
+                (session['remote_host'], session['remote_path'], snapshot_fp,
+                 session['total_files'] or len(manifest_by_order),
+                 session['total_bytes'] or sum(
+                     int(row['file_size_bytes']) for row in manifest_by_order),
+                 now))
+            snapshot_id = conn.execute(
+                "SELECT snapshot_id FROM remote_snapshots WHERE fingerprint=?",
+                (snapshot_fp,)).fetchone()[0]
+            existing = conn.execute(
+                "SELECT COUNT(*) FROM remote_snapshot_files WHERE snapshot_id=?",
+                (snapshot_id,)).fetchone()[0]
+            if not existing:
+                conn.executemany(
+                    """INSERT INTO remote_snapshot_files
+                       (snapshot_id,remote_path,file_size_bytes) VALUES (?,?,?)""",
+                    ((snapshot_id, row['remote_path'], row['file_size_bytes'])
+                     for row in manifest_by_path))
+
+            conn.execute("""INSERT INTO remote_plans
+                (snapshot_id,fingerprint,chunk_count,created_at)
+                VALUES (?,?,?,?) ON CONFLICT(fingerprint) DO NOTHING""",
+                (snapshot_id, plan_fp,
+                 session['chunk_count'] or len(
+                     {int(row['chunk_index']) for row in manifest_by_order}),
+                 now))
+            plan_id = conn.execute(
+                "SELECT plan_id FROM remote_plans WHERE fingerprint=?",
+                (plan_fp,)).fetchone()[0]
+            existing = conn.execute(
+                "SELECT COUNT(*) FROM remote_plan_files WHERE plan_id=?",
+                (plan_id,)).fetchone()[0]
+            if not existing:
+                snapshot_ids = dict(conn.execute(
+                    """SELECT remote_path,snapshot_file_id
+                       FROM remote_snapshot_files WHERE snapshot_id=?""",
+                    (snapshot_id,)).fetchall())
+                conn.executemany(
+                    """INSERT INTO remote_plan_files
+                       (plan_id,snapshot_file_id,chunk_index,ordinal)
+                       VALUES (?,?,?,?)""",
+                    ((plan_id, snapshot_ids[row['remote_path']],
+                      row['chunk_index'], row['manifest_id'])
+                     for row in manifest_by_order))
+
+            conn.execute("""INSERT INTO remote_sessions
+                (session_id,session_label,remote_host,remote_user,remote_path,tape_label,
+                 staging_dir,total_files,total_bytes,chunk_count,plan_id,created_at,
+                 completed_at,status)
+                SELECT session_id,session_label,remote_host,remote_user,remote_path,
+                       tape_label,staging_dir,total_files,total_bytes,chunk_count,?,
+                       created_at,completed_at,status
+                FROM remote_sessions_legacy WHERE session_id=?""",
+                (plan_id, session_id))
+            conn.execute("""INSERT INTO remote_chunks(session_id,chunk_index,status,updated_at)
+                SELECT session_id,chunk_index,
+                       CASE WHEN MIN(chunk_status)='done' AND MAX(chunk_status)='done'
+                            THEN 'done'
+                            ELSE COALESCE(MAX(chunk_status),'pending') END,
+                       MAX(updated_at)
+                FROM remote_manifest
+                WHERE session_id=?
+                GROUP BY session_id,chunk_index""", (session_id,))
+            conn.execute("""INSERT INTO remote_file_state
+                (session_id,plan_file_id,status,local_rel_path,error_msg,updated_at)
+                SELECT m.session_id,pf.plan_file_id,m.status,m.local_rel_path,
+                       m.error_msg,m.updated_at
+                FROM remote_manifest m
+                JOIN remote_snapshot_files sf
+                  ON sf.snapshot_id=? AND sf.remote_path=m.remote_path
+                JOIN remote_plan_files pf
+                  ON pf.plan_id=? AND pf.snapshot_file_id=sf.snapshot_file_id
+                WHERE m.session_id=?
+                  AND COALESCE(m.status,'pending')!='pending'""",
+                (snapshot_id, plan_id, session_id))
         conn.execute('DROP TABLE remote_manifest')
         conn.execute('DROP TABLE remote_sessions_legacy')
         conn.execute('PRAGMA foreign_keys=ON')
