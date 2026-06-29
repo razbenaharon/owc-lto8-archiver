@@ -99,3 +99,8 @@ hardware/manual verification if relevant, and any database/config changes. For
   it is printed as a `[WARNING]` (`LTFS_WRITE_WARNING`, defined in
   `src/constants.py`) at the start of every tape-write run and at remote-pipeline
   start.
+- **No Independent Write Verification.** Never add code that reads from the tape
+  immediately after a write/copy operation just for verification purposes.
+  Unnecessary reading right after writing causes wear and tear and damages the
+  tape. Rely solely on copy tool success reports (for example, `robocopy`) and
+  minimize tape reads as a critical architectural rule.

@@ -749,15 +749,16 @@ class DatabaseManager:
         unknown = set(values) - allowed
         if unknown:
             raise RuntimeError(f"[DB] Invalid remote state field(s): {sorted(unknown)}")
-        current = self.conn.execute(
-            "SELECT * FROM remote_file_state WHERE session_id=? AND plan_file_id=?",
-            (session_id, plan_file_id),
-        ).fetchone()
-        merged = {key: (current[key] if current else None)
-                  for key in ('status','local_rel_path','error_msg')}
-        merged.update(values)
-        self._commit_write(
-            lambda: self.conn.execute(
+
+        def operation():
+            current = self.conn.execute(
+                "SELECT * FROM remote_file_state WHERE session_id=? AND plan_file_id=?",
+                (session_id, plan_file_id),
+            ).fetchone()
+            merged = {key: (current[key] if current else None)
+                      for key in ('status','local_rel_path','error_msg')}
+            merged.update(values)
+            return self.conn.execute(
                 """INSERT INTO remote_file_state
                    (session_id,plan_file_id,status,local_rel_path,error_msg,updated_at)
                    VALUES (?,?,?,?,?,?)
@@ -767,7 +768,10 @@ class DatabaseManager:
                 (session_id, plan_file_id, merged['status'],
                  merged['local_rel_path'], merged['error_msg'],
                  datetime.now().isoformat()),
-            ),
+            )
+
+        self._commit_write(
+            operation,
             f"normalized remote file {plan_file_id} update",
         )
 
@@ -1297,22 +1301,29 @@ class DatabaseManager:
         def flush(items):
             if not items:
                 return
-            labels = {item.get('tape_label') for item in items}
-            missing = []
-            for label in labels - registered:
-                if not self.conn.execute(
-                        "SELECT 1 FROM tapes WHERE volume_label = ?", (label,)
-                ).fetchone():
-                    missing.append(label)
-                else:
-                    registered.add(label)
-            if missing:
-                raise RuntimeError(
-                    f"[DB] Cannot index files for unregistered tape(s): {missing}")
-            stats = self._commit_write(
-                lambda: self._bulk_upsert_batch(items, update_existing),
+
+            def operation():
+                labels = {item.get('tape_label') for item in items}
+                found = set()
+                missing = []
+                for label in labels - registered:
+                    if not self.conn.execute(
+                            "SELECT 1 FROM tapes WHERE volume_label = ?", (label,)
+                    ).fetchone():
+                        missing.append(label)
+                    else:
+                        found.add(label)
+                if missing:
+                    raise RuntimeError(
+                        f"[DB] Cannot index files for unregistered tape(s): {missing}")
+                stats = self._bulk_upsert_batch(items, update_existing)
+                return stats, found
+
+            stats, found = self._commit_write(
+                operation,
                 f"file catalog batch ({len(items):,} rows)",
             )
+            registered.update(found)
             for key in totals:
                 totals[key] += stats[key]
 

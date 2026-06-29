@@ -175,13 +175,20 @@ class LTORetriever:
         print(f"\n[RESTORE] Complete. {total} file(s) restored to: {self.restore_dir}")
 
     def _verify_tape(self, required_label):
-        mounted = get_volume_label(self.tape_drive)
-        if mounted and mounted.upper() != required_label.upper():
-            print(f"\n[TAPE] Required: {required_label}  |  Currently mounted: {mounted}")
-            input(f"Please insert tape '{required_label}' and press Enter to continue...")
-        elif not mounted:
-            print(f"\n[TAPE] Could not auto-detect tape label. Required tape: {required_label}")
-            input("Ensure the correct tape is inserted, then press Enter...")
+        while True:
+            mounted = get_volume_label(self.tape_drive)
+            if mounted and mounted.upper() == required_label.upper():
+                return
+
+            current = mounted or "not detected"
+            print(f"\n[TAPE] Required: {required_label}  |  Currently mounted: {current}")
+            choice = input(
+                f"Insert tape '{required_label}', then press Enter to re-check "
+                "or type CANCEL to abort: "
+            ).strip()
+            if choice.upper() == 'CANCEL':
+                raise RuntimeError(
+                    f"[RESTORE] Cancelled: tape '{required_label}' was not mounted.")
 
     def _restore_loose(self, record):
         src = record['stored_path']

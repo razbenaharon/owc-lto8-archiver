@@ -4,7 +4,11 @@ import tempfile
 import unittest
 
 from src.db import DatabaseManager, _apply_canonical_remote_paths
-from src.maintenance import DatabaseOptimizer, _staging_relative
+from src.maintenance import (
+    DatabaseOptimizer,
+    _staging_relative,
+    _staging_session_id,
+)
 
 
 LEGACY_SCHEMA = """
@@ -37,6 +41,13 @@ class CanonicalPathTests(unittest.TestCase):
         self.assertIsNone(_staging_relative("/source/_fetch_003/file.dat"))
         self.assertIsNone(_staging_relative(r"C:\source\my_fetch_003\file.dat"))
 
+    def test_staging_session_id_is_extracted_only_from_fetch_component(self):
+        self.assertEqual(
+            _staging_session_id(r"C:\stage\_fetch_s0042_003\project\file.dat"),
+            42)
+        self.assertIsNone(_staging_session_id(r"C:\stage\_fetch_003\file.dat"))
+        self.assertIsNone(_staging_session_id(r"C:\source\_fetch_s0042_003.dat"))
+
     def test_metadata_keeps_stored_path_and_gets_canonical_source(self):
         metadata = [{
             'original_path': r'C:\stage\_fetch_000\project\file.dat',
@@ -65,9 +76,9 @@ class OptimizerTests(unittest.TestCase):
         tapes = [('Tape_03',), ('Tape02',), ('Tape01',), ('Tape_01',)]
         conn.executemany('INSERT INTO tapes(volume_label) VALUES (?)', tapes)
         sessions = [
-            (4, 'old4', 'Tape02', 'abandoned'),
-            (5, 'old5', 'Tape01', 'abandoned'),
-            (6, 'kept6', 'Tape_01', 'completed'),
+            (11, 'old11', 'Tape02', 'abandoned'),
+            (27, 'old27', 'Tape01', 'abandoned'),
+            (42, 'kept42', 'Tape_01', 'completed'),
         ]
         for sid, label, tape, status in sessions:
             conn.execute("""INSERT INTO remote_sessions VALUES
@@ -123,12 +134,12 @@ class OptimizerTests(unittest.TestCase):
             self.assertTrue(paths['Tape_01'][1].endswith('project/a.dat'))
             self.assertEqual(
                 [r[0] for r in conn.execute('SELECT session_id FROM remote_sessions')],
-                [6])
+                [11, 27, 42])
             self.assertEqual(conn.execute(
                 'SELECT COUNT(*) FROM remote_snapshot_files').fetchone()[0], 2)
             self.assertEqual(conn.execute(
                 "SELECT COUNT(*) FROM remote_file_state WHERE status='source_missing'"
-            ).fetchone()[0], 1)
+            ).fetchone()[0], 3)
             self.assertEqual(conn.execute(
                 'SELECT COUNT(*) FROM files_index WHERE file_hash_blob IS NOT NULL'
             ).fetchone()[0], 3)
@@ -143,6 +154,35 @@ class OptimizerTests(unittest.TestCase):
                 self.assertTrue(row['backup_date'].startswith('2026-01-02'))
             finally:
                 db.close()
+
+    def test_ambiguous_legacy_tape_fallback_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'ambiguous.db')
+            conn = sqlite3.connect(path)
+            conn.executescript(LEGACY_SCHEMA)
+            conn.execute("INSERT INTO tapes(volume_label) VALUES ('Tape_A')")
+            for sid, remote_path in (
+                    (101, '/root/one/same.dat'),
+                    (202, '/root/two/same.dat')):
+                conn.execute("""INSERT INTO remote_sessions VALUES
+                    (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (sid, f's{sid}', 'host', 'user', '/root', 'Tape_A',
+                     r'C:\stage', 1, 10, 1, '2026-01-01', None, 'completed'))
+                conn.execute("""INSERT INTO remote_manifest VALUES
+                    (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (sid, sid, 0, remote_path, 'same.dat', 10, 'same.dat',
+                     'fetched', 'done', None, '2026-01-01'))
+            conn.execute("""INSERT INTO files_index
+                (file_name,original_path,file_size_bytes,file_hash,backup_date,
+                 tape_label,is_packed,container_name,stored_path)
+                VALUES ('same.dat',?,10,'','2026-01-01','Tape_A',0,NULL,?)""",
+                (r'C:\stage\_fetch_001\same.dat', r'E:\same.dat'))
+            conn.commit()
+            conn.close()
+
+            with self.assertRaisesRegex(RuntimeError, 'ambiguous'):
+                DatabaseOptimizer(path, source_root='/root',
+                                  progress=lambda _msg: None).run()
 
 
 class SchemaV2RuntimeTests(unittest.TestCase):
@@ -175,12 +215,39 @@ class SchemaV2RuntimeTests(unittest.TestCase):
                 db.update_manifest_rows_fetched(
                     [('a.dat', rows[0]['manifest_id'])], session_id=session_id)
                 db.update_manifest_row(
+                    rows[0]['manifest_id'], session_id=session_id,
+                    error_msg='kept note')
+                pre_done = db.get_chunk_files(session_id, 0)
+                self.assertEqual(pre_done[0]['status'], 'fetched')
+                self.assertEqual(pre_done[0]['local_rel_path'], 'a.dat')
+                self.assertEqual(pre_done[0]['error_msg'], 'kept note')
+                db.update_manifest_row(
                     rows[1]['manifest_id'], session_id=session_id,
                     status='source_missing', error_msg='missing')
                 db.update_chunk_status(session_id, 0, 'done')
                 states = db.get_chunk_files(session_id, 0)
                 self.assertEqual(states[0]['status'], 'fetched')
                 self.assertEqual(states[1]['status'], 'source_missing')
+            finally:
+                db.close()
+
+    def test_bulk_upsert_rejects_unregistered_tape_without_partial_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = DatabaseManager(os.path.join(tmp, 'missing-tape.db'))
+            try:
+                with self.assertRaises(RuntimeError):
+                    db.bulk_upsert_files([{
+                        'file_name': 'orphan.dat',
+                        'original_path': '/source/orphan.dat',
+                        'file_size_bytes': 1,
+                        'file_hash': '',
+                        'tape_label': 'MISSING',
+                        'is_packed': False,
+                        'container_name': None,
+                        'stored_path': r'E:\orphan.dat',
+                    }])
+                self.assertEqual(db.conn.execute(
+                    'SELECT COUNT(*) FROM files_index').fetchone()[0], 0)
             finally:
                 db.close()
 
