@@ -94,6 +94,96 @@ class InspectorRepository:
                ORDER BY source_host"""
         ) if row[0]]
 
+    def _table_exists(self, name):
+        return self.conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (name,),
+        ).fetchone() is not None
+
+    def list_sessions(self):
+        rows = []
+        if self._table_exists("local_sessions"):
+            rows.extend(dict(row) for row in self.conn.execute("""
+                SELECT 'local' AS kind,s.session_id,s.session_label,s.status,
+                       COALESCE(s.backup_mode,'auto') AS mode,s.created_at,
+                       s.completed_at,s.total_chunks AS chunks,
+                       COALESCE((SELECT COUNT(*) FROM local_chunks_manifest m
+                                 WHERE m.session_id=s.session_id),0) AS manifest_rows,
+                       COALESCE((SELECT SUM(dir_size_bytes) FROM local_chunks_manifest m
+                                 WHERE m.session_id=s.session_id),0) AS manifest_bytes,
+                       COALESCE((SELECT COUNT(*) FROM files_index f
+                                 WHERE f.local_session_id=s.session_id),0) AS file_records
+                FROM local_sessions s ORDER BY s.session_id"""))
+        if self._table_exists("remote_sessions"):
+            if self._table_exists("remote_plan_files"):
+                rows.extend(dict(row) for row in self.conn.execute("""
+                    SELECT 'remote' AS kind,s.session_id,s.session_label,s.status,
+                           '' AS mode,s.created_at,s.completed_at,s.chunk_count AS chunks,
+                           COALESCE((SELECT COUNT(*) FROM remote_plan_files pf
+                                     WHERE pf.plan_id=s.plan_id),0) AS manifest_rows,
+                           COALESCE((SELECT SUM(sf.file_size_bytes)
+                                     FROM remote_plan_files pf
+                                     JOIN remote_snapshot_files sf
+                                       ON sf.snapshot_file_id=pf.snapshot_file_id
+                                     WHERE pf.plan_id=s.plan_id),0) AS manifest_bytes,
+                           0 AS file_records
+                    FROM remote_sessions s ORDER BY s.session_id"""))
+            elif self._table_exists("remote_manifest"):
+                rows.extend(dict(row) for row in self.conn.execute("""
+                    SELECT 'remote' AS kind,s.session_id,s.session_label,s.status,
+                           '' AS mode,s.created_at,s.completed_at,s.chunk_count AS chunks,
+                           COALESCE((SELECT COUNT(*) FROM remote_manifest m
+                                     WHERE m.session_id=s.session_id),0) AS manifest_rows,
+                           COALESCE((SELECT SUM(file_size_bytes) FROM remote_manifest m
+                                     WHERE m.session_id=s.session_id),0) AS manifest_bytes,
+                           0 AS file_records
+                    FROM remote_sessions s ORDER BY s.session_id"""))
+        return sorted(rows, key=lambda r: (r["kind"], int(r["session_id"])))
+
+    def unreferenced_remote_data_summary(self):
+        required = {
+            'remote_sessions', 'remote_snapshots', 'remote_snapshot_files',
+            'remote_plans', 'remote_plan_files',
+        }
+        if not all(self._table_exists(table) for table in required):
+            return {
+                'supported': False, 'active_sessions': 0,
+                'plans': 0, 'plan_files': 0,
+                'snapshots': 0, 'snapshot_files': 0,
+            }
+        return dict(self.conn.execute("""
+            SELECT
+              1 AS supported,
+              (SELECT COUNT(*) FROM remote_sessions
+               WHERE status='active') AS active_sessions,
+              (SELECT COUNT(*) FROM remote_plans p
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM remote_sessions s WHERE s.plan_id=p.plan_id
+               )) AS plans,
+              (SELECT COUNT(*) FROM remote_plan_files pf
+               WHERE EXISTS (
+                 SELECT 1 FROM remote_plans p
+                 WHERE p.plan_id=pf.plan_id AND NOT EXISTS (
+                   SELECT 1 FROM remote_sessions s WHERE s.plan_id=p.plan_id
+                 )
+               )) AS plan_files,
+              (SELECT COUNT(*) FROM remote_snapshots sn
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM remote_plans p
+                 JOIN remote_sessions s ON s.plan_id=p.plan_id
+                 WHERE p.snapshot_id=sn.snapshot_id
+               )) AS snapshots,
+              (SELECT COUNT(*) FROM remote_snapshot_files sf
+               WHERE EXISTS (
+                 SELECT 1 FROM remote_snapshots sn
+                 WHERE sn.snapshot_id=sf.snapshot_id AND NOT EXISTS (
+                   SELECT 1 FROM remote_plans p
+                   JOIN remote_sessions s ON s.plan_id=p.plan_id
+                   WHERE p.snapshot_id=sn.snapshot_id
+                 )
+               )) AS snapshot_files
+        """).fetchone())
+
     def list_child_directories(self, parent_id=None, cursor=None, limit=None,
                                tape_label=None):
         self._require_v3()

@@ -30,7 +30,7 @@ in a local SQLite database.
 
 ```powershell
 python -m pip install -r requirements.txt          # set up / update the environment
-python -m py_compile src/*.py run.py inspect_db.py  # syntax check before handoff
+$files = @(Get-ChildItem src -Filter *.py | ForEach-Object { $_.FullName }) + @((Resolve-Path run.py).Path, (Resolve-Path inspect_db.py).Path); python -m py_compile @files  # syntax check before handoff
 python run.py                                        # run the main application
 python inspect_db.py                                # run the database inspector
 ```
@@ -45,8 +45,8 @@ behavior. Avoid broad refactors during operational fixes.
 
 ## Testing Guidelines
 
-There is no formal test suite yet. At minimum run `python -m py_compile ...` after
-edits. Pure parsing, config, database, path-normalization, and reporting changes do
+Run `python -m pytest -q` and the PowerShell-expanded `py_compile` command above
+after edits. Pure parsing, config, database, path-normalization, and reporting changes do
 **not** require real tape hardware — validate them directly where possible. For
 tape-related changes, reason carefully about hardware side effects and verify with a
 small staged dataset before a full remote archive run.

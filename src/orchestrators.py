@@ -837,7 +837,10 @@ class RemoteOrchestrator:
     def _chunk_budget(self):
         # Cap each chunk at chunk_cap_gb so the deep-prefetch pipeline can keep
         # 2+ chunks resident on the NVMe staging disk under the staging_max cap.
-        free_budget = int(shutil.disk_usage(self.staging_dir).free * self.fill_pct)
+        os.makedirs(self.staging_dir, exist_ok=True)
+        free = shutil.disk_usage(self.staging_dir).free
+        usable = max(0, free - LOCAL_STAGING_RESERVE_BYTES)
+        free_budget = int(usable * self.fill_pct)
         return min(free_budget, self.chunk_cap_bytes)
 
     def _bin_pack(self, manifest):
@@ -1042,8 +1045,15 @@ class RemoteOrchestrator:
                 free = need + floor
             room_cap  = (resident + need) <= self.staging_max_bytes
             room_disk = (free - need) >= floor
-            alone     = (resident == 0)    # nothing else resident: must proceed
-            if (room_cap and room_disk) or alone:
+            if not room_disk:
+                raise RuntimeError(
+                    "Insufficient local staging space for remote chunk. "
+                    f"Need {need / 1024**3:.2f} GiB peak staging + "
+                    f"{floor / 1024**3:.0f} GiB reserve; current free on "
+                    f"'{self.staging_dir}': {free / 1024**3:.2f} GiB."
+                )
+            alone     = (resident == 0)    # nothing else resident: may exceed cap
+            if room_cap or alone:
                 return
             if not warned:
                 _status('PIPELINE',
@@ -1214,6 +1224,16 @@ class RemoteOrchestrator:
                 ).eject_tape(self.cfg.lto_drive)
             return True
 
+        planned_bytes = sum(
+            int(row['file_size_bytes'] or 0)
+            for row in self.db.get_chunk_files(session_id, chunk_index)
+            if row['status'] != 'source_missing'
+        )
+        if not self._ensure_remote_chunk_fits_tape(
+                tape_label, planned_bytes, chunk_index):
+            self.db.update_chunk_status(session_id, chunk_index, 'backup_failed')
+            return False
+
         self.db.update_chunk_status(session_id, chunk_index, 'backing')
         # _NoEjectBackup keeps the tape mounted; eject only after the final chunk.
         backup_cls = LTOBackup if eject_after else _NoEjectBackup
@@ -1249,6 +1269,26 @@ class RemoteOrchestrator:
         self._cleanup_dir(pack_dir)
         with self._staged_lock:
             self._staged_bytes = max(0, self._staged_bytes - desc['staged_bytes'])
+        return True
+
+    def _ensure_remote_chunk_fits_tape(self, tape_label, planned_bytes,
+                                       chunk_index):
+        tape = self.db.get_tape(tape_label)
+        if not tape:
+            print(f"[DB] Tape '{tape_label}' is not registered.")
+            return False
+        used_bytes = self.db.recalculate_tape_used_space(tape_label)
+        capacity_bytes = LOCAL_TAPE_BUDGET_BYTES
+        if tape['total_capacity']:
+            capacity_bytes = min(
+                capacity_bytes, int(tape['total_capacity'] * 1024**3))
+        available_bytes = capacity_bytes - used_bytes
+        if planned_bytes > available_bytes:
+            print(f"[TAPE] Remote chunk {chunk_index + 1} does not fit on "
+                  f"'{tape_label}' ({planned_bytes / 1024**3:.2f} GiB needed, "
+                  f"{max(0, available_bytes) / 1024**3:.2f} GiB available "
+                  "under the DB safety budget).")
+            return False
         return True
 
     # ------------------------------------------------------------------

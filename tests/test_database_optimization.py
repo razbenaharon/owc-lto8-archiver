@@ -318,6 +318,66 @@ class SchemaV2RuntimeTests(unittest.TestCase):
             finally:
                 db.close()
 
+    def test_delete_session_removes_bookkeeping_not_catalog_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'sessions.db')
+            db = DatabaseManager(path)
+            try:
+                db.register_tape('T1', 100)
+                db.insert_file(
+                    'catalog.dat', '/source/catalog.dat', 99,
+                    'T1', False, None, r'E:\catalog.dat')
+
+                local_id = db.create_local_session(
+                    'local', r'C:\source',
+                    [[{'name': 'dir', 'size_bytes': 99}]])
+                remote_id = db.create_remote_session(
+                    'remote', 'host', 'user', '/source', 'T1', r'C:\stage')
+                db.insert_remote_manifest_batch(
+                    remote_id, [(0, '/source/a.dat', 'a.dat', 10)])
+
+                db.delete_session('local', local_id)
+                db.delete_session('remote', remote_id)
+
+                self.assertEqual(db.conn.execute(
+                    'SELECT COUNT(*) FROM local_sessions').fetchone()[0], 0)
+                self.assertEqual(db.conn.execute(
+                    'SELECT COUNT(*) FROM local_chunks_manifest').fetchone()[0], 0)
+                self.assertEqual(db.conn.execute(
+                    'SELECT COUNT(*) FROM remote_sessions').fetchone()[0], 0)
+                self.assertEqual(db.conn.execute(
+                    'SELECT COUNT(*) FROM remote_chunks').fetchone()[0], 0)
+                self.assertEqual(db.conn.execute(
+                    'SELECT COUNT(*) FROM files_index').fetchone()[0], 1)
+            finally:
+                db.close()
+
+    def test_tape_rename_rolls_back_on_existing_label_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'rename-rollback.db')
+            db = DatabaseManager(path)
+            try:
+                db.register_tape('OLD', 100)
+                db.register_tape('NEW', 100)
+                db.insert_file(
+                    'same.dat', '/source/same.dat', 1,
+                    'OLD', False, None, r'E:\old\same.dat')
+                db.insert_file(
+                    'same.dat', '/source/same.dat', 1,
+                    'NEW', False, None, r'E:\new\same.dat')
+
+                with self.assertRaises(sqlite3.IntegrityError):
+                    db.rename_tape('OLD', 'NEW')
+
+                counts = dict(db.conn.execute(
+                    'SELECT tape_label,COUNT(*) FROM files_index GROUP BY tape_label'
+                ).fetchall())
+                self.assertEqual(counts, {'NEW': 1, 'OLD': 1})
+                self.assertTrue(db.tape_exists('OLD'))
+                self.assertTrue(db.tape_exists('NEW'))
+            finally:
+                db.close()
+
 
 class HashlessOriginMigrationTests(unittest.TestCase):
     def test_hashless_origin_migration_drops_hash_columns(self):

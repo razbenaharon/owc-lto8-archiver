@@ -665,6 +665,9 @@ class ManageWidget(QWidget):
         super().__init__(parent)
         self.db = db
         self.db_path = db_path
+        self.pool = QThreadPool.globalInstance()
+        self._sessions_token = 0
+        self._cleanup_summary = {}
         layout = QVBoxLayout(self)
         tabs = QTabWidget(self)
         layout.addWidget(tabs)
@@ -797,43 +800,29 @@ class ManageWidget(QWidget):
             self.db.delete_tape(label)
             self.refresh()
 
-    def _table_exists(self, name):
-        return self.db.conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-            (name,),
-        ).fetchone() is not None
-
-    def _session_rows(self):
-        rows = []
-        if self._table_exists("local_sessions"):
-            rows.extend(dict(row) for row in self.db.conn.execute("""
-                SELECT 'local' AS kind,s.session_id,s.session_label,s.status,
-                       COALESCE(s.backup_mode,'auto') AS mode,s.created_at,
-                       s.completed_at,s.total_chunks AS chunks,
-                       COALESCE((SELECT COUNT(*) FROM local_chunks_manifest m
-                                 WHERE m.session_id=s.session_id),0) AS manifest_rows,
-                       COALESCE((SELECT SUM(dir_size_bytes) FROM local_chunks_manifest m
-                                 WHERE m.session_id=s.session_id),0) AS manifest_bytes,
-                       COALESCE((SELECT COUNT(*) FROM files_index f
-                                 WHERE f.local_session_id=s.session_id),0) AS file_records
-                FROM local_sessions s ORDER BY s.session_id"""))
-        if self._table_exists("remote_sessions"):
-            rows.extend(dict(row) for row in self.db.conn.execute("""
-                SELECT 'remote' AS kind,s.session_id,s.session_label,s.status,
-                       '' AS mode,s.created_at,s.completed_at,s.chunk_count AS chunks,
-                       COALESCE((SELECT COUNT(*) FROM remote_plan_files pf
-                                 WHERE pf.plan_id=s.plan_id),0) AS manifest_rows,
-                       COALESCE((SELECT SUM(sf.file_size_bytes)
-                                 FROM remote_plan_files pf
-                                 JOIN remote_snapshot_files sf
-                                   ON sf.snapshot_file_id=pf.snapshot_file_id
-                                 WHERE pf.plan_id=s.plan_id),0) AS manifest_bytes,
-                       0 AS file_records
-                FROM remote_sessions s ORDER BY s.session_id"""))
-        return sorted(rows, key=lambda r: (r["kind"], int(r["session_id"])))
-
     def refresh_sessions(self):
-        rows = self._session_rows()
+        self._sessions_token += 1
+        token = self._sessions_token
+        self.sessions_table.setRowCount(0)
+        self.cleanup_btn.setEnabled(False)
+        worker = RepositoryWorker(
+            self.db_path,
+            token,
+            lambda repo: {
+                "rows": repo.list_sessions(),
+                "summary": repo.unreferenced_remote_data_summary(),
+            },
+        )
+        worker.signals.finished.connect(self._on_sessions_loaded)
+        worker.signals.failed.connect(lambda _token, msg: self._show_error(msg))
+        self.pool.start(worker)
+
+    @Slot(object, object)
+    def _on_sessions_loaded(self, token, result):
+        if token != self._sessions_token:
+            return
+        rows = result["rows"]
+        self._cleanup_summary = result.get("summary") or {}
         self.sessions_table.setRowCount(len(rows))
         for row, item in enumerate(rows):
             values = [
@@ -845,7 +834,7 @@ class ManageWidget(QWidget):
             for col, value in enumerate(values):
                 self.sessions_table.setItem(row, col, QTableWidgetItem(str(value)))
         self.sessions_table.resizeColumnsToContents()
-        summary = self.db.get_unreferenced_remote_data_summary()
+        summary = self._cleanup_summary
         self.cleanup_btn.setEnabled(
             bool(summary.get("plans") or summary.get("snapshots"))
             and not summary.get("active_sessions"))
@@ -867,25 +856,20 @@ class ManageWidget(QWidget):
                 self, "Delete Session",
                 f"Delete {kind} session {session_id}?") != QMessageBox.Yes:
             return
-        table = "local_sessions" if kind == "local" else "remote_sessions"
-        with self.db.lock:
-            with self.db.conn:
-                if kind == "local":
-                    self.db.conn.execute(
-                        "DELETE FROM local_chunks_manifest WHERE session_id=?",
-                        (session_id,))
-                self.db.conn.execute(f"DELETE FROM {table} WHERE session_id=?",
-                                     (session_id,))
+        self.db.delete_session(kind, session_id)
         self.refresh_sessions()
 
     def cleanup_sessions(self):
-        summary = self.db.get_unreferenced_remote_data_summary()
+        summary = self._cleanup_summary or self.db.get_unreferenced_remote_data_summary()
         if QMessageBox.question(
                 self, "Clean Unused Session Data",
                 f"Delete unused plans/snapshots?\n\n{summary}") == QMessageBox.Yes:
             result = self.db.cleanup_unreferenced_remote_data(compact=True)
             QMessageBox.information(self, "Cleanup Complete", str(result))
             self.refresh_sessions()
+
+    def _show_error(self, message):
+        QMessageBox.critical(self, "Database Error", message)
 
     def open_preflight_console(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
