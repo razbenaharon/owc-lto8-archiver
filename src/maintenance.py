@@ -964,7 +964,20 @@ class CatalogV3Optimizer:
         ensure_catalog_schema(conn)
         self._drop_fts_triggers(conn)
         conn.commit()
+        self._index_catalog_rows(conn)
 
+    def _rebuild_catalog_v3(self, conn):
+        """Rebuild the directory tree in place from the current path logic."""
+        ensure_catalog_schema(conn)
+        self._drop_fts_triggers(conn)
+        conn.execute(
+            'UPDATE files_index SET directory_id=NULL, catalog_name=NULL, '
+            'catalog_backup_date=NULL')
+        conn.execute('DELETE FROM catalog_directories')
+        conn.commit()
+        self._index_catalog_rows(conn)
+
+    def _index_catalog_rows(self, conn):
         total = conn.execute('SELECT COUNT(*) FROM files_index').fetchone()[0]
         self.stats['files'] = total
         cache = {}
@@ -973,7 +986,8 @@ class CatalogV3Optimizer:
         while True:
             rows = conn.execute(
                 """SELECT f.file_id, f.tape_label, f.original_path, f.stored_path,
-                          f.backup_date, r.started_at AS run_started_at
+                          f.backup_date, f.source_host,
+                          r.started_at AS run_started_at
                    FROM files_index f
                    LEFT JOIN archive_runs r ON r.run_id=f.archive_run_id
                    WHERE f.file_id > ?
@@ -1095,18 +1109,26 @@ class CatalogV3Optimizer:
         finally:
             conn.close()
 
-    def run(self):
+    def rebuild(self):
+        """Re-index the directory tree (e.g. after path-rooting logic changes)."""
+        return self.run(build=self._rebuild_catalog_v3,
+                        lock_label='catalog-v3-rebuild',
+                        report_kind='db_catalog_v3_rebuild')
+
+    def run(self, build=None, lock_label='catalog-v3-migrate',
+            report_kind='db_catalog_v3'):
+        build = build or self._apply_catalog_v3
         before_stat = os.stat(self.db_path)
         source_signature = self._catalog_signature(self.db_path)
         required = os.path.getsize(self.db_path) * 3 + 1024**3
         if shutil.disk_usage(os.path.dirname(self.db_path)).free < required:
             raise RuntimeError('insufficient free disk for safe catalog-v3 migration')
-        with maintenance_lock(self.lock_path, 'catalog-v3-migrate'):
+        with maintenance_lock(self.lock_path, lock_label):
             self._phase('copy source database', self._copy_database)
             conn = self._connect(self.work_path)
             try:
                 self._phase('build catalog directory and search indexes',
-                            lambda: self._apply_catalog_v3(conn))
+                            lambda: build(conn))
             finally:
                 conn.close()
             self._phase('validate catalog-v3 working copy',
@@ -1148,7 +1170,7 @@ class CatalogV3Optimizer:
                 (1 - self.stats['after_bytes'] / before_stat.st_size) * 100, 2)
             report_dir = os.path.join(os.path.dirname(self.db_path), 'backup_logs')
             self.stats['report_path'] = append_maintenance_summary_row(
-                report_dir, 'db_catalog_v3', self.stats)
+                report_dir, report_kind, self.stats)
             os.remove(self.rollback_path)
             if os.path.exists(self.work_path):
                 os.remove(self.work_path)

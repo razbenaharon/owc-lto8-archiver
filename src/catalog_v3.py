@@ -33,6 +33,32 @@ def _split_path(path):
     return [p for p in value.split("/") if p]
 
 
+def _short_host(value):
+    """Short, display-friendly source host (matches db._short_source_host)."""
+    value = (value or "").strip()
+    if not value:
+        return "local"
+    return value.split(".", 1)[0]
+
+
+def _root_parts(file_path, source_host):
+    """Path components with the leading drive/`/` replaced by a meaningful root.
+
+    Drive-letter paths collapse onto a single ``LOCAL`` root; server paths
+    (those that begin with ``/``) use the short ``source_host`` (e.g. ``so02``)
+    so data from different servers stays in separate subtrees.
+    """
+    parts = _split_path(file_path)
+    if not parts:
+        return parts
+    first = parts[0]
+    if _DRIVE_RE.match(first):
+        return ["LOCAL"] + parts[1:]
+    if first == "/":
+        return [_short_host(source_host)] + parts[1:]
+    return parts
+
+
 def catalog_file_name(stored_path=None, original_path=None):
     """Return the display/search filename used by the v3 catalog indexes."""
     for candidate in (stored_path, original_path):
@@ -44,21 +70,16 @@ def catalog_file_name(stored_path=None, original_path=None):
     return ""
 
 
-def catalog_directory_chain(file_path):
+def catalog_directory_chain(file_path, source_host=None):
     """Return directory rows as (normalized_path, parent_path, name)."""
-    parts = _split_path(file_path)
+    parts = _root_parts(file_path, source_host)
     if len(parts) <= 1:
         return []
 
     chain = []
     current = None
     for index, part in enumerate(parts[:-1]):
-        if index == 0:
-            normalized = part
-        elif current == "/":
-            normalized = "/" + part
-        else:
-            normalized = current + "/" + part
+        normalized = part if index == 0 else current + "/" + part
         parent = current
         name = normalized if parent is None else part
         chain.append((normalized, parent, name))
@@ -161,11 +182,12 @@ def catalog_v3_available(conn):
     return {"directory_id", "catalog_name", "catalog_backup_date"}.issubset(columns)
 
 
-def ensure_directory_chain(conn, tape_label, file_path, cache=None):
+def ensure_directory_chain(conn, tape_label, file_path, source_host=None, cache=None):
     """Insert directory ancestors for file_path and return the leaf directory id."""
     cache = cache if cache is not None else {}
     parent_id = None
-    for normalized_path, parent_path, name in catalog_directory_chain(file_path):
+    for normalized_path, parent_path, name in catalog_directory_chain(
+            file_path, source_host):
         key = (tape_label, normalized_path)
         cached = cache.get(key)
         if cached is not None:
@@ -197,7 +219,7 @@ def catalog_values_for_file(conn, row, cache=None):
     original_path = row["original_path"]
     stored_path = row["stored_path"]
     directory_id = ensure_directory_chain(
-        conn, tape_label, original_path or stored_path, cache)
+        conn, tape_label, original_path or stored_path, row["source_host"], cache)
     return (
         directory_id,
         catalog_file_name(stored_path, original_path),

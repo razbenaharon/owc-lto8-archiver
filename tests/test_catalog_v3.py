@@ -3,6 +3,7 @@ import sqlite3
 import tempfile
 import unittest
 
+from src.catalog_v3 import catalog_directory_chain
 from src.db import DatabaseManager
 from src.inspector_repository import InspectorRepository
 from src.maintenance import (
@@ -78,7 +79,7 @@ class CatalogV3Tests(unittest.TestCase):
 
                 roots = repo.list_child_directories(
                     tape_label='Tape_A', limit=1)
-                self.assertEqual(roots['rows'][0]['name'], 'C:')
+                self.assertEqual(roots['rows'][0]['name'], 'LOCAL')
 
                 source = repo.list_child_directories(
                     parent_id=roots['rows'][0]['directory_id'])
@@ -201,6 +202,40 @@ class CatalogV3Tests(unittest.TestCase):
                 search = repo.search_catalog_fts('alpha', limit=5)
                 self.assertEqual(len(search['rows']), 1)
                 self.assertEqual(search['rows'][0]['source_host'], 'so01')
+
+
+class CatalogDirectoryChainTests(unittest.TestCase):
+    def _roots(self, file_path, source_host):
+        chain = catalog_directory_chain(file_path, source_host)
+        return [(normalized, parent, name) for normalized, parent, name in chain]
+
+    def test_server_path_uses_source_host_as_root(self):
+        chain = catalog_directory_chain('/strg/E/shared-data/x', 'so02')
+        self.assertEqual(chain[0], ('so02', None, 'so02'))
+        self.assertEqual(chain[1], ('so02/strg', 'so02', 'strg'))
+        self.assertEqual(chain[2], ('so02/strg/E', 'so02/strg', 'E'))
+
+    def test_server_hosts_split_into_separate_roots(self):
+        so01 = catalog_directory_chain('/strg/E/y', 'so01')
+        so02 = catalog_directory_chain('/strg/E/y', 'so02')
+        self.assertEqual(so01[0][0], 'so01')
+        self.assertEqual(so02[0][0], 'so02')
+        self.assertNotEqual(so01[0][0], so02[0][0])
+
+    def test_long_source_host_is_shortened(self):
+        chain = catalog_directory_chain('/strg/E/y', 'so02.iem.technion.ac.il')
+        self.assertEqual(chain[0][2], 'so02')
+
+    def test_local_drive_collapses_to_local_root(self):
+        chain = catalog_directory_chain(
+            r'C:\temp_for_disk\source\ForTal\f', 'local')
+        self.assertEqual(chain[0], ('LOCAL', None, 'LOCAL'))
+        self.assertEqual(chain[1], ('LOCAL/temp_for_disk', 'LOCAL', 'temp_for_disk'))
+
+    def test_local_drive_root_folder_under_local(self):
+        chain = catalog_directory_chain(r'D:\Sequence_Backup\f', 'local')
+        self.assertEqual(chain[0], ('LOCAL', None, 'LOCAL'))
+        self.assertEqual(chain[1], ('LOCAL/Sequence_Backup', 'LOCAL', 'Sequence_Backup'))
 
 
 if __name__ == '__main__':
