@@ -47,7 +47,6 @@ class RetrieverDirectoryTests(unittest.TestCase):
                     'file1.h265',
                     r'C:\temp_for_disk\source\ForTal\DATA_A\file1.h265',
                     123,
-                    '',
                     'Tape_03',
                     False,
                     None,
@@ -56,7 +55,6 @@ class RetrieverDirectoryTests(unittest.TestCase):
                     'other.txt',
                     r'C:\temp_for_disk\source\Other\other.txt',
                     1,
-                    '',
                     'Tape_03',
                     False,
                     None,
@@ -82,6 +80,35 @@ class RetrieverDirectoryTests(unittest.TestCase):
                                  'file1.h265'))
             finally:
                 db.close()
+
+
+class RetrieverPaginationTests(unittest.TestCase):
+    def test_filename_search_uses_bounded_page(self):
+        class FakeDB:
+            def __init__(self):
+                self.calls = []
+
+            def count_search_files(self, name_query, date_from, date_to):
+                return 300
+
+            def search_files(self, name_query, date_from, date_to,
+                             limit=None, offset=None, source_host=None):
+                self.calls.append((limit, offset))
+                return [{
+                    'file_id': 1,
+                    'file_name': 'alpha.mov',
+                    'file_size_bytes': 10,
+                    'backup_date': '2026-01-01T00:00:00',
+                    'source_host': 'so02',
+                    'tape_label': 'Tape_A',
+                    'is_packed': False,
+                }]
+
+        fake = FakeDB()
+        retriever = LTORetriever(fake, r'E:\\', r'C:\stage', r'C:\restore')
+        with mock.patch('builtins.input', side_effect=['1', '*.mov', '0']):
+            retriever.run()
+        self.assertEqual(fake.calls, [(250, 0)])
 
 
 if __name__ == '__main__':

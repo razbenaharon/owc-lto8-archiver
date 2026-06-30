@@ -1,36 +1,21 @@
 """robocopy execution/parsing and Defender exclusion helpers."""
 import os
-import re
-import sys
 import time
-import queue
-import signal
-import shutil
-import hashlib
-import zipfile
-import sqlite3
 import threading
-import configparser
 import subprocess
-import tempfile
-import shlex
-import posixpath
-import atexit
-from datetime import datetime
-from collections import defaultdict
 
 try:
     import psutil
 except ImportError:  # optional dependency — priority/affinity degrade gracefully
     psutil = None
 
-from .runtime import _apply_proc_tuning, _fmt_eta, _progress_done, _progress_line, register_proc, unregister_proc
+from .runtime import _apply_proc_tuning, _progress_done, _progress_line, register_proc, unregister_proc
 
 
 def _robocopy_file(src, dst, display_name=None):
     """
     Copy a single file using robocopy with unbuffered I/O.
-    Streams live transfer speed and progress to stdout while copying.
+    Shows a simple active heartbeat while copying.
     Returns True on success (robocopy exit code < 8).
     """
     src_dir  = os.path.dirname(os.path.abspath(src))
@@ -59,30 +44,21 @@ def _robocopy_file(src, dst, display_name=None):
     )
     register_proc(proc)  # so Ctrl+C can terminate a long restore copy
 
-    # Monitor destination file growth to compute live MB/s
     stop_evt = threading.Event()
 
     def _monitor():
-        prev_size = 0
-        prev_time = time.time()
-        while not stop_evt.is_set():
-            time.sleep(0.5)
+        start = time.time()
+        while not stop_evt.wait(5):
             try:
                 cur_size = os.path.getsize(dst) if os.path.exists(dst) else 0
             except OSError:
                 cur_size = 0
-            now     = time.time()
-            delta_t = now - prev_time
-            speed   = ((cur_size - prev_size) / 1024**2) / delta_t if delta_t > 0 else 0
             pct     = (cur_size / fsize * 100) if fsize else 100
-            remaining = max(0, fsize - cur_size)
-            eta = remaining / (speed * 1024**2) if speed > 0 else None
+            elapsed = int(time.time() - start)
             _progress_line(
                 f"[COPYING] {disp} | {min(pct, 100):.1f}% | "
-                f"{speed:.1f} MB/s | ETA {_fmt_eta(eta)}"
+                f"elapsed {elapsed}s"
             )
-            prev_size = cur_size
-            prev_time = now
 
     t = threading.Thread(target=_monitor, daemon=True)
     t.start()

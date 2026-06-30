@@ -5,7 +5,11 @@ import unittest
 
 from src.db import DatabaseManager
 from src.inspector_repository import InspectorRepository
-from src.maintenance import CatalogV3Optimizer, inspect_catalog_database
+from src.maintenance import (
+    CatalogV3Optimizer,
+    HashlessOriginOptimizer,
+    inspect_catalog_database,
+)
 
 
 class CatalogV3Tests(unittest.TestCase):
@@ -17,20 +21,20 @@ class CatalogV3Tests(unittest.TestCase):
                 'alpha.txt',
                 r'C:\source\Project\alpha.txt',
                 10,
-                'aa' * 32,
                 'Tape_A',
                 False,
                 None,
-                r'E:\Project\alpha.txt')
+                r'E:\Project\alpha.txt',
+                source_host='so01')
             db.insert_file(
                 'beta.bin',
                 r'C:\source\Project\Nested\beta.bin',
                 20,
-                'bb' * 32,
                 'Tape_A',
                 True,
                 r'E:\packs\Bundle.zip',
-                'Project/Nested/beta.bin')
+                'Project/Nested/beta.bin',
+                source_host='so02')
         finally:
             db.close()
 
@@ -85,15 +89,22 @@ class CatalogV3Tests(unittest.TestCase):
                 project_id = project['rows'][0]['directory_id']
                 files = repo.list_directory_files(project_id, limit=1)
                 self.assertEqual(files['rows'][0]['file_name'], 'alpha.txt')
-                self.assertEqual(files['rows'][0]['file_hash'], 'aa' * 32)
+                self.assertEqual(files['rows'][0]['source_host'], 'so01')
                 filtered = repo.list_directory_files(
                     project_id, filters={'name_prefix': 'alp'})
                 self.assertEqual(len(filtered['rows']), 1)
                 self.assertEqual(filtered['rows'][0]['file_name'], 'alpha.txt')
+                source_filtered = repo.list_directory_files(
+                    project_id, filters={'source_host': 'so01'})
+                self.assertEqual(len(source_filtered['rows']), 1)
 
                 search = repo.search_catalog_fts('alpha', limit=5)
                 self.assertEqual(len(search['rows']), 1)
                 self.assertEqual(search['rows'][0]['file_name'], 'alpha.txt')
+                self.assertEqual(
+                    repo.search_catalog_fts(
+                        'alpha', scope={'source_host': 'so02'}, limit=5)['rows'],
+                    [])
 
     def test_post_v3_inserts_populate_catalog_fields(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -107,11 +118,11 @@ class CatalogV3Tests(unittest.TestCase):
                     'gamma.mov',
                     '/mnt/archive/gamma.mov',
                     30,
-                    'cc' * 32,
                     'Tape_A',
                     False,
                     None,
-                    'gamma.mov'))
+                    'gamma.mov',
+                    source_host='so03'))
             finally:
                 db.close()
 
@@ -169,6 +180,27 @@ class CatalogV3Tests(unittest.TestCase):
                 ).fetchone()[0], 0)
             finally:
                 conn.close()
+
+    def test_hashless_migration_preserves_v3_search(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'archive.db')
+            self._make_v2_database(path)
+            CatalogV3Optimizer(path, progress=lambda _msg: None).run()
+            HashlessOriginOptimizer(path, progress=lambda _msg: None).run()
+
+            conn = sqlite3.connect(path)
+            try:
+                columns = {row[1] for row in conn.execute(
+                    'PRAGMA table_info(files_index)')}
+                self.assertNotIn('file_hash', columns)
+                self.assertNotIn('file_hash_blob', columns)
+            finally:
+                conn.close()
+
+            with InspectorRepository(path) as repo:
+                search = repo.search_catalog_fts('alpha', limit=5)
+                self.assertEqual(len(search['rows']), 1)
+                self.assertEqual(search['rows'][0]['source_host'], 'so01')
 
 
 if __name__ == '__main__':

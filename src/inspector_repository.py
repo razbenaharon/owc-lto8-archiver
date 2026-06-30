@@ -45,14 +45,15 @@ class InspectorRepository:
     @staticmethod
     def _hydrate(row):
         item = dict(row)
+        item.pop("file_hash", None)
+        item.pop("file_hash_blob", None)
         if not item.get("file_name"):
             item["file_name"] = item.get("catalog_name") or _derived_file_name(
                 item.get("stored_path"), item.get("original_path"))
         if not item.get("backup_date"):
             item["backup_date"] = item.get("catalog_backup_date") or item.get(
                 "run_started_at")
-        if not item.get("file_hash") and item.get("file_hash_blob"):
-            item["file_hash"] = bytes(item["file_hash_blob"]).hex()
+        item["source_host"] = item.get("source_host") or "so02"
         if not item.get("container_name"):
             item["container_name"] = item.get("bundle_tape_path")
         return item
@@ -85,6 +86,13 @@ class InspectorRepository:
                ) d ON d.tape_label=t.volume_label
                ORDER BY t.date_formatted DESC, t.volume_label"""
         )]
+
+    def list_source_hosts(self):
+        return [row[0] for row in self.conn.execute(
+            """SELECT DISTINCT COALESCE(source_host,'so02') AS source_host
+               FROM files_index
+               ORDER BY source_host"""
+        ) if row[0]]
 
     def list_child_directories(self, parent_id=None, cursor=None, limit=None,
                                tape_label=None):
@@ -130,6 +138,9 @@ class InspectorRepository:
         if filters.get("date_to"):
             where.append("DATE(f.catalog_backup_date) <= ?")
             params.append(filters["date_to"])
+        if filters.get("source_host"):
+            where.append("f.source_host=?")
+            params.append(filters["source_host"])
         if cursor_sql:
             where.append(cursor_sql[0][4:])
             params.extend(cursor_sql[1])
@@ -164,6 +175,9 @@ class InspectorRepository:
         if scope.get("directory_id"):
             where.append("f.directory_id=?")
             params.append(scope["directory_id"])
+        if scope.get("source_host"):
+            where.append("f.source_host=?")
+            params.append(scope["source_host"])
         if cursor:
             where.append("files_index_fts.rowid > ?")
             params.append(cursor["file_id"])

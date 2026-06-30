@@ -1,23 +1,10 @@
 """DatabaseManager and catalog normalization helpers."""
 import os
-import re
-import sys
 import time
-import queue
-import signal
-import shutil
 import hashlib
-import zipfile
 import sqlite3
 import threading
-import configparser
-import subprocess
-import tempfile
-import shlex
-import posixpath
-import atexit
 from datetime import datetime
-from collections import defaultdict
 
 try:
     import psutil
@@ -29,25 +16,11 @@ from .catalog_v3 import (
     catalog_v3_available,
     catalog_values_for_file,
 )
+from .maintenance_lock import ensure_no_active_maintenance_lock
 from .paths import _clean_config_path
 from .runtime import CANCEL
 
 SCHEMA_VERSION = 2
-
-
-def _hash_to_blob(value):
-    """Return a compact 32-byte SHA-256 value, or None when no hash exists."""
-    if not value:
-        return None
-    if isinstance(value, memoryview):
-        value = value.tobytes()
-    if isinstance(value, bytes):
-        return value if len(value) == 32 else None
-    try:
-        raw = bytes.fromhex(str(value))
-    except ValueError:
-        return None
-    return raw if len(raw) == 32 else None
 
 
 def _derived_file_name(stored_path, original_path=None):
@@ -56,11 +29,18 @@ def _derived_file_name(stored_path, original_path=None):
     return os.path.basename(str(path).replace('/', os.sep))
 
 
+def _short_source_host(value):
+    value = (value or '').strip()
+    if not value:
+        return 'local'
+    return value.split('.', 1)[0]
+
+
 def _file_record_key(original_path, tape_label, local_session_id=None,
-                     local_chunk_index=None):
+                     local_chunk_index=None, source_host='so02'):
     """Stable compact key for NULL-safe file-record upserts."""
     digest = hashlib.sha256()
-    for value in (original_path or '', tape_label or '',
+    for value in (_short_source_host(source_host), original_path or '', tape_label or '',
                   -1 if local_session_id is None else local_session_id,
                   -1 if local_chunk_index is None else local_chunk_index):
         raw = str(value).encode('utf-8', errors='surrogatepass')
@@ -104,11 +84,7 @@ class DatabaseManager:
         db_path = _clean_config_path(db_path)
         self.db_path = os.path.abspath(db_path)
         maintenance_lock = os.path.abspath(db_path) + '.maintenance.lock'
-        if os.path.exists(maintenance_lock):
-            raise RuntimeError(
-                "[DB] Database optimization is in progress; archive and "
-                "inspector access is temporarily disabled."
-            )
+        ensure_no_active_maintenance_lock(maintenance_lock)
         db_dir = os.path.dirname(os.path.abspath(db_path))
         try:
             os.makedirs(db_dir, exist_ok=True)
@@ -188,9 +164,9 @@ class DatabaseManager:
                 file_name       TEXT,
                 original_path   TEXT,
                 file_size_bytes INTEGER,
-                file_hash       TEXT,
                 backup_date     DATETIME,
                 tape_label      TEXT,
+                source_host     TEXT NOT NULL DEFAULT 'so02',
                 is_packed       BOOLEAN,
                 container_name  TEXT,
                 stored_path     TEXT,
@@ -226,9 +202,9 @@ class DatabaseManager:
             ('local_session_id', 'INTEGER'),
             ('local_chunk_index', 'INTEGER'),
             ('bundle_id', 'INTEGER REFERENCES archive_bundles(bundle_id)'),
-            ('file_hash_blob', 'BLOB'),
             ('record_key', 'BLOB'),
             ('archive_run_id', 'INTEGER REFERENCES archive_runs(run_id)'),
+            ('source_host', "TEXT NOT NULL DEFAULT 'so02'"),
         ):
             try:
                 self.conn.execute(f"ALTER TABLE files_index ADD COLUMN {column} {col_type}")
@@ -251,7 +227,13 @@ class DatabaseManager:
                 WHERE record_key IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_files_bundle_id
                 ON files_index(bundle_id) WHERE bundle_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_files_source_host
+                ON files_index(source_host, tape_label, original_path);
         """)
+        self.conn.execute(
+            "UPDATE files_index SET source_host='so02' "
+            "WHERE source_host IS NULL OR source_host=''"
+        )
         self.conn.commit()
 
     def _init_local_schema(self):
@@ -1073,13 +1055,14 @@ class DatabaseManager:
         if row is None:
             return None
         item = dict(row)
+        item.pop('file_hash', None)
+        item.pop('file_hash_blob', None)
         if not item.get('backup_date'):
             item['backup_date'] = item.get('run_started_at')
         if not item.get('file_name'):
             item['file_name'] = _derived_file_name(
                 item.get('stored_path'), item.get('original_path'))
-        if not item.get('file_hash') and item.get('file_hash_blob'):
-            item['file_hash'] = bytes(item['file_hash_blob']).hex()
+        item['source_host'] = _short_source_host(item.get('source_host') or 'so02')
         if not item.get('container_name'):
             item['container_name'] = item.get('bundle_tape_path')
         return item
@@ -1177,8 +1160,9 @@ class DatabaseManager:
             tape_label = record.get('tape_label') or ''
             session_id = record.get('local_session_id')
             chunk_index = record.get('local_chunk_index')
+            source_host = _short_source_host(record.get('source_host') or 'so02')
             key = _file_record_key(
-                original_path, tape_label, session_id, chunk_index)
+                original_path, tape_label, session_id, chunk_index, source_host)
             container = record.get('container_name')
             bundle_id = bundle_ids.get((tape_label, container))
             backup_date = record.get('backup_date') or batch_now
@@ -1189,10 +1173,9 @@ class DatabaseManager:
                 None,  # file_name is derived from stored_path on reads
                 original_path,
                 record.get('file_size_bytes'),
-                None,  # text hashes are legacy-only
-                _hash_to_blob(record.get('file_hash')),
                 None,  # timestamp is normalized through archive_runs
                 tape_label,
+                source_host,
                 bool(record.get('is_packed')),
                 None if bundle_id is not None else container,
                 record.get('stored_path'),
@@ -1214,7 +1197,7 @@ class DatabaseManager:
                     self.conn, row, catalog_dir_cache))
             normalized_by_key[key] = tuple(values)
             legacy_lookup[key] = (
-                key, original_path, tape_label, session_id, chunk_index)
+                key, original_path, source_host, tape_label, session_id, chunk_index)
 
         existing = self._existing_record_keys(normalized_by_key)
         # Adopt matching pre-normalization rows lazily. The permanent rescue
@@ -1228,6 +1211,7 @@ class DatabaseManager:
                    WHERE target.file_id = (
                        SELECT legacy.file_id FROM files_index AS legacy
                        WHERE COALESCE(legacy.original_path, '') = COALESCE(?, '')
+                         AND COALESCE(legacy.source_host, 'so02') = COALESCE(?, 'so02')
                          AND COALESCE(legacy.tape_label, '') = COALESCE(?, '')
                          AND COALESCE(legacy.local_session_id, -1) = COALESCE(?, -1)
                          AND COALESCE(legacy.local_chunk_index, -1) = COALESCE(?, -1)
@@ -1238,18 +1222,17 @@ class DatabaseManager:
             )
             existing = self._existing_record_keys(normalized_by_key)
 
-        columns = """file_name, original_path, file_size_bytes, file_hash,
-                     file_hash_blob, backup_date, tape_label, is_packed,
+        columns = """file_name, original_path, file_size_bytes, backup_date,
+                     tape_label, source_host, is_packed,
                      container_name, stored_path, local_session_id,
                      local_chunk_index, bundle_id, record_key, archive_run_id"""
-        placeholders = "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
+        placeholders = "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
         update_sets = """file_name = excluded.file_name,
                         original_path = excluded.original_path,
                         file_size_bytes = excluded.file_size_bytes,
-                        file_hash = excluded.file_hash,
-                        file_hash_blob = excluded.file_hash_blob,
                         backup_date = excluded.backup_date,
                         tape_label = excluded.tape_label,
+                        source_host = excluded.source_host,
                         is_packed = excluded.is_packed,
                         container_name = excluded.container_name,
                         stored_path = excluded.stored_path,
@@ -1365,10 +1348,12 @@ class DatabaseManager:
         return [r['tape_path'] for r in rows if r['tape_path']]
 
     def file_record_exists(self, original_path, tape_label, local_session_id=None,
-                           local_chunk_index=None):
+                           local_chunk_index=None, source_host='so02'):
         with self.lock:
+            source_host = _short_source_host(source_host or 'so02')
             key = _file_record_key(original_path, tape_label,
-                                   local_session_id, local_chunk_index)
+                                   local_session_id, local_chunk_index,
+                                   source_host)
             if self.conn.execute(
                     "SELECT 1 FROM files_index WHERE record_key = ?", (key,)
             ).fetchone():
@@ -1376,10 +1361,12 @@ class DatabaseManager:
             return bool(self.conn.execute(
                 """SELECT 1 FROM files_index
                    WHERE COALESCE(original_path, '') = COALESCE(?, '')
+                     AND COALESCE(source_host, 'so02') = COALESCE(?, 'so02')
                      AND COALESCE(tape_label, '') = COALESCE(?, '')
                      AND COALESCE(local_session_id, -1) = COALESCE(?, -1)
                      AND COALESCE(local_chunk_index, -1) = COALESCE(?, -1)""",
-                (original_path, tape_label, local_session_id, local_chunk_index)
+                (original_path, source_host, tape_label, local_session_id,
+                 local_chunk_index)
             ).fetchone())
 
     def register_tape(self, volume_label, capacity_gb=None):
@@ -1531,15 +1518,16 @@ class DatabaseManager:
                 "SELECT * FROM tapes WHERE volume_label = ?", (volume_label,)
             ).fetchone()
 
-    def insert_file(self, file_name, original_path, file_size_bytes, file_hash,
+    def insert_file(self, file_name, original_path, file_size_bytes,
                     tape_label, is_packed, container_name, stored_path,
-                    local_session_id=None, local_chunk_index=None):
+                    local_session_id=None, local_chunk_index=None,
+                    source_host='local'):
         stats = self.bulk_upsert_files([{
             'file_name': file_name,
             'original_path': original_path,
             'file_size_bytes': file_size_bytes,
-            'file_hash': file_hash,
             'tape_label': tape_label,
+            'source_host': source_host,
             'is_packed': is_packed,
             'container_name': container_name,
             'stored_path': stored_path,
@@ -1548,12 +1536,16 @@ class DatabaseManager:
         }])
         return bool(stats['inserted'])
 
-    def search_files(self, name_query=None, date_from=None, date_to=None):
+    def search_files(self, name_query=None, date_from=None, date_to=None,
+                     limit=None, offset=None, source_host=None):
         return self.search_catalog(name_query=name_query,
-                                   date_from=date_from, date_to=date_to)
+                                   date_from=date_from, date_to=date_to,
+                                   limit=limit, offset=offset,
+                                   source_host=source_host)
 
     def search_catalog(self, name_query=None, tape_label=None,
-                       date_from=None, date_to=None, limit=None):
+                       date_from=None, date_to=None, limit=None, offset=None,
+                       source_host=None):
         where = ["1=1"]
         params = []
         if name_query:
@@ -1571,29 +1563,84 @@ class DatabaseManager:
         if tape_label:
             where.append("f.tape_label = ?")
             params.append(tape_label)
+        if source_host:
+            where.append("f.source_host = ?")
+            params.append(_short_source_host(source_host))
         order = 'f.original_path, COALESCE(f.file_name, f.stored_path)'
         sql = self._catalog_select() + ' WHERE ' + ' AND '.join(where)
         sql += ' ORDER BY ' + order
         if limit is not None:
             sql += ' LIMIT ?'
             params.append(int(limit))
+            if offset is not None:
+                sql += ' OFFSET ?'
+                params.append(int(offset))
         with self.lock:
             rows = self.conn.execute(sql, params).fetchall()
         return [self._hydrate_file_row(row) for row in rows]
+
+    def count_search_files(self, name_query=None, date_from=None, date_to=None,
+                           source_host=None):
+        where = ["1=1"]
+        params = []
+        if name_query:
+            where.append("COALESCE(f.file_name, f.stored_path) LIKE ?")
+            pattern = name_query.replace('*', '%').replace('?', '_')
+            if '%' not in pattern and '_' not in pattern:
+                pattern = f'%{pattern}%'
+            params.append(pattern)
+        if date_from:
+            where.append("DATE(COALESCE(f.backup_date,r.started_at)) >= ?")
+            params.append(date_from)
+        if date_to:
+            where.append("DATE(COALESCE(f.backup_date,r.started_at)) <= ?")
+            params.append(date_to)
+        if source_host:
+            where.append("f.source_host = ?")
+            params.append(_short_source_host(source_host))
+        sql = self._catalog_select() + ' WHERE ' + ' AND '.join(where)
+        with self.lock:
+            return self.conn.execute(
+                f"SELECT COUNT(*) FROM ({sql})", params).fetchone()[0]
 
     def get_file_by_id(self, file_id):
         rows = self._catalog_rows("f.file_id = ?", (file_id,))
         return rows[0] if rows else None
 
-    def search_by_directory(self, dir_path):
+    def search_by_directory(self, dir_path, limit=None, offset=None,
+                            source_host=None):
         needle = dir_path.strip().rstrip('/\\')
         if not needle:
             return []
         prefix_pattern = needle + '%'
         contains_pattern = f'%{needle}%'
-        return self._catalog_rows("(f.original_path LIKE ? OR f.original_path LIKE ?)",
-                                  (prefix_pattern, contains_pattern),
-                                  'f.original_path')
+        where = "(f.original_path LIKE ? OR f.original_path LIKE ?)"
+        params = [prefix_pattern, contains_pattern]
+        if source_host:
+            where += " AND f.source_host = ?"
+            params.append(_short_source_host(source_host))
+        if limit is None:
+            return self._catalog_rows(where, params, 'f.original_path')
+        sql = self._catalog_select() + ' WHERE ' + where
+        sql += ' ORDER BY f.original_path LIMIT ? OFFSET ?'
+        params.extend([int(limit), int(offset or 0)])
+        with self.lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        return [self._hydrate_file_row(row) for row in rows]
+
+    def count_by_directory(self, dir_path, source_host=None):
+        needle = dir_path.strip().rstrip('/\\')
+        if not needle:
+            return 0
+        where = "(f.original_path LIKE ? OR f.original_path LIKE ?)"
+        params = [needle + '%', f'%{needle}%']
+        if source_host:
+            where += " AND f.source_host = ?"
+            params.append(_short_source_host(source_host))
+        sql = self._catalog_select() + ' WHERE ' + where
+        with self.lock:
+            return self.conn.execute(
+                f"SELECT COUNT(*) FROM ({sql})", params).fetchone()[0]
 
     def list_backup_sessions(self):
         with self.lock:
@@ -1607,16 +1654,41 @@ class DatabaseManager:
                 ORDER BY session_date DESC
             """).fetchall()
 
-    def search_by_session(self, session_date, tape_label):
-        return self._catalog_rows(
-            "DATE(COALESCE(f.backup_date,r.started_at)) = ? AND f.tape_label = ?",
-            (session_date, tape_label), 'f.original_path')
+    def search_by_session(self, session_date, tape_label, limit=None, offset=None):
+        where = "DATE(COALESCE(f.backup_date,r.started_at)) = ? AND f.tape_label = ?"
+        params = [session_date, tape_label]
+        if limit is None:
+            return self._catalog_rows(where, params, 'f.original_path')
+        sql = self._catalog_select() + ' WHERE ' + where
+        sql += ' ORDER BY f.original_path LIMIT ? OFFSET ?'
+        params.extend([int(limit), int(offset or 0)])
+        with self.lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        return [self._hydrate_file_row(row) for row in rows]
+
+    def count_by_session(self, session_date, tape_label):
+        with self.lock:
+            return self.conn.execute("""
+                SELECT COUNT(*)
+                FROM files_index f
+                LEFT JOIN archive_runs r ON r.run_id=f.archive_run_id
+                WHERE DATE(COALESCE(f.backup_date,r.started_at)) = ?
+                  AND f.tape_label = ?
+            """, (session_date, tape_label)).fetchone()[0]
 
     def list_tapes(self):
         with self.lock:
             return self.conn.execute(
                 "SELECT * FROM tapes ORDER BY date_formatted DESC"
             ).fetchall()
+
+    def list_source_hosts(self):
+        with self.lock:
+            return [row[0] for row in self.conn.execute(
+                """SELECT DISTINCT COALESCE(source_host,'so02') AS source_host
+                   FROM files_index
+                   ORDER BY source_host"""
+            ).fetchall() if row[0]]
 
     def delete_file(self, file_id):
         with self.lock:
@@ -1646,12 +1718,15 @@ class DatabaseManager:
                     (new_label, old_label)
                 )
                 rows = self.conn.execute(
-                    """SELECT file_id,original_path,local_session_id,local_chunk_index
+                    """SELECT file_id,original_path,source_host,
+                              local_session_id,local_chunk_index
                        FROM files_index WHERE tape_label=?""", (new_label,))
                 self.conn.executemany(
                     "UPDATE files_index SET record_key=? WHERE file_id=?",
                     ((_file_record_key(r['original_path'], new_label,
-                                       r['local_session_id'], r['local_chunk_index']),
+                                       r['local_session_id'],
+                                       r['local_chunk_index'],
+                                       r['source_host']),
                       r['file_id']) for r in rows),
                 )
                 self.conn.execute(

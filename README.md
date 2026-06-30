@@ -7,7 +7,7 @@ Licensed under the [MIT License](LICENSE) — © 2026 Raz Ben Aharon. Free to us
 ## Features
 
 - **Smart packing** — small files (under a configurable threshold) are bundled into ZIP archives to minimize tape fragmentation; large files are copied directly
-- **SQLite index** — every archived file is recorded with its original path, SHA-256 hash, tape label, backup date, and ZIP container (if packed)
+- **SQLite index** — every archived file is recorded with its original path, source host, tape label, backup date, and ZIP container (if packed)
 - **Restore** — search by filename/wildcard, date range, original directory, or full backup session; restore individual files or entire sets
 - **Tape management** — format, register, check, and inspect tapes via IBM LTFS command-line tools
 - **Multi-tape support** — tracks multiple tapes; prompts you to swap tapes during restore when needed
@@ -82,6 +82,7 @@ python inspect_db.py
 | 5 | **Open config.ini** |
 | 6 | **Remote Archive** — fetch from a remote host and back up to LTO |
 | 7 | **Database Management** — edit or delete tape and file records |
+| 8 | **Backup Summary** — ensure `backup_logs/SUMMARY.csv` exists |
 | 0 | Exit |
 
 ### Archive Workflow
@@ -91,8 +92,9 @@ python inspect_db.py
 3. The app creates a resumable local session in SQLite. If a previous local session is active, you can resume it or abandon it.
 4. Before each chunk is written, the mounted tape label is detected and assigned to that chunk.
 5. New blank tapes are registered automatically. Registered non-empty LTFS tapes can also be used for append backups when both the LTFS free-space check and the database capacity check show enough room.
-6. Robocopy streams the staged batch to tape with `/J` unbuffered I/O, retry settings, live progress, and tuned priority/affinity when available.
+6. Robocopy streams the staged batch to tape with `/J` unbuffered I/O, retry settings, a simple active heartbeat, and tuned priority/affinity when available.
 7. After copying, file records are written to SQLite, tape used-space is reconciled, and the tape is ejected automatically via `LtfsCmdEject.exe`.
+8. A compact aggregate CSV row is appended to `backup_logs/SUMMARY.csv`; per-file manifests are not written to logs.
 
 If a write is interrupted, re-run option 1 and choose **Resume from first incomplete chunk**. The app skips records that are already indexed for the same local session/chunk/tape.
 
@@ -114,10 +116,11 @@ Choose a search mode:
 | 4 | Restore full directory — partial path match against original paths |
 | 5 | Restore full backup session — select from a dated session list |
 
-Results are displayed in a table showing file ID, filename, size, backup date, and tape label.
+Results are displayed in bounded pages showing file ID, filename, size, backup date, source host, and tape label.
 
 - Enter a **file ID** to restore a single file.
-- Enter **ALL** to restore every result.
+- Enter **N** / **P** to move between result pages.
+- Enter **ALL** to restore every result; large result sets require typing `RESTORE ALL` to confirm.
 - Enter **0** to cancel.
 
 **Tape handling** — before each restore the script checks the mounted tape label. If the wrong tape is inserted you'll be prompted to swap it before copying begins.
@@ -127,9 +130,7 @@ Results are displayed in a table showing file ID, filename, size, backup date, a
 2. Extracts the target file(s) from the ZIP to the restore directory.
 3. Deletes the staging ZIP automatically.
 
-When restoring multiple files from the same ZIP bundle, the bundle is copied from tape only once.
-
-**Hash verification** — after each file is restored its SHA-256 hash is verified against the value stored in the database. A `[VERIFY] OK` or `[VERIFY] FAIL` line is printed for each file.
+When restoring multiple files from the same ZIP bundle in one page, the bundle is copied from tape only once.
 
 ### Tape Maintenance Sub-menu
 
@@ -157,9 +158,9 @@ python inspect_db.py
 - **Wipe File Records** — delete all file records for the tape (tape entry kept); type the label to confirm
 - **Delete Tape** — permanently remove the tape and all its file records; type the label to confirm
 
-**Files tab** — lazy tape/directory browser backed by catalog-v3 indexes. Select one or more rows to **Delete Selected** or double-click a row to open a **View Details** panel showing all fields (including the full SHA-256 hash).
+**Files tab** — lazy tape/directory browser backed by catalog-v3 indexes. Select one or more rows to **Delete Selected** or double-click a row to open a **View Details** panel showing all fields, including the source host.
 
-**Search tab** — FTS5 substring search over catalog names and original paths, with bounded result pages.
+**Search tab** — FTS5 substring search over catalog names and original paths, with bounded result pages and source-host filtering.
 
 **Manage tab** — tape and session management actions, including rename, capacity, recalculation, wipe/delete, and unused session-data cleanup.
 
@@ -169,6 +170,7 @@ catalog-v3 maintenance path:
 ```
 python run.py --catalog-v3-preflight   # read-only report for lto_archive.db
 python run.py --catalog-v3-migrate     # copy-and-swap migration with rollback
+python run.py --hashless-origin-migrate # drop legacy hash columns and backfill source_host
 ```
 
 The preflight report includes the real configured database path, size, row
@@ -185,10 +187,10 @@ session tables. The database is runtime data and remains gitignored.
 - `volume_label`, `date_formatted`, `total_capacity`, `used_space`
 
 **`files_index`** — one row per file
-- `file_name`, `original_path`, `file_size_bytes`, `file_hash` (SHA-256)
+- `file_name`, `original_path`, `file_size_bytes`, `source_host`
 - `backup_date`, `tape_label`, `is_packed`, `container_name`, `stored_path`
 - `local_session_id`, `local_chunk_index`
-- v2 databases may normalize names, dates, hashes, and bundle paths through
+- v2 databases may normalize names, dates, and bundle paths through
   `archive_runs`, `archive_bundles`, and hydrated read helpers.
 - catalog-v3 databases additionally contain `directory_id`, `catalog_name`, and
   `catalog_backup_date`, plus `catalog_directories` and `files_index_fts`.
@@ -200,7 +202,7 @@ The CLI also creates session tables for resumable work:
 
 ## Important
 
-**Run the script as Administrator.** Windows Defender exclusions are added automatically during both archive and retrieval operations (covering the LTO drive, staging directory, and restore directory) and require elevated privileges. Exclusions are removed automatically when each operation completes.
+**Run the script as Administrator for best tape throughput.** When elevated, the app temporarily adds a Windows Defender process exclusion for `robocopy.exe` during archive and retrieval operations, then removes only the exclusion it added. It does not add drive, staging-directory, or restore-directory path exclusions.
 
 ## License
 

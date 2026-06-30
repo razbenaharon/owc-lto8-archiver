@@ -19,7 +19,10 @@ in a local SQLite database.
 - `config.ini` — local paths, tape drive settings, remote archive settings, and
   performance tuning. `.env` stores secrets (e.g. `remote_password`); keep it
   untracked and use `.env.example` as the template.
-- `backup_logs/` — generated per-pack logs plus the cross-pack `SUMMARY.md` report.
+- `backup_logs/` — holds the single `SUMMARY.csv`: the one statistics file for
+  the whole system (backup/tape-write sessions and database-maintenance runs).
+  No per-run log files and no per-file manifests are written, so it never
+  contains individual file names.
 - `Framework & Drivers/` — installer assets and hardware documentation.
 - `lto_archive.db` — local SQLite archive index; treat as runtime data, not source.
 
@@ -44,37 +47,38 @@ behavior. Avoid broad refactors during operational fixes.
 
 There is no formal test suite yet. At minimum run `python -m py_compile ...` after
 edits. Pure parsing, config, database, path-normalization, and reporting changes do
-**not** require real tape hardware — validate them directly (e.g. run
-`generate_backup_summary()` against the existing logs in `backup_logs/`). For
+**not** require real tape hardware — validate them directly where possible. For
 tape-related changes, reason carefully about hardware side effects and verify with a
 small staged dataset before a full remote archive run.
 
 ## Logging & Reports
 
-- **Per-pack logs** (`backup_logs/<timestamp>_<tape>_<source>.log`) are written by
-  `LTOBackup._write_backup_log`. The Summary section reports `Total time`,
-  `Data copied`, robocopy `Average speed`/`Robocopy time`, and — for the
-  staged/packed pipeline — per-phase timing and throughput:
-  - `Fetch time` / `Fetched data` / `Fetch speed (remote->PC)` — the remote→PC
-    ("internet") throughput, measured in `_stage_chunk`.
-  - `Pack time` / `Pack speed` — local ZIP packing.
-  - `DB sync time` — the Phase-3 database indexing (see Performance characteristics).
-  - `End-to-end speed` — `Data copied ÷ Total time`.
-  Fetch and pack run in the producer and overlap the *previous* chunk's tape write,
-  so these phases need not sum to `Total time`.
-- **Cross-pack summary** (`backup_logs/SUMMARY.md`) is a Markdown table across all
-  per-pack logs, produced by `generate_backup_summary()`. It regenerates
-  automatically after each pack and on demand via main-menu option **8**.
+- **One statistics file** (`backup_logs/SUMMARY.csv`) holds every system
+  statistic. A leading `record_type` column distinguishes the two row kinds and
+  `operation` names the specific activity; columns not relevant to a row are left
+  blank. No per-file manifests or robocopy stdout dumps are written — the CSV is
+  file-name-free by construction.
+  - `record_type=backup` rows are appended by `LTOBackup._write_backup_log` via
+    `reporting.append_backup_summary_row`. Each reports `total_time_seconds`,
+    `copied_bytes`, final robocopy stats, source host, tape label, and — for the
+    staged/packed pipeline — per-phase timing and throughput (`fetch_seconds`,
+    `pack_seconds`, `db_sync_seconds`; see Performance characteristics). Fetch and
+    pack run in the producer and overlap the *previous* chunk's tape write, so
+    these phases need not sum to `total_time_seconds`.
+  - `record_type=maintenance` rows are appended by the database optimizers
+    (`DatabaseOptimizer`, `HashlessOriginOptimizer`, `CatalogV3Optimizer`) via
+    `reporting.append_maintenance_summary_row`, reporting `operation`,
+    `started_at`/`finished_at`, `total_time_seconds`, and `before_bytes` /
+    `after_bytes` / `reduction_pct`. These replace the former per-run
+    `DB_*.json` reports.
+- Main-menu option **8** ensures `backup_logs/SUMMARY.csv` exists.
 
 ## Performance Characteristics
 
-For staged/packed runs the dominant cost is usually **not** fetch bandwidth or
-SHA-256 hashing — it is the **Phase-3 DB sync** in `LTOBackup._run_locked`, which
-calls `file_record_exists` + `insert_file` per file, and `insert_file` issues a
-`commit()` (fsync) **per row**. This scales with file *count*, not bytes: packs with
-more, smaller files take far longer for the same data volume (observed: ~3.4× longer
-end-to-end from 89k to 157k files at a constant ~100 GiB). The new `DB sync time` log
-field makes this visible.
+For staged/packed runs the dominant cost is usually **not** fetch bandwidth — it
+is the **Phase-3 DB sync** in `LTOBackup._run_locked`. This scales with file
+*count*, not bytes: packs with more, smaller files take far longer for the same
+data volume. The `db_sync_seconds` CSV field makes this visible.
 
 Recommended future optimization (not yet implemented): batch Phase-3 inserts into a
 single transaction / `executemany`, and add an index on

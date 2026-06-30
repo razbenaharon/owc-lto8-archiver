@@ -16,7 +16,9 @@ from .catalog_v3 import (
     ensure_catalog_schema,
     free_space_report,
 )
-from .db import SCHEMA_VERSION, _file_record_key, _hash_to_blob
+from .db import SCHEMA_VERSION, _file_record_key
+from .maintenance_lock import maintenance_lock
+from .reporting import append_maintenance_summary_row
 
 
 _STAGING_COMPONENT = re.compile(r"^_fetch(?:_s(?P<session>\d+))?_\d+$",
@@ -226,9 +228,7 @@ class DatabaseOptimizer:
         conn.create_function(
             'fallback_canonical', 2, _fallback_canonical, deterministic=True)
         conn.create_function(
-            'compact_hash', 1, _hash_to_blob, deterministic=True)
-        conn.create_function(
-            'catalog_key', 4, _file_record_key, deterministic=True)
+            'catalog_key', 5, _file_record_key, deterministic=True)
         return conn
 
     def _checkpoint(self, conn, phase):
@@ -262,6 +262,9 @@ class DatabaseOptimizer:
         if 'archive_run_id' not in columns:
             conn.execute('ALTER TABLE files_index ADD COLUMN archive_run_id INTEGER '
                          'REFERENCES archive_runs(run_id)')
+        if 'source_host' not in columns:
+            conn.execute("ALTER TABLE files_index ADD COLUMN source_host TEXT "
+                         "NOT NULL DEFAULT 'so02'")
         if conn.execute('PRAGMA user_version').fetchone()[0] >= SCHEMA_VERSION:
             now = datetime.now().isoformat()
             conn.executemany(
@@ -563,10 +566,11 @@ class DatabaseOptimizer:
             SELECT run_id FROM archive_runs r
             WHERE r.run_label=DATE(f.backup_date)||':'||f.tape_label
               AND r.tape_label=f.tape_label)""")
+        conn.execute(
+            "UPDATE files_index SET source_host='so02' "
+            "WHERE source_host IS NULL OR source_host=''")
         conn.execute("""UPDATE files_index SET
-            file_hash_blob=compact_hash(file_hash),
-            file_hash=CASE WHEN LENGTH(file_hash)=64 THEN NULL ELSE NULLIF(file_hash,'') END,
-            record_key=catalog_key(original_path,tape_label,local_session_id,local_chunk_index),
+            record_key=catalog_key(original_path,tape_label,local_session_id,local_chunk_index,source_host),
             file_name=NULL,container_name=NULL,backup_date=NULL""")
         conn.execute('DROP INDEX IF EXISTS idx_files_dedup_expr')
         conn.execute('DROP INDEX IF EXISTS idx_files_bundle_id')
@@ -581,6 +585,8 @@ class DatabaseOptimizer:
               WHERE local_session_id IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_files_archive_run
               ON files_index(archive_run_id) WHERE archive_run_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_files_source_host
+              ON files_index(source_host,tape_label,original_path);
         """)
         conn.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
         self._checkpoint(conn, phase)
@@ -613,15 +619,11 @@ class DatabaseOptimizer:
         return result
 
     def run(self):
-        if os.path.exists(self.lock_path):
-            raise RuntimeError(f"maintenance lock already exists: {self.lock_path}")
         before_stat = os.stat(self.db_path)
         required = os.path.getsize(self.db_path) * 3 + 1024**3
         if shutil.disk_usage(os.path.dirname(self.db_path)).free < required:
             raise RuntimeError('insufficient free disk for safe copy-and-swap migration')
-        with open(self.lock_path, 'x', encoding='utf-8') as lock:
-            lock.write(str(os.getpid()))
-        try:
+        with maintenance_lock(self.lock_path, 'optimize-db'):
             self._phase('copy source database', self._copy_database)
             conn = self._connect(self.work_path)
             try:
@@ -657,19 +659,12 @@ class DatabaseOptimizer:
             self.stats['reduction_pct'] = round(
                 (1 - self.stats['after_bytes'] / before_stat.st_size) * 100, 2)
             report_dir = os.path.join(os.path.dirname(self.db_path), 'backup_logs')
-            os.makedirs(report_dir, exist_ok=True)
-            report_path = os.path.join(
-                report_dir, self.started.strftime('DB_OPTIMIZATION_%Y%m%d_%H%M%S.json'))
-            with open(report_path, 'w', encoding='utf-8') as report_file:
-                json.dump(self.stats, report_file, indent=2)
-            self.stats['report_path'] = report_path
+            self.stats['report_path'] = append_maintenance_summary_row(
+                report_dir, 'db_optimization', self.stats)
             os.remove(self.rollback_path)
             os.remove(self.work_path)
             self.progress(json.dumps(self.stats, indent=2))
             return self.stats
-        finally:
-            if os.path.exists(self.lock_path):
-                os.remove(self.lock_path)
 
     def _copy_database(self):
         source = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
@@ -686,6 +681,202 @@ class DatabaseOptimizer:
             conn.execute(sql)
         finally:
             conn.close()
+
+
+class HashlessOriginOptimizer:
+    """Copy/swap migration that drops file-content hash columns and adds origin."""
+
+    def __init__(self, db_path, progress=print):
+        self.db_path = os.path.abspath(db_path)
+        self.progress = progress or (lambda _message: None)
+        self.started = datetime.now()
+        stamp = self.started.strftime('%Y%m%d_%H%M%S')
+        self.work_path = self.db_path + f'.hashless_{stamp}.work'
+        self.compact_path = self.db_path + f'.hashless_{stamp}.compact'
+        self.rollback_path = self.db_path + f'.pre_hashless_{stamp}.bak'
+        self.lock_path = self.db_path + '.maintenance.lock'
+        self.stats = {'started_at': self.started.isoformat(), 'phases': {}}
+
+    def _phase(self, name, function):
+        start = time.perf_counter()
+        self.progress(f"[HASHLESS] {name}...")
+        result = function()
+        self.stats['phases'][name] = round(time.perf_counter() - start, 3)
+        return result
+
+    def _connect(self, path):
+        conn = sqlite3.connect(path, timeout=60)
+        conn.row_factory = sqlite3.Row
+        conn.execute('PRAGMA foreign_keys=ON')
+        conn.execute('PRAGMA busy_timeout=60000')
+        conn.create_function('catalog_key', 5, _file_record_key,
+                             deterministic=True)
+        return conn
+
+    def _copy_database(self):
+        source = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        target = sqlite3.connect(self.work_path)
+        try:
+            source.backup(target, pages=8192)
+        finally:
+            target.close()
+            source.close()
+
+    @staticmethod
+    def _columns(conn):
+        return {row['name'] for row in conn.execute('PRAGMA table_info(files_index)')}
+
+    def _apply_hashless_origin(self, conn):
+        columns = self._columns(conn)
+        if 'source_host' not in columns:
+            conn.execute("ALTER TABLE files_index ADD COLUMN source_host TEXT "
+                         "NOT NULL DEFAULT 'so02'")
+        conn.execute(
+            "UPDATE files_index SET source_host='so02' "
+            "WHERE source_host IS NULL OR source_host=''")
+
+        for index_name in (
+                'idx_files_record_key', 'idx_files_source_host',
+                'idx_files_bundle_id', 'idx_files_local_session_chunk',
+                'idx_files_archive_run'):
+            conn.execute(f'DROP INDEX IF EXISTS {index_name}')
+        for row in conn.execute("""
+                SELECT name FROM sqlite_master
+                WHERE type='index' AND tbl_name='files_index'
+                  AND sql IS NOT NULL
+                  AND (sql LIKE '%file_hash%' OR sql LIKE '%file_hash_blob%')
+        """):
+            index_name = '"' + str(row['name']).replace('"', '""') + '"'
+            conn.execute(f"DROP INDEX IF EXISTS {index_name}")
+
+        columns = self._columns(conn)
+        for column in ('file_hash_blob', 'file_hash'):
+            if column in columns:
+                conn.execute(f'ALTER TABLE files_index DROP COLUMN {column}')
+                columns.remove(column)
+
+        conn.execute("""UPDATE files_index SET record_key=
+            catalog_key(original_path,tape_label,local_session_id,
+                        local_chunk_index,source_host)""")
+        conn.executescript("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_files_record_key
+              ON files_index(record_key) WHERE record_key IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_files_bundle_id
+              ON files_index(bundle_id) WHERE bundle_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_files_local_session_chunk
+              ON files_index(local_session_id,local_chunk_index,tape_label)
+              WHERE local_session_id IS NOT NULL;
+            CREATE INDEX IF NOT EXISTS idx_files_source_host
+              ON files_index(source_host,tape_label,original_path);
+        """)
+        columns = self._columns(conn)
+        if 'archive_run_id' in columns:
+            conn.execute("""CREATE INDEX IF NOT EXISTS idx_files_archive_run
+                ON files_index(archive_run_id)
+                WHERE archive_run_id IS NOT NULL""")
+        if catalog_v3_available(conn):
+            ensure_catalog_schema(conn)
+            conn.execute("INSERT INTO files_index_fts(files_index_fts) VALUES ('rebuild')")
+        conn.execute('ANALYZE')
+        conn.commit()
+
+    def _validate(self, path, expected_files=None, allow_hash_columns=False):
+        conn = self._connect(path)
+        try:
+            columns = self._columns(conn)
+            result = {
+                'quick_check': conn.execute('PRAGMA quick_check').fetchone()[0],
+                'foreign_key_violations':
+                    len(conn.execute('PRAGMA foreign_key_check').fetchall()),
+                'files': conn.execute('SELECT COUNT(*) FROM files_index').fetchone()[0],
+                'hash_columns_present':
+                    sorted(columns.intersection({'file_hash', 'file_hash_blob'})),
+            }
+            if 'source_host' in columns:
+                result['source_hosts'] = [row[0] for row in conn.execute(
+                    'SELECT DISTINCT source_host FROM files_index ORDER BY source_host')]
+                result['source_host_missing'] = conn.execute(
+                    """SELECT COUNT(*) FROM files_index
+                       WHERE source_host IS NULL OR source_host=''"""
+                ).fetchone()[0]
+            else:
+                result['source_hosts'] = []
+                result['source_host_missing'] = result['files']
+            if catalog_v3_available(conn):
+                result['fts_rows'] = conn.execute(
+                    'SELECT COUNT(*) FROM files_index_fts').fetchone()[0]
+        finally:
+            conn.close()
+        if result['quick_check'] != 'ok':
+            raise RuntimeError(f"hashless validation failed: {result!r}")
+        if result['foreign_key_violations']:
+            raise RuntimeError(f"hashless validation failed: {result!r}")
+        if result['hash_columns_present'] and not allow_hash_columns:
+            raise RuntimeError(f"hashless validation failed: {result!r}")
+        if result['source_host_missing'] and not allow_hash_columns:
+            raise RuntimeError(f"hashless validation failed: {result!r}")
+        if expected_files is not None and result['files'] != expected_files:
+            raise RuntimeError(
+                f"hashless validation failed: files={result['files']} "
+                f"expected={expected_files}")
+        if result.get('fts_rows') is not None and result['fts_rows'] != result['files']:
+            raise RuntimeError(f"hashless validation failed: {result!r}")
+        return result
+
+    def _vacuum(self, sql):
+        conn = self._connect(self.work_path)
+        try:
+            conn.execute(sql)
+        finally:
+            conn.close()
+
+    def run(self):
+        before_stat = os.stat(self.db_path)
+        before_files = self._validate(
+            self.db_path, allow_hash_columns=True)['files']
+        required = os.path.getsize(self.db_path) * 3 + 1024**3
+        if shutil.disk_usage(os.path.dirname(self.db_path)).free < required:
+            raise RuntimeError('insufficient free disk for safe hashless migration')
+        with maintenance_lock(self.lock_path, 'hashless-origin-migrate'):
+            self._phase('copy source database', self._copy_database)
+            conn = self._connect(self.work_path)
+            try:
+                self._phase('drop hash columns and add source origin',
+                            lambda: self._apply_hashless_origin(conn))
+            finally:
+                conn.close()
+            self._phase('validate working copy',
+                        lambda: self._validate(self.work_path, before_files))
+            compact_sql = "VACUUM INTO '" + self.compact_path.replace("'", "''") + "'"
+            self._phase('compact hashless copy', lambda: self._vacuum(compact_sql))
+            self._phase('validate compact copy',
+                        lambda: self._validate(self.compact_path, before_files))
+            current_stat = os.stat(self.db_path)
+            if (current_stat.st_size, current_stat.st_mtime_ns) != (
+                    before_stat.st_size, before_stat.st_mtime_ns):
+                raise RuntimeError('source database changed during migration; refusing swap')
+            os.replace(self.db_path, self.rollback_path)
+            try:
+                os.replace(self.compact_path, self.db_path)
+                final_validation = self._validate(self.db_path, before_files)
+            except BaseException:
+                if os.path.exists(self.db_path):
+                    os.remove(self.db_path)
+                os.replace(self.rollback_path, self.db_path)
+                raise
+            self.stats['validation'] = final_validation
+            self.stats['before_bytes'] = before_stat.st_size
+            self.stats['after_bytes'] = os.path.getsize(self.db_path)
+            self.stats['reclaimed_bytes'] = (
+                self.stats['before_bytes'] - self.stats['after_bytes'])
+            report_dir = os.path.join(os.path.dirname(self.db_path), 'backup_logs')
+            self.stats['report_path'] = append_maintenance_summary_row(
+                report_dir, 'db_hashless', self.stats)
+            os.remove(self.rollback_path)
+            if os.path.exists(self.work_path):
+                os.remove(self.work_path)
+            self.progress(json.dumps(self.stats, indent=2))
+            return self.stats
 
 
 class CatalogV3Optimizer:
@@ -763,6 +954,13 @@ class CatalogV3Optimizer:
         if user_version < SCHEMA_VERSION or legacy_remote:
             raise RuntimeError(
                 "[DB] Run the existing v2 optimizer before catalog-v3 migration.")
+        columns = {row['name'] for row in conn.execute('PRAGMA table_info(files_index)')}
+        if 'source_host' not in columns:
+            conn.execute("ALTER TABLE files_index ADD COLUMN source_host TEXT "
+                         "NOT NULL DEFAULT 'so02'")
+        conn.execute(
+            "UPDATE files_index SET source_host='so02' "
+            "WHERE source_host IS NULL OR source_host=''")
         ensure_catalog_schema(conn)
         self._drop_fts_triggers(conn)
         conn.commit()
@@ -898,16 +1096,12 @@ class CatalogV3Optimizer:
             conn.close()
 
     def run(self):
-        if os.path.exists(self.lock_path):
-            raise RuntimeError(f"maintenance lock already exists: {self.lock_path}")
         before_stat = os.stat(self.db_path)
         source_signature = self._catalog_signature(self.db_path)
         required = os.path.getsize(self.db_path) * 3 + 1024**3
         if shutil.disk_usage(os.path.dirname(self.db_path)).free < required:
             raise RuntimeError('insufficient free disk for safe catalog-v3 migration')
-        with open(self.lock_path, 'x', encoding='utf-8') as lock:
-            lock.write(str(os.getpid()))
-        try:
+        with maintenance_lock(self.lock_path, 'catalog-v3-migrate'):
             self._phase('copy source database', self._copy_database)
             conn = self._connect(self.work_path)
             try:
@@ -953,17 +1147,10 @@ class CatalogV3Optimizer:
             self.stats['reduction_pct'] = round(
                 (1 - self.stats['after_bytes'] / before_stat.st_size) * 100, 2)
             report_dir = os.path.join(os.path.dirname(self.db_path), 'backup_logs')
-            os.makedirs(report_dir, exist_ok=True)
-            report_path = os.path.join(
-                report_dir, self.started.strftime('DB_CATALOG_V3_%Y%m%d_%H%M%S.json'))
-            with open(report_path, 'w', encoding='utf-8') as report_file:
-                json.dump(self.stats, report_file, indent=2)
-            self.stats['report_path'] = report_path
+            self.stats['report_path'] = append_maintenance_summary_row(
+                report_dir, 'db_catalog_v3', self.stats)
             os.remove(self.rollback_path)
             if os.path.exists(self.work_path):
                 os.remove(self.work_path)
             self.progress(json.dumps(self.stats, indent=2))
             return self.stats
-        finally:
-            if os.path.exists(self.lock_path):
-                os.remove(self.lock_path)

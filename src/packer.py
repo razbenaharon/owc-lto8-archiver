@@ -1,23 +1,7 @@
 """LTOAnalyzer and LTOPacker."""
 import os
-import re
-import sys
-import time
-import queue
-import signal
 import shutil
-import hashlib
 import zipfile
-import sqlite3
-import threading
-import configparser
-import subprocess
-import tempfile
-import shlex
-import posixpath
-import atexit
-from datetime import datetime
-from collections import defaultdict
 
 try:
     import psutil
@@ -257,8 +241,8 @@ class LTOPacker:
 
         metadata             = []
         zip_idx              = 1
-        zip_path             = os.path.join(dest, f"{bundle_prefix}_{zip_idx:03d}.zip")
-        zipf                 = zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED, allowZip64=True)
+        zip_path             = None
+        zipf                 = None
         current_zip_size     = 0
         files_in_current_zip = 0
         total_packed         = 0
@@ -281,7 +265,14 @@ class LTOPacker:
                 if fsize_mb < threshold_mb:
                     ensure_staging_space(dest, fsize, context=file)
                     zip_rel = rel.replace('\\', '/')
-                    if current_zip_size + fsize > self.max_zip_size_gb * 1024**3 * 0.99:
+                    if zipf is None:
+                        zip_path = os.path.join(
+                            dest, f"{bundle_prefix}_{zip_idx:03d}.zip")
+                        zipf = zipfile.ZipFile(
+                            zip_path, 'w', zipfile.ZIP_STORED, allowZip64=True)
+                    if (files_in_current_zip > 0 and
+                            current_zip_size + fsize >
+                            self.max_zip_size_gb * 1024**3 * 0.99):
                         zipf.close()
                         _progress_done()
                         print(f"\n -> Sealed {bundle_prefix}_{zip_idx:03d}.zip ({files_in_current_zip} files)")
@@ -292,15 +283,12 @@ class LTOPacker:
                         files_in_current_zip = 0
 
                     container = f"{bundle_prefix}_{zip_idx:03d}.zip"
-                    hasher = hashlib.sha256()
                     with open(src, 'rb') as fsrc, zipf.open(zip_rel, 'w', force_zip64=True) as zdst:
                         while True:
                             buf = fsrc.read(BUFFER_SIZE)
                             if not buf:
                                 break
-                            hasher.update(buf)
                             zdst.write(buf)
-                    file_hash            = hasher.hexdigest()
                     current_zip_size     += fsize
                     files_in_current_zip += 1
                     total_packed         += 1
@@ -309,7 +297,6 @@ class LTOPacker:
                         'file_name':       file,
                         'original_path':   src,
                         'file_size_bytes': fsize,
-                        'file_hash':       file_hash,
                         'is_packed':       True,
                         'container_name':  container,
                         'stored_path':     zip_rel,
@@ -319,8 +306,8 @@ class LTOPacker:
                         _progress_line(f"[PACKING] {total_packed} files packed")
 
                 else:
-                    # Large/loose files are not hashed — skipping the extra
-                    # full-file read keeps the tape from waiting on Python I/O.
+                    # Large/loose files are copied without an extra full-file
+                    # read so the tape does not wait on Python I/O.
                     dst_path = os.path.join(dest, rel)
                     ensure_staging_space(dest, fsize, context=file)
 
@@ -332,7 +319,6 @@ class LTOPacker:
                         'file_name':       file,
                         'original_path':   src,
                         'file_size_bytes': fsize,
-                        'file_hash':       '',
                         'is_packed':       False,
                         'container_name':  None,
                         'stored_path':     rel,
@@ -341,7 +327,8 @@ class LTOPacker:
             except StagingSpaceError:
                 _progress_done()
                 try:
-                    zipf.close()
+                    if zipf is not None:
+                        zipf.close()
                 except Exception:
                     pass
                 raise
@@ -354,10 +341,6 @@ class LTOPacker:
             zipf.close()
             _progress_done()
             print(f"\n -> Sealed {bundle_prefix}_{zip_idx:03d}.zip ({files_in_current_zip} files)")
-        else:
-            zipf.close()
-            if os.path.exists(zip_path) and os.path.getsize(zip_path) < 100:
-                os.remove(zip_path)
 
         if errors:
             raise RuntimeError(
@@ -396,8 +379,8 @@ class LTOPacker:
 
         metadata             = []
         zip_idx              = 1
-        zip_path             = os.path.join(dest, f"Bundle_{zip_idx:03d}.zip")
-        zipf                 = zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED, allowZip64=True)
+        zip_path             = None
+        zipf                 = None
         current_zip_size     = 0
         files_in_current_zip = 0
         total_packed         = 0
@@ -417,7 +400,13 @@ class LTOPacker:
                         ensure_staging_space(dest, fsize, context=file)
                         zip_rel = rel.replace('\\', '/')  # ZIP entries use POSIX separators
                         # Roll over to a new ZIP bundle if current one is full
-                        if current_zip_size + fsize > self.max_zip_size_gb * 1024**3 * 0.99:
+                        if zipf is None:
+                            zip_path = os.path.join(dest, f"Bundle_{zip_idx:03d}.zip")
+                            zipf = zipfile.ZipFile(
+                                zip_path, 'w', zipfile.ZIP_STORED, allowZip64=True)
+                        if (files_in_current_zip > 0 and
+                                current_zip_size + fsize >
+                                self.max_zip_size_gb * 1024**3 * 0.99):
                             zipf.close()
                             _progress_done()
                             print(f"\n -> Sealed Bundle_{zip_idx:03d}.zip ({files_in_current_zip} files)")
@@ -428,15 +417,12 @@ class LTOPacker:
                             files_in_current_zip = 0
 
                         container = f"Bundle_{zip_idx:03d}.zip"
-                        hasher = hashlib.sha256()
                         with open(src, 'rb') as fsrc, zipf.open(zip_rel, 'w', force_zip64=True) as zdst:
                             while True:
                                 buf = fsrc.read(BUFFER_SIZE)
                                 if not buf:
                                     break
-                                hasher.update(buf)
                                 zdst.write(buf)
-                        file_hash            = hasher.hexdigest()
                         current_zip_size     += fsize
                         files_in_current_zip += 1
                         total_packed         += 1
@@ -445,7 +431,6 @@ class LTOPacker:
                             'file_name':       file,
                             'original_path':   src,
                             'file_size_bytes': fsize,
-                            'file_hash':       file_hash,
                             'is_packed':       True,
                             'container_name':  container,
                             'stored_path':     zip_rel,
@@ -455,8 +440,8 @@ class LTOPacker:
                             _progress_line(f"[PACKING] {total_packed} files packed")
 
                     else:
-                        # Large/loose files are not hashed — skipping the extra
-                        # full-file read keeps the tape from waiting on Python I/O.
+                        # Large/loose files are copied without an extra full-file
+                        # read so the tape does not wait on Python I/O.
                         dst_path = os.path.join(dest, rel)
                         ensure_staging_space(dest, fsize, context=file)
 
@@ -468,7 +453,6 @@ class LTOPacker:
                             'file_name':       file,
                             'original_path':   src,
                             'file_size_bytes': fsize,
-                            'file_hash':       '',
                             'is_packed':       False,
                             'container_name':  None,
                             'stored_path':     rel,
@@ -477,7 +461,8 @@ class LTOPacker:
                 except StagingSpaceError:
                     _progress_done()
                     try:
-                        zipf.close()
+                        if zipf is not None:
+                            zipf.close()
                     except Exception:
                         pass
                     raise
@@ -489,11 +474,7 @@ class LTOPacker:
             zipf.close()
             _progress_done()
             print(f"\n -> Sealed Bundle_{zip_idx:03d}.zip ({files_in_current_zip} files)")
-        else:
-            zipf.close()
-            if os.path.exists(zip_path) and os.path.getsize(zip_path) < 100:
-                os.remove(zip_path)
 
         _progress_done()
-        print(f"\n[PACKER] Offline phase done: {total_packed} packed into ZIPs | {total_loose} large files staged (not hashed).")
+        print(f"\n[PACKER] Offline phase done: {total_packed} packed into ZIPs | {total_loose} large files staged.")
         return metadata

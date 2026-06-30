@@ -1,23 +1,10 @@
 """LTORetriever restore flows."""
 import os
 import re
-import sys
-import time
-import queue
-import signal
 import shutil
-import hashlib
 import zipfile
-import sqlite3
-import threading
-import configparser
-import subprocess
-import tempfile
-import shlex
 import posixpath
 import ntpath
-import atexit
-from datetime import datetime
 from collections import defaultdict
 
 try:
@@ -27,9 +14,11 @@ except ImportError:  # optional dependency — priority/affinity degrade gracefu
 
 from .db import DatabaseManager
 from .ltfs import get_volume_label
-from .paths import _verify_restored_hash
 from .robocopy import _robocopy_file
 from .runtime import _acquire_tape_io_lock, _release_tape_io_lock
+
+
+RESTORE_PAGE_SIZE = 250
 
 
 class LTORetriever:
@@ -134,7 +123,8 @@ class LTORetriever:
         print("5. Restore full backup session")
         opt = input("Option (1-5): ").strip()
 
-        results = []
+        fetch_page = None
+        total_results = 0
         restore_base = None
 
         if opt in ('1', '2', '3'):
@@ -144,15 +134,21 @@ class LTORetriever:
             if opt in ('2', '3'):
                 date_from = input("Backed-up from (YYYY-MM-DD, blank=any): ").strip() or None
                 date_to   = input("Backed-up to   (YYYY-MM-DD, blank=any): ").strip() or None
-            results = self.db.search_files(name_q, date_from, date_to)
+            total_results = self.db.count_search_files(name_q, date_from, date_to)
+            fetch_page = lambda offset: self.db.search_files(
+                name_q, date_from, date_to,
+                limit=RESTORE_PAGE_SIZE, offset=offset)
 
         elif opt == '4':
             dir_q = input("Original directory path (partial ok): ").strip()
             if not dir_q:
                 return
-            results = self.db.search_by_directory(dir_q)
-            if results:
-                directory_root = self._infer_directory_root(dir_q, results)
+            total_results = self.db.count_by_directory(dir_q)
+            fetch_page = lambda offset: self.db.search_by_directory(
+                dir_q, limit=RESTORE_PAGE_SIZE, offset=offset)
+            first_page = fetch_page(0)
+            if first_page:
+                directory_root = self._infer_directory_root(dir_q, first_page)
                 mod = self._source_path_module(directory_root)
                 restore_base = mod.dirname(directory_root)
 
@@ -174,52 +170,97 @@ class LTORetriever:
             if idx < 1 or idx > len(sessions):
                 return
             s = sessions[idx - 1]
-            results = self.db.search_by_session(s['session_date'], s['tape_label'])
+            total_results = self.db.count_by_session(s['session_date'], s['tape_label'])
+            fetch_page = lambda offset: self.db.search_by_session(
+                s['session_date'], s['tape_label'],
+                limit=RESTORE_PAGE_SIZE, offset=offset)
 
         else:
             return
 
-        if not results:
+        if not fetch_page or total_results <= 0:
             print("[RETRIEVER] No matching files found.")
             return
 
-        total_size = sum(r['file_size_bytes'] or 0 for r in results)
-        print(f"\n{'ID':>7}  {'Filename':<42}  {'Size':>10}  {'Backup Date':<20}  Tape")
-        print("-" * 100)
+        offset = 0
+        while True:
+            results = fetch_page(offset)
+            if not results and offset:
+                offset = max(0, offset - RESTORE_PAGE_SIZE)
+                results = fetch_page(offset)
+            self._print_results_page(results, offset, total_results)
+            sel_raw = input(
+                "Enter file ID, ALL, N=next, P=previous, or 0=cancel: "
+            ).strip()
+            if sel_raw == '0' or not sel_raw:
+                return
+            if sel_raw.upper() == 'N':
+                if offset + RESTORE_PAGE_SIZE < total_results:
+                    offset += RESTORE_PAGE_SIZE
+                else:
+                    print("[RETRIEVER] Already on last page.")
+                continue
+            if sel_raw.upper() == 'P':
+                offset = max(0, offset - RESTORE_PAGE_SIZE)
+                continue
+            os.makedirs(self.restore_dir, exist_ok=True)
+            if sel_raw.upper() == 'ALL':
+                if total_results > RESTORE_PAGE_SIZE:
+                    confirm = input(
+                        f"Restore all {total_results:,} matching file(s)? "
+                        "Type RESTORE ALL to confirm: "
+                    ).strip()
+                    if confirm != 'RESTORE ALL':
+                        print("[ABORTED]")
+                        continue
+                self._restore_all_pages(fetch_page, total_results,
+                                        restore_base=restore_base)
+                return
+            try:
+                sel = int(sel_raw)
+            except ValueError:
+                print("[RETRIEVER] Invalid input.")
+                continue
+            record = self.db.get_file_by_id(sel)
+            if not record:
+                print("[RETRIEVER] File ID not found.")
+                continue
+            self._verify_tape(record['tape_label'])
+            if record['is_packed']:
+                self._restore_packed(record, restore_base=restore_base)
+            else:
+                self._restore_loose(record, restore_base=restore_base)
+            return
+
+    @staticmethod
+    def _print_results_page(results, offset, total_results):
+        page_start = offset + 1 if results else 0
+        page_end = offset + len(results)
+        print(f"\n{'ID':>7}  {'Filename':<42}  {'Size':>10}  "
+              f"{'Backup Date':<20}  {'Host':<8}  Tape")
+        print("-" * 112)
         for row in results:
-            size_s = f"{row['file_size_bytes']/1024**2:.1f} MB"
+            size_s = f"{(row['file_size_bytes'] or 0)/1024**2:.1f} MB"
             date_s = (row['backup_date'] or '')[:19]
-            print(f"{row['file_id']:>7}  {row['file_name']:<42}  {size_s:>10}  {date_s:<20}  {row['tape_label']}")
-        print(f"\n{len(results)} file(s)  |  {total_size/1024**3:.2f} GB total")
+            host_s = row.get('source_host') or 'so02'
+            print(f"{row['file_id']:>7}  {row['file_name']:<42}  "
+                  f"{size_s:>10}  {date_s:<20}  {host_s:<8}  "
+                  f"{row['tape_label']}")
+        print(f"\nShowing {page_start:,}-{page_end:,} of "
+              f"{total_results:,} matching file(s)")
 
-        print()
-        sel_raw = input("Enter file ID to restore, ALL to restore all, or 0 to cancel: ").strip()
-
-        if sel_raw == '0' or not sel_raw:
-            return
-
-        os.makedirs(self.restore_dir, exist_ok=True)
-
-        if sel_raw.upper() == 'ALL':
-            self._restore_many(list(results), restore_base=restore_base)
-            return
-
-        try:
-            sel = int(sel_raw)
-        except ValueError:
-            print("[RETRIEVER] Invalid input.")
-            return
-
-        record = self.db.get_file_by_id(sel)
-        if not record:
-            print("[RETRIEVER] File ID not found.")
-            return
-
-        self._verify_tape(record['tape_label'])
-        if record['is_packed']:
-            self._restore_packed(record, restore_base=restore_base)
-        else:
-            self._restore_loose(record, restore_base=restore_base)
+    def _restore_all_pages(self, fetch_page, total_results, restore_base=None):
+        offset = 0
+        restored = 0
+        while offset < total_results:
+            page = fetch_page(offset)
+            if not page:
+                break
+            self._restore_many(page, restore_base=restore_base)
+            restored += len(page)
+            offset += RESTORE_PAGE_SIZE
+        print(f"\n[RESTORE] Requested {total_results:,}; processed "
+              f"{restored:,} file(s).")
 
     def _restore_many(self, records, restore_base=None):
         total = len(records)
@@ -281,7 +322,6 @@ class LTORetriever:
             _release_tape_io_lock()
         if ok:
             print(f"[RESTORE] Saved to: {dst}")
-            _verify_restored_hash(dst, record)
         else:
             print(f"[ERROR] Restore failed: robocopy error")
 
@@ -342,7 +382,6 @@ class LTORetriever:
                 with zf.open(entry) as zf_src, open(dst, 'wb') as out:
                     shutil.copyfileobj(zf_src, out)
             print(f"[RESTORE] Saved to: {dst}")
-            _verify_restored_hash(dst, record)
         except Exception as e:
             print(f"[ERROR] Extraction failed: {e}")
         finally:
@@ -385,7 +424,6 @@ class LTORetriever:
                         with zf.open(entry) as zf_src, open(dst, 'wb') as out:
                             shutil.copyfileobj(zf_src, out)
                         print(f"[OK] {record['file_name']}")
-                        _verify_restored_hash(dst, record)
                     except Exception as e:
                         print(f"[ERROR] {record['file_name']}: {e}")
         except Exception as e:

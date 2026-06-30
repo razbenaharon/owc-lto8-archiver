@@ -1,21 +1,7 @@
 """LTOBackup and _NoEjectBackup tape writers."""
 import os
-import re
-import sys
 import time
-import queue
-import signal
-import shutil
-import hashlib
-import zipfile
-import sqlite3
 import threading
-import configparser
-import subprocess
-import tempfile
-import shlex
-import posixpath
-import atexit
 from datetime import datetime
 from collections import defaultdict
 
@@ -27,10 +13,9 @@ except ImportError:  # optional dependency — priority/affinity degrade gracefu
 from .constants import BACKUP_LOG_DIR, LTFS_DIR, LTFS_WRITE_WARNING
 from .db import DatabaseManager
 from .ltfs import _ensure_lto_drive_ready
-from .paths import _safe_log_token, _unique_path
-from .reporting import generate_backup_summary
+from .reporting import append_backup_summary_row
 from .robocopy import _parse_robocopy_summary, _run_robocopy_tuned
-from .runtime import CANCEL, _acquire_tape_io_lock, _fmt_bytes, _fmt_eta, _phase, _progress_done, _progress_line, _release_tape_io_lock, _speed_str
+from .runtime import CANCEL, _acquire_tape_io_lock, _fmt_eta, _phase, _progress_done, _progress_line, _release_tape_io_lock
 
 
 def _tape_destination_root(source, tape_drive, tape_parent_dir=None):
@@ -54,190 +39,19 @@ class LTOBackup:
         self.tape_affinity = tape_affinity   # consumer (tape-writer) core set
         self.log_dir       = log_dir or BACKUP_LOG_DIR
 
-    def _write_backup_log(self, details, packer_metadata, hash_map,
+    def _write_backup_log(self, details, packer_metadata, loose_map,
                           recovered_direct_existing, skipped_existing,
                           robocopy_cmd, robocopy_result):
-        """Write a reviewable text log for one completed tape-write step."""
+        """Append one compact CSV row for a completed tape-write step."""
         try:
-            log_dir = os.path.abspath(self.log_dir or BACKUP_LOG_DIR)
-            os.makedirs(log_dir, exist_ok=True)
-
-            finished_at = details['finished_at']
-            source_token = _safe_log_token(details.get('source'), 'source')
-            tape_token = _safe_log_token(details.get('tape_label'), 'tape')
-            name_parts = [finished_at.strftime('%Y%m%d_%H%M%S'),
-                          tape_token, source_token]
-            if details.get('local_session_id') is not None:
-                name_parts.append(f"s{int(details['local_session_id']):04d}")
-            if details.get('local_chunk_index') is not None:
-                name_parts.append(f"c{int(details['local_chunk_index']) + 1:03d}")
-
-            log_path = _unique_path(os.path.join(log_dir, '_'.join(name_parts) + '.log'))
-            rc_sum = details.get('rc_sum') or {}
-            counts = details.get('record_counts') or {}
-            source_missing_files = details.get('source_missing_files') or []
-            mode = 'staged/packed' if packer_metadata is not None else 'direct'
-
-            def cell(value):
-                text = '' if value is None else str(value)
-                return text.replace('\t', ' ').replace('\r', ' ').replace('\n', ' ')
-
-            def write_kv(f, key, value):
-                f.write(f"{key:<28}: {value}\n")
-
-            with open(log_path, 'w', encoding='utf-8', newline='\n') as f:
-                f.write("LTO Backup Log\n")
-                f.write("=" * 60 + "\n")
-                write_kv(f, "Status", details.get('status', 'completed'))
-                write_kv(f, "Started", details['started_at'].isoformat(timespec='seconds'))
-                write_kv(f, "Finished", finished_at.isoformat(timespec='seconds'))
-                write_kv(f, "Source", details.get('source'))
-                write_kv(f, "Tape label", details.get('tape_label'))
-                write_kv(f, "Tape drive", details.get('tape_drive'))
-                write_kv(f, "Tape root", details.get('tape_root'))
-                write_kv(f, "Backup mode", mode)
-                if details.get('local_session_id') is not None:
-                    write_kv(f, "Local session id", details.get('local_session_id'))
-                if details.get('local_chunk_index') is not None:
-                    write_kv(f, "Local chunk", int(details['local_chunk_index']) + 1)
-                write_kv(f, "Robocopy exit code", robocopy_result.returncode)
-                write_kv(f, "Robocopy command", subprocess.list2cmdline(robocopy_cmd))
-
-                f.write("\nSummary\n")
-                f.write("-" * 60 + "\n")
-                write_kv(f, "Total time", f"{details['total_time_seconds'] / 60:.1f} minutes")
-                write_kv(f, "Data copied", f"{_fmt_bytes(details['copied_bytes'])} ({details['copied_bytes']} bytes)")
-                write_kv(f, "Planned copy size", f"{_fmt_bytes(details['total_bytes'])} ({details['total_bytes']} bytes)")
-                write_kv(f, "Average speed", f"{rc_sum.get('speed_mbs', 0):.1f} MB/s")
-                write_kv(f, "Files copied", rc_sum.get('files_copied', 0))
-                write_kv(f, "Files skipped", rc_sum.get('files_skipped', 0) + details.get('skipped', 0))
-                write_kv(f, "Files failed", rc_sum.get('files_failed', 0))
-                if rc_sum.get('elapsed'):
-                    write_kv(f, "Robocopy time", rc_sum.get('elapsed'))
-                write_kv(f, "Loose files hashed", len(hash_map))
-                write_kv(f, "Already on tape", details.get('skipped', 0))
-                write_kv(f, "Source-missing files skipped",
-                         len(source_missing_files))
-                write_kv(f, "Tape used after backup", f"{_fmt_bytes(details['new_used'])} ({details['new_used']} bytes)")
-
-                # Per-phase timing & throughput. Present only for the staged/packed
-                # pipeline (omitted for direct/local backups). Fetch and pack run
-                # in the producer and overlap the *previous* chunk's tape write, so
-                # these phases need not sum to Total time.
-                fetch_s = details.get('fetch_seconds')
-                if fetch_s is not None:
-                    fetch_b = details.get('fetch_bytes') or 0
-                    write_kv(f, "Fetch time", f"{fetch_s / 60:.1f} minutes")
-                    write_kv(f, "Fetched data", f"{_fmt_bytes(fetch_b)} ({fetch_b} bytes)")
-                    write_kv(f, "Fetch speed (remote->PC)", _speed_str(fetch_b, fetch_s))
-                pack_s = details.get('pack_seconds')
-                if pack_s is not None:
-                    pack_b = details.get('pack_bytes') or 0
-                    write_kv(f, "Pack time", f"{pack_s / 60:.1f} minutes")
-                    write_kv(f, "Pack speed", _speed_str(pack_b, pack_s))
-                db_s = details.get('db_sync_seconds')
-                if db_s is not None:
-                    write_kv(f, "DB sync time", f"{db_s / 60:.1f} minutes")
-                total_secs = details.get('total_time_seconds')
-                if total_secs:
-                    write_kv(f, "End-to-end speed",
-                             _speed_str(details.get('copied_bytes'), total_secs, with_rate=True))
-                if fetch_s is not None or pack_s is not None:
-                    f.write("  (fetch/pack overlap the previous chunk's tape write; "
-                            "phases need not sum to Total time)\n")
-
-                if counts:
-                    f.write("\nDatabase Records\n")
-                    f.write("-" * 60 + "\n")
-                    for key in sorted(counts):
-                        write_kv(f, key.replace('_', ' ').title(), counts[key])
-
-                if source_missing_files:
-                    f.write("\nSource-Missing Files Skipped\n")
-                    f.write("-" * 60 + "\n")
-                    f.write("manifest_id\tremote_path\tsize\n")
-                    for item in source_missing_files:
-                        f.write('\t'.join(cell(value) for value in (
-                            item.get('manifest_id'),
-                            item.get('remote_path'),
-                            item.get('file_size_bytes'),
-                        )) + "\n")
-
-                f.write("\nFile Manifest\n")
-                f.write("-" * 60 + "\n")
-                f.write("Status\tPacked\tSizeBytes\tSHA256\tOriginalPath\tTapePath\tContainer\tStoredPath\n")
-
-                if packer_metadata is None:
-                    for info in recovered_direct_existing:
-                        f.write('\t'.join(cell(v) for v in (
-                            'already_on_tape_recovered',
-                            'no',
-                            info.get('file_size_bytes'),
-                            info.get('file_hash'),
-                            info.get('original_path'),
-                            info.get('stored_path'),
-                            '',
-                            info.get('stored_path'),
-                        )) + "\n")
-                    for rel_path, info in hash_map.items():
-                        f.write('\t'.join(cell(v) for v in (
-                            'copied',
-                            'no',
-                            info.get('fsize'),
-                            info.get('hash'),
-                            info.get('src'),
-                            info.get('dst'),
-                            '',
-                            rel_path,
-                        )) + "\n")
-                    if details.get('skipped', 0) > len(recovered_direct_existing):
-                        f.write("# Skipped files already present in the DB are counted above but not expanded here.\n")
-                else:
-                    skipped_originals = {
-                        m.get('original_path')
-                        for _, m, _ in skipped_existing
-                        if isinstance(m, dict)
-                    }
-                    tape_root = details.get('tape_root')
-                    for m in packer_metadata or []:
-                        is_packed = bool(m.get('is_packed'))
-                        container = m.get('container_name') if is_packed else ''
-                        tape_path = (os.path.join(tape_root, container)
-                                     if is_packed and container
-                                     else os.path.join(tape_root, m.get('stored_path') or ''))
-                        if not is_packed and m.get('original_path') in skipped_originals:
-                            status = 'already_on_tape'
-                        elif is_packed:
-                            status = 'packed_file'
-                        else:
-                            status = 'copied'
-                        f.write('\t'.join(cell(v) for v in (
-                            status,
-                            'yes' if is_packed else 'no',
-                            m.get('file_size_bytes'),
-                            m.get('file_hash'),
-                            m.get('original_path'),
-                            tape_path,
-                            container,
-                            m.get('stored_path'),
-                        )) + "\n")
-
-                if robocopy_result.stdout:
-                    f.write("\nRobocopy Stdout\n")
-                    f.write("-" * 60 + "\n")
-                    f.write(robocopy_result.stdout)
-                    if not robocopy_result.stdout.endswith("\n"):
-                        f.write("\n")
-                if robocopy_result.stderr:
-                    f.write("\nRobocopy Stderr\n")
-                    f.write("-" * 60 + "\n")
-                    f.write(robocopy_result.stderr)
-                    if not robocopy_result.stderr.endswith("\n"):
-                        f.write("\n")
-
-            return log_path
+            details = dict(details)
+            details.setdefault(
+                'backup_mode',
+                'staged/packed' if packer_metadata is not None else 'direct')
+            return append_backup_summary_row(
+                self.log_dir or BACKUP_LOG_DIR, details, robocopy_result)
         except Exception as e:
-            print(f"[LOG] Warning: could not write backup log: {e}")
+            print(f"[REPORT] Warning: could not update CSV summary: {e}")
             return None
 
     def _legacy_eject_tape_unlocked(self, tape_drive):
@@ -273,7 +87,7 @@ class LTOBackup:
     def run(self, source, tape_drive, tape_label, packer_metadata=None,
             exclude_file_paths=None, exclude_dir_paths=None,
             local_session_id=None, local_chunk_index=None, stage_stats=None,
-            tape_parent_dir=None):
+            tape_parent_dir=None, source_host='local'):
         print(f"[WARNING] {LTFS_WRITE_WARNING}")
         _acquire_tape_io_lock(f"backup write to {tape_drive}")
         try:
@@ -286,6 +100,7 @@ class LTOBackup:
                 local_chunk_index=local_chunk_index,
                 stage_stats=stage_stats,
                 tape_parent_dir=tape_parent_dir,
+                source_host=source_host,
             )
         finally:
             _release_tape_io_lock()
@@ -293,15 +108,15 @@ class LTOBackup:
     def _run_locked(self, source, tape_drive, tape_label, packer_metadata=None,
                     exclude_file_paths=None, exclude_dir_paths=None,
                     local_session_id=None, local_chunk_index=None,
-                    stage_stats=None, tape_parent_dir=None):
+                    stage_stats=None, tape_parent_dir=None,
+                    source_host='local'):
         """
         Copy files from source to tape and commit to the database.
 
         packer_metadata:
             list of dicts  — staged backup with full metadata (from LTOPacker).
-                             Hashes already computed; live hashing is skipped.
             []             — staged backup, existing staging, no per-file metadata.
-            None           — direct backup from source directory (files not hashed).
+            None           — direct backup from source directory.
         """
         print(f"\n[BACKUP] Starting... Tape: {tape_label} | Drive: {tape_drive}")
         if not _ensure_lto_drive_ready(tape_drive, prefix="[BACKUP]"):
@@ -334,23 +149,19 @@ class LTOBackup:
         record_counts = defaultdict(int)
 
         # ---------------------------------------------------------------
-        # Phase 1 — Build hash_map *before* any tape I/O.
-        #   AUTO-PILOT : consume pre-computed hashes from packer_metadata
-        #                (packed small files only; loose large files unhashed).
-        #   DIRECT     : walk source_dir and stage every new/changed file
-        #                (no hashing) while the tape stays idle.
+        # Phase 1 — Build loose-file map before any tape I/O.
+        #   AUTO-PILOT : consume metadata from packer_metadata.
+        #   DIRECT     : walk source_dir and stage every new/changed file.
         # ---------------------------------------------------------------
-        # hash_map: rel_path -> {'hash', 'fsize', 'src', 'dst'}
-        hash_map = {}
+        loose_map = {}
         skipped  = 0
         skipped_existing = []
         recovered_direct_existing = []
 
         if packer_metadata is not None:
             # AUTO-PILOT path (metadata list, possibly empty).
-            # Loose large files: pull hashes from packer_metadata.
-            # Already-on-tape (same size) files: count as skipped, omit from hash_map.
-            print("[BACKUP] Pre-hashed metadata loaded — no live hashing.")
+            # Already-on-tape (same size) files: count as skipped, omit from loose_map.
+            print("[BACKUP] Staged metadata loaded.")
             for m in packer_metadata:
                 if m['is_packed']:
                     continue  # bundle ZIPs handled via packer_metadata directly
@@ -365,16 +176,15 @@ class LTOBackup:
                             continue
                     except OSError:
                         pass
-                hash_map[rel_path] = {
-                    'hash':  m.get('file_hash', ''),
+                loose_map[rel_path] = {
                     'fsize': m['file_size_bytes'],
                     'src':   src,
                     'dst':   dst,
                 }
         else:
-            # DIRECT path — files are written loose to tape and not hashed;
-            # skipping the extra full-file read keeps the tape from waiting.
-            print("[BACKUP] Walking source files (no hashing)...")
+            # DIRECT path — files are written loose to tape; skipping an extra
+            # full-file read keeps the tape from waiting.
+            print("[BACKUP] Walking source files...")
             for root, _, files in os.walk(source):
                 rel_folder  = os.path.relpath(root, source)
                 dest_folder = os.path.join(tape_root, rel_folder)
@@ -390,12 +200,12 @@ class LTOBackup:
                                     src, tape_label,
                                     local_session_id=local_session_id,
                                     local_chunk_index=local_chunk_index,
+                                    source_host=source_host,
                                 ):
                                     recovered_direct_existing.append({
                                         'file_name': file,
                                         'original_path': src,
                                         'file_size_bytes': os.path.getsize(src),
-                                        'file_hash': '',
                                         'stored_path': dst,
                                     })
                                 continue
@@ -403,14 +213,14 @@ class LTOBackup:
                             pass
                     try:
                         fsize = os.path.getsize(src)
-                        hash_map[rel_path] = {'hash': '', 'fsize': fsize,
+                        loose_map[rel_path] = {'fsize': fsize,
                                               'src': src, 'dst': dst}
                     except Exception as e:
                         _progress_done()
                         print(f"\n[WARN] Cannot stat {file}: {e}")
 
         if packer_metadata is not None:
-            # Bundle ZIPs aren't in hash_map; walk staging to size the progress bar.
+            # Bundle ZIPs aren't in loose_map; walk staging to size the progress bar.
             total_bytes = 0
             for r, _, fs in os.walk(source):
                 for f in fs:
@@ -419,10 +229,10 @@ class LTOBackup:
                     except OSError:
                         pass
         else:
-            total_bytes = sum(v['fsize'] for v in hash_map.values())
+            total_bytes = sum(v['fsize'] for v in loose_map.values())
 
         _progress_done()
-        print(f"[BACKUP] {len(hash_map)} loose file(s) staged "
+        print(f"[BACKUP] {len(loose_map)} loose file(s) staged "
               f"({total_bytes / 1024**3:.2f} GB to copy) | {skipped} already on tape.")
 
         # ---------------------------------------------------------------
@@ -517,6 +327,7 @@ class LTOBackup:
                     'started_at': started_at,
                     'finished_at': datetime.now(),
                     'source': source,
+                    'source_host': source_host,
                     'tape_drive': tape_drive,
                     'tape_label': tape_label,
                     'tape_root': tape_root,
@@ -533,7 +344,7 @@ class LTOBackup:
                         (stage_stats or {}).get('source_missing_files', []),
                 },
                 packer_metadata,
-                hash_map,
+                loose_map,
                 recovered_direct_existing,
                 skipped_existing,
                 robocopy_cmd,
@@ -545,16 +356,16 @@ class LTOBackup:
                 "No file records were committed to the database."
             )
             if log_path:
-                msg += f" Log: {log_path}"
+                msg += f" CSV summary: {log_path}"
             print(f"[ERROR] {msg}")
             raise RuntimeError(msg)
 
         # ---------------------------------------------------------------
-        # Phase 3 — DB inserts (only files that were hashed / new this run)
+        # Phase 3 — DB inserts (new/recovered files from this run)
         # ---------------------------------------------------------------
         db_sync_start = time.perf_counter()
 
-        def catalog_record(file_name, original_path, file_size_bytes, file_hash,
+        def catalog_record(file_name, original_path, file_size_bytes,
                            is_packed, container_name, stored_path,
                            canonical_source_path=None):
             return {
@@ -562,8 +373,8 @@ class LTOBackup:
                 'original_path': canonical_source_path or original_path,
                 'canonical_source_path': canonical_source_path,
                 'file_size_bytes': file_size_bytes,
-                'file_hash': file_hash,
                 'tape_label': tape_label,
+                'source_host': source_host,
                 'is_packed': is_packed,
                 'container_name': container_name,
                 'stored_path': stored_path,
@@ -575,7 +386,7 @@ class LTOBackup:
             recovered_stats = self.db.bulk_upsert_files(
                 (catalog_record(
                     info['file_name'], info['original_path'],
-                    info['file_size_bytes'], info['file_hash'], False, None,
+                    info['file_size_bytes'], False, None,
                     info['stored_path'])
                  for info in recovered_direct_existing),
             )
@@ -587,8 +398,8 @@ class LTOBackup:
             loose_stats = self.db.bulk_upsert_files(
                 (catalog_record(
                     os.path.basename(info['src']), info['src'], info['fsize'],
-                    info['hash'], False, None, info['dst'])
-                 for info in hash_map.values()),
+                    False, None, info['dst'])
+                 for info in loose_map.values()),
             )
             record_counts['loose_records_inserted'] += loose_stats['inserted']
             record_counts['loose_records_updated'] += loose_stats['updated']
@@ -599,7 +410,7 @@ class LTOBackup:
             recovered_stats = self.db.bulk_upsert_files(
                 (catalog_record(
                     m['file_name'], m['original_path'], m['file_size_bytes'],
-                    m.get('file_hash', ''), False, None, dst,
+                    False, None, dst,
                     m.get('canonical_source_path'))
                  for _, m, dst in skipped_existing),
                 update_existing=False,
@@ -609,15 +420,15 @@ class LTOBackup:
             record_counts['loose_records_skipped_existing'] += recovered_stats['skipped']
 
             def loose_staged_records():
-                for rel_path, info in hash_map.items():
+                for rel_path, info in loose_map.items():
                     file = os.path.basename(info['src'])
                     if file.startswith("Bundle_") and file.endswith(".zip"):
                         continue
                     m = meta_by_rel.get(rel_path)
                     if m:
                         yield catalog_record(
-                            file, m['original_path'], info['fsize'], info['hash'],
-                            False, None, info['dst'],
+                            file, m['original_path'], info['fsize'], False,
+                            None, info['dst'],
                             m.get('canonical_source_path'))
 
             loose_stats = self.db.bulk_upsert_files(
@@ -629,8 +440,7 @@ class LTOBackup:
             packed_stats = self.db.bulk_upsert_files(
                 (catalog_record(
                     m['file_name'], m['original_path'], m['file_size_bytes'],
-                    m.get('file_hash', ''), True,
-                    os.path.join(tape_root, m['container_name']),
+                    True, os.path.join(tape_root, m['container_name']),
                     m['stored_path'], m.get('canonical_source_path'))
                  for m in packer_metadata if m['is_packed']),
                 update_existing=False,
@@ -669,6 +479,7 @@ class LTOBackup:
                 'started_at': started_at,
                 'finished_at': finished_at,
                 'source': source,
+                'source_host': source_host,
                 'tape_drive': tape_drive,
                 'tape_label': tape_label,
                 'tape_root': tape_root,
@@ -690,18 +501,12 @@ class LTOBackup:
                     (stage_stats or {}).get('source_missing_files', []),
             },
             packer_metadata,
-            hash_map,
+            loose_map,
             recovered_direct_existing,
             skipped_existing,
             robocopy_cmd,
             rc,
         )
-        try:
-            summary_path = generate_backup_summary(self.log_dir or BACKUP_LOG_DIR)
-            if summary_path:
-                print(f"[REPORT] Backup summary updated: {summary_path}")
-        except Exception as e:
-            print(f"[REPORT] Could not update backup summary: {e}")
         print("\n" + "=" * 60)
         print("BACKUP SESSION SUMMARY  [Robocopy]")
         print("=" * 60)
@@ -717,7 +522,7 @@ class LTOBackup:
         if rc_sum['elapsed']:
             print(f"Robocopy Time   : {rc_sum['elapsed']}")
         if log_path:
-            print(f"Backup Log      : {log_path}")
+            print(f"CSV Summary     : {log_path}")
         print("-" * 60)
 
         self.eject_tape(tape_drive)

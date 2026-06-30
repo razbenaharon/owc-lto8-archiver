@@ -6,6 +6,7 @@ import unittest
 from src.db import DatabaseManager, _apply_canonical_remote_paths
 from src.maintenance import (
     DatabaseOptimizer,
+    HashlessOriginOptimizer,
     _staging_relative,
     _staging_session_id,
 )
@@ -141,16 +142,17 @@ class OptimizerTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM remote_file_state WHERE status='source_missing'"
             ).fetchone()[0], 3)
             self.assertEqual(conn.execute(
-                'SELECT COUNT(*) FROM files_index WHERE file_hash_blob IS NOT NULL'
-            ).fetchone()[0], 3)
+                "SELECT COUNT(*) FROM files_index WHERE source_host='so02'"
+            ).fetchone()[0], 4)
             conn.close()
 
-            # The normal API must hydrate normalized hashes, names and dates.
+            # The normal API must hydrate normalized names, dates, and origins.
             db = DatabaseManager(path)
             try:
                 row = db.search_catalog(tape_label='Tape_01', limit=1)[0]
-                self.assertEqual(row['file_hash'], 'ab' * 32)
+                self.assertNotIn('file_hash', row)
                 self.assertEqual(row['file_name'], 'a.dat')
+                self.assertEqual(row['source_host'], 'so02')
                 self.assertTrue(row['backup_date'].startswith('2026-01-02'))
             finally:
                 db.close()
@@ -193,11 +195,13 @@ class SchemaV2RuntimeTests(unittest.TestCase):
             try:
                 db.register_tape('T1', 100)
                 self.assertTrue(db.insert_file(
-                    'file.dat', '/source/file.dat', 10, 'cd' * 32,
-                    'T1', True, r'E:\pack\Bundle.zip', 'file.dat'))
+                    'file.dat', '/source/file.dat', 10,
+                    'T1', True, r'E:\pack\Bundle.zip', 'file.dat',
+                    source_host='so01.example.edu'))
                 row = db.search_catalog(tape_label='T1')[0]
                 self.assertEqual(row['original_path'], '/source/file.dat')
-                self.assertEqual(row['file_hash'], 'cd' * 32)
+                self.assertNotIn('file_hash', row)
+                self.assertEqual(row['source_host'], 'so01')
                 self.assertIsNotNone(row['backup_date'])
                 self.assertEqual(db.conn.execute(
                     'SELECT COUNT(*) FROM archive_runs').fetchone()[0], 1)
@@ -240,7 +244,6 @@ class SchemaV2RuntimeTests(unittest.TestCase):
                         'file_name': 'orphan.dat',
                         'original_path': '/source/orphan.dat',
                         'file_size_bytes': 1,
-                        'file_hash': '',
                         'tape_label': 'MISSING',
                         'is_packed': False,
                         'container_name': None,
@@ -270,7 +273,7 @@ class SchemaV2RuntimeTests(unittest.TestCase):
             try:
                 db.register_tape('T1', 100)
                 db.insert_file(
-                    'catalog.dat', '/source/catalog.dat', 99, 'ef' * 32,
+                    'catalog.dat', '/source/catalog.dat', 99,
                     'T1', False, None, r'E:\catalog.dat')
 
                 kept = db.create_remote_session(
@@ -314,6 +317,28 @@ class SchemaV2RuntimeTests(unittest.TestCase):
                                  [tuple(r) for r in after_catalog])
             finally:
                 db.close()
+
+
+class HashlessOriginMigrationTests(unittest.TestCase):
+    def test_hashless_origin_migration_drops_hash_columns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'archive.db')
+            OptimizerTests._legacy_database(self, path)
+            result = HashlessOriginOptimizer(
+                path, progress=lambda _msg: None).run()
+            self.assertEqual(result['validation']['quick_check'], 'ok')
+            conn = sqlite3.connect(path)
+            try:
+                columns = {row[1] for row in conn.execute(
+                    'PRAGMA table_info(files_index)')}
+                self.assertNotIn('file_hash', columns)
+                self.assertNotIn('file_hash_blob', columns)
+                self.assertIn('source_host', columns)
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM files_index WHERE source_host='so02'"
+                ).fetchone()[0], 4)
+            finally:
+                conn.close()
 
 
 if __name__ == '__main__':
