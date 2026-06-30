@@ -1,216 +1,213 @@
-"""Backup-log parsing and SUMMARY.md generation."""
-import os
-import re
-import sys
-import time
-import queue
-import signal
-import shutil
-import hashlib
-import zipfile
-import sqlite3
-import threading
-import configparser
-import subprocess
-import tempfile
-import shlex
-import posixpath
-import atexit
-from datetime import datetime
-from collections import defaultdict
+"""Unified CSV statistics reporting.
 
-try:
-    import psutil
-except ImportError:  # optional dependency — priority/affinity degrade gracefully
-    psutil = None
+All system statistics — backup/tape-write sessions and database-maintenance
+runs — are appended to a single ``SUMMARY.csv`` in the backup-log directory.
+No per-run log files and no per-file manifests are written, so the CSV never
+contains individual file names: only run-level aggregate statistics.
+"""
+import csv
+import os
+from datetime import datetime
 
 from .constants import BACKUP_LOG_DIR
-from .paths import _safe_log_token, _unique_path
+
+
+SUMMARY_CSV = 'SUMMARY.csv'
+
+SUMMARY_COLUMNS = [
+    'record_type',          # 'backup' or 'maintenance'
+    'operation',            # 'backup', 'db_optimization', 'db_hashless', ...
+    'status',
+    'source_host',
+    'source_path',
+    'tape_label',
+    'backup_mode',
+    'local_session_id',
+    'local_chunk_index',
+    'started_at',
+    'finished_at',
+    'total_time_seconds',
+    'robocopy_elapsed',
+    'fetch_seconds',
+    'pack_seconds',
+    'db_sync_seconds',
+    'copied_bytes',
+    'planned_bytes',
+    'fetch_bytes',
+    'pack_bytes',
+    'files_copied',
+    'files_skipped',
+    'files_failed',
+    'already_on_tape',
+    'source_missing_files',
+    'records_inserted',
+    'records_updated',
+    'records_skipped',
+    'tape_used_after_bytes',
+    'robocopy_exit_code',
+    'robocopy_speed_mbs',
+    'before_bytes',         # maintenance: db size before the run
+    'after_bytes',          # maintenance: db size after the run
+    'reduction_pct',        # maintenance: size reduction percentage
+]
+
+
+def _iso(value):
+    if hasattr(value, 'isoformat'):
+        return value.isoformat(timespec='seconds')
+    return value or ''
+
+
+def _seconds(value):
+    if value is None:
+        return ''
+    try:
+        return f"{float(value):.3f}"
+    except (TypeError, ValueError):
+        return ''
+
+
+def _blank_row():
+    return {column: '' for column in SUMMARY_COLUMNS}
+
+
+def _append_row(log_dir, row):
+    """Write a single fully-keyed row to SUMMARY.csv, creating it if needed."""
+    log_dir = os.path.abspath(log_dir or BACKUP_LOG_DIR)
+    os.makedirs(log_dir, exist_ok=True)
+    path = os.path.join(log_dir, SUMMARY_CSV)
+    write_header = not os.path.exists(path) or os.path.getsize(path) == 0
+    with open(path, 'a', encoding='utf-8', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=SUMMARY_COLUMNS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+    return path
+
+
+def append_backup_summary_row(log_dir=None, details=None, robocopy_result=None):
+    """Append one compact backup/chunk/session row to SUMMARY.csv."""
+    details = details or {}
+    rc_sum = details.get('rc_sum') or {}
+    counts = details.get('record_counts') or {}
+
+    inserted = sum(
+        int(value or 0) for key, value in counts.items()
+        if key.endswith('_inserted'))
+    updated = sum(
+        int(value or 0) for key, value in counts.items()
+        if key.endswith('_updated'))
+    skipped = sum(
+        int(value or 0) for key, value in counts.items()
+        if key.endswith('_skipped') or key.endswith('_skipped_existing'))
+
+    row = _blank_row()
+    row.update({
+        'record_type': 'backup',
+        'operation': 'backup',
+        'status': details.get('status', ''),
+        'source_host': details.get('source_host', ''),
+        'source_path': details.get('source', ''),
+        'tape_label': details.get('tape_label', ''),
+        'backup_mode': details.get('backup_mode', ''),
+        'local_session_id': details.get('local_session_id', ''),
+        'local_chunk_index': details.get('local_chunk_index', ''),
+        'started_at': _iso(details.get('started_at')),
+        'finished_at': _iso(details.get('finished_at') or datetime.now()),
+        'total_time_seconds': _seconds(details.get('total_time_seconds')),
+        'robocopy_elapsed': rc_sum.get('elapsed', ''),
+        'fetch_seconds': _seconds(details.get('fetch_seconds')),
+        'pack_seconds': _seconds(details.get('pack_seconds')),
+        'db_sync_seconds': _seconds(details.get('db_sync_seconds')),
+        'copied_bytes': details.get('copied_bytes', 0),
+        'planned_bytes': details.get('total_bytes', 0),
+        'fetch_bytes': details.get('fetch_bytes', ''),
+        'pack_bytes': details.get('pack_bytes', ''),
+        'files_copied': rc_sum.get('files_copied', 0),
+        'files_skipped': int(rc_sum.get('files_skipped', 0) or 0) +
+                         int(details.get('skipped', 0) or 0),
+        'files_failed': rc_sum.get('files_failed', 0),
+        'already_on_tape': details.get('skipped', 0),
+        'source_missing_files': len(details.get('source_missing_files') or []),
+        'records_inserted': inserted,
+        'records_updated': updated,
+        'records_skipped': skipped,
+        'tape_used_after_bytes': details.get('new_used', ''),
+        'robocopy_exit_code': (
+            '' if robocopy_result is None else robocopy_result.returncode),
+        'robocopy_speed_mbs': rc_sum.get('speed_mbs', ''),
+    })
+    return _append_row(log_dir, row)
+
+
+def append_maintenance_summary_row(log_dir=None, operation='', stats=None):
+    """Append one database-maintenance statistics row to SUMMARY.csv.
+
+    ``stats`` is the optimizer's result dict (``started_at``, ``phases``,
+    ``before_bytes``, ``after_bytes``, optional ``reduction_pct``).
+    """
+    stats = stats or {}
+    phases = stats.get('phases') or {}
+    try:
+        duration = sum(float(value) for value in phases.values())
+    except (TypeError, ValueError):
+        duration = None
+
+    before = stats.get('before_bytes')
+    after = stats.get('after_bytes')
+    reduction = stats.get('reduction_pct')
+    if reduction is None and before and after:
+        try:
+            reduction = round((1 - float(after) / float(before)) * 100, 2)
+        except (TypeError, ValueError, ZeroDivisionError):
+            reduction = ''
+
+    row = _blank_row()
+    row.update({
+        'record_type': 'maintenance',
+        'operation': operation,
+        'status': stats.get('status', 'completed'),
+        'started_at': _iso(stats.get('started_at')),
+        'finished_at': _iso(stats.get('finished_at') or datetime.now()),
+        'total_time_seconds': _seconds(duration),
+        'before_bytes': '' if before is None else before,
+        'after_bytes': '' if after is None else after,
+        'reduction_pct': '' if reduction is None else reduction,
+    })
+    return _append_row(log_dir, row)
 
 
 def _write_source_missing_only_log(log_dir, session_id, chunk_index,
-                                   tape_label, missing_files):
-    """Write an audit log for a chunk with no remaining source files."""
-    try:
-        log_dir = os.path.abspath(log_dir or BACKUP_LOG_DIR)
-        os.makedirs(log_dir, exist_ok=True)
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        tape_token = _safe_log_token(tape_label, 'tape')
-        name = (f"{timestamp}_{tape_token}_pack_{chunk_index:03d}"
-                "_source_missing.log")
-        log_path = _unique_path(os.path.join(log_dir, name))
-
-        def cell(value):
-            text = '' if value is None else str(value)
-            return text.replace('\t', ' ').replace('\r', ' ').replace('\n', ' ')
-
-        with open(log_path, 'w', encoding='utf-8', newline='\n') as f:
-            f.write("Remote Source-Missing Log\n")
-            f.write("=" * 60 + "\n")
-            f.write(f"Session id                  : {session_id}\n")
-            f.write(f"Chunk                       : {chunk_index + 1}\n")
-            f.write(f"Tape label                  : {tape_label}\n")
-            f.write("Status                      : completed_without_tape_write\n")
-            f.write(f"Source-missing files skipped: {len(missing_files)}\n")
-            f.write("\nSource-Missing Files Skipped\n")
-            f.write("-" * 60 + "\n")
-            f.write("manifest_id\tremote_path\tsize\n")
-            for item in missing_files:
-                f.write('\t'.join(cell(value) for value in (
-                    item.get('manifest_id'),
-                    item.get('remote_path'),
-                    item.get('file_size_bytes'),
-                )) + "\n")
-        return log_path
-    except Exception as e:
-        print(f"[LOG] Warning: could not write source-missing log: {e}")
-        return None
-
-
-def _parse_backup_log(path):
-    """Parse a per-pack backup .log into a flat {key: value} dict.
-
-    Reads only the header + Summary + Database Records sections and stops at the
-    File Manifest table (large, and every row contains colons). Returns None if
-    the file is not a recognizable backup log. Keys use the labels written by
-    LTOBackup._write_backup_log (e.g. 'Total time', 'Data copied')."""
-    fields = {}
-    try:
-        with open(path, 'r', encoding='utf-8', errors='replace') as f:
-            for line in f:
-                if line.startswith('File Manifest'):
-                    break
-                key, sep, val = line.partition(':')
-                if not sep:
-                    continue
-                key = key.strip()
-                if key and key not in fields:
-                    fields[key] = val.strip()
-    except OSError:
-        return None
-    return fields if 'Total time' in fields else None
-
-
-def _summarize_log(name, fields):
-    """Build one cross-pack summary-table row from parsed log fields."""
-    def num(text):
-        m = re.search(r'[-+]?\d*\.?\d+', text or '')
-        return float(m.group()) if m else None
-
-    def bytes_of(text):
-        m = re.search(r'\((\d+)\s*bytes\)', text or '')
-        return int(m.group(1)) if m else None
-
-    total_min  = num(fields.get('Total time'))                 # "387.3 minutes"
-    data_label = (fields.get('Data copied') or '').split('(')[0].strip()
-    data_bytes = bytes_of(fields.get('Data copied'))
-    avg_speed  = fields.get('Average speed') or ''             # "220.4 MB/s"
-    robo       = (fields.get('Robocopy time') or '').strip()
-
-    window, sort_time = '', name
-    try:
-        ds = datetime.fromisoformat(fields['Started'])
-        de = datetime.fromisoformat(fields['Finished'])
-        window = f"{ds.strftime('%b %d %H:%M')} → {de.strftime('%b %d %H:%M')}"
-        sort_time = de.isoformat()
-    except (KeyError, ValueError):
-        pass
-
-    total_txt = f"{total_min:.1f} min ({total_min / 60:.1f} h)" if total_min else ''
-
-    robo_short = robo[2:] if robo.startswith('0:') else robo
-    tape_txt = avg_speed + (f" ({robo_short})" if robo_short else '')
-
-    e2e_txt = ''
-    if data_bytes and total_min:
-        e2e_txt = f"~{(data_bytes / 1024**3) / (total_min / 60):.1f} GiB/h"
-
-    rec = fields.get('Packed Records Inserted')
-    if rec is None:
-        total = sum(int(v) for k, v in fields.items()
-                    if k.endswith('Inserted') and v.strip().isdigit())
-        rec = str(total) if total else ''
-    try:
-        records_txt = f"{int(str(rec).strip()):,}" if str(rec).strip() else ''
-    except ValueError:
-        records_txt = str(rec)
-
-    m = re.search(r'pack[_-]?(\d+)', name, re.IGNORECASE)
-    if m:
-        pack, sort_pack = m.group(1), (0, int(m.group(1)))
-    else:
-        pack, sort_pack = os.path.splitext(name)[0], (1, 0)
-
-    return {
-        'pack': pack, 'window': window, 'total': total_txt, 'data': data_label,
-        'tape': tape_txt, 'e2e': e2e_txt, 'records': records_txt,
-        'fetch': fields.get('Fetch speed (remote->PC)') or '',
-        'dbsync': fields.get('DB sync time') or '',
-        'sort_pack': sort_pack, 'sort_time': sort_time,
+                                   tape_label, missing_files,
+                                   source_host='', source_path=''):
+    details = {
+        'status': 'completed_without_tape_write',
+        'source_host': source_host,
+        'source': source_path,
+        'tape_label': tape_label,
+        'backup_mode': 'source-missing-only',
+        'local_session_id': session_id,
+        'local_chunk_index': chunk_index,
+        'started_at': datetime.now(),
+        'finished_at': datetime.now(),
+        'total_time_seconds': 0,
+        'total_bytes': 0,
+        'copied_bytes': 0,
+        'skipped': 0,
+        'new_used': '',
+        'source_missing_files': missing_files or [],
+        'record_counts': {},
+        'rc_sum': {},
     }
+    return append_backup_summary_row(log_dir, details, None)
 
 
-def generate_backup_summary(log_dir=None, output_name='SUMMARY.md'):
-    """(Re)write a Markdown table summarizing every per-pack log in log_dir.
-
-    Returns the output path, or None if no logs could be summarized. Never
-    raises on a single malformed log — it is skipped."""
+def generate_backup_summary(log_dir=None, output_name=SUMMARY_CSV):
+    """Ensure the aggregate CSV exists and return its path."""
     log_dir = os.path.abspath(log_dir or BACKUP_LOG_DIR)
-    try:
-        names = [n for n in os.listdir(log_dir) if n.lower().endswith('.log')]
-    except OSError:
-        return None
-
-    rows = []
-    for name in names:
-        fields = _parse_backup_log(os.path.join(log_dir, name))
-        if not fields:
-            continue
-        try:
-            rows.append(_summarize_log(name, fields))
-        except Exception:
-            continue
-    if not rows:
-        return None
-
-    rows.sort(key=lambda r: (r['sort_pack'], r['sort_time']))
-    have_fetch  = any(r['fetch'] for r in rows)
-    have_dbsync = any(r['dbsync'] for r in rows)
-
-    headers = ['Pack', 'Window', 'Total job time', 'Data copied',
-               'Tape-write speed¹', 'End-to-end speed²', 'Records']
-    if have_fetch:
-        headers.append('Fetch speed³')
-    if have_dbsync:
-        headers.append('DB sync')
-
-    out = ['# LTO Backup Summary', '',
-           f'_Generated {datetime.now().strftime("%Y-%m-%d %H:%M")} from '
-           f'{len(rows)} log(s) in `{log_dir}`._', '',
-           '| ' + ' | '.join(headers) + ' |',
-           '|' + '|'.join('---' for _ in headers) + '|']
-    for r in rows:
-        cells = [r['pack'], r['window'], r['total'], r['data'],
-                 r['tape'], r['e2e'], r['records']]
-        if have_fetch:
-            cells.append(r['fetch'])
-        if have_dbsync:
-            cells.append(r['dbsync'])
-        out.append('| ' + ' | '.join(cells) + ' |')
-    out += ['',
-            '¹ Tape-write speed = data ÷ robocopy time (raw LTO write); '
-            'value in parens is robocopy duration.',
-            '² End-to-end speed = data ÷ total job time (covers fetch, '
-            'pack, DB sync, and tape write).']
-    if have_fetch:
-        out.append('³ Fetch speed = remote→PC throughput over SSH '
-                   '("internet speed").')
-    out.append('')
-
-    out_path = os.path.join(log_dir, output_name)
-    try:
-        with open(out_path, 'w', encoding='utf-8', newline='\n') as f:
-            f.write('\n'.join(out))
-    except OSError:
-        return None
-    return out_path
+    os.makedirs(log_dir, exist_ok=True)
+    path = os.path.join(log_dir, output_name)
+    if not os.path.exists(path):
+        with open(path, 'w', encoding='utf-8', newline='') as handle:
+            csv.DictWriter(handle, fieldnames=SUMMARY_COLUMNS).writeheader()
+    return path

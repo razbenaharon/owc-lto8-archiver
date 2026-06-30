@@ -98,6 +98,8 @@ def ensure_catalog_schema(conn):
             ON files_index(directory_id, file_size_bytes, catalog_name, file_id);
         CREATE INDEX IF NOT EXISTS idx_files_directory_date
             ON files_index(directory_id, catalog_backup_date, catalog_name, file_id);
+        CREATE INDEX IF NOT EXISTS idx_files_source_host
+            ON files_index(source_host, tape_label, original_path);
     """)
     _ensure_fts(conn)
     _ensure_fts_triggers(conn)

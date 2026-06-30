@@ -1,21 +1,11 @@
 """Local and remote archive orchestrators."""
 import os
-import re
-import sys
 import time
 import queue
-import signal
 import shutil
-import hashlib
-import zipfile
-import sqlite3
 import threading
-import configparser
-import subprocess
-import tempfile
 import shlex
 import posixpath
-import atexit
 from datetime import datetime
 from collections import defaultdict
 
@@ -912,7 +902,7 @@ class RemoteOrchestrator:
         self._consumer_chunk = None
         last_chunk = pending_chunks[-1]
 
-        # Pin hashing/packing (this process) to the fetch cores so the tape
+        # Pin fetch/packing (this process) to the fetch cores so the tape
         # writer's cores stay free of SSH decryption + Python packing.
         if self.fetch_cores:
             pin_current_process(self.fetch_cores, label='fetch/pack')
@@ -1208,12 +1198,14 @@ class RemoteOrchestrator:
                 chunk_index,
                 tape_label,
                 desc.get('source_missing_files') or [],
+                source_host=self.remote_host.split('.', 1)[0],
+                source_path=self.remote_session_path,
             )
             self.db.update_chunk_status(session_id, chunk_index, 'done')
             self._cleanup_dir(desc['fetch_dir'])
             self._cleanup_dir(pack_dir)
             if log_path:
-                print(f"[REMOTE] Source-missing log: {log_path}")
+                print(f"[REMOTE] Source-missing CSV summary: {log_path}")
             if eject_after:
                 LTOBackup(
                     self.db,
@@ -1235,6 +1227,7 @@ class RemoteOrchestrator:
                 tape_label=tape_label,
                 packer_metadata=desc['metadata'],
                 stage_stats=desc,
+                source_host=self.remote_host.split('.', 1)[0],
             )
         except Exception as e:
             if CANCEL.is_set():

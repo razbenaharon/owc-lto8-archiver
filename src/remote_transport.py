@@ -1,23 +1,11 @@
 """SSH/SCP/tar transport over OpenSSH."""
 import os
-import re
-import sys
-import time
-import queue
-import signal
 import shutil
-import hashlib
-import zipfile
-import sqlite3
 import threading
-import configparser
 import subprocess
 import tempfile
 import shlex
-import posixpath
 import atexit
-from datetime import datetime
-from collections import defaultdict
 
 try:
     import psutil
@@ -47,14 +35,17 @@ def _cleanup_askpass_helpers():
 
 def _openssh_askpass_env(password):
     """Build an environment that lets OpenSSH read a configured password."""
-    helper_path = os.path.join(tempfile.gettempdir(), 'lto_ssh_askpass.cmd')
     helper_body = (
         "@echo off\r\n"
         "powershell -NoProfile -ExecutionPolicy Bypass "
         "-Command \"[Console]::Out.Write($env:LTO_REMOTE_PASSWORD)\"\r\n"
     )
     try:
-        with open(helper_path, 'w', encoding='utf-8', newline='') as f:
+        with tempfile.NamedTemporaryFile(
+                'w', encoding='utf-8', newline='',
+                prefix='lto_ssh_askpass_', suffix='.cmd',
+                delete=False) as f:
+            helper_path = f.name
             f.write(helper_body)
     except OSError as e:
         raise RuntimeError(f"Could not create SSH askpass helper: {e}") from e

@@ -1,23 +1,9 @@
 """Status output, cancellation, subprocess registry, CPU tuning."""
 import os
-import re
 import sys
 import time
-import queue
 import signal
-import shutil
-import hashlib
-import zipfile
-import sqlite3
 import threading
-import configparser
-import subprocess
-import tempfile
-import shlex
-import posixpath
-import atexit
-from datetime import datetime
-from collections import defaultdict
 
 try:
     import psutil
@@ -352,7 +338,7 @@ def compute_affinity_sets(spec):
 
 
 def pin_current_process(cores, label='main'):
-    """Pin the current (Python) process to a core set — hashing/packing run here."""
+    """Pin the current (Python) process to a core set for fetch/packing work."""
     if psutil is None or not cores:
         return
     try:

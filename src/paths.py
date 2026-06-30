@@ -1,31 +1,13 @@
-"""Path cleaning, sanitization, hashing and long-path helpers."""
+"""Path cleaning, sanitization and long-path helpers."""
 import os
 import re
-import sys
 import time
-import queue
-import signal
-import shutil
-import hashlib
-import zipfile
-import sqlite3
-import threading
-import configparser
-import subprocess
-import tempfile
-import shlex
 import posixpath
-import atexit
-from datetime import datetime
-from collections import defaultdict
 
 try:
     import psutil
 except ImportError:  # optional dependency — priority/affinity degrade gracefully
     psutil = None
-
-from .constants import BUFFER_SIZE
-
 
 def _safe_log_token(value, default='item'):
     text = str(value or '').strip()
@@ -78,37 +60,6 @@ def _config_list(value):
             if part:
                 items.append(part)
     return items
-
-
-def _hash_file(path):
-    """Compute SHA-256 hash of a file, reading in chunks."""
-    hasher = hashlib.sha256()
-    with open(path, 'rb') as f:
-        while True:
-            buf = f.read(BUFFER_SIZE)
-            if not buf:
-                break
-            hasher.update(buf)
-    return hasher.hexdigest()
-
-
-def _verify_restored_hash(local_path, record):
-    """Verify a restored file against the stored DB hash.
-    Runs entirely on local disk after tape transfer is complete — no impact on tape speed."""
-    try:
-        stored_hash = record['file_hash']
-    except (KeyError, IndexError):
-        stored_hash = None
-    if not stored_hash:
-        print(f"[VERIFY] No stored hash for {record['file_name']} — skipping.")
-        return
-    actual_hash = _hash_file(local_path)
-    if actual_hash == stored_hash:
-        print(f"[VERIFY] OK  {record['file_name']}")
-    else:
-        print(f"[VERIFY] FAIL  {record['file_name']}")
-        print(f"         expected: {stored_hash}")
-        print(f"         got:      {actual_hash}")
 
 
 def _dir_tree_size(path):

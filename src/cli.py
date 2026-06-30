@@ -1,23 +1,5 @@
 """Main menu, archiver entry points, DB management submenu."""
 import os
-import re
-import sys
-import time
-import queue
-import signal
-import shutil
-import hashlib
-import zipfile
-import sqlite3
-import threading
-import configparser
-import subprocess
-import tempfile
-import shlex
-import posixpath
-import atexit
-from datetime import datetime
-from collections import defaultdict
 
 try:
     import psutil
@@ -257,7 +239,7 @@ def main():
         print("  5. Open config.ini")
         print("  6. Remote Archive — Fetch from remote host & backup to LTO")
         print("  7. Database Management — Edit / delete tape & file records")
-        print("  8. Backup Summary — Regenerate backup_logs/SUMMARY.md report")
+        print("  8. Backup Summary — Ensure backup_logs/SUMMARY.csv report")
         print("  0. Exit")
         print("-" * 60)
 
@@ -336,9 +318,9 @@ def main():
         elif choice == '8':
             path = generate_backup_summary(cfg.backup_log_dir)
             if path:
-                print(f"[REPORT] Backup summary written: {path}")
+                print(f"[REPORT] Backup summary CSV: {path}")
             else:
-                print("[REPORT] No backup logs found to summarize.")
+                print("[REPORT] Could not create backup summary CSV.")
 
         elif choice == '0':
             print("Goodbye.")

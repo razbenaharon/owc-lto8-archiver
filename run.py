@@ -21,6 +21,7 @@ def _run_maintenance():
     from src.maintenance import (
         CatalogV3Optimizer,
         DatabaseOptimizer,
+        HashlessOriginOptimizer,
         inspect_catalog_database,
         inspect_legacy_database,
     )
@@ -33,6 +34,9 @@ def _run_maintenance():
     if '--catalog-v3-migrate' in sys.argv:
         CatalogV3Optimizer(cfg.db_path).run()
         return
+    if '--hashless-origin-migrate' in sys.argv:
+        HashlessOriginOptimizer(cfg.db_path).run()
+        return
     dry_run = '--dry-run' in sys.argv
     if dry_run:
         import json
@@ -44,7 +48,7 @@ if __name__ == "__main__":
     try:
         if any(arg in sys.argv for arg in (
                 '--optimize-db', '--catalog-v3-preflight',
-                '--catalog-v3-migrate')):
+                '--catalog-v3-migrate', '--hashless-origin-migrate')):
             _run_maintenance()
         else:
             main()

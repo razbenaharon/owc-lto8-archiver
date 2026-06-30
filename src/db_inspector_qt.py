@@ -24,7 +24,6 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
-    QFormLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -243,6 +242,7 @@ class FileTableModel(QAbstractTableModel):
         ("file_name", "Name"),
         ("file_size_bytes", "Size"),
         ("tape_label", "Tape"),
+        ("source_host", "Source Host"),
         ("backup_date", "Backup Date"),
         ("is_packed", "Packed"),
         ("original_path", "Original Path"),
@@ -306,7 +306,7 @@ class FileDetailDialog(QDialog):
         lines = []
         for key in (
                 "file_id", "file_name", "original_path", "file_size_bytes",
-                "file_hash", "backup_date", "tape_label", "is_packed",
+                "source_host", "backup_date", "tape_label", "is_packed",
                 "container_name", "stored_path", "local_session_id",
                 "local_chunk_index"):
             lines.append(f"{key}: {record.get(key)}")
@@ -515,6 +515,7 @@ class SearchWidget(QWidget):
         self.query = QLineEdit()
         self.query.setPlaceholderText("FTS search")
         self.tape_combo = QComboBox()
+        self.source_combo = QComboBox()
         self.search_btn = QPushButton("Search")
         self.prev_btn = QPushButton("Previous")
         self.next_btn = QPushButton("Next")
@@ -522,6 +523,7 @@ class SearchWidget(QWidget):
         self.delete_btn = QPushButton("Delete Selected")
         for widget in (
                 QLabel("Query:"), self.query, QLabel("Tape:"), self.tape_combo,
+                QLabel("Source:"), self.source_combo,
                 self.search_btn, self.prev_btn, self.next_btn,
                 self.details_btn, self.delete_btn):
             controls.addWidget(widget)
@@ -543,6 +545,7 @@ class SearchWidget(QWidget):
         self.details_btn.clicked.connect(self.show_details)
         self.delete_btn.clicked.connect(self.delete_selected)
         self.refresh_tapes()
+        self.refresh_sources()
         self._update_buttons()
 
     def refresh_tapes(self):
@@ -555,6 +558,17 @@ class SearchWidget(QWidget):
             idx = self.tape_combo.findText(current)
             if idx >= 0:
                 self.tape_combo.setCurrentIndex(idx)
+
+    def refresh_sources(self):
+        current = self.source_combo.currentText()
+        self.source_combo.clear()
+        self.source_combo.addItem("All")
+        for source_host in self.db.list_source_hosts():
+            self.source_combo.addItem(source_host)
+        if current:
+            idx = self.source_combo.findText(current)
+            if idx >= 0:
+                self.source_combo.setCurrentIndex(idx)
 
     def new_search(self):
         self.cursor_stack = [None]
@@ -574,6 +588,9 @@ class SearchWidget(QWidget):
         scope = {}
         if tape and tape != "All":
             scope["tape_label"] = tape
+        source_host = self.source_combo.currentText()
+        if source_host and source_host != "All":
+            scope["source_host"] = source_host
         self.status.setText("Searching...")
         worker = RepositoryWorker(
             self.db_path, generation,
