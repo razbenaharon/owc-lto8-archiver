@@ -24,9 +24,42 @@ try:
 except ImportError:  # optional dependency — priority/affinity degrade gracefully
     psutil = None
 
-from .constants import BUFFER_SIZE, LOCAL_TAPE_BUDGET_BYTES, ROOT_FILES_GROUP, _auto_pack_decision
+from .constants import (BUFFER_SIZE, LOCAL_STAGING_RESERVE_BYTES,
+                        LOCAL_TAPE_BUDGET_BYTES, ROOT_FILES_GROUP,
+                        _auto_pack_decision)
 from .robocopy import _robocopy_file
 from .runtime import _progress_done, _progress_line
+
+
+def _gib(value):
+    return value / 1024**3
+
+
+def _staging_write_overhead(required_bytes):
+    return max(1 * 1024**3, int(required_bytes * 0.01))
+
+
+class StagingSpaceError(RuntimeError):
+    pass
+
+
+def ensure_staging_space(staging_dir, required_bytes, context="staging"):
+    """Refuse a staging write unless the current disk free space is safe."""
+    os.makedirs(staging_dir, exist_ok=True)
+    required_bytes = max(0, int(required_bytes))
+    overhead = _staging_write_overhead(required_bytes)
+    floor = LOCAL_STAGING_RESERVE_BYTES
+    free = shutil.disk_usage(staging_dir).free
+    needed = required_bytes + overhead + floor
+    if free < needed:
+        raise StagingSpaceError(
+            f"Insufficient local staging space for {context}. "
+            f"Need {_gib(required_bytes):.2f} GiB + "
+            f"{_gib(overhead):.2f} GiB overhead + "
+            f"{_gib(floor):.0f} GiB reserve; "
+            f"current free on '{staging_dir}': {_gib(free):.2f} GiB."
+        )
+    return free
 
 
 class LTOAnalyzer:
@@ -246,6 +279,7 @@ class LTOPacker:
                 fsize_mb = fsize / (1024 * 1024)
 
                 if fsize_mb < threshold_mb:
+                    ensure_staging_space(dest, fsize, context=file)
                     zip_rel = rel.replace('\\', '/')
                     if current_zip_size + fsize > self.max_zip_size_gb * 1024**3 * 0.99:
                         zipf.close()
@@ -288,6 +322,7 @@ class LTOPacker:
                     # Large/loose files are not hashed — skipping the extra
                     # full-file read keeps the tape from waiting on Python I/O.
                     dst_path = os.path.join(dest, rel)
+                    ensure_staging_space(dest, fsize, context=file)
 
                     if not _robocopy_file(src, dst_path, display_name=file):
                         raise RuntimeError(f"robocopy failed for: {src}")
@@ -303,6 +338,13 @@ class LTOPacker:
                         'stored_path':     rel,
                     })
 
+            except StagingSpaceError:
+                _progress_done()
+                try:
+                    zipf.close()
+                except Exception:
+                    pass
+                raise
             except Exception as e:
                 _progress_done()
                 print(f"\n[ERROR] {file}: {e}")
@@ -372,6 +414,7 @@ class LTOPacker:
                     rel      = os.path.relpath(src, source)
 
                     if fsize_mb < threshold_mb:
+                        ensure_staging_space(dest, fsize, context=file)
                         zip_rel = rel.replace('\\', '/')  # ZIP entries use POSIX separators
                         # Roll over to a new ZIP bundle if current one is full
                         if current_zip_size + fsize > self.max_zip_size_gb * 1024**3 * 0.99:
@@ -415,6 +458,7 @@ class LTOPacker:
                         # Large/loose files are not hashed — skipping the extra
                         # full-file read keeps the tape from waiting on Python I/O.
                         dst_path = os.path.join(dest, rel)
+                        ensure_staging_space(dest, fsize, context=file)
 
                         if not _robocopy_file(src, dst_path, display_name=file):
                             raise RuntimeError(f"robocopy failed for: {src}")
@@ -430,6 +474,13 @@ class LTOPacker:
                             'stored_path':     rel,
                         })
 
+                except StagingSpaceError:
+                    _progress_done()
+                    try:
+                        zipf.close()
+                    except Exception:
+                        pass
+                    raise
                 except Exception as e:
                     _progress_done()
                     print(f"\n[ERROR] {file}: {e}")

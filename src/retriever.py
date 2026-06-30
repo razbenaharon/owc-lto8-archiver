@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import shlex
 import posixpath
+import ntpath
 import atexit
 from datetime import datetime
 from collections import defaultdict
@@ -39,17 +40,90 @@ class LTORetriever:
         self.staging_dir = staging_dir
         self.restore_dir = restore_dir
 
-    def _unique_dest(self, file_name):
+    @staticmethod
+    def _source_path_module(path):
+        if re.match(r'^[A-Za-z]:', path or '') or '\\' in (path or ''):
+            return ntpath
+        return posixpath
+
+    @staticmethod
+    def _path_is_under(path, base):
+        if not path or not base:
+            return False
+        mod = LTORetriever._source_path_module(path)
+        path_norm = mod.normcase(mod.normpath(path))
+        base_norm = mod.normcase(mod.normpath(base))
+        return path_norm == base_norm or path_norm.startswith(
+            base_norm.rstrip('\\/') + mod.sep)
+
+    @staticmethod
+    def _join_source_parts(parts, sep):
+        if not parts:
+            return ''
+        if parts[0].endswith(':'):
+            return parts[0] + sep + sep.join(parts[1:])
+        return sep.join(parts)
+
+    @staticmethod
+    def _infer_directory_root(dir_query, records):
+        query = (dir_query or '').strip().strip('"').rstrip('/\\')
+        if not query or not records:
+            return query
+
+        first_path = records[0].get('original_path') or ''
+        mod = LTORetriever._source_path_module(first_path or query)
+        query_norm = mod.normpath(query)
+        is_abs_query = bool(re.match(r'^[A-Za-z]:', query_norm)) or query_norm.startswith(('/', '\\'))
+        if is_abs_query and all(
+                LTORetriever._path_is_under(r.get('original_path'), query_norm)
+                for r in records):
+            return query_norm
+
+        query_leaf = query.replace('\\', '/').strip('/').split('/')[-1].lower()
+        for record in records:
+            original = record.get('original_path') or ''
+            parts = [p for p in re.split(r'[\\/]+', original) if p]
+            for i, part in enumerate(parts[:-1]):
+                if part.lower() == query_leaf:
+                    sep = '\\' if ('\\' in original or re.match(r'^[A-Za-z]:', original)) else '/'
+                    return LTORetriever._join_source_parts(parts[:i + 1], sep)
+
+        paths = [r.get('original_path') for r in records if r.get('original_path')]
+        if not paths:
+            return query_norm
+        try:
+            return mod.commonpath(paths)
+        except ValueError:
+            return mod.dirname(paths[0])
+
+    @staticmethod
+    def _safe_restore_relpath(rel_path):
+        parts = []
+        for part in re.split(r'[\\/]+', rel_path or ''):
+            if not part or part in ('.', '..') or part.endswith(':'):
+                continue
+            parts.append(part)
+        return os.path.join(*parts) if parts else ''
+
+    def _unique_dest_path(self, candidate):
         """Return a restore path under restore_dir that won't overwrite an
         existing file. Distinct source files that share a basename would
         otherwise silently clobber each other when flattened into restore_dir."""
-        base, ext = os.path.splitext(file_name)
-        candidate = os.path.join(self.restore_dir, file_name)
+        base, ext = os.path.splitext(candidate)
         counter = 1
         while os.path.exists(candidate):
-            candidate = os.path.join(self.restore_dir, f"{base}_{counter}{ext}")
+            candidate = f"{base}_{counter}{ext}"
             counter += 1
         return candidate
+
+    def _destination_for_record(self, record, restore_base=None):
+        rel_path = None
+        original = record.get('original_path')
+        if restore_base and original and self._path_is_under(original, restore_base):
+            mod = self._source_path_module(original)
+            rel_path = mod.relpath(original, restore_base)
+        safe_rel = self._safe_restore_relpath(rel_path or record['file_name'])
+        return self._unique_dest_path(os.path.join(self.restore_dir, safe_rel))
 
     def run(self):
         print("\n--- RETRIEVER: Search & Restore ---")
@@ -61,6 +135,7 @@ class LTORetriever:
         opt = input("Option (1-5): ").strip()
 
         results = []
+        restore_base = None
 
         if opt in ('1', '2', '3'):
             name_q = date_from = date_to = None
@@ -76,6 +151,10 @@ class LTORetriever:
             if not dir_q:
                 return
             results = self.db.search_by_directory(dir_q)
+            if results:
+                directory_root = self._infer_directory_root(dir_q, results)
+                mod = self._source_path_module(directory_root)
+                restore_base = mod.dirname(directory_root)
 
         elif opt == '5':
             sessions = self.db.list_backup_sessions()
@@ -122,7 +201,7 @@ class LTORetriever:
         os.makedirs(self.restore_dir, exist_ok=True)
 
         if sel_raw.upper() == 'ALL':
-            self._restore_many(list(results))
+            self._restore_many(list(results), restore_base=restore_base)
             return
 
         try:
@@ -138,11 +217,11 @@ class LTORetriever:
 
         self._verify_tape(record['tape_label'])
         if record['is_packed']:
-            self._restore_packed(record)
+            self._restore_packed(record, restore_base=restore_base)
         else:
-            self._restore_loose(record)
+            self._restore_loose(record, restore_base=restore_base)
 
-    def _restore_many(self, records):
+    def _restore_many(self, records, restore_base=None):
         total = len(records)
         done  = 0
 
@@ -158,7 +237,7 @@ class LTORetriever:
             packed = [r for r in tape_records if r['is_packed']]
 
             for record in loose:
-                self._restore_loose(record)
+                self._restore_loose(record, restore_base=restore_base)
                 done += 1
                 print(f"[RESTORE] Progress: {done}/{total}")
 
@@ -168,7 +247,8 @@ class LTORetriever:
                 by_container[r['container_name']].append(r)
 
             for container_path, container_records in by_container.items():
-                self._restore_packed_bulk(container_path, container_records)
+                self._restore_packed_bulk(container_path, container_records,
+                                          restore_base=restore_base)
                 done += len(container_records)
                 print(f"[RESTORE] Progress: {done}/{total}")
 
@@ -190,9 +270,9 @@ class LTORetriever:
                 raise RuntimeError(
                     f"[RESTORE] Cancelled: tape '{required_label}' was not mounted.")
 
-    def _restore_loose(self, record):
+    def _restore_loose(self, record, restore_base=None):
         src = record['stored_path']
-        dst = self._unique_dest(record['file_name'])
+        dst = self._destination_for_record(record, restore_base=restore_base)
         print(f"\n[RESTORE] Copying loose file: {record['file_name']}")
         _acquire_tape_io_lock(f"restore {record['file_name']}")
         try:
@@ -229,7 +309,7 @@ class LTORetriever:
                             f"the stored path '{stored_in_zip}' is absent — "
                             "refusing to guess.")
 
-    def _restore_packed(self, record):
+    def _restore_packed(self, record, restore_base=None):
         tape_zip_path = record['container_name']   # full path of ZIP on tape
         stored_in_zip = record['stored_path']       # relative path inside the ZIP
         local_zip     = os.path.join(self.staging_dir, os.path.basename(tape_zip_path))
@@ -248,7 +328,7 @@ class LTORetriever:
             return
 
         print(f"[RESTORE] Step 2/3: Extracting '{record['file_name']}' from ZIP...")
-        dst = self._unique_dest(record['file_name'])
+        dst = self._destination_for_record(record, restore_base=restore_base)
         try:
             with zipfile.ZipFile(local_zip, 'r') as zf:
                 entry, warn, err = self._resolve_zip_entry(
@@ -258,6 +338,7 @@ class LTORetriever:
                     return
                 if warn:
                     print(f"[WARN] {warn}")
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
                 with zf.open(entry) as zf_src, open(dst, 'wb') as out:
                     shutil.copyfileobj(zf_src, out)
             print(f"[RESTORE] Saved to: {dst}")
@@ -271,7 +352,7 @@ class LTORetriever:
             except OSError:
                 pass
 
-    def _restore_packed_bulk(self, tape_zip_path, records):
+    def _restore_packed_bulk(self, tape_zip_path, records, restore_base=None):
         """Extract multiple files from a single ZIP bundle in one pass."""
         local_zip = os.path.join(self.staging_dir, os.path.basename(tape_zip_path))
         print(f"\n[RESTORE] Copying {os.path.basename(tape_zip_path)} from tape to staging...")
@@ -290,7 +371,8 @@ class LTORetriever:
                 zip_names = zf.namelist()
                 for record in records:
                     stored_in_zip = record['stored_path']
-                    dst = self._unique_dest(record['file_name'])
+                    dst = self._destination_for_record(record,
+                                                       restore_base=restore_base)
                     entry, warn, err = self._resolve_zip_entry(
                         zip_names, stored_in_zip, record['file_name'])
                     if err:
@@ -299,6 +381,7 @@ class LTORetriever:
                     if warn:
                         print(f"[WARN] {warn}")
                     try:
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
                         with zf.open(entry) as zf_src, open(dst, 'wb') as out:
                             shutil.copyfileobj(zf_src, out)
                         print(f"[OK] {record['file_name']}")

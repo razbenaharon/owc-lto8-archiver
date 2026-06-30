@@ -37,6 +37,7 @@ AUTO_PACK_FILE_RATIO = 0.30
 AUTO_PACK_MIN_SMALL_BYTES = 1 * 1024**3
 AUTO_PACK_MIN_SMALL_BYTE_RATIO = 0.01
 DB_UPSERT_BATCH_SIZE = 10_000
+LOCAL_STAGING_RESERVE_BYTES = 20 * 1024**3
 
 
 def _auto_pack_decision(total_files, total_bytes, small_files, small_bytes):
