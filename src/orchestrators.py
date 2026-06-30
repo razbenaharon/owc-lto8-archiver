@@ -25,11 +25,12 @@ except ImportError:  # optional dependency — priority/affinity degrade gracefu
     psutil = None
 
 from .backup import LTOBackup, _NoEjectBackup
-from .constants import (LOCAL_TAPE_BUDGET_BYTES, LTFS_WRITE_WARNING,
-                        ROOT_FILES_GROUP, _auto_pack_decision)
+from .constants import (LOCAL_STAGING_RESERVE_BYTES, LOCAL_TAPE_BUDGET_BYTES,
+                        LTFS_WRITE_WARNING, ROOT_FILES_GROUP,
+                        _auto_pack_decision)
 from .db import _apply_canonical_remote_paths
 from .ltfs import _ensure_lto_drive_ready, get_volume_label
-from .packer import LTOAnalyzer, LTOPacker
+from .packer import LTOAnalyzer, LTOPacker, ensure_staging_space
 from .paths import _LEGACY_PATH_LIMIT, _dir_tree_size, _disambiguate_local_rel, _exceeds_legacy_path_limit, _long, _remote_fetch_base_and_rel, _reserved_name_component, _winsafe_extracted_rel
 from .remote_transport import _remote_tar_fetch, _ssh_run
 from .reporting import _write_source_missing_only_log
@@ -252,10 +253,17 @@ class LocalOrchestrator:
             batch_name = self._batch_name(session['session_id'], chunk_index, batch_index)
             pack_dir = os.path.join(self.staging_dir, batch_name)
             bundle_prefix = f"Bundle_s{session['session_id']:04d}_c{chunk_index + 1:03d}_b{batch_index + 1:03d}"
+            batch_bytes = sum(f['size'] for f in pending)
             print(f"\n[LOCAL] Batch {batch_index + 1}/{len(batches)}: "
-                  f"{len(pending)} file(s), {sum(f['size'] for f in pending) / 1024**3:.2f} GiB")
+                  f"{len(pending)} file(s), {batch_bytes / 1024**3:.2f} GiB")
 
             try:
+                self._cleanup_dir(pack_dir)
+                ensure_staging_space(
+                    self.staging_dir,
+                    batch_bytes,
+                    context=f"local batch {batch_index + 1}/{len(batches)}",
+                )
                 metadata = LTOPacker(self.cfg.max_zip_size_gb).run_manifest(
                     source_root=session['source_dir'],
                     dest=pack_dir,
@@ -509,7 +517,7 @@ class LocalOrchestrator:
     def _staging_limits(self):
         os.makedirs(self.staging_dir, exist_ok=True)
         free = shutil.disk_usage(self.staging_dir).free
-        reserve = 20 * 1024**3
+        reserve = LOCAL_STAGING_RESERVE_BYTES
         usable = min(int(free * self.fill_pct), max(0, free - reserve))
         # Local staging is sequential. Unlike the SSH producer/consumer
         # pipeline, it does not benefit from small network-friendly chunks.
@@ -518,7 +526,8 @@ class LocalOrchestrator:
         if target <= 0:
             raise RuntimeError(
                 f"Not enough free staging space in '{self.staging_dir}'. "
-                f"Free: {free / 1024**3:.2f} GiB; required reserve: 20 GiB."
+                f"Free: {free / 1024**3:.2f} GiB; "
+                f"required reserve: {reserve / 1024**3:.0f} GiB."
             )
         return target, usable, free
 
@@ -1032,7 +1041,7 @@ class RemoteOrchestrator:
         staging cap or starving the disk. Accounts for the ~2x transient
         footprint while a chunk is packed (fetch_dir + pack_dir coexist)."""
         need  = 2 * planned_bytes          # peak while fetch + pack dirs coexist
-        floor = 20 * 1024**3               # keep >=20 GB free on the staging volume
+        floor = LOCAL_STAGING_RESERVE_BYTES
         warned = False
         while not (CANCEL.is_set() or stop_evt.is_set()):
             with self._staged_lock:

@@ -1586,8 +1586,13 @@ class DatabaseManager:
         return rows[0] if rows else None
 
     def search_by_directory(self, dir_path):
-        pattern = dir_path.rstrip('/\\') + '%'
-        return self._catalog_rows("f.original_path LIKE ?", (pattern,),
+        needle = dir_path.strip().rstrip('/\\')
+        if not needle:
+            return []
+        prefix_pattern = needle + '%'
+        contains_pattern = f'%{needle}%'
+        return self._catalog_rows("(f.original_path LIKE ? OR f.original_path LIKE ?)",
+                                  (prefix_pattern, contains_pattern),
                                   'f.original_path')
 
     def list_backup_sessions(self):
