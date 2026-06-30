@@ -26,11 +26,12 @@ _ASKPASS_HELPERS = set()
 @atexit.register
 def _cleanup_askpass_helpers():
     """Remove any SSH askpass helper scripts created during this run."""
-    for helper_path in _ASKPASS_HELPERS:
+    for helper_path in list(_ASKPASS_HELPERS):
         try:
             os.remove(helper_path)
         except OSError:
             pass
+        _ASKPASS_HELPERS.discard(helper_path)
 
 
 def _openssh_askpass_env(password):
@@ -63,7 +64,9 @@ def _ssh_run(remote_user, remote_host, command, capture=True, password=''):
     """Run a command on the remote host.
 
     Blank password uses normal OpenSSH key auth. A configured password uses
-    sshpass when available, or PuTTY plink on Windows-style installations.
+    sshpass when available, or OpenSSH askpass. PuTTY's ``-pw`` fallback is
+    intentionally not supported because it exposes the password in process
+    arguments.
     """
     password = password or ''
     if password:
@@ -111,30 +114,15 @@ def _ssh_run(remote_user, remote_host, command, capture=True, password=''):
                     env=env,
                 )
             return subprocess.run(ssh_cmd, stdin=subprocess.DEVNULL, env=env)
-        if _has_command('plink'):
-            ssh_cmd = [
-                'plink',
-                '-batch',
-                '-pw', password,
-                f'{remote_user}@{remote_host}',
-                command,
-            ]
-            if capture:
-                return subprocess.run(
-                    ssh_cmd,
-                    capture_output=True,
-                    text=True,
-                    encoding='utf-8',
-                    errors='replace',
-                )
-            return subprocess.run(ssh_cmd)
         return subprocess.CompletedProcess(
             args=['ssh'],
             returncode=255,
             stdout='',
             stderr=(
                 "remote_password is set, but no password-capable SSH helper was found. "
-                "Install OpenSSH, sshpass, or PuTTY plink/pscp; or configure SSH key auth."
+                "Install OpenSSH or sshpass; or configure SSH key auth. "
+                "PuTTY -pw/pscp password fallbacks are disabled because they expose "
+                "passwords in process arguments."
             ),
         )
 
@@ -191,17 +179,7 @@ def _scp_fetch_file(remote_user, remote_host, remote_file_path, local_dest_path,
                 env=env,
             )
             return proc.wait()
-        if _has_command('pscp'):
-            proc = subprocess.Popen([
-                'pscp',
-                '-scp',
-                '-p',
-                '-pw', password,
-                remote_spec,
-                local_dest_path,
-            ])
-            return proc.wait()
-        print("[REMOTE] remote_password is set, but scp, sshpass, or PuTTY pscp was not found.")
+        print("[REMOTE] remote_password is set, but scp/OpenSSH or sshpass was not found.")
         return 255
 
     proc = subprocess.Popen(['scp', '-p', remote_spec, local_dest_path])
@@ -214,7 +192,7 @@ def _ssh_stream_command(remote_user, remote_host, command, password='', cipher='
     cipher: optional OpenSSH cipher name (e.g. aes128-gcm@openssh.com). When set,
             it is requested with SSH-level compression disabled — a fast AES-NI
             cipher keeps the fetch stream from being CPU-bound on incompressible
-            media. Ignored for PuTTY plink (different cipher naming)."""
+            media."""
     password = password or ''
     # OpenSSH cipher/compression tuning, inserted right after the 'ssh' binary.
     cipher_opts = (['-c', cipher, '-o', 'Compression=no'] if cipher else [])
@@ -241,17 +219,11 @@ def _ssh_stream_command(remote_user, remote_host, command, password='', cipher='
                 f'{remote_user}@{remote_host}',
                 command,
             ], _openssh_askpass_env(password), None
-        if _has_command('plink'):
-            return [
-                'plink',
-                '-batch',
-                '-pw', password,
-                f'{remote_user}@{remote_host}',
-                command,
-            ], None, None
         return None, None, (
             "remote_password is set, but no password-capable SSH helper was found. "
-            "Install OpenSSH, sshpass, or PuTTY plink/pscp; or configure SSH key auth."
+            "Install OpenSSH or sshpass; or configure SSH key auth. "
+            "PuTTY -pw fallbacks are disabled because they expose passwords "
+            "in process arguments."
         )
 
     if not _has_command('ssh'):

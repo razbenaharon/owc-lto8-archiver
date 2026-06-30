@@ -14,6 +14,7 @@ from .orchestrators import LocalOrchestrator, RemoteOrchestrator
 from .reporting import generate_backup_summary
 from .retriever import LTORetriever
 from .robocopy import _prepare_robocopy_exclusion, _remove_robocopy_exclusion
+from .remote_transport import _cleanup_askpass_helpers
 from .runtime import _terminate_all_procs, install_cancel_handler, reset_cancel, uninstall_cancel_handler, unpin_current_process
 
 
@@ -37,6 +38,7 @@ def run_archiver(cfg: ConfigManager, db: DatabaseManager):
         unpin_current_process()
         uninstall_cancel_handler()
         reset_cancel()
+        _cleanup_askpass_helpers()
         if added_exclusion:
             _remove_robocopy_exclusion()
 
@@ -71,6 +73,7 @@ def run_remote_archiver(cfg, db):
         unpin_current_process()
         uninstall_cancel_handler()
         reset_cancel()
+        _cleanup_askpass_helpers()
         if added_exclusion:
             _remove_robocopy_exclusion()
 

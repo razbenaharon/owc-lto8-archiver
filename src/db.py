@@ -126,6 +126,7 @@ class DatabaseManager:
         for attempt in range(1, attempts + 1):
             with self.lock:
                 try:
+                    self.conn.execute("BEGIN IMMEDIATE")
                     result = operation()
                     self.conn.commit()
                     return result
@@ -134,6 +135,9 @@ class DatabaseManager:
                     locked = 'locked' in str(e).lower() or 'busy' in str(e).lower()
                     if not locked or attempt == attempts:
                         raise
+                except BaseException:
+                    self.conn.rollback()
+                    raise
             wait_s = min(5, attempt)
             print(f"[DB] Database busy during {description}; retrying in "
                   f"{wait_s}s ({attempt}/{attempts})...")
@@ -542,12 +546,12 @@ class DatabaseManager:
             return
         sets = ', '.join(f"{k} = ?" for k in kwargs)
         vals = list(kwargs.values()) + [session_id]
-        with self.lock:
+        def operation():
             cur = self.conn.execute(
                 f"UPDATE remote_sessions SET {sets} WHERE session_id = ?", vals
             )
             self._require_updated(cur, f"[DB] Remote session not found: {session_id}")
-            self.conn.commit()
+        self._commit_write(operation, f"update remote session {session_id}")
 
     def get_active_remote_session(self, remote_host, remote_path):
         with self.lock:
@@ -1415,26 +1419,24 @@ class DatabaseManager:
             if label and label not in labels_to_clear:
                 labels_to_clear.append(label)
 
-        with self.lock:
-            try:
-                self.conn.execute("BEGIN")
-                removed = {}
-                for label in labels_to_clear:
-                    stats = self._delete_tape_records_unlocked(label)
-                    cur = self.conn.execute(
-                        "DELETE FROM tapes WHERE volume_label = ?", (label,))
-                    if cur.rowcount or any(stats.values()):
-                        removed[label] = stats
-                self.conn.execute(
-                    """INSERT INTO tapes
-                       (volume_label, date_formatted, total_capacity, used_space)
-                       VALUES (?, ?, ?, 0)""",
-                    (volume_label, datetime.now().isoformat(), capacity_gb),
-                )
-                self.conn.commit()
-            except Exception:
-                self.conn.rollback()
-                raise
+        def operation():
+            removed = {}
+            for label in labels_to_clear:
+                stats = self._delete_tape_records_unlocked(label)
+                cur = self.conn.execute(
+                    "DELETE FROM tapes WHERE volume_label = ?", (label,))
+                if cur.rowcount or any(stats.values()):
+                    removed[label] = stats
+            self.conn.execute(
+                """INSERT INTO tapes
+                   (volume_label, date_formatted, total_capacity, used_space)
+                   VALUES (?, ?, ?, 0)""",
+                (volume_label, datetime.now().isoformat(), capacity_gb),
+            )
+            return removed
+
+        removed = self._commit_write(
+            operation, f"replace formatted tape {volume_label}")
 
         if removed:
             for label, stats in removed.items():
@@ -1494,18 +1496,14 @@ class DatabaseManager:
                 break
 
     def delete_tape(self, volume_label):
-        with self.lock:
-            try:
-                self.conn.execute("BEGIN")
-                self._delete_tape_records_unlocked(volume_label)
-                cur = self.conn.execute(
-                    "DELETE FROM tapes WHERE volume_label = ?", (volume_label,))
-                self._require_updated(cur, f"[DB] Tape not found: {volume_label}")
-                self.conn.commit()
-            except Exception:
-                self.conn.rollback()
-                raise
-            print(f"[DB] Tape '{volume_label}' and its file records removed from database.")
+        def operation():
+            self._delete_tape_records_unlocked(volume_label)
+            cur = self.conn.execute(
+                "DELETE FROM tapes WHERE volume_label = ?", (volume_label,))
+            self._require_updated(cur, f"[DB] Tape not found: {volume_label}")
+
+        self._commit_write(operation, f"delete tape {volume_label}")
+        print(f"[DB] Tape '{volume_label}' and its file records removed from database.")
 
     def tape_exists(self, volume_label):
         with self.lock:
@@ -1692,7 +1690,7 @@ class DatabaseManager:
             ).fetchall() if row[0]]
 
     def delete_file(self, file_id):
-        with self.lock:
+        def operation():
             row = self.conn.execute(
                 "SELECT tape_label,directory_id FROM files_index WHERE file_id = ?",
                 (file_id,),
@@ -1702,64 +1700,59 @@ class DatabaseManager:
             if row:
                 self._prune_empty_catalog_directories(
                     row['tape_label'], row['directory_id'])
-            self.conn.commit()
+        self._commit_write(operation, f"delete file record {file_id}")
 
     def rename_tape(self, old_label, new_label):
-        with self.lock:
-            try:
-                self.conn.execute("BEGIN")
-                self.conn.execute("PRAGMA defer_foreign_keys = ON")
-                cur = self.conn.execute(
-                    "UPDATE tapes SET volume_label = ? WHERE volume_label = ?",
-                    (new_label, old_label)
-                )
-                self._require_updated(cur, f"[DB] Tape not found: {old_label}")
-                self.conn.execute(
-                    "UPDATE files_index SET tape_label = ? WHERE tape_label = ?",
-                    (new_label, old_label)
-                )
-                rows = self.conn.execute(
-                    """SELECT file_id,original_path,source_host,
-                              local_session_id,local_chunk_index
-                       FROM files_index WHERE tape_label=?""", (new_label,))
-                self.conn.executemany(
-                    "UPDATE files_index SET record_key=? WHERE file_id=?",
-                    ((_file_record_key(r['original_path'], new_label,
-                                       r['local_session_id'],
-                                       r['local_chunk_index'],
-                                       r['source_host']),
-                      r['file_id']) for r in rows),
-                )
-                self.conn.execute(
-                    "UPDATE archive_bundles SET tape_label = ? WHERE tape_label = ?",
-                    (new_label, old_label)
-                )
-                self.conn.execute(
-                    "UPDATE archive_runs SET tape_label = ? WHERE tape_label = ?",
-                    (new_label, old_label)
-                )
-                self.conn.execute(
-                    "UPDATE remote_sessions SET tape_label = ? WHERE tape_label = ?",
-                    (new_label, old_label)
-                )
-                self.conn.commit()
-            except Exception:
-                self.conn.rollback()
-                raise
+        def operation():
+            self.conn.execute("PRAGMA defer_foreign_keys = ON")
+            cur = self.conn.execute(
+                "UPDATE tapes SET volume_label = ? WHERE volume_label = ?",
+                (new_label, old_label)
+            )
+            self._require_updated(cur, f"[DB] Tape not found: {old_label}")
+            self.conn.execute(
+                "UPDATE files_index SET tape_label = ? WHERE tape_label = ?",
+                (new_label, old_label)
+            )
+            rows = self.conn.execute(
+                """SELECT file_id,original_path,source_host,
+                          local_session_id,local_chunk_index
+                   FROM files_index WHERE tape_label=?""", (new_label,))
+            self.conn.executemany(
+                "UPDATE files_index SET record_key=? WHERE file_id=?",
+                ((_file_record_key(r['original_path'], new_label,
+                                   r['local_session_id'],
+                                   r['local_chunk_index'],
+                                   r['source_host']),
+                  r['file_id']) for r in rows),
+            )
+            self.conn.execute(
+                "UPDATE archive_bundles SET tape_label = ? WHERE tape_label = ?",
+                (new_label, old_label)
+            )
+            self.conn.execute(
+                "UPDATE archive_runs SET tape_label = ? WHERE tape_label = ?",
+                (new_label, old_label)
+            )
+            self.conn.execute(
+                "UPDATE remote_sessions SET tape_label = ? WHERE tape_label = ?",
+                (new_label, old_label)
+            )
+        self._commit_write(operation, f"rename tape {old_label}")
         print(f"[DB] Tape '{old_label}' renamed to '{new_label}'.")
 
     def update_tape_capacity(self, volume_label, capacity_gb):
-        with self.lock:
+        def operation():
             cur = self.conn.execute(
                 "UPDATE tapes SET total_capacity = ? WHERE volume_label = ?",
                 (capacity_gb, volume_label)
             )
             self._require_updated(cur, f"[DB] Tape not found: {volume_label}")
-            self.conn.commit()
+        self._commit_write(operation, f"update tape capacity {volume_label}")
         print(f"[DB] Tape '{volume_label}' capacity set to {capacity_gb} GB.")
 
     def recalculate_tape_used_space(self, volume_label):
-        with self.lock:
+        def operation():
             row = self.conn.execute(
                 "SELECT COALESCE(SUM(file_size_bytes), 0) FROM files_index WHERE tape_label = ?",
                 (volume_label,)
@@ -1770,11 +1763,12 @@ class DatabaseManager:
                 (new_used, volume_label)
             )
             self._require_updated(cur, f"[DB] Tape not found: {volume_label}")
-            self.conn.commit()
             return new_used
+        return self._commit_write(
+            operation, f"recalculate tape used space {volume_label}")
 
     def delete_files_for_tape(self, volume_label):
-        with self.lock:
+        def operation():
             if not self.conn.execute(
                 "SELECT 1 FROM tapes WHERE volume_label = ?", (volume_label,)
             ).fetchone():
@@ -1787,8 +1781,60 @@ class DatabaseManager:
                               (volume_label,))
             self._prune_empty_catalog_directories(volume_label)
             self.conn.execute("UPDATE tapes SET used_space = 0 WHERE volume_label = ?", (volume_label,))
-            self.conn.commit()
-            print(f"[DB] Removed {removed} file record(s) for tape '{volume_label}' (tape entry kept).")
+            return removed
+        removed = self._commit_write(
+            operation, f"delete file records for tape {volume_label}")
+        print(f"[DB] Removed {removed} file record(s) for tape '{volume_label}' (tape entry kept).")
+
+    def delete_session(self, kind, session_id):
+        """Delete one local or remote session and session-owned state.
+
+        Tape catalog records are intentionally preserved. This mirrors the
+        inspector's historical behavior: deleting a session removes resumability
+        bookkeeping, not archived file records.
+        """
+        kind = (kind or '').strip().lower()
+        session_id = int(session_id)
+        if kind not in ('local', 'remote'):
+            raise RuntimeError(f"[DB] Unknown session kind: {kind}")
+
+        def operation():
+            if kind == 'local':
+                self.conn.execute(
+                    "DELETE FROM local_chunks_manifest WHERE session_id=?",
+                    (session_id,))
+                cur = self.conn.execute(
+                    "DELETE FROM local_sessions WHERE session_id=?",
+                    (session_id,))
+                self._require_updated(
+                    cur, f"[DB] Local session not found: {session_id}")
+                return cur.rowcount
+
+            tables = {row[0] for row in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            if 'remote_manifest' in tables:
+                self.conn.execute(
+                    "DELETE FROM remote_manifest WHERE session_id=?",
+                    (session_id,))
+            if 'remote_chunks' in tables:
+                self.conn.execute(
+                    "DELETE FROM remote_chunks WHERE session_id=?",
+                    (session_id,))
+            if 'remote_file_state' in tables:
+                self.conn.execute(
+                    "DELETE FROM remote_file_state WHERE session_id=?",
+                    (session_id,))
+            cur = self.conn.execute(
+                "DELETE FROM remote_sessions WHERE session_id=?",
+                (session_id,))
+            self._require_updated(
+                cur, f"[DB] Remote session not found: {session_id}")
+            return cur.rowcount
+
+        removed = self._commit_write(
+            operation, f"delete {kind} session {session_id}")
+        print(f"[DB] Deleted {kind} session {session_id}.")
+        return removed
 
     def get_unreferenced_remote_data_summary(self):
         """Describe normalized remote data not reachable from any session."""
