@@ -1192,6 +1192,7 @@ class DatabaseManager:
                     'stored_path': record.get('stored_path'),
                     'backup_date': backup_date,
                     'run_started_at': backup_date,
+                    'source_host': source_host,
                 }
                 values.extend(catalog_values_for_file(
                     self.conn, row, catalog_dir_cache))

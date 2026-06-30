@@ -34,6 +34,9 @@ def _run_maintenance():
     if '--catalog-v3-migrate' in sys.argv:
         CatalogV3Optimizer(cfg.db_path).run()
         return
+    if '--catalog-rebuild' in sys.argv:
+        CatalogV3Optimizer(cfg.db_path).rebuild()
+        return
     if '--hashless-origin-migrate' in sys.argv:
         HashlessOriginOptimizer(cfg.db_path).run()
         return
@@ -48,7 +51,8 @@ if __name__ == "__main__":
     try:
         if any(arg in sys.argv for arg in (
                 '--optimize-db', '--catalog-v3-preflight',
-                '--catalog-v3-migrate', '--hashless-origin-migrate')):
+                '--catalog-v3-migrate', '--catalog-rebuild',
+                '--hashless-origin-migrate')):
             _run_maintenance()
         else:
             main()
