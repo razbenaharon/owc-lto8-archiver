@@ -5,6 +5,7 @@ from collections import namedtuple
 from unittest import mock
 
 from src import packer
+from src.skipped import SkippedFileTracker
 
 
 class StagingSpaceTests(unittest.TestCase):
@@ -73,6 +74,27 @@ class StagingSpaceTests(unittest.TestCase):
                     )
         finally:
             packer.shutil.disk_usage = original_disk_usage
+
+    def test_manifest_pack_tracks_missing_file_without_failing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, "staging")
+            missing = os.path.join(tmp, "missing.txt")
+            tracker = SkippedFileTracker()
+            metadata = packer.LTOPacker(max_zip_size_gb=1).run_manifest(
+                source_root=tmp,
+                dest=dest,
+                threshold_mb=1,
+                file_entries=[{"path": missing, "rel": "missing.txt", "size": 5}],
+                skipped_tracker=tracker,
+                source_name="local",
+            )
+            self.assertEqual(metadata, [])
+            self.assertEqual(tracker.count(), 1)
+            report = tracker.write_csv(tmp)
+            with open(report, encoding="utf-8") as handle:
+                text = handle.read()
+            self.assertIn("missing.txt", text)
+            self.assertIn("local", text)
 
 
 if __name__ == "__main__":

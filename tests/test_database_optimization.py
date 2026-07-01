@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import tempfile
+import threading
 import unittest
 
 from src.db import DatabaseManager, _apply_canonical_remote_paths
@@ -188,6 +189,30 @@ class OptimizerTests(unittest.TestCase):
 
 
 class SchemaV2RuntimeTests(unittest.TestCase):
+    def test_database_manager_serializes_concurrent_public_calls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = DatabaseManager(os.path.join(tmp, 'worker.db'))
+            try:
+                db.register_tape('T1', 100)
+
+                def insert_one(idx):
+                    db.insert_file(
+                        f'{idx}.dat', f'/source/{idx}.dat', idx + 1,
+                        'T1', False, None, rf'E:\{idx}.dat')
+
+                threads = [
+                    threading.Thread(target=insert_one, args=(idx,))
+                    for idx in range(10)
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+
+                self.assertEqual(db.count_tape_file_records('T1'), 10)
+            finally:
+                db.close()
+
     def test_new_catalog_and_remote_runtime(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, 'new.db')

@@ -84,6 +84,7 @@ class ConfigManager:
             'robocopy_priority':     'high',
             'cpu_affinity':          'auto',
             'ssh_cipher':            'aes128-gcm@openssh.com',
+            'ssh_command_timeout_seconds': '3600',
             'use_mbuffer':           'true',
             'mbuffer_size':          '2G',
         }
@@ -171,6 +172,15 @@ class ConfigManager:
     @property
     def ssh_cipher(self):
         return self.config.get('PERFORMANCE', 'ssh_cipher', fallback='aes128-gcm@openssh.com').strip()
+    @property
+    def ssh_command_timeout_seconds(self):
+        raw = self.config.get('PERFORMANCE', 'ssh_command_timeout_seconds',
+                              fallback='3600').strip()
+        try:
+            value = int(float(raw))
+        except ValueError:
+            return 3600
+        return max(1, value)
     @property
     def use_mbuffer(self):
         return self.config.get('PERFORMANCE', 'use_mbuffer', fallback='true').strip().lower() in ('1', 'true', 'yes', 'on')

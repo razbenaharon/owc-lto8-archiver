@@ -87,7 +87,7 @@ class LTOBackup:
     def run(self, source, tape_drive, tape_label, packer_metadata=None,
             exclude_file_paths=None, exclude_dir_paths=None,
             local_session_id=None, local_chunk_index=None, stage_stats=None,
-            tape_parent_dir=None, source_host='local'):
+            tape_parent_dir=None, source_host='local', skipped_tracker=None):
         print(f"[WARNING] {LTFS_WRITE_WARNING}")
         _acquire_tape_io_lock(f"backup write to {tape_drive}")
         try:
@@ -101,6 +101,7 @@ class LTOBackup:
                 stage_stats=stage_stats,
                 tape_parent_dir=tape_parent_dir,
                 source_host=source_host,
+                skipped_tracker=skipped_tracker,
             )
         finally:
             _release_tape_io_lock()
@@ -109,7 +110,7 @@ class LTOBackup:
                     exclude_file_paths=None, exclude_dir_paths=None,
                     local_session_id=None, local_chunk_index=None,
                     stage_stats=None, tape_parent_dir=None,
-                    source_host='local'):
+                    source_host='local', skipped_tracker=None):
         """
         Copy files from source to tape and commit to the database.
 
@@ -218,6 +219,11 @@ class LTOBackup:
                     except Exception as e:
                         _progress_done()
                         print(f"\n[WARN] Cannot stat {file}: {e}")
+                        if skipped_tracker is not None:
+                            skipped_tracker.add(
+                                source_host, src, e, "backup_scan",
+                                session_id=local_session_id,
+                                chunk_index=local_chunk_index)
 
         if packer_metadata is not None:
             # Bundle ZIPs aren't in loose_map; walk staging to size the progress bar.
@@ -251,20 +257,6 @@ class LTOBackup:
                        f"priority={prio_label}, {cores_label}")
         print("[BACKUP] Copying to tape via robocopy...")
 
-        def _dir_size(path):
-            total = 0
-            try:
-                for r, _, fs in os.walk(path):
-                    for f in fs:
-                        try:
-                            total += os.path.getsize(os.path.join(r, f))
-                        except OSError:
-                            pass
-            except OSError:
-                pass
-            return total
-
-        initial_tape_bytes = _dir_size(tape_root)
         stop_evt = threading.Event()
 
         def _monitor():
@@ -287,6 +279,7 @@ class LTOBackup:
              '/NP',    # no per-file progress %
              '/NDL',   # no directory listing lines
              '/NFL',   # no per-file listing lines (keep job header+summary)
+             '/BYTES', # report byte counts as integers for reliable parsing
         ]
         if exclude_file_paths:
             robocopy_cmd.extend(['/XF'] + exclude_file_paths)
@@ -318,8 +311,6 @@ class LTOBackup:
         )
         if critical_robocopy_failure:
             copied_bytes = rc_sum.get('bytes_copied', 0)
-            if copied_bytes <= 0:
-                copied_bytes = max(0, _dir_size(tape_root) - initial_tape_bytes)
             new_used = self.db.recalculate_tape_used_space(tape_label)
             log_path = self._write_backup_log(
                 {
@@ -342,6 +333,11 @@ class LTOBackup:
                     'record_counts': {},
                     'source_missing_files':
                         (stage_stats or {}).get('source_missing_files', []),
+                    'skipped_files_count':
+                        skipped_tracker.count() if skipped_tracker else '',
+                    'skipped_files_report':
+                        skipped_tracker.write_csv(self.log_dir or BACKUP_LOG_DIR)
+                        if skipped_tracker and skipped_tracker.has_items() else '',
                 },
                 packer_metadata,
                 loose_map,
@@ -455,12 +451,9 @@ class LTOBackup:
 
         db_sync_seconds = time.perf_counter() - db_sync_start
 
-        # The robocopy summary parser is English-only; on a localized console
-        # it yields 0 bytes. Fall back to the measured growth of the tape
-        # directory so used-space accounting still works.
+        # /BYTES keeps robocopy byte counts parseable without reading LTFS
+        # immediately after a write.
         copied_bytes = rc_sum['bytes_copied']
-        if copied_bytes <= 0:
-            copied_bytes = max(0, _dir_size(tape_root) - initial_tape_bytes)
         new_used = self.db.recalculate_tape_used_space(tape_label)
         print(f"[DB] Tape used space reconciled to {new_used / 1024**3:.3f} GB.")
 
@@ -469,10 +462,12 @@ class LTOBackup:
         # ---------------------------------------------------------------
         total_time = time.time() - total_start
         finished_at = datetime.now()
-        # Reaching here means robocopy did not fail critically: returncode < 8
-        # and files_failed == 0 both raised earlier, so the status is always
-        # 'completed' (the old 'completed_with_warnings' branch was unreachable).
-        log_status = 'completed'
+        skipped_count = skipped_tracker.count() if skipped_tracker else 0
+        skipped_report = (
+            skipped_tracker.write_csv(self.log_dir or BACKUP_LOG_DIR)
+            if skipped_tracker and skipped_tracker.has_items() else ''
+        )
+        log_status = 'completed_with_skips' if skipped_count else 'completed'
         log_path = self._write_backup_log(
             {
                 'status': log_status,
@@ -499,6 +494,8 @@ class LTOBackup:
                 'pack_bytes':    (stage_stats or {}).get('pack_bytes'),
                 'source_missing_files':
                     (stage_stats or {}).get('source_missing_files', []),
+                'skipped_files_count': skipped_count,
+                'skipped_files_report': skipped_report,
             },
             packer_metadata,
             loose_map,

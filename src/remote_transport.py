@@ -60,7 +60,8 @@ def _openssh_askpass_env(password):
     return env
 
 
-def _ssh_run(remote_user, remote_host, command, capture=True, password=''):
+def _ssh_run(remote_user, remote_host, command, capture=True, password='',
+             timeout=None):
     """Run a command on the remote host.
 
     Blank password uses normal OpenSSH key auth. A configured password uses
@@ -83,15 +84,25 @@ def _ssh_run(remote_user, remote_host, command, capture=True, password=''):
             env = os.environ.copy()
             env['SSHPASS'] = password
             if capture:
-                return subprocess.run(
-                    ssh_cmd,
-                    capture_output=True,
-                    text=True,
-                    encoding='utf-8',
-                    errors='replace',
-                    env=env,
-                )
-            return subprocess.run(ssh_cmd, env=env)
+                try:
+                    return subprocess.run(
+                        ssh_cmd,
+                        capture_output=True,
+                        text=True,
+                        encoding='utf-8',
+                        errors='replace',
+                        env=env,
+                        timeout=timeout,
+                    )
+                except subprocess.TimeoutExpired as e:
+                    return subprocess.CompletedProcess(
+                        ssh_cmd, 124, e.stdout or '',
+                        f"SSH command timed out after {timeout}s")
+            try:
+                return subprocess.run(ssh_cmd, env=env, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                return subprocess.CompletedProcess(
+                    ssh_cmd, 124, '', f"SSH command timed out after {timeout}s")
         if _has_command('ssh'):
             ssh_cmd = [
                 'ssh',
@@ -104,16 +115,27 @@ def _ssh_run(remote_user, remote_host, command, capture=True, password=''):
             ]
             env = _openssh_askpass_env(password)
             if capture:
+                try:
+                    return subprocess.run(
+                        ssh_cmd,
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        text=True,
+                        encoding='utf-8',
+                        errors='replace',
+                        env=env,
+                        timeout=timeout,
+                    )
+                except subprocess.TimeoutExpired as e:
+                    return subprocess.CompletedProcess(
+                        ssh_cmd, 124, e.stdout or '',
+                        f"SSH command timed out after {timeout}s")
+            try:
                 return subprocess.run(
-                    ssh_cmd,
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    text=True,
-                    encoding='utf-8',
-                    errors='replace',
-                    env=env,
-                )
-            return subprocess.run(ssh_cmd, stdin=subprocess.DEVNULL, env=env)
+                    ssh_cmd, stdin=subprocess.DEVNULL, env=env, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                return subprocess.CompletedProcess(
+                    ssh_cmd, 124, '', f"SSH command timed out after {timeout}s")
         return subprocess.CompletedProcess(
             args=['ssh'],
             returncode=255,
@@ -134,14 +156,24 @@ def _ssh_run(remote_user, remote_host, command, capture=True, password=''):
         command,
     ]
     if capture:
-        return subprocess.run(
-            ssh_cmd,
-            capture_output=True,
-            text=True,
-            encoding='utf-8',
-            errors='replace',
-        )
-    return subprocess.run(ssh_cmd)
+        try:
+            return subprocess.run(
+                ssh_cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as e:
+            return subprocess.CompletedProcess(
+                ssh_cmd, 124, e.stdout or '',
+                f"SSH command timed out after {timeout}s")
+    try:
+        return subprocess.run(ssh_cmd, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            ssh_cmd, 124, '', f"SSH command timed out after {timeout}s")
 
 
 def _scp_fetch_file(remote_user, remote_host, remote_file_path, local_dest_path, password=''):
