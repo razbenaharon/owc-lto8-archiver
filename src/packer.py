@@ -13,6 +13,7 @@ from .constants import (BUFFER_SIZE, LOCAL_STAGING_RESERVE_BYTES,
                         _auto_pack_decision)
 from .robocopy import _robocopy_file
 from .runtime import _progress_done, _progress_line
+from .skipped import SkippedFileTracker
 
 
 def _gib(value):
@@ -44,6 +45,45 @@ def ensure_staging_space(staging_dir, required_bytes, context="staging"):
             f"current free on '{staging_dir}': {_gib(free):.2f} GiB."
         )
     return free
+
+
+class StagingSpaceBudget:
+    """Batch-scoped free-space guard that avoids one disk_usage call per file."""
+
+    def __init__(self, staging_dir, planned_bytes=0, context="staging"):
+        self.staging_dir = staging_dir
+        self.planned_bytes = max(0, int(planned_bytes or 0))
+        self.context = context
+        self.available = 0
+        self.refresh()
+
+    def refresh(self):
+        os.makedirs(self.staging_dir, exist_ok=True)
+        free = shutil.disk_usage(self.staging_dir).free
+        overhead = _staging_write_overhead(self.planned_bytes)
+        floor = LOCAL_STAGING_RESERVE_BYTES
+        self.available = free - overhead - floor
+        if self.available < 0:
+            raise StagingSpaceError(
+                f"Insufficient local staging space for {self.context}. "
+                f"Need {_gib(self.planned_bytes):.2f} GiB + "
+                f"{_gib(overhead):.2f} GiB overhead + "
+                f"{_gib(floor):.0f} GiB reserve; "
+                f"current free on '{self.staging_dir}': {_gib(free):.2f} GiB."
+            )
+        return free
+
+    def consume(self, required_bytes, context="staging"):
+        required_bytes = max(0, int(required_bytes or 0))
+        if required_bytes > self.available:
+            self.refresh()
+        if required_bytes > self.available:
+            raise StagingSpaceError(
+                f"Insufficient local staging space for {context}. "
+                f"Need {_gib(required_bytes):.2f} GiB; "
+                f"available batch budget: {_gib(max(0, self.available)):.2f} GiB."
+            )
+        self.available -= required_bytes
 
 
 class LTOAnalyzer:
@@ -229,7 +269,8 @@ class LTOPacker:
         self.max_zip_size_gb = max_zip_size_gb
 
     def run_manifest(self, source_root, dest, threshold_mb, file_entries,
-                     bundle_prefix="Bundle"):
+                     bundle_prefix="Bundle", skipped_tracker=None,
+                     source_name='local', session_id=None, chunk_index=None):
         """Pack a selected list of source files into a staging directory.
 
         file_entries: iterable of {'path', 'rel', 'size'} dicts, where rel is
@@ -238,18 +279,37 @@ class LTOPacker:
         if os.path.exists(dest):
             shutil.rmtree(dest)
         os.makedirs(dest, exist_ok=True)
+        return self._pack_entries(
+            dest, threshold_mb, list(file_entries),
+            bundle_prefix=bundle_prefix,
+            skipped_tracker=skipped_tracker,
+            source_name=source_name,
+            session_id=session_id,
+            chunk_index=chunk_index,
+            heading="Local sub-chunk staging",
+            done_label="Sub-chunk done",
+        )
 
+    def _pack_entries(self, dest, threshold_mb, file_entries,
+                      bundle_prefix="Bundle", skipped_tracker=None,
+                      source_name='local', session_id=None, chunk_index=None,
+                      heading="Offline phase - tape idle",
+                      done_label="Offline phase done"):
+        skipped_tracker = skipped_tracker or SkippedFileTracker()
+        budget = StagingSpaceBudget(
+            dest,
+            sum(int(entry.get('size') or 0) for entry in file_entries),
+            context=heading,
+        )
         metadata             = []
         zip_idx              = 1
-        zip_path             = None
         zipf                 = None
         current_zip_size     = 0
         files_in_current_zip = 0
         total_packed         = 0
         total_loose          = 0
-        errors               = []
 
-        print(f"\n[PACKER] Local sub-chunk staging. "
+        print(f"\n[PACKER] {heading}. "
               f"(Threshold: {threshold_mb:.0f} MB | Max ZIP: {self.max_zip_size_gb:.0f} GB)")
 
         for entry in file_entries:
@@ -263,7 +323,7 @@ class LTOPacker:
                 fsize_mb = fsize / (1024 * 1024)
 
                 if fsize_mb < threshold_mb:
-                    ensure_staging_space(dest, fsize, context=file)
+                    budget.consume(fsize, context=file)
                     zip_rel = rel.replace('\\', '/')
                     if zipf is None:
                         zip_path = os.path.join(
@@ -309,11 +369,15 @@ class LTOPacker:
                     # Large/loose files are copied without an extra full-file
                     # read so the tape does not wait on Python I/O.
                     dst_path = os.path.join(dest, rel)
-                    ensure_staging_space(dest, fsize, context=file)
+                    budget.consume(fsize, context=file)
 
                     if not _robocopy_file(src, dst_path, display_name=file):
-                        raise RuntimeError(f"robocopy failed for: {src}")
+                        skipped_tracker.add(
+                            source_name, src, "robocopy failed", "pack",
+                            session_id=session_id, chunk_index=chunk_index)
+                        continue
                     total_loose += 1
+                    budget.refresh()
 
                     metadata.append({
                         'file_name':       file,
@@ -335,24 +399,21 @@ class LTOPacker:
             except Exception as e:
                 _progress_done()
                 print(f"\n[ERROR] {file}: {e}")
-                errors.append((src, e))
+                skipped_tracker.add(
+                    source_name, src, e, "pack",
+                    session_id=session_id, chunk_index=chunk_index)
 
         if files_in_current_zip > 0:
             zipf.close()
             _progress_done()
             print(f"\n -> Sealed {bundle_prefix}_{zip_idx:03d}.zip ({files_in_current_zip} files)")
 
-        if errors:
-            raise RuntimeError(
-                f"{len(errors)} file(s) failed during local staging; "
-                f"first failure: {errors[0][0]} ({errors[0][1]})"
-            )
-
         _progress_done()
-        print(f"\n[PACKER] Sub-chunk done: {total_packed} packed | {total_loose} loose.")
+        print(f"\n[PACKER] {done_label}: {total_packed} packed | {total_loose} loose.")
         return metadata
 
-    def run(self, source, dest, threshold_mb):
+    def run(self, source, dest, threshold_mb, skipped_tracker=None,
+            source_name='local', session_id=None, chunk_index=None):
         """
         Pack small files into ZIP bundles; copy large files loose.
 
@@ -377,104 +438,29 @@ class LTOPacker:
 
         os.makedirs(dest, exist_ok=True)
 
-        metadata             = []
-        zip_idx              = 1
-        zip_path             = None
-        zipf                 = None
-        current_zip_size     = 0
-        files_in_current_zip = 0
-        total_packed         = 0
-        total_loose          = 0
-
-        print(f"\n[PACKER] Offline phase — tape idle. (Threshold: {threshold_mb:.0f} MB | Max ZIP: {self.max_zip_size_gb:.0f} GB)")
-
+        skipped_tracker = skipped_tracker or SkippedFileTracker()
+        entries = []
         for root, _, files in os.walk(source):
             for file in files:
                 src = os.path.join(root, file)
                 try:
                     fsize    = os.path.getsize(src)
-                    fsize_mb = fsize / (1024 * 1024)
                     rel      = os.path.relpath(src, source)
-
-                    if fsize_mb < threshold_mb:
-                        ensure_staging_space(dest, fsize, context=file)
-                        zip_rel = rel.replace('\\', '/')  # ZIP entries use POSIX separators
-                        # Roll over to a new ZIP bundle if current one is full
-                        if zipf is None:
-                            zip_path = os.path.join(dest, f"Bundle_{zip_idx:03d}.zip")
-                            zipf = zipfile.ZipFile(
-                                zip_path, 'w', zipfile.ZIP_STORED, allowZip64=True)
-                        if (files_in_current_zip > 0 and
-                                current_zip_size + fsize >
-                                self.max_zip_size_gb * 1024**3 * 0.99):
-                            zipf.close()
-                            _progress_done()
-                            print(f"\n -> Sealed Bundle_{zip_idx:03d}.zip ({files_in_current_zip} files)")
-                            zip_idx += 1
-                            zip_path = os.path.join(dest, f"Bundle_{zip_idx:03d}.zip")
-                            zipf = zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED, allowZip64=True)
-                            current_zip_size     = 0
-                            files_in_current_zip = 0
-
-                        container = f"Bundle_{zip_idx:03d}.zip"
-                        with open(src, 'rb') as fsrc, zipf.open(zip_rel, 'w', force_zip64=True) as zdst:
-                            while True:
-                                buf = fsrc.read(BUFFER_SIZE)
-                                if not buf:
-                                    break
-                                zdst.write(buf)
-                        current_zip_size     += fsize
-                        files_in_current_zip += 1
-                        total_packed         += 1
-
-                        metadata.append({
-                            'file_name':       file,
-                            'original_path':   src,
-                            'file_size_bytes': fsize,
-                            'is_packed':       True,
-                            'container_name':  container,
-                            'stored_path':     zip_rel,
-                        })
-
-                        if total_packed % 500 == 0:
-                            _progress_line(f"[PACKING] {total_packed} files packed")
-
-                    else:
-                        # Large/loose files are copied without an extra full-file
-                        # read so the tape does not wait on Python I/O.
-                        dst_path = os.path.join(dest, rel)
-                        ensure_staging_space(dest, fsize, context=file)
-
-                        if not _robocopy_file(src, dst_path, display_name=file):
-                            raise RuntimeError(f"robocopy failed for: {src}")
-                        total_loose += 1
-
-                        metadata.append({
-                            'file_name':       file,
-                            'original_path':   src,
-                            'file_size_bytes': fsize,
-                            'is_packed':       False,
-                            'container_name':  None,
-                            'stored_path':     rel,
-                        })
-
-                except StagingSpaceError:
-                    _progress_done()
-                    try:
-                        if zipf is not None:
-                            zipf.close()
-                    except Exception:
-                        pass
-                    raise
+                    entries.append({'path': src, 'rel': rel, 'size': fsize})
                 except Exception as e:
                     _progress_done()
                     print(f"\n[ERROR] {file}: {e}")
+                    skipped_tracker.add(
+                        source_name, src, e, "scan",
+                        session_id=session_id, chunk_index=chunk_index)
 
-        if files_in_current_zip > 0:
-            zipf.close()
-            _progress_done()
-            print(f"\n -> Sealed Bundle_{zip_idx:03d}.zip ({files_in_current_zip} files)")
-
-        _progress_done()
-        print(f"\n[PACKER] Offline phase done: {total_packed} packed into ZIPs | {total_loose} large files staged.")
-        return metadata
+        return self._pack_entries(
+            dest, threshold_mb, entries,
+            bundle_prefix="Bundle",
+            skipped_tracker=skipped_tracker,
+            source_name=source_name,
+            session_id=session_id,
+            chunk_index=chunk_index,
+            heading="Offline phase - tape idle",
+            done_label="Offline phase done",
+        )

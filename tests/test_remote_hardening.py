@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from src.constants import LOCAL_STAGING_RESERVE_BYTES
-from src.orchestrators import RemoteOrchestrator
+from src.orchestrators import RemoteOrchestrator, RemoteScanner
 from src.remote_transport import (
     _ASKPASS_HELPERS,
     _cleanup_askpass_helpers,
@@ -14,6 +14,7 @@ from src.remote_transport import (
     _ssh_run,
     _ssh_stream_command,
 )
+from src.skipped import SkippedFileTracker
 
 
 class RemoteStagingSafetyTests(unittest.TestCase):
@@ -113,6 +114,25 @@ class RemotePasswordSafetyTests(unittest.TestCase):
         self.assertIsNone(cmd)
         self.assertIsNone(env)
         self.assertIn("disabled", err)
+
+
+class RemoteScannerTests(unittest.TestCase):
+    def test_partial_find_warnings_are_recorded_and_manifest_continues(self):
+        tracker = SkippedFileTracker()
+        scanner = RemoteScanner(
+            "user", "host", skipped_tracker=tracker, timeout=10)
+        result = SimpleNamespace(
+            returncode=1,
+            stdout="10 /data/ok.txt\0",
+            stderr="find: ‘/data/private’: Permission denied",
+        )
+        with mock.patch("src.orchestrators._ssh_run", return_value=result):
+            manifest = scanner.scan(["/data"])
+        self.assertEqual(manifest, [("/data/ok.txt", 10)])
+        self.assertEqual(tracker.count(), 1)
+        item = tracker.items()[0]
+        self.assertEqual(item.path, "/data/private")
+        self.assertIn("Permission denied", item.reason)
 
 
 if __name__ == "__main__":

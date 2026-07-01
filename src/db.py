@@ -4,6 +4,8 @@ import time
 import hashlib
 import sqlite3
 import threading
+import re
+import queue
 from datetime import datetime
 
 try:
@@ -21,6 +23,155 @@ from .paths import _clean_config_path
 from .runtime import CANCEL
 
 SCHEMA_VERSION = 2
+
+
+class ArchiveRow:
+    """Immutable sqlite row replacement safe to return across threads."""
+
+    def __init__(self, cursor, row):
+        self._keys = tuple(col[0] for col in cursor.description)
+        self._values = tuple(row)
+        self._index = {key: idx for idx, key in enumerate(self._keys)}
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._values[key]
+        return self._values[self._index[key]]
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self):
+        return len(self._values)
+
+    def keys(self):
+        return self._keys
+
+    def get(self, key, default=None):
+        idx = self._index.get(key)
+        return default if idx is None else self._values[idx]
+
+    def __contains__(self, key):
+        return key in self._index
+
+
+class _DatabaseWorker:
+    def __init__(self, manager):
+        self.manager = manager
+        self.tasks = queue.Queue()
+        self.ready = threading.Event()
+        self.thread = threading.Thread(
+            target=self._run, name='database-worker', daemon=True)
+        self.thread.start()
+        self.ready.wait()
+
+    def _run(self):
+        self.manager._db_thread_id = threading.get_ident()
+        self.ready.set()
+        while True:
+            item = self.tasks.get()
+            if item is None:
+                break
+            func, args, kwargs, done, box = item
+            try:
+                box['result'] = func(*args, **kwargs)
+            except BaseException as exc:
+                box['exc'] = exc
+            finally:
+                done.set()
+
+    def call(self, func, *args, **kwargs):
+        if threading.get_ident() == self.manager._db_thread_id:
+            return func(*args, **kwargs)
+        done = threading.Event()
+        box = {}
+        self.tasks.put((func, args, kwargs, done, box))
+        done.wait()
+        if 'exc' in box:
+            raise box['exc']
+        return box.get('result')
+
+    def stop(self):
+        self.tasks.put(None)
+        self.thread.join(timeout=10)
+
+
+class _CursorResult:
+    def __init__(self, rows=None, rowcount=-1, lastrowid=None):
+        self._rows = list(rows or [])
+        self.rowcount = rowcount
+        self.lastrowid = lastrowid
+        self._pos = 0
+
+    def fetchone(self):
+        if self._pos >= len(self._rows):
+            return None
+        row = self._rows[self._pos]
+        self._pos += 1
+        return row
+
+    def fetchall(self):
+        rows = self._rows[self._pos:]
+        self._pos = len(self._rows)
+        return rows
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+class _ConnectionProxy:
+    """Compatibility proxy for external db.conn access."""
+
+    def __init__(self, manager):
+        self.manager = manager
+
+    def _call(self, func, *args, **kwargs):
+        return self.manager._worker.call(func, *args, **kwargs)
+
+    def execute(self, sql, params=()):
+        def operation():
+            cur = self.manager._conn.execute(sql, params)
+            first = str(sql or '').lstrip().split(None, 1)
+            verb = first[0].upper() if first else ''
+            if verb in ('SELECT', 'PRAGMA', 'WITH'):
+                return _CursorResult(cur.fetchall(), cur.rowcount, cur.lastrowid)
+            return _CursorResult([], cur.rowcount, cur.lastrowid)
+        return self._call(operation)
+
+    def executemany(self, sql, params):
+        def operation():
+            cur = self.manager._conn.executemany(sql, params)
+            return _CursorResult([], cur.rowcount, cur.lastrowid)
+        return self._call(operation)
+
+    def executescript(self, sql):
+        def operation():
+            cur = self.manager._conn.executescript(sql)
+            return _CursorResult([], cur.rowcount, cur.lastrowid)
+        return self._call(operation)
+
+    def commit(self):
+        return self._call(self.manager._conn.commit)
+
+    def rollback(self):
+        return self._call(self.manager._conn.rollback)
+
+    def close(self):
+        return self._call(self.manager._conn.close)
+
+    def __enter__(self):
+        def operation():
+            self.manager._conn.__enter__()
+            return self
+        return self._call(operation)
+
+    def __exit__(self, exc_type, exc, tb):
+        def operation():
+            return self.manager._conn.__exit__(exc_type, exc, tb)
+        return self._call(operation)
+
+    def __getattr__(self, name):
+        return getattr(self.manager._conn, name)
 
 
 def _derived_file_name(stored_path, original_path=None):
@@ -79,25 +230,58 @@ def _apply_canonical_remote_paths(metadata, manifest_rows):
     return replaced
 
 
+def _fts_query_from_name_pattern(pattern):
+    text = str(pattern or '').replace('*', ' ').replace('?', ' ')
+    tokens = [token for token in re.split(r'\s+', text.strip()) if token]
+    if not tokens:
+        return None
+    # FTS5 phrase quoting keeps punctuation-heavy filename fragments literal.
+    return ' AND '.join('"' + token.replace('"', '""') + '"' for token in tokens)
+
+
 class DatabaseManager:
+    _DIRECT_ATTRS = {
+        'close', 'conn', 'lock', 'db_path', '_worker', '_db_thread_id',
+        '_bundle_cache', '_DIRECT_ATTRS', '__class__', '__dict__',
+        '__getattribute__',
+    }
+
+    def __getattribute__(self, name):
+        attr = object.__getattribute__(self, name)
+        if (name.startswith('_') or name in object.__getattribute__(self, '_DIRECT_ATTRS')
+                or not callable(attr)):
+            return attr
+        worker = object.__getattribute__(self, '_worker') if '_worker' in self.__dict__ else None
+        db_thread_id = object.__getattribute__(self, '_db_thread_id') if '_db_thread_id' in self.__dict__ else None
+        if worker is None or threading.get_ident() == db_thread_id:
+            return attr
+
+        def dispatched(*args, **kwargs):
+            return worker.call(attr, *args, **kwargs)
+
+        return dispatched
+
     def __init__(self, db_path):
         db_path = _clean_config_path(db_path)
         self.db_path = os.path.abspath(db_path)
+        self.lock = threading.RLock()
+        self._bundle_cache = {}
+        self._db_thread_id = None
         maintenance_lock = os.path.abspath(db_path) + '.maintenance.lock'
         ensure_no_active_maintenance_lock(maintenance_lock)
+        self._worker = _DatabaseWorker(self)
+        self._worker.call(self._open_connection, db_path)
+
+    def _open_connection(self, db_path):
         db_dir = os.path.dirname(os.path.abspath(db_path))
         try:
             os.makedirs(db_dir, exist_ok=True)
-            # check_same_thread=False: the streaming pipeline updates the DB from
-            # both the producer (fetch/pack) thread and the consumer (tape) thread.
-            # self.lock serialises every write so the shared connection stays safe.
-            self.conn = sqlite3.connect(
+            self._conn = sqlite3.connect(
                 db_path,
-                check_same_thread=False,
                 timeout=60,
             )
-            self.conn.execute("PRAGMA busy_timeout = 60000")
-            self.conn.execute("PRAGMA foreign_keys = ON")
+            self._conn.execute("PRAGMA busy_timeout = 60000")
+            self._conn.execute("PRAGMA foreign_keys = ON")
         except (OSError, sqlite3.Error) as e:
             raise RuntimeError(
                 f"[DB] Cannot open database at: {db_path}\n"
@@ -105,9 +289,8 @@ class DatabaseManager:
                 f"     Reason: {e}\n"
                 f"     Edit {CONFIG_FILE} and set [PATHS] db_path to a writable location."
             ) from e
-        self.conn.row_factory = sqlite3.Row
-        self.lock = threading.RLock()
-        self._bundle_cache = {}
+        self._conn.row_factory = ArchiveRow
+        self.conn = _ConnectionProxy(self)
         self._init_schema()
         self._init_remote_schema()
         self._init_local_schema()
@@ -1058,7 +1241,7 @@ class DatabaseManager:
         """Expose normalized and legacy catalog rows through the old API shape."""
         if row is None:
             return None
-        item = dict(row)
+        item = {key: row[key] for key in row.keys()}
         item.pop('file_hash', None)
         item.pop('file_hash_blob', None)
         if not item.get('backup_date'):
@@ -1072,12 +1255,18 @@ class DatabaseManager:
         return item
 
     @staticmethod
-    def _catalog_select():
-        return """SELECT f.*, b.tape_path AS bundle_tape_path,
-                         r.started_at AS run_started_at
-                  FROM files_index AS f
-                  LEFT JOIN archive_bundles AS b ON b.bundle_id = f.bundle_id
-                  LEFT JOIN archive_runs AS r ON r.run_id = f.archive_run_id"""
+    def _catalog_select(from_fts=False):
+        source = (
+            """files_index_fts
+               JOIN files_index AS f ON f.file_id = files_index_fts.rowid"""
+            if from_fts else
+            "files_index AS f"
+        )
+        return f"""SELECT f.*, b.tape_path AS bundle_tape_path,
+                          r.started_at AS run_started_at
+                   FROM {source}
+                   LEFT JOIN archive_bundles AS b ON b.bundle_id = f.bundle_id
+                   LEFT JOIN archive_runs AS r ON r.run_id = f.archive_run_id"""
 
     def _catalog_rows(self, where='', params=(), order_by=''):
         sql = self._catalog_select()
@@ -1113,13 +1302,24 @@ class DatabaseManager:
             bundle_paths,
         )
         bundle_ids = {}
-        for tape_label, tape_path in bundle_paths:
-            row = self.conn.execute(
-                """SELECT bundle_id FROM archive_bundles
-                   WHERE tape_label = ? AND tape_path = ?""",
-                (tape_label, tape_path),
-            ).fetchone()
-            bundle_ids[(tape_label, tape_path)] = row['bundle_id']
+        if bundle_paths:
+            values_sql = ','.join('(?, ?)' for _ in bundle_paths)
+            params = []
+            for tape_label, tape_path in bundle_paths:
+                params.extend([tape_label, tape_path])
+            rows = self.conn.execute(
+                f"""WITH wanted(tape_label, tape_path) AS (VALUES {values_sql})
+                    SELECT b.tape_label, b.tape_path, b.bundle_id
+                    FROM archive_bundles AS b
+                    JOIN wanted AS w
+                      ON w.tape_label = b.tape_label
+                     AND w.tape_path = b.tape_path""",
+                params,
+            ).fetchall()
+            bundle_ids = {
+                (row['tape_label'], row['tape_path']): row['bundle_id']
+                for row in rows
+            }
 
         batch_now = datetime.now().isoformat()
         run_specs = {}
@@ -1547,12 +1747,20 @@ class DatabaseManager:
                        source_host=None):
         where = ["1=1"]
         params = []
+        from_fts = False
         if name_query:
-            where.append("COALESCE(f.file_name, f.stored_path) LIKE ?")
-            pattern = name_query.replace('*', '%').replace('?', '_')
-            if '%' not in pattern and '_' not in pattern:
-                pattern = f'%{pattern}%'
-            params.append(pattern)
+            fts_query = (_fts_query_from_name_pattern(name_query)
+                         if catalog_v3_available(self.conn) else None)
+            if fts_query:
+                from_fts = True
+                where.append("files_index_fts MATCH ?")
+                params.append(fts_query)
+            else:
+                where.append("COALESCE(f.file_name, f.stored_path) LIKE ?")
+                pattern = name_query.replace('*', '%').replace('?', '_')
+                if '%' not in pattern and '_' not in pattern:
+                    pattern = f'%{pattern}%'
+                params.append(pattern)
         if date_from:
             where.append("DATE(COALESCE(f.backup_date,r.started_at)) >= ?")
             params.append(date_from)
@@ -1566,7 +1774,7 @@ class DatabaseManager:
             where.append("f.source_host = ?")
             params.append(_short_source_host(source_host))
         order = 'f.original_path, COALESCE(f.file_name, f.stored_path)'
-        sql = self._catalog_select() + ' WHERE ' + ' AND '.join(where)
+        sql = self._catalog_select(from_fts=from_fts) + ' WHERE ' + ' AND '.join(where)
         sql += ' ORDER BY ' + order
         if limit is not None:
             sql += ' LIMIT ?'
@@ -1582,12 +1790,20 @@ class DatabaseManager:
                            source_host=None):
         where = ["1=1"]
         params = []
+        from_fts = False
         if name_query:
-            where.append("COALESCE(f.file_name, f.stored_path) LIKE ?")
-            pattern = name_query.replace('*', '%').replace('?', '_')
-            if '%' not in pattern and '_' not in pattern:
-                pattern = f'%{pattern}%'
-            params.append(pattern)
+            fts_query = (_fts_query_from_name_pattern(name_query)
+                         if catalog_v3_available(self.conn) else None)
+            if fts_query:
+                from_fts = True
+                where.append("files_index_fts MATCH ?")
+                params.append(fts_query)
+            else:
+                where.append("COALESCE(f.file_name, f.stored_path) LIKE ?")
+                pattern = name_query.replace('*', '%').replace('?', '_')
+                if '%' not in pattern and '_' not in pattern:
+                    pattern = f'%{pattern}%'
+                params.append(pattern)
         if date_from:
             where.append("DATE(COALESCE(f.backup_date,r.started_at)) >= ?")
             params.append(date_from)
@@ -1597,7 +1813,7 @@ class DatabaseManager:
         if source_host:
             where.append("f.source_host = ?")
             params.append(_short_source_host(source_host))
-        sql = self._catalog_select() + ' WHERE ' + ' AND '.join(where)
+        sql = self._catalog_select(from_fts=from_fts) + ' WHERE ' + ' AND '.join(where)
         with self.lock:
             return self.conn.execute(
                 f"SELECT COUNT(*) FROM ({sql})", params).fetchone()[0]
@@ -1985,4 +2201,9 @@ class DatabaseManager:
             return result
 
     def close(self):
-        self.conn.close()
+        worker = getattr(self, '_worker', None)
+        if worker is None:
+            return
+        worker.call(self.conn.close)
+        worker.stop()
+        self._worker = None

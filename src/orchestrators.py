@@ -6,6 +6,7 @@ import shutil
 import threading
 import shlex
 import posixpath
+import re
 from datetime import datetime
 from collections import defaultdict
 
@@ -25,41 +26,139 @@ from .paths import _LEGACY_PATH_LIMIT, _dir_tree_size, _disambiguate_local_rel, 
 from .remote_transport import _remote_tar_fetch, _ssh_run
 from .reporting import _write_source_missing_only_log
 from .runtime import CANCEL, _acquire_tape_io_lock, _fmt_eta, _phase, _priority_class, _progress_done, _progress_line, _release_tape_io_lock, _status, compute_affinity_sets, pin_current_process, unpin_current_process
+from .skipped import SkippedFileTracker
+from .ui import ConsoleUI
+
+
+_FIND_WARNING_RE = re.compile(r"^find:\s+[\"'`‘](.*?)[\"'`’]:\s*(.*)$")
+
+
+class RemoteScanner:
+    """Run remote find and preserve partial-scan omissions as skipped rows."""
+
+    def __init__(self, remote_user, remote_host, remote_password='',
+                 timeout=None, skipped_tracker=None, ui=None):
+        self.remote_user = remote_user
+        self.remote_host = remote_host
+        self.remote_password = remote_password
+        self.timeout = timeout
+        self.skipped_tracker = skipped_tracker or SkippedFileTracker()
+        self.ui = ui or ConsoleUI()
+
+    def _record_find_warnings(self, stderr):
+        for line in (stderr or '').splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            match = _FIND_WARNING_RE.match(line)
+            if match:
+                path, reason = match.groups()
+            else:
+                path, reason = line, "remote find warning"
+            self.skipped_tracker.add('remote', path, reason, 'scan')
+
+    def scan(self, scan_paths):
+        quoted_paths = ' '.join(shlex.quote(path) for path in scan_paths)
+        find_cmd = f"find {quoted_paths} -type f -printf '%s %p\\0'"
+        result = _ssh_run(
+            self.remote_user,
+            self.remote_host,
+            find_cmd,
+            capture=True,
+            password=self.remote_password,
+            timeout=self.timeout,
+        )
+        stdout = result.stdout or ''
+        stderr = (result.stderr or '').strip()
+        if result.returncode == 255 or (result.returncode != 0 and not stdout.strip()):
+            raise RuntimeError(
+                f"[REMOTE] SSH scan failed (exit {result.returncode}):\n{stderr}"
+            )
+        if result.returncode != 0 and stderr:
+            self._record_find_warnings(stderr)
+            self.ui.warning(
+                f"[REMOTE] Scan completed with warnings (find exit {result.returncode}); "
+                "inaccessible paths were recorded in the skipped-file report."
+            )
+        manifest = []
+        for record in stdout.split('\0'):
+            if not record:
+                continue
+            parts = record.split(' ', 1)
+            if len(parts) != 2:
+                continue
+            size_s, path = parts
+            try:
+                manifest.append((path, int(size_s)))
+            except ValueError:
+                self.skipped_tracker.add(
+                    'remote', path, f"invalid find size token: {size_s}", 'scan')
+        return manifest
+
+
+class ChunkPlanner:
+    """Greedy largest-first chunk planner."""
+
+    def __init__(self, budget_bytes):
+        self.budget_bytes = budget_bytes
+
+    def plan(self, manifest):
+        chunks = []
+        current = []
+        cur_sz = 0
+        for remote_path, fsize in sorted(manifest, key=lambda x: x[1], reverse=True):
+            if fsize > self.budget_bytes:
+                chunks.append([(remote_path, fsize)])
+                continue
+            if cur_sz + fsize > self.budget_bytes and current:
+                chunks.append(current)
+                current = []
+                cur_sz = 0
+            current.append((remote_path, fsize))
+            cur_sz += fsize
+        if current:
+            chunks.append(current)
+        return chunks
 
 
 class LocalOrchestrator:
     """Persistent local multi-tape archive workflow."""
 
-    def __init__(self, cfg, db):
+    def __init__(self, cfg, db, ui=None, skipped_tracker=None):
         self.cfg = cfg
         self.db = db
+        self.ui = ui or ConsoleUI()
+        self.skipped_tracker = skipped_tracker or SkippedFileTracker()
         self.source_dir = cfg.source_dir
         self.staging_dir = cfg.staging_dir
         self.fill_pct = cfg.staging_fill_pct
 
     def run(self):
-        source_dir = os.path.abspath(self.source_dir)
-        existing = self.db.get_active_local_session(source_dir)
-        if existing:
-            pending = self.db.get_local_pending_chunks(existing['session_id'])
-            done = existing['total_chunks'] - len(pending)
-            print(f"\n[LOCAL] Found active session: {existing['session_label']}")
-            print(f"        Created : {existing['created_at']}")
-            print(f"        Progress: {done}/{existing['total_chunks']} chunks completed.")
-            print(f"        Mode    : {existing['backup_mode']}")
-            print("1. Resume from first incomplete chunk")
-            print("2. Abandon and start a fresh session")
-            print("0. Cancel")
-            choice = input("Choose: ").strip()
-            if choice == '1':
-                self._run_session(existing['session_id'])
-                return
-            if choice == '2':
-                self.db.update_local_session(existing['session_id'], status='abandoned')
-            else:
-                return
+        try:
+            source_dir = os.path.abspath(self.source_dir)
+            existing = self.db.get_active_local_session(source_dir)
+            if existing:
+                pending = self.db.get_local_pending_chunks(existing['session_id'])
+                done = existing['total_chunks'] - len(pending)
+                print(f"\n[LOCAL] Found active session: {existing['session_label']}")
+                print(f"        Created : {existing['created_at']}")
+                print(f"        Progress: {done}/{existing['total_chunks']} chunks completed.")
+                print(f"        Mode    : {existing['backup_mode']}")
+                print("1. Resume from first incomplete chunk")
+                print("2. Abandon and start a fresh session")
+                print("0. Cancel")
+                choice = self.ui.prompt("Choose: ").strip()
+                if choice == '1':
+                    self._run_session(existing['session_id'])
+                    return
+                if choice == '2':
+                    self.db.update_local_session(existing['session_id'], status='abandoned')
+                else:
+                    return
 
-        self._start_new_session(source_dir)
+            self._start_new_session(source_dir)
+        finally:
+            self.skipped_tracker.print_summary(self.ui, self.cfg.backup_log_dir)
 
     def _start_new_session(self, source_dir):
         analyzer = LTOAnalyzer()
@@ -260,6 +359,10 @@ class LocalOrchestrator:
                     threshold_mb=self.cfg.zip_threshold_mb,
                     file_entries=pending,
                     bundle_prefix=bundle_prefix,
+                    skipped_tracker=self.skipped_tracker,
+                    source_name='local',
+                    session_id=session['session_id'],
+                    chunk_index=chunk_index,
                 )
                 exclude_files, exclude_dirs = self._build_resume_excludes(
                     session['session_id'], chunk_index, tape_label,
@@ -279,6 +382,7 @@ class LocalOrchestrator:
                     local_session_id=session['session_id'],
                     local_chunk_index=chunk_index,
                     tape_parent_dir=self._session_tape_dir(session),
+                    skipped_tracker=self.skipped_tracker,
                 )
                 already.update(m['original_path'] for m in metadata)
             except Exception as e:
@@ -456,6 +560,7 @@ class LocalOrchestrator:
                     local_session_id=session['session_id'],
                     local_chunk_index=chunk_index,
                     tape_parent_dir=self._session_tape_dir(session),
+                    skipped_tracker=self.skipped_tracker,
                 )
         except Exception as e:
             print(f"[LOCAL] Direct chunk failed: {e}")
@@ -568,9 +673,11 @@ class RemoteOrchestrator:
     interrupted run can be resumed from the last completed chunk.
     """
 
-    def __init__(self, cfg, db):
+    def __init__(self, cfg, db, ui=None, skipped_tracker=None):
         self.cfg          = cfg
         self.db           = db
+        self.ui           = ui or ConsoleUI()
+        self.skipped_tracker = skipped_tracker or SkippedFileTracker()
         self.remote_host  = cfg.remote_host
         self.remote_user  = cfg.remote_user
         self.remote_password = cfg.remote_password
@@ -587,6 +694,7 @@ class RemoteOrchestrator:
         self.prefetch_ahead    = cfg.prefetch_chunks_ahead
         self.eject_after_pack  = cfg.eject_after_pack
         self.ssh_cipher        = cfg.ssh_cipher
+        self.ssh_timeout       = cfg.ssh_command_timeout_seconds
         self.use_mbuffer       = cfg.use_mbuffer
         self.mbuffer_size      = cfg.mbuffer_size
         self.tape_priority     = _priority_class(cfg.robocopy_priority)
@@ -602,32 +710,35 @@ class RemoteOrchestrator:
     # ------------------------------------------------------------------
 
     def run(self):
-        self._validate_config()
+        try:
+            self._validate_config()
 
-        existing = self.db.get_active_remote_session(self.remote_host, self.remote_session_path)
-        if existing:
-            pending = self.db.get_pending_chunks(existing['session_id'])
-            total   = self.db.count_chunks(existing['session_id'])
-            done    = total - len(pending)
-            print(f"\n[REMOTE] Found active session: {existing['session_label']}")
-            print(f"         Created : {existing['created_at']}")
-            print(f"         Progress: {done}/{total} chunks completed.")
-            print("1. Resume from last completed chunk")
-            print("2. Abandon and start a fresh session")
-            print("0. Cancel")
-            choice = input("Choose: ").strip()
-            if choice == '1':
-                self._run_session(existing['session_id'])
-                return
-            elif choice == '2':
-                print("[REMOTE] Starting a fresh-session scan. The current session "
-                      "will remain resumable until the replacement is approved.")
-                self._start_new_session(replacing_session=existing)
-                return
-            else:
-                return
+            existing = self.db.get_active_remote_session(self.remote_host, self.remote_session_path)
+            if existing:
+                pending = self.db.get_pending_chunks(existing['session_id'])
+                total   = self.db.count_chunks(existing['session_id'])
+                done    = total - len(pending)
+                print(f"\n[REMOTE] Found active session: {existing['session_label']}")
+                print(f"         Created : {existing['created_at']}")
+                print(f"         Progress: {done}/{total} chunks completed.")
+                print("1. Resume from last completed chunk")
+                print("2. Abandon and start a fresh session")
+                print("0. Cancel")
+                choice = self.ui.prompt("Choose: ").strip()
+                if choice == '1':
+                    self._run_session(existing['session_id'])
+                    return
+                elif choice == '2':
+                    print("[REMOTE] Starting a fresh-session scan. The current session "
+                          "will remain resumable until the replacement is approved.")
+                    self._start_new_session(replacing_session=existing)
+                    return
+                else:
+                    return
 
-        self._start_new_session()
+            self._start_new_session()
+        finally:
+            self.skipped_tracker.print_summary(self.ui, self.cfg.backup_log_dir)
 
     # ------------------------------------------------------------------
     # Session lifecycle
@@ -785,50 +896,16 @@ class RemoteOrchestrator:
     # ------------------------------------------------------------------
 
     def _scan_remote(self):
-        """SSH find with -printf '%s %p\0' to get size + path for every file.
-
-        NUL-delimited records survive filenames containing spaces or newlines;
-        only the size token is parsed, the path is never stripped."""
-        quoted_paths = ' '.join(shlex.quote(path) for path in self.remote_scan_paths)
-        find_cmd = f"find {quoted_paths} -type f -printf '%s %p\\0'"
-        result   = _ssh_run(
+        """SSH find with -printf '%s %p\0' to get size + path for every file."""
+        scanner = RemoteScanner(
             self.remote_user,
             self.remote_host,
-            find_cmd,
-            capture=True,
-            password=self.remote_password,
+            remote_password=self.remote_password,
+            timeout=self.ssh_timeout,
+            skipped_tracker=self.skipped_tracker,
+            ui=self.ui,
         )
-        stdout = result.stdout or ''
-        stderr = (result.stderr or '').strip()
-        # `find` returns a non-zero exit (typically 1) when it cannot descend
-        # into some directories (e.g. "Permission denied"), even though it has
-        # still listed every file it *could* read. Only abort when SSH itself
-        # failed (exit 255) or nothing usable came back; otherwise warn and use
-        # the partial listing.
-        if result.returncode == 255 or (result.returncode != 0 and not stdout.strip()):
-            raise RuntimeError(
-                f"[REMOTE] SSH scan failed (exit {result.returncode}):\n{stderr}"
-            )
-        if result.returncode != 0 and stderr:
-            print(
-                f"[REMOTE] Scan completed with warnings (find exit {result.returncode}); "
-                f"some paths were skipped:\n{stderr}"
-            )
-        manifest = []
-        for record in stdout.split('\0'):
-            if not record:
-                continue
-            parts = record.split(' ', 1)
-            if len(parts) != 2:
-                continue
-            size_s, path = parts
-            # int() tolerates a leading newline on the size token; the path is
-            # left verbatim so names with spaces/newlines survive intact.
-            try:
-                manifest.append((path, int(size_s)))
-            except ValueError:
-                continue
-        return manifest
+        return scanner.scan(self.remote_scan_paths)
 
     # ------------------------------------------------------------------
     # Bin-packing
@@ -846,28 +923,13 @@ class RemoteOrchestrator:
     def _bin_pack(self, manifest):
         """Greedy largest-first bin-packing into chunks that fit staging budget.
         Files larger than the budget get their own single-file chunk."""
-        budget  = self._chunk_budget()
-        chunks  = []
-        current = []
-        cur_sz  = 0
-
+        budget = self._chunk_budget()
         for remote_path, fsize in sorted(manifest, key=lambda x: x[1], reverse=True):
             if fsize > budget:
                 print(f"[WARN] File exceeds staging budget "
                       f"({fsize/1024**3:.2f} GB > {budget/1024**3:.2f} GB), "
                       f"placing in dedicated chunk: {os.path.basename(remote_path)}")
-                chunks.append([(remote_path, fsize)])
-                continue
-            if cur_sz + fsize > budget and current:
-                chunks.append(current)
-                current = []
-                cur_sz  = 0
-            current.append((remote_path, fsize))
-            cur_sz += fsize
-
-        if current:
-            chunks.append(current)
-        return chunks
+        return ChunkPlanner(budget).plan(manifest)
 
     # ------------------------------------------------------------------
     # Pipeline execution
@@ -1124,6 +1186,10 @@ class RemoteOrchestrator:
                 source=fetch_dir,
                 dest=pack_dir,
                 threshold_mb=self.cfg.zip_threshold_mb,
+                skipped_tracker=self.skipped_tracker,
+                source_name='remote',
+                session_id=session_id,
+                chunk_index=chunk_index,
             )
         except Exception as e:
             print(f"[REMOTE] Packer error: {e}")
@@ -1248,6 +1314,7 @@ class RemoteOrchestrator:
                 packer_metadata=desc['metadata'],
                 stage_stats=desc,
                 source_host=self.remote_host.split('.', 1)[0],
+                skipped_tracker=self.skipped_tracker,
             )
         except Exception as e:
             if CANCEL.is_set():
@@ -1349,6 +1416,9 @@ class RemoteOrchestrator:
                     'remote_path': remote_fpath,
                     'file_size_bytes': fsize,
                 })
+                self.skipped_tracker.add(
+                    'remote', remote_fpath, row['error_msg'] or 'source missing',
+                    'fetch', session_id=session_id, chunk_index=chunk_index)
                 print(f"[REMOTE] Skip (source already missing): {remote_fpath}")
                 continue
 
@@ -1497,6 +1567,9 @@ class RemoteOrchestrator:
                 }
                 source_missing_files.append(detail)
                 source_missing_ids.add(manifest_id)
+                self.skipped_tracker.add(
+                    'remote', row['remote_path'], "missing after tar fetch",
+                    'fetch', session_id=session_id, chunk_index=chunk_index)
                 print(f"[REMOTE] Source missing; skipped: {row['remote_path']}")
                 self.db.update_manifest_row(
                     manifest_id,
@@ -1607,6 +1680,9 @@ class RemoteOrchestrator:
                         'file_size_bytes': row['file_size_bytes'],
                     }
                     source_missing_files.append(detail)
+                    self.skipped_tracker.add(
+                        'remote', row['remote_path'], "missing after tar fetch",
+                        'fetch', session_id=session_id, chunk_index=None)
                     print(f"[REMOTE] Source missing; skipped: {row['remote_path']}")
                     self.db.update_manifest_row(
                         row['manifest_id'], session_id=session_id,
