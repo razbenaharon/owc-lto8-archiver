@@ -85,6 +85,41 @@ single transaction / `executemany`, and add an index on
 `(original_path, tape_label, local_session_id, local_chunk_index)` to speed the
 dedup lookups.
 
+## Storage Map & Analytics (`storage_map.py`)
+
+A self-contained, two-stage remote disk-usage mapper for the lab servers,
+**decoupled from the tape pipeline** (it does not touch `src/cli.py`,
+`lto_archive.db`, or the LTFS drive). It lives at the top of the package
+dependency graph in `src/storage_map.py` with a root runner `storage_map.py`.
+
+- **Stage 1 — `scan` (fire-and-forget).** Connects to each configured server
+  over SSH (reusing `remote_transport._ssh_run`), launches a low-priority
+  `ionice -c3 nice -n19 du -x -h --max-depth=2` per mount under
+  `nohup`/`setsid`, then exits immediately. The scan keeps running on the server
+  after the SSH session closes — no live connection is held for the ~hours-long
+  `du`.
+- **Stage 1.5 — `status` / `fetch`.** `status` checks each server's remote
+  completion sentinel; `fetch` SCPs the finished raw log to
+  `storage_map_logs/<server>_<ts>.rawlog` (+ a `<server>_latest.rawlog` pointer)
+  via `remote_transport._scp_fetch_file`.
+- **Stage 2 — `view` / `treemap`.** Parse a *local* raw log only (never the
+  disks again): `parse_size` normalizes `du -h` units to bytes and `parse_raw_log`
+  builds a Mount → user/project → sub-folder tree, rendered as a Rich terminal
+  dashboard (`view`) or an interactive Plotly HTML treemap (`treemap`). `rich`
+  and `plotly` are **optional** — each visualizer prints a `pip install` hint if
+  its library is missing.
+
+Mount points and servers are **config-driven, never hardcoded** — see the
+`[STORAGE_MAP]` / `[STORAGE_MAP:<name>]` sections in `config.ini`
+(`config.example.ini` documents them). SSH user/password default to the
+`[REMOTE]` account (secret still in `.env`). Output lands in
+`storage_map_logs/` (gitignored like `backup_logs/`).
+
+Typical nightly use (Windows Task Scheduler): schedule `python storage_map.py
+scan` at night and, hours later, `python storage_map.py fetch --treemap`. Unit
+tests: `tests/test_storage_map.py` (pure parser + launcher-script coverage, no
+hardware/network).
+
 ## Commit & Pull Request Guidelines
 
 Use concise, imperative commit messages, optionally prefixed `fix:`, `feat:`,

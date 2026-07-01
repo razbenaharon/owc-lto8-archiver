@@ -11,6 +11,7 @@ source/
 staging/
 restored/
 backup_logs/
+storage_map_logs/
 lto_archive*.db
 
 # Local config — contains host/user/paths. Use config.example.ini as template.
