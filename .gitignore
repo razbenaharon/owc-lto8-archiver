@@ -6,12 +6,17 @@
 __pycache__/
 *.pyc
 
+# Virtual environment
+venv/
+.venv/
+
 # Local archive working directories
 source/
 staging/
 restored/
 backup_logs/
 storage_map_logs/
+db_backups/
 lto_archive*.db
 
 # Local config — contains host/user/paths. Use config.example.ini as template.

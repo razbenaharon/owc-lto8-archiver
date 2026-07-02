@@ -9,6 +9,7 @@
 # (e.g. `apt install mbuffer`). It is invoked there, not on this Windows PC.
 psutil>=5.9
 PySide6>=6.7
+psycopg[binary,pool]>=3.2
 #
 # Optional — only needed for the Storage Map & Analytics visualizers
 # (storage_map.py). The scanner and parser run without them; each visualizer
