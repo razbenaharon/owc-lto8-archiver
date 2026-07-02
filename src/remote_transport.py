@@ -194,6 +194,48 @@ def _ssh_run(remote_user, remote_host, command, capture=True, password='',
             ssh_cmd, 124, '', f"SSH command timed out after {timeout}s")
 
 
+def _scp_fetch_file(remote_user, remote_host, remote_file_path, local_dest_path, password=''):
+    """Copy a single file from remote_user@remote_host:remote_file_path to
+    local_dest_path using SCP.  stdout/stderr are NOT redirected so SCP's
+    native progress output is visible in the terminal.
+    Returns SCP's exit code (0 = success).
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(local_dest_path)), exist_ok=True)
+    remote_spec = f'{remote_user}@{remote_host}:{remote_file_path}'
+
+    password = password or ''
+    if password:
+        if _has_command('sshpass'):
+            env = os.environ.copy()
+            env['SSHPASS'] = password
+            proc = subprocess.Popen(
+                ['sshpass', '-e', 'scp', '-p', remote_spec, local_dest_path],
+                env=env
+            )
+            return proc.wait()
+        if _has_command('scp'):
+            env = _openssh_askpass_env(password)
+            proc = subprocess.Popen(
+                [
+                    'scp',
+                    '-o', 'BatchMode=no',
+                    '-o', 'PubkeyAuthentication=no',
+                    '-o', 'NumberOfPasswordPrompts=1',
+                    '-p',
+                    remote_spec,
+                    local_dest_path,
+                ],
+                stdin=subprocess.DEVNULL,
+                env=env,
+            )
+            return proc.wait()
+        print("[REMOTE] remote_password is set, but scp/OpenSSH or sshpass was not found.")
+        return 255
+
+    proc = subprocess.Popen(['scp', '-p', remote_spec, local_dest_path])
+    return proc.wait()
+
+
 def _ssh_stream_command(remote_user, remote_host, command, password='', cipher=''):
     """Return a command/env pair for an SSH process that streams stdin/stdout.
 
