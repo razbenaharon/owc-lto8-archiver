@@ -3,7 +3,7 @@
 This repository is a Windows-focused Python utility for archiving data to LTO/LTFS
 tapes. It fetches data from a remote host over SSH, packs many small files into ZIP
 bundles, writes them to an LTFS-mounted tape via `robocopy`, and indexes every file
-in a local SQLite database.
+in a PostgreSQL catalog (see `docker-compose.yml` and `scripts/sql/`).
 
 ## Project Structure & Module Organization
 
@@ -14,17 +14,19 @@ in a local SQLite database.
   strictly downward dependencies: `constants` → `runtime` → `paths` →
   `reporting`/`config`/`db` → `robocopy`/`remote_transport` → `ltfs` → `packer`
   → `backup`/`retriever` → `orchestrators` → `cli`; `src/db_inspector_qt.py`
-  holds the GUI. Data files (`config.ini`, `.env`, `lto_archive.db`, `backup_logs/`)
-  stay in the project root; `src/constants.py` anchors paths to `PROJECT_ROOT`.
+  holds the GUI. Data files (`config.ini`, `.env`, `backup_logs/`) stay in the
+  project root; `src/constants.py` anchors paths to `PROJECT_ROOT`. The archive
+  catalog itself lives in PostgreSQL, not in a repo file.
 - `config.ini` — local paths, tape drive settings, remote archive settings, and
   performance tuning. `.env` stores secrets (e.g. `remote_password`); keep it
   untracked and use `.env.example` as the template.
 - `backup_logs/` — holds the single `SUMMARY.csv`: the one statistics file for
-  the whole system (backup/tape-write sessions and database-maintenance runs).
-  No per-run log files and no per-file manifests are written, so it never
-  contains individual file names.
+  backup/tape-write sessions. No per-run log files and no per-file manifests are
+  written, so it never contains individual file names.
 - `Framework & Drivers/` — installer assets and hardware documentation.
-- `lto_archive.db` — local SQLite archive index; treat as runtime data, not source.
+- `scripts/sql/` — PostgreSQL schema/index/constraint migrations applied on
+  startup by `PgDatabaseManager._init_schema`; `docker-compose.yml` runs the
+  local database. Catalog rows are runtime data, not source.
 
 ## Build, Test, and Development Commands
 
@@ -53,24 +55,17 @@ small staged dataset before a full remote archive run.
 
 ## Logging & Reports
 
-- **One statistics file** (`backup_logs/SUMMARY.csv`) holds every system
-  statistic. A leading `record_type` column distinguishes the two row kinds and
-  `operation` names the specific activity; columns not relevant to a row are left
-  blank. No per-file manifests or robocopy stdout dumps are written — the CSV is
-  file-name-free by construction.
-  - `record_type=backup` rows are appended by `LTOBackup._write_backup_log` via
+- **One statistics file** (`backup_logs/SUMMARY.csv`) holds every backup/
+  tape-write statistic. `record_type` and `operation` are always `backup`;
+  columns not relevant to a row are left blank. No per-file manifests or
+  robocopy stdout dumps are written — the CSV is file-name-free by construction.
+  - Rows are appended by `LTOBackup._write_backup_log` via
     `reporting.append_backup_summary_row`. Each reports `total_time_seconds`,
     `copied_bytes`, final robocopy stats, source host, tape label, and — for the
     staged/packed pipeline — per-phase timing and throughput (`fetch_seconds`,
     `pack_seconds`, `db_sync_seconds`; see Performance characteristics). Fetch and
     pack run in the producer and overlap the *previous* chunk's tape write, so
     these phases need not sum to `total_time_seconds`.
-  - `record_type=maintenance` rows are appended by the database optimizers
-    (`DatabaseOptimizer`, `HashlessOriginOptimizer`, `CatalogV3Optimizer`) via
-    `reporting.append_maintenance_summary_row`, reporting `operation`,
-    `started_at`/`finished_at`, `total_time_seconds`, and `before_bytes` /
-    `after_bytes` / `reduction_pct`. These replace the former per-run
-    `DB_*.json` reports.
 - Main-menu option **8** ensures `backup_logs/SUMMARY.csv` exists.
 
 ## Performance Characteristics
@@ -80,10 +75,12 @@ is the **Phase-3 DB sync** in `LTOBackup._run_locked`. This scales with file
 *count*, not bytes: packs with more, smaller files take far longer for the same
 data volume. The `db_sync_seconds` CSV field makes this visible.
 
-Recommended future optimization (not yet implemented): batch Phase-3 inserts into a
-single transaction / `executemany`, and add an index on
-`(original_path, tape_label, local_session_id, local_chunk_index)` to speed the
-dedup lookups.
+Phase-3 inserts are batched: rows are streamed via PostgreSQL `COPY` into a temp
+table and applied with a single `INSERT ... ON CONFLICT (record_key)` upsert
+(`PgDatabaseManager._bulk_upsert_batch`), and the per-file directory chain is
+resolved with one multi-row upsert per tree depth
+(`PgDatabaseManager._ensure_directories`) instead of one round-trip per file.
+Dedup lookups use the unique `record_key` index.
 
 ## Commit & Pull Request Guidelines
 
@@ -95,8 +92,8 @@ hardware/manual verification if relevant, and any database/config changes. For
 
 ## Security & Operations Notes
 
-- Never commit `.env`, real credentials, generated logs with sensitive paths, or
-  large runtime databases (`lto_archive.db`).
+- Never commit `.env`, real credentials, or generated logs with sensitive paths.
+  The PostgreSQL catalog lives in a Docker volume, never in the repo.
 - **During archive writes, avoid browsing the LTFS drive or starting separate copy
   jobs.** Internal tape access is serialized (`_acquire_tape_io_lock`), but external
   processes can still degrade tape throughput. This is enforced as guidance only —
