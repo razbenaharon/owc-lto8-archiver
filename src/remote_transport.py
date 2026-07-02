@@ -21,40 +21,58 @@ def _has_command(name):
 
 
 _ASKPASS_HELPERS = set()
+_ASKPASS_HELPER_PATH = None
+_ASKPASS_LOCK = threading.Lock()
 
 
 @atexit.register
 def _cleanup_askpass_helpers():
     """Remove any SSH askpass helper scripts created during this run."""
+    global _ASKPASS_HELPER_PATH
     for helper_path in list(_ASKPASS_HELPERS):
         try:
             os.remove(helper_path)
         except OSError:
             pass
         _ASKPASS_HELPERS.discard(helper_path)
+    _ASKPASS_HELPER_PATH = None
+
+
+def _get_askpass_helper():
+    """Return a shared askpass helper script, creating it once per run.
+
+    The helper only reads ``$env:LTO_REMOTE_PASSWORD`` at call time, so a single
+    script serves every SSH invocation regardless of the password value. Reusing
+    it avoids leaking one temp file per remote fetch during a long archive run.
+    """
+    global _ASKPASS_HELPER_PATH
+    with _ASKPASS_LOCK:
+        if _ASKPASS_HELPER_PATH and os.path.exists(_ASKPASS_HELPER_PATH):
+            return _ASKPASS_HELPER_PATH
+        helper_body = (
+            "@echo off\r\n"
+            "powershell -NoProfile -ExecutionPolicy Bypass "
+            "-Command \"[Console]::Out.Write($env:LTO_REMOTE_PASSWORD)\"\r\n"
+        )
+        try:
+            with tempfile.NamedTemporaryFile(
+                    'w', encoding='utf-8', newline='',
+                    prefix='lto_ssh_askpass_', suffix='.cmd',
+                    delete=False) as f:
+                helper_path = f.name
+                f.write(helper_body)
+        except OSError as e:
+            raise RuntimeError(f"Could not create SSH askpass helper: {e}") from e
+        _ASKPASS_HELPERS.add(helper_path)
+        _ASKPASS_HELPER_PATH = helper_path
+        return helper_path
 
 
 def _openssh_askpass_env(password):
     """Build an environment that lets OpenSSH read a configured password."""
-    helper_body = (
-        "@echo off\r\n"
-        "powershell -NoProfile -ExecutionPolicy Bypass "
-        "-Command \"[Console]::Out.Write($env:LTO_REMOTE_PASSWORD)\"\r\n"
-    )
-    try:
-        with tempfile.NamedTemporaryFile(
-                'w', encoding='utf-8', newline='',
-                prefix='lto_ssh_askpass_', suffix='.cmd',
-                delete=False) as f:
-            helper_path = f.name
-            f.write(helper_body)
-    except OSError as e:
-        raise RuntimeError(f"Could not create SSH askpass helper: {e}") from e
-    _ASKPASS_HELPERS.add(helper_path)
-
     env = os.environ.copy()
     env['LTO_REMOTE_PASSWORD'] = password
-    env['SSH_ASKPASS'] = helper_path
+    env['SSH_ASKPASS'] = _get_askpass_helper()
     env['SSH_ASKPASS_REQUIRE'] = 'force'
     env['DISPLAY'] = env.get('DISPLAY') or 'lto-archive-manager'
     return env
@@ -174,48 +192,6 @@ def _ssh_run(remote_user, remote_host, command, capture=True, password='',
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(
             ssh_cmd, 124, '', f"SSH command timed out after {timeout}s")
-
-
-def _scp_fetch_file(remote_user, remote_host, remote_file_path, local_dest_path, password=''):
-    """Copy a single file from remote_user@remote_host:remote_file_path to
-    local_dest_path using SCP.  stdout/stderr are NOT redirected so SCP's
-    native progress output is visible in the terminal.
-    Returns SCP's exit code (0 = success).
-    """
-    os.makedirs(os.path.dirname(os.path.abspath(local_dest_path)), exist_ok=True)
-    remote_spec = f'{remote_user}@{remote_host}:{remote_file_path}'
-
-    password = password or ''
-    if password:
-        if _has_command('sshpass'):
-            env = os.environ.copy()
-            env['SSHPASS'] = password
-            proc = subprocess.Popen(
-                ['sshpass', '-e', 'scp', '-p', remote_spec, local_dest_path],
-                env=env
-            )
-            return proc.wait()
-        if _has_command('scp'):
-            env = _openssh_askpass_env(password)
-            proc = subprocess.Popen(
-                [
-                    'scp',
-                    '-o', 'BatchMode=no',
-                    '-o', 'PubkeyAuthentication=no',
-                    '-o', 'NumberOfPasswordPrompts=1',
-                    '-p',
-                    remote_spec,
-                    local_dest_path,
-                ],
-                stdin=subprocess.DEVNULL,
-                env=env,
-            )
-            return proc.wait()
-        print("[REMOTE] remote_password is set, but scp/OpenSSH or sshpass was not found.")
-        return 255
-
-    proc = subprocess.Popen(['scp', '-p', remote_spec, local_dest_path])
-    return proc.wait()
 
 
 def _ssh_stream_command(remote_user, remote_host, command, password='', cipher=''):
