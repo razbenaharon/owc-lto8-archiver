@@ -14,6 +14,8 @@ from src.constants import PROJECT_ROOT
 os.chdir(PROJECT_ROOT)
 
 from src.cli import main
+from src.config import ConfigManager
+from src.pg_backup import create_database_backup
 
 
 _REMOVED_SQLITE_FLAGS = {
@@ -27,6 +29,12 @@ _REMOVED_SQLITE_FLAGS = {
 
 if __name__ == "__main__":
     try:
+        if "--backup-db" in sys.argv:
+            cfg = ConfigManager()
+            path = create_database_backup(cfg)
+            print(f"[DB BACKUP] PostgreSQL dump created: {path}")
+            raise SystemExit(0)
+
         removed = sorted(_REMOVED_SQLITE_FLAGS.intersection(sys.argv))
         if removed:
             raise RuntimeError(

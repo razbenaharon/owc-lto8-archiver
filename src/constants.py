@@ -15,6 +15,7 @@ BUFFER_SIZE = 1024 * 1024 * 16  # 16 MB read buffer
 CONFIG_FILE = "config.ini"      # relative; runners chdir(PROJECT_ROOT)
 LTFS_DIR = r'C:\Program Files\IBM\LTFS'  # IBM LTFS tools must run from this directory
 BACKUP_LOG_DIR = os.path.join(PROJECT_ROOT, 'backup_logs')
+DB_BACKUP_DIR = os.path.join(PROJECT_ROOT, 'db_backups')
 # Surfaced to the operator at the start of every tape-write run. Internal tape
 # I/O is serialized (see _acquire_tape_io_lock), but external processes are not.
 LTFS_WRITE_WARNING = (
