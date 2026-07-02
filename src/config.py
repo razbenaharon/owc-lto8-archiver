@@ -86,7 +86,6 @@ class ConfigManager:
         self.config['PERFORMANCE'] = {
             'chunk_cap_gb':          '100',
             'prefetch_chunks_ahead': '2',
-            'eject_after_pack':      'off',
             'staging_max_gb':        '350',
             'robocopy_priority':     'high',
             'cpu_affinity':          'auto',
@@ -196,16 +195,6 @@ class ConfigManager:
     @property
     def prefetch_chunks_ahead(self):
         return max(1, int(float(self.config.get('PERFORMANCE', 'prefetch_chunks_ahead', fallback='2'))))
-    @property
-    def eject_after_pack(self):
-        raw = self.config.get('PERFORMANCE', 'eject_after_pack', fallback='off').strip().lower()
-        if raw in ('', 'off', 'none', 'false', 'no'):
-            return None
-        try:
-            value = int(float(raw))
-        except ValueError:
-            return None
-        return value if value >= 0 else None
     @property
     def staging_max_gb(self):
         return float(self.config.get('PERFORMANCE', 'staging_max_gb', fallback='350'))

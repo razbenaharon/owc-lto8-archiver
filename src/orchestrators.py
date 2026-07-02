@@ -692,7 +692,6 @@ class RemoteOrchestrator:
         self.chunk_cap_bytes   = int(cfg.chunk_cap_gb * 1024**3)
         self.staging_max_bytes = int(cfg.staging_max_gb * 1024**3)
         self.prefetch_ahead    = cfg.prefetch_chunks_ahead
-        self.eject_after_pack  = cfg.eject_after_pack
         self.ssh_cipher        = cfg.ssh_cipher
         self.ssh_timeout       = cfg.ssh_command_timeout_seconds
         self.use_mbuffer       = cfg.use_mbuffer
@@ -1040,21 +1039,6 @@ class RemoteOrchestrator:
                     failed = True
                     break
                 completed += 1
-                if (self.eject_after_pack is not None and
-                        ci == self.eject_after_pack and
-                        ci != last_chunk):
-                    stop_pipeline.set()
-                    _status('REMOTE',
-                            f"Checkpoint reached after pack {ci:03d}; "
-                            "ejecting tape and saving session.")
-                    LTOBackup(
-                        self.db,
-                        self.cfg.ibm_eject_cmd,
-                        log_dir=self.cfg.backup_log_dir,
-                    ).eject_tape(self.cfg.lto_drive)
-                    print("\n[REMOTE] Checkpoint complete. Session saved - "
-                          "re-run option 6 to resume from the next pack.")
-                    return
         finally:
             stop_pipeline.set()
             hb_stop.set()
