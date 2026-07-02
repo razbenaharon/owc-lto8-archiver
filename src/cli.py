@@ -8,7 +8,7 @@ except ImportError:  # optional dependency — priority/affinity degrade gracefu
 
 from .config import ConfigManager
 from .constants import CONFIG_FILE
-from .db import DatabaseManager
+from .db import DatabaseManager, create_database_manager
 from .ltfs import TapeManager
 from .orchestrators import LocalOrchestrator, RemoteOrchestrator
 from .reporting import generate_backup_summary
@@ -227,7 +227,7 @@ def main():
     print("=" * 60)
 
     cfg       = ConfigManager()
-    db        = DatabaseManager(cfg.db_path)
+    db        = create_database_manager(cfg)
     tape_mgr  = TapeManager(db, cfg.lto_drive, cfg.ibm_eject_cmd)
     retriever = LTORetriever(db, cfg.lto_drive, cfg.staging_dir, cfg.restore_dir)
 
