@@ -6,6 +6,10 @@
 __pycache__/
 *.pyc
 
+# Virtual environment
+venv/
+.venv/
+
 # Local archive working directories
 source/
 staging/
