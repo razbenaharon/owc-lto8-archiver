@@ -1,8 +1,13 @@
-"""Read-only, bounded query layer for the database inspector."""
-import os
-import sqlite3
+"""Read-only, bounded PostgreSQL query layer for the database inspector."""
 
-from .catalog_v3 import catalog_v3_available
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:  # pragma: no cover - optional until PG backend is selected
+    psycopg = None
+    dict_row = None
+
+from .catalog_query import prefix_pattern, substring_pattern
 from .db import _derived_file_name
 
 
@@ -11,15 +16,23 @@ MAX_PAGE_SIZE = 500
 
 
 class InspectorRepository:
-    """Open one read-only SQLite connection for inspector worker use."""
+    """Open one read-only connection for inspector worker use."""
 
     def __init__(self, db_path):
-        self.db_path = os.path.abspath(db_path)
-        uri = "file:" + self.db_path.replace("\\", "/") + "?mode=ro"
-        self.conn = sqlite3.connect(uri, uri=True, timeout=30)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA query_only=ON")
-        self.conn.execute("PRAGMA busy_timeout=30000")
+        self.db_path = db_path
+        if psycopg is None:
+            raise RuntimeError(
+                "[DB] psycopg 3 is required for PostgreSQL inspector access.")
+        # autocommit=True keeps each read in its own short transaction. Without
+        # it, psycopg's default deferred transaction would stay open for the
+        # connection's lifetime ("idle in transaction"), pinning xmin and
+        # blocking VACUUM while an inspector tab is left open.
+        self.conn = psycopg.connect(
+            db_path, autocommit=True, row_factory=dict_row)
+        self.conn.execute("SET default_transaction_read_only = on")
+
+    def _execute(self, sql, params=()):
+        return self.conn.execute(sql, params)
 
     def close(self):
         self.conn.close()
@@ -31,12 +44,25 @@ class InspectorRepository:
         self.close()
 
     def _require_v3(self):
-        if not catalog_v3_available(self.conn):
-            raise RuntimeError(
-                "[DB] Catalog v3 indexes are not available. Run "
-                "`python run.py --catalog-v3-preflight` and then migrate a "
-                "validated copy before using lazy inspector browsing."
+        columns = {
+            row["column_name"]
+            for row in self._execute(
+                """SELECT column_name
+                   FROM information_schema.columns
+                   WHERE table_name='files_index'"""
             )
+        }
+        available = {"directory_id", "catalog_name",
+                     "catalog_backup_date"}.issubset(columns)
+        if not available:
+            raise RuntimeError(
+                "[DB] PostgreSQL catalog indexes are not available. Apply "
+                "scripts/sql/001_postgres_schema.sql and "
+                "scripts/sql/002_postgres_indexes.sql before using the inspector."
+            )
+
+    def require_catalog_v3(self):
+        self._require_v3()
 
     @staticmethod
     def _limit(limit):
@@ -74,7 +100,7 @@ class InspectorRepository:
 
     def list_tapes(self):
         self._require_v3()
-        return [dict(row) for row in self.conn.execute(
+        return [dict(row) for row in self._execute(
             """SELECT t.*,
                       COALESCE(d.root_count, 0) AS root_directory_count
                FROM tapes t
@@ -88,22 +114,25 @@ class InspectorRepository:
         )]
 
     def list_source_hosts(self):
-        return [row[0] for row in self.conn.execute(
+        rows = self._execute(
             """SELECT DISTINCT COALESCE(source_host,'so02') AS source_host
                FROM files_index
                ORDER BY source_host"""
-        ) if row[0]]
+        )
+        return [row["source_host"] for row in rows if row["source_host"]]
 
     def _table_exists(self, name):
-        return self.conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        return self._execute(
+            """SELECT 1
+               FROM information_schema.tables
+               WHERE table_schema='public' AND table_name=%s""",
             (name,),
         ).fetchone() is not None
 
     def list_sessions(self):
         rows = []
         if self._table_exists("local_sessions"):
-            rows.extend(dict(row) for row in self.conn.execute("""
+            rows.extend(dict(row) for row in self._execute("""
                 SELECT 'local' AS kind,s.session_id,s.session_label,s.status,
                        COALESCE(s.backup_mode,'auto') AS mode,s.created_at,
                        s.completed_at,s.total_chunks AS chunks,
@@ -116,7 +145,7 @@ class InspectorRepository:
                 FROM local_sessions s ORDER BY s.session_id"""))
         if self._table_exists("remote_sessions"):
             if self._table_exists("remote_plan_files"):
-                rows.extend(dict(row) for row in self.conn.execute("""
+                rows.extend(dict(row) for row in self._execute("""
                     SELECT 'remote' AS kind,s.session_id,s.session_label,s.status,
                            '' AS mode,s.created_at,s.completed_at,s.chunk_count AS chunks,
                            COALESCE((SELECT COUNT(*) FROM remote_plan_files pf
@@ -129,7 +158,7 @@ class InspectorRepository:
                            0 AS file_records
                     FROM remote_sessions s ORDER BY s.session_id"""))
             elif self._table_exists("remote_manifest"):
-                rows.extend(dict(row) for row in self.conn.execute("""
+                rows.extend(dict(row) for row in self._execute("""
                     SELECT 'remote' AS kind,s.session_id,s.session_label,s.status,
                            '' AS mode,s.created_at,s.completed_at,s.chunk_count AS chunks,
                            COALESCE((SELECT COUNT(*) FROM remote_manifest m
@@ -151,7 +180,7 @@ class InspectorRepository:
                 'plans': 0, 'plan_files': 0,
                 'snapshots': 0, 'snapshot_files': 0,
             }
-        return dict(self.conn.execute("""
+        return dict(self._execute("""
             SELECT
               1 AS supported,
               (SELECT COUNT(*) FROM remote_sessions
@@ -192,20 +221,20 @@ class InspectorRepository:
         if parent_id is None:
             if not tape_label:
                 raise RuntimeError("[DB] tape_label is required for root directories.")
-            where = "tape_label=? AND parent_id IS NULL"
+            where = "tape_label=%s AND parent_id IS NULL"
             params.append(tape_label)
         else:
-            where = "parent_id=?"
+            where = "parent_id=%s"
             params.append(parent_id)
         if cursor:
-            where += " AND (name > ? OR (name = ? AND directory_id > ?))"
+            where += " AND (name > %s OR (name = %s AND directory_id > %s))"
             params.extend([cursor["name"], cursor["name"], cursor["directory_id"]])
-        rows = self.conn.execute(
+        rows = self._execute(
             f"""SELECT directory_id, tape_label, parent_id, name, normalized_path
                 FROM catalog_directories
                 WHERE {where}
                 ORDER BY name, directory_id
-                LIMIT ?""",
+                LIMIT %s""",
             params + [page_size + 1],
         ).fetchall()
         return self._page(rows, page_size, ("name", "directory_id"))
@@ -216,29 +245,28 @@ class InspectorRepository:
         page_size = self._limit(limit)
         sort_sql, cursor_sql, cursor_columns = self._sort_parts(sort, cursor)
         filters = filters or {}
-        where = ["f.directory_id=?"]
+        where = ["f.directory_id=%s"]
         params = [directory_id]
         if filters.get("name_prefix"):
-            where.append("f.catalog_name LIKE ? ESCAPE '\\'")
-            prefix = filters["name_prefix"]
-            params.append(prefix.replace("%", r"\%").replace("_", r"\_") + "%")
+            where.append("f.catalog_name ILIKE %s ESCAPE '\\'")
+            params.append(prefix_pattern(filters["name_prefix"]))
         if filters.get("date_from"):
-            where.append("DATE(f.catalog_backup_date) >= ?")
+            where.append("f.catalog_backup_date >= %s::date")
             params.append(filters["date_from"])
         if filters.get("date_to"):
-            where.append("DATE(f.catalog_backup_date) <= ?")
+            where.append("f.catalog_backup_date < (%s::date + INTERVAL '1 day')")
             params.append(filters["date_to"])
         if filters.get("source_host"):
-            where.append("f.source_host=?")
+            where.append("f.source_host=%s")
             params.append(filters["source_host"])
         if cursor_sql:
             where.append(cursor_sql[0][4:])
             params.extend(cursor_sql[1])
-        rows = self.conn.execute(
+        rows = self._execute(
             f"""{self._file_select()}
                 WHERE {' AND '.join(where)}
                 ORDER BY {sort_sql}
-                LIMIT ?""",
+                LIMIT %s""",
             params + [page_size + 1],
         ).fetchall()
         visible = rows[:page_size]
@@ -257,24 +285,28 @@ class InspectorRepository:
         self._require_v3()
         page_size = self._limit(limit)
         scope = scope or {}
-        where = ["files_index_fts MATCH ?"]
-        params = [query]
+        where = ["(f.catalog_name ILIKE %s ESCAPE '\\' "
+                 "OR f.original_path ILIKE %s ESCAPE '\\')"]
+        like = substring_pattern(query)
+        params = [like, like]
+        cursor_column = "f.file_id"
         if scope.get("tape_label"):
-            where.append("f.tape_label=?")
+            where.append("f.tape_label=%s")
             params.append(scope["tape_label"])
         if scope.get("directory_id"):
-            where.append("f.directory_id=?")
+            where.append("f.directory_id=%s")
             params.append(scope["directory_id"])
         if scope.get("source_host"):
-            where.append("f.source_host=?")
+            where.append("f.source_host=%s")
             params.append(scope["source_host"])
         if cursor:
-            where.append("files_index_fts.rowid > ?")
+            where.append(f"{cursor_column} > %s")
             params.append(cursor["file_id"])
-        rows = self.conn.execute(
-            f"""{self._file_select(from_fts=True)}
+        rows = self._execute(
+            f"""{self._file_select()}
                 WHERE {' AND '.join(where)}
-                LIMIT ?""",
+                ORDER BY f.file_id
+                LIMIT %s""",
             params + [page_size + 1],
         ).fetchall()
         visible = rows[:page_size]
@@ -287,22 +319,18 @@ class InspectorRepository:
         }
 
     def get_file(self, file_id):
-        row = self.conn.execute(
-            self._file_select() + " WHERE f.file_id=?",
+        row = self._execute(
+            self._file_select() + " WHERE f.file_id=%s",
             (file_id,),
         ).fetchone()
         return self._hydrate(row) if row else None
 
     @staticmethod
-    def _file_select(from_fts=False):
+    def _file_select():
         prefix = """SELECT f.*, b.tape_path AS bundle_tape_path,
                            r.started_at AS run_started_at
                     FROM """
-        if from_fts:
-            prefix += """files_index_fts
-                         JOIN files_index f ON f.file_id=files_index_fts.rowid"""
-        else:
-            prefix += "files_index f"
+        prefix += "files_index f"
         return prefix + """
                     LEFT JOIN archive_bundles b ON b.bundle_id=f.bundle_id
                     LEFT JOIN archive_runs r ON r.run_id=f.archive_run_id"""
@@ -315,10 +343,10 @@ class InspectorRepository:
             columns = ("file_size_bytes", "catalog_name", "file_id")
             if cursor:
                 return order, (
-                    """AND (f.file_size_bytes > ?
-                         OR (f.file_size_bytes = ? AND f.catalog_name > ?)
-                         OR (f.file_size_bytes = ? AND f.catalog_name = ?
-                             AND f.file_id > ?))""",
+                    """AND (f.file_size_bytes > %s
+                         OR (f.file_size_bytes = %s AND f.catalog_name > %s)
+                         OR (f.file_size_bytes = %s AND f.catalog_name = %s
+                             AND f.file_id > %s))""",
                     [cursor["file_size_bytes"], cursor["file_size_bytes"],
                      cursor["catalog_name"], cursor["file_size_bytes"],
                      cursor["catalog_name"], cursor["file_id"]],
@@ -329,10 +357,10 @@ class InspectorRepository:
             columns = ("catalog_backup_date", "catalog_name", "file_id")
             if cursor:
                 return order, (
-                    """AND (f.catalog_backup_date > ?
-                         OR (f.catalog_backup_date = ? AND f.catalog_name > ?)
-                         OR (f.catalog_backup_date = ? AND f.catalog_name = ?
-                             AND f.file_id > ?))""",
+                    """AND (f.catalog_backup_date > %s
+                         OR (f.catalog_backup_date = %s AND f.catalog_name > %s)
+                         OR (f.catalog_backup_date = %s AND f.catalog_name = %s
+                             AND f.file_id > %s))""",
                     [cursor["catalog_backup_date"], cursor["catalog_backup_date"],
                      cursor["catalog_name"], cursor["catalog_backup_date"],
                      cursor["catalog_name"], cursor["file_id"]],
@@ -342,7 +370,7 @@ class InspectorRepository:
         columns = ("catalog_name", "file_id")
         if cursor:
             return order, (
-                "AND (f.catalog_name > ? OR (f.catalog_name = ? AND f.file_id > ?))",
+                "AND (f.catalog_name > %s OR (f.catalog_name = %s AND f.file_id > %s))",
                 [cursor["catalog_name"], cursor["catalog_name"], cursor["file_id"]],
             ), columns
         return order, None, columns

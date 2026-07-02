@@ -831,6 +831,11 @@ class RemoteOrchestrator:
                 print("[REMOTE] Cancelled before creating backup session.")
             return
 
+        if not self.db.tape_exists(tape_label):
+            print(f"[TAPE] '{tape_label}' not in database. Registering...")
+            cap = input("Tape capacity in GB (default 12288 for 12 TB, Enter to skip): ").strip()
+            self.db.register_tape(tape_label, int(cap) if cap.isdigit() else 12288)
+
         if replacing_session:
             self.db.update_remote_session(
                 replacing_session['session_id'],
@@ -859,11 +864,6 @@ class RemoteOrchestrator:
                 rows.append((chunk_idx, remote_fpath,
                               os.path.basename(remote_fpath), fsize))
         self.db.insert_remote_manifest_batch(session_id, rows)
-
-        if not self.db.tape_exists(tape_label):
-            print(f"[TAPE] '{tape_label}' not in database. Registering...")
-            cap = input("Tape capacity in GB (default 12288 for 12 TB, Enter to skip): ").strip()
-            self.db.register_tape(tape_label, int(cap) if cap.isdigit() else 12288)
 
         self._run_session(session_id)
 

@@ -1,4 +1,4 @@
-"""PySide6 lazy SQLite archive inspector."""
+"""PySide6 lazy PostgreSQL archive inspector."""
 import os
 import subprocess
 import sys
@@ -43,7 +43,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .catalog_v3 import catalog_v3_available
 from .inspector_repository import InspectorRepository
 
 
@@ -883,16 +882,14 @@ class ManageWidget(QWidget):
 
 
 class DBInspectorQtApp(QMainWindow):
-    def __init__(self, db, db_path):
+    def __init__(self, db, db_path, display_ref=None):
         super().__init__()
         self.db = db
         self.db_path = db_path
         self.setWindowTitle("LTO Archive Inspector")
         self.resize(1500, 900)
-        if not catalog_v3_available(db.conn):
-            raise RuntimeError(
-                "Catalog-v3 indexes are required. Run "
-                "`python run.py --catalog-v3-migrate` first.")
+        with InspectorRepository(db_path) as repo:
+            repo.require_catalog_v3()
 
         tabs = QTabWidget(self)
         self.browse = BrowseWidget(db, db_path, self)
@@ -907,7 +904,7 @@ class DBInspectorQtApp(QMainWindow):
         refresh = QAction("Refresh", self)
         refresh.triggered.connect(self.refresh_all)
         self.menuBar().addAction(refresh)
-        self.statusBar().showMessage(db_path)
+        self.statusBar().showMessage(display_ref or db_path)
 
     def refresh_all(self):
         self.search.refresh_tapes()
@@ -919,10 +916,10 @@ class DBInspectorQtApp(QMainWindow):
             self.manage.refresh()
 
 
-def run_qt_inspector(db, db_path):
+def run_qt_inspector(db, db_path, display_ref=None):
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("LTO Archive Inspector")
-    window = DBInspectorQtApp(db, db_path)
+    window = DBInspectorQtApp(db, db_path, display_ref=display_ref)
     window.show()
     return app.exec()
 
@@ -930,12 +927,13 @@ def run_qt_inspector(db, db_path):
 if __name__ == "__main__":
     from .config import ConfigManager
     from .constants import PROJECT_ROOT
-    from .db import DatabaseManager
+    from .db import create_database_manager
 
     os.chdir(PROJECT_ROOT)
     cfg = ConfigManager()
-    db = DatabaseManager(cfg.db_path)
+    db = create_database_manager(cfg)
     try:
-        raise SystemExit(run_qt_inspector(db, cfg.db_path))
+        raise SystemExit(run_qt_inspector(
+            db, cfg.db_dsn, display_ref=cfg.db_display_ref))
     finally:
         db.close()
