@@ -8,9 +8,10 @@ except ImportError:  # optional dependency — priority/affinity degrade gracefu
 
 from .config import ConfigManager
 from .constants import CONFIG_FILE
-from .db import DatabaseManager
+from .db import DatabaseManager, create_database_manager
 from .ltfs import TapeManager
 from .orchestrators import LocalOrchestrator, RemoteOrchestrator
+from .pg_backup import create_database_backup
 from .reporting import generate_backup_summary
 from .retriever import LTORetriever
 from .robocopy import _prepare_robocopy_exclusion, _remove_robocopy_exclusion
@@ -227,7 +228,7 @@ def main():
     print("=" * 60)
 
     cfg       = ConfigManager()
-    db        = DatabaseManager(cfg.db_path)
+    db        = create_database_manager(cfg)
     tape_mgr  = TapeManager(db, cfg.lto_drive, cfg.ibm_eject_cmd)
     retriever = LTORetriever(db, cfg.lto_drive, cfg.staging_dir, cfg.restore_dir)
 
@@ -243,6 +244,7 @@ def main():
         print("  6. Remote Archive — Fetch from remote host & backup to LTO")
         print("  7. Database Management — Edit / delete tape & file records")
         print("  8. Backup Summary — Ensure backup_logs/SUMMARY.csv report")
+        print("  9. Database Backup — Dump PostgreSQL catalog to db_backups")
         print("  0. Exit")
         print("-" * 60)
 
@@ -324,6 +326,14 @@ def main():
                 print(f"[REPORT] Backup summary CSV: {path}")
             else:
                 print("[REPORT] Could not create backup summary CSV.")
+
+        elif choice == '9':
+            try:
+                path = create_database_backup(cfg)
+            except RuntimeError as e:
+                print(str(e))
+            else:
+                print(f"[DB BACKUP] PostgreSQL dump created: {path}")
 
         elif choice == '0':
             print("Goodbye.")

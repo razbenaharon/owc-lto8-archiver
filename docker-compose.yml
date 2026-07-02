@@ -1,0 +1,44 @@
+services:
+  db:
+    image: postgres:17
+    container_name: lto_pg
+    environment:
+      POSTGRES_DB: lto_archive
+      POSTGRES_USER: lto
+      POSTGRES_PASSWORD: ${PGPASSWORD:-change_me_local}
+    ports:
+      - "5432:5432"
+    volumes:
+      - lto_pgdata:/var/lib/postgresql/data
+      - ./scripts/pg_init:/docker-entrypoint-initdb.d:ro
+    shm_size: "1gb"
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=50"
+      - "-c"
+      - "shared_buffers=2GB"
+      - "-c"
+      - "effective_cache_size=6GB"
+      - "-c"
+      - "work_mem=64MB"
+      - "-c"
+      - "maintenance_work_mem=2GB"
+      - "-c"
+      - "max_wal_size=8GB"
+      - "-c"
+      - "checkpoint_timeout=30min"
+      - "-c"
+      - "max_parallel_maintenance_workers=4"
+      - "-c"
+      - "max_parallel_workers_per_gather=4"
+      - "-c"
+      - "wal_compression=on"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lto -d lto_archive"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  lto_pgdata:

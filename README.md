@@ -7,7 +7,7 @@ Licensed under the [MIT License](LICENSE) — © 2026 Raz Ben Aharon. Free to us
 ## Features
 
 - **Smart packing** — small files (under a configurable threshold) are bundled into ZIP archives to minimize tape fragmentation; large files are copied directly
-- **SQLite index** — every archived file is recorded with its original path, source host, tape label, backup date, and ZIP container (if packed)
+- **PostgreSQL catalog** — every archived file is recorded with its original path, source host, tape label, backup date, and ZIP container (if packed)
 - **Restore** — search by filename/wildcard, date range, original directory, or full backup session; restore individual files or entire sets
 - **Tape management** — format, register, check, and inspect tapes via IBM LTFS command-line tools
 - **Multi-tape support** — tracks multiple tapes; prompts you to swap tapes during restore when needed
@@ -21,6 +21,7 @@ Licensed under the [MIT License](LICENSE) — © 2026 Raz Ben Aharon. Free to us
 - [IBM LTFS SDE](https://www.ibm.com/support/pages/ibm-linear-tape-file-system-ltfs) installed to `C:\Program Files\IBM\LTFS\`
 - OWC Mercury Pro LTO-8 (or compatible LTFS-formatted LTO drive)
 - OpenSSH client tools for remote archive mode
+- PostgreSQL 17, either local via `docker compose up -d db` or an existing server
 - `PySide6` (required only for the DB Inspector GUI): `pip install PySide6`
 
 These installers are **not** bundled in this repository (they are proprietary). Download
@@ -37,14 +38,20 @@ folder (gitignored):
 2. Format a tape and mount it so it appears as a drive letter (e.g. `E:\`).
 3. Copy `config.example.ini` to `config.ini` and edit it (your `config.ini` is
    gitignored). For remote archive, also copy `.env.example` to `.env` and set
-   `REMOTE_PASSWORD` there. Key fields:
+   `PGPASSWORD` and `REMOTE_PASSWORD` there. Key fields:
 
 ```ini
 [PATHS]
 source_dir  = C:\path\to\your\source\files
 staging_dir = C:\path\to\staging\area
 restore_dir = C:\path\to\restored\files
-db_path     = C:\path\to\lto_archive.db
+
+[DATABASE]
+host = localhost
+port = 5432
+dbname = lto_archive
+user = lto
+sslmode = prefer
 
 [HARDWARE]
 lto_drive     = E:\\
@@ -67,6 +74,9 @@ staging_fill_pct = 0.80
 # CLI (no extra dependencies)
 python run.py
 
+# Create a PostgreSQL catalog backup
+python run.py --backup-db
+
 # Database Inspector GUI (requires PySide6)
 python inspect_db.py
 ```
@@ -83,17 +93,18 @@ python inspect_db.py
 | 6 | **Remote Archive** — fetch from a remote host and back up to LTO |
 | 7 | **Database Management** — edit or delete tape and file records |
 | 8 | **Backup Summary** — ensure `backup_logs/SUMMARY.csv` exists |
+| 9 | **Database Backup** — dump the PostgreSQL catalog to `db_backups/` |
 | 0 | Exit |
 
 ### Archive Workflow
 
 1. The analyzer scans `source_dir`, reports file-size distribution, and builds a local multi-tape allocation plan.
 2. Files under `zip_threshold_mb` are packed into session-specific ZIP bundles; large files are staged as loose files.
-3. The app creates a resumable local session in SQLite. If a previous local session is active, you can resume it or abandon it.
+3. The app creates a resumable local session in PostgreSQL. If a previous local session is active, you can resume it or abandon it.
 4. Before each chunk is written, the mounted tape label is detected and assigned to that chunk.
 5. New blank tapes are registered automatically. Registered non-empty LTFS tapes can also be used for append backups when both the LTFS free-space check and the database capacity check show enough room.
 6. Robocopy streams the staged batch to tape with `/J` unbuffered I/O, retry settings, a simple active heartbeat, and tuned priority/affinity when available.
-7. After copying, file records are written to SQLite, tape used-space is reconciled, and the tape is ejected automatically via `LtfsCmdEject.exe`.
+7. After copying, file records are written to PostgreSQL, tape used-space is reconciled, and the tape is ejected automatically via `LtfsCmdEject.exe`.
 8. A compact aggregate CSV row is appended to `backup_logs/SUMMARY.csv`; per-file manifests are not written to logs.
 
 If a write is interrupted, re-run option 1 and choose **Resume from first incomplete chunk**. The app skips records that are already indexed for the same local session/chunk/tape.
@@ -145,7 +156,7 @@ When restoring multiple files from the same ZIP bundle in one page, the bundle i
 
 ## Database Inspector GUI
 
-`inspect_db.py` launches a PySide6 GUI, implemented in `src/db_inspector_qt.py`, for lazy browsing, FTS search, and management of the SQLite archive index without using the CLI.
+`inspect_db.py` launches a PySide6 GUI, implemented in `src/db_inspector_qt.py`, for lazy browsing, trigram search, and management of the PostgreSQL archive catalog without using the CLI.
 
 ```
 python inspect_db.py
@@ -158,42 +169,49 @@ python inspect_db.py
 - **Wipe File Records** — delete all file records for the tape (tape entry kept); type the label to confirm
 - **Delete Tape** — permanently remove the tape and all its file records; type the label to confirm
 
-**Files tab** — lazy tape/directory browser backed by catalog-v3 indexes. Select one or more rows to **Delete Selected** or double-click a row to open a **View Details** panel showing all fields, including the source host.
+**Files tab** — lazy tape/directory browser backed by PostgreSQL catalog indexes. Select one or more rows to **Delete Selected** or double-click a row to open a **View Details** panel showing all fields, including the source host.
 
-**Search tab** — FTS5 substring search over catalog names and original paths, with bounded result pages and source-host filtering.
+**Search tab** — PostgreSQL trigram substring search over catalog names and original paths, with bounded result pages and source-host filtering.
 
 **Manage tab** — tape and session management actions, including rename, capacity, recalculation, wipe/delete, and unused session-data cleanup.
 
-Large catalogs can be prepared for the lazy inspector rewrite with the guarded
-catalog-v3 maintenance path:
+## PostgreSQL Setup
 
 ```
-python run.py --catalog-v3-preflight   # read-only report for lto_archive.db
-python run.py --catalog-v3-migrate     # copy-and-swap migration with rollback
-python run.py --hashless-origin-migrate # drop legacy hash columns and backfill source_host
+docker compose up -d db
 ```
 
-The preflight report includes the real configured database path, size, row
-counts, tape labels, SQLite/FTS5 support, free-space estimate, integrity checks,
-and current query plans. The migration adds directory and FTS indexes for bounded
-inspector browsing without committing `lto_archive.db` to source control.
+PostgreSQL artifacts:
+
+- `docker-compose.yml` — Postgres 17 dev service with bulk-load tuning
+- `scripts/pg_init/00_extensions.sql` — `pg_trgm` and `btree_gin`
+- `scripts/sql/001_postgres_schema.sql` — normalized non-partitioned schema
+- `scripts/sql/002_postgres_indexes.sql` — unique record key, browse B-trees,
+  and trigram GIN search indexes
+- `src/pg_bulk.py` — reusable psycopg 3 COPY/staging upsert helper
 
 ## Database Schema
 
-`lto_archive.db` (SQLite) contains the permanent archive catalog plus normalized
-session tables. The database is runtime data and remains gitignored.
+PostgreSQL contains the permanent archive catalog plus normalized session
+tables. Local credentials live in `.env`, which remains gitignored.
+
+### Database Backups
+
+Use menu option 9 or run `python run.py --backup-db` to create a PostgreSQL
+custom-format dump in `db_backups/`. The helper uses the local Docker container
+when available, otherwise it falls back to `pg_dump` from PostgreSQL client
+tools on PATH.
 
 **`tapes`** — one row per tape
 - `volume_label`, `date_formatted`, `total_capacity`, `used_space`
 
 **`files_index`** — one row per file
-- `file_name`, `original_path`, `file_size_bytes`, `source_host`
-- `backup_date`, `tape_label`, `is_packed`, `container_name`, `stored_path`
-- `local_session_id`, `local_chunk_index`
-- v2 databases may normalize names, dates, and bundle paths through
-  `archive_runs`, `archive_bundles`, and hydrated read helpers.
-- catalog-v3 databases additionally contain `directory_id`, `catalog_name`, and
-  `catalog_backup_date`, plus `catalog_directories` and `files_index_fts`.
+- `original_path`, `file_size_bytes`, `source_host`, `tape_label`
+- `is_packed`, `stored_path`, `local_session_id`, `local_chunk_index`
+- `record_key`, `archive_run_id`, `directory_id`, `catalog_name`,
+  `catalog_backup_date`
+- ZIP bundle and run metadata are normalized through `archive_bundles` and
+  `archive_runs`.
 
 The CLI also creates session tables for resumable work:
 

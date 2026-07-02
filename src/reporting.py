@@ -1,9 +1,9 @@
 """Unified CSV statistics reporting.
 
-All system statistics — backup/tape-write sessions and database-maintenance
-runs — are appended to a single ``SUMMARY.csv`` in the backup-log directory.
-No per-run log files and no per-file manifests are written, so the CSV never
-contains individual file names: only run-level aggregate statistics.
+Every backup/tape-write session is appended as one row to a single
+``SUMMARY.csv`` in the backup-log directory. No per-run log files and no
+per-file manifests are written, so the CSV never contains individual file
+names: only run-level aggregate statistics.
 """
 import csv
 import os
@@ -15,8 +15,8 @@ from .constants import BACKUP_LOG_DIR
 SUMMARY_CSV = 'SUMMARY.csv'
 
 SUMMARY_COLUMNS = [
-    'record_type',          # 'backup' or 'maintenance'
-    'operation',            # 'backup', 'db_optimization', 'db_hashless', ...
+    'record_type',          # always 'backup'
+    'operation',            # always 'backup'
     'status',
     'source_host',
     'source_path',
@@ -48,9 +48,6 @@ SUMMARY_COLUMNS = [
     'tape_used_after_bytes',
     'robocopy_exit_code',
     'robocopy_speed_mbs',
-    'before_bytes',         # maintenance: db size before the run
-    'after_bytes',          # maintenance: db size after the run
-    'reduction_pct',        # maintenance: size reduction percentage
 ]
 
 
@@ -140,43 +137,6 @@ def append_backup_summary_row(log_dir=None, details=None, robocopy_result=None):
         'robocopy_exit_code': (
             '' if robocopy_result is None else robocopy_result.returncode),
         'robocopy_speed_mbs': rc_sum.get('speed_mbs', ''),
-    })
-    return _append_row(log_dir, row)
-
-
-def append_maintenance_summary_row(log_dir=None, operation='', stats=None):
-    """Append one database-maintenance statistics row to SUMMARY.csv.
-
-    ``stats`` is the optimizer's result dict (``started_at``, ``phases``,
-    ``before_bytes``, ``after_bytes``, optional ``reduction_pct``).
-    """
-    stats = stats or {}
-    phases = stats.get('phases') or {}
-    try:
-        duration = sum(float(value) for value in phases.values())
-    except (TypeError, ValueError):
-        duration = None
-
-    before = stats.get('before_bytes')
-    after = stats.get('after_bytes')
-    reduction = stats.get('reduction_pct')
-    if reduction is None and before and after:
-        try:
-            reduction = round((1 - float(after) / float(before)) * 100, 2)
-        except (TypeError, ValueError, ZeroDivisionError):
-            reduction = ''
-
-    row = _blank_row()
-    row.update({
-        'record_type': 'maintenance',
-        'operation': operation,
-        'status': stats.get('status', 'completed'),
-        'started_at': _iso(stats.get('started_at')),
-        'finished_at': _iso(stats.get('finished_at') or datetime.now()),
-        'total_time_seconds': _seconds(duration),
-        'before_bytes': '' if before is None else before,
-        'after_bytes': '' if after is None else after,
-        'reduction_pct': '' if reduction is None else reduction,
     })
     return _append_row(log_dir, row)
 
