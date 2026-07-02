@@ -74,6 +74,9 @@ staging_fill_pct = 0.80
 # CLI (no extra dependencies)
 python run.py
 
+# Create a PostgreSQL catalog backup
+python run.py --backup-db
+
 # Database Inspector GUI (requires PySide6)
 python inspect_db.py
 ```
@@ -90,6 +93,7 @@ python inspect_db.py
 | 6 | **Remote Archive** — fetch from a remote host and back up to LTO |
 | 7 | **Database Management** — edit or delete tape and file records |
 | 8 | **Backup Summary** — ensure `backup_logs/SUMMARY.csv` exists |
+| 9 | **Database Backup** — dump the PostgreSQL catalog to `db_backups/` |
 | 0 | Exit |
 
 ### Archive Workflow
@@ -190,6 +194,13 @@ PostgreSQL artifacts:
 
 PostgreSQL contains the permanent archive catalog plus normalized session
 tables. Local credentials live in `.env`, which remains gitignored.
+
+### Database Backups
+
+Use menu option 9 or run `python run.py --backup-db` to create a PostgreSQL
+custom-format dump in `db_backups/`. The helper uses the local Docker container
+when available, otherwise it falls back to `pg_dump` from PostgreSQL client
+tools on PATH.
 
 **`tapes`** — one row per tape
 - `volume_label`, `date_formatted`, `total_capacity`, `used_space`
