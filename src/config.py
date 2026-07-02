@@ -1,6 +1,7 @@
 """ConfigManager and .env loading."""
 import os
 import configparser
+from urllib.parse import quote
 
 try:
     import psutil
@@ -56,8 +57,14 @@ class ConfigManager:
             'source_dir':  os.path.join(PROJECT_ROOT, 'source'),
             'staging_dir': os.path.join(PROJECT_ROOT, 'staging'),
             'restore_dir': os.path.join(PROJECT_ROOT, 'restored'),
-            'db_path':     os.path.join(PROJECT_ROOT, 'lto_archive.db'),
             'backup_log_dir': BACKUP_LOG_DIR,
+        }
+        self.config['DATABASE'] = {
+            'host': 'localhost',
+            'port': '5432',
+            'dbname': 'lto_archive',
+            'user': 'lto',
+            'sslmode': 'prefer',
         }
         self.config['HARDWARE'] = {
             'lto_drive':     r'D:\\',
@@ -98,7 +105,46 @@ class ConfigManager:
     @property
     def restore_dir(self):   return _clean_config_path(self.config['PATHS']['restore_dir'])
     @property
-    def db_path(self):       return _clean_config_path(self.config['PATHS']['db_path'])
+    def pg_host(self):
+        return self.config.get('DATABASE', 'host', fallback='localhost').strip()
+    @property
+    def pg_port(self):
+        return self.config.get('DATABASE', 'port', fallback='5432').strip()
+    @property
+    def pg_dbname(self):
+        return self.config.get('DATABASE', 'dbname', fallback='lto_archive').strip()
+    @property
+    def pg_user(self):
+        return self.config.get('DATABASE', 'user', fallback='lto').strip()
+    @property
+    def pg_password(self):
+        value = (os.environ.get('PGPASSWORD')
+                 or self.env.get('PGPASSWORD')
+                 or self.config.get('DATABASE', 'password', fallback='', raw=True))
+        value = (value or '').strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+            value = value[1:-1]
+        return value
+    @property
+    def pg_sslmode(self):
+        return self.config.get('DATABASE', 'sslmode', fallback='prefer').strip()
+    @property
+    def db_dsn(self):
+        user = quote(self.pg_user, safe='')
+        password = quote(self.pg_password, safe='')
+        auth = f"{user}:{password}@" if password else f"{user}@"
+        return (
+            f"postgresql://{auth}{self.pg_host}:{self.pg_port}/"
+            f"{quote(self.pg_dbname, safe='')}?sslmode={quote(self.pg_sslmode, safe='')}"
+        )
+    @property
+    def db_display_ref(self):
+        user = quote(self.pg_user, safe='')
+        auth = f"{user}:***@" if self.pg_password else f"{user}@"
+        return (
+            f"postgresql://{auth}{self.pg_host}:{self.pg_port}/"
+            f"{quote(self.pg_dbname, safe='')}?sslmode={quote(self.pg_sslmode, safe='')}"
+        )
     @property
     def backup_log_dir(self):
         return _clean_config_path(self.config.get('PATHS', 'backup_log_dir',
