@@ -16,6 +16,19 @@ class DatabaseManager:
         )
 
 
+def _fmt_ts(value, width=19):
+    """Render a timestamp for fixed-width display.
+
+    PostgreSQL returns datetime/date objects where the legacy SQLite catalog
+    returned ISO strings; both forms (and None) must display safely.
+    """
+    if value is None:
+        return ''
+    if hasattr(value, 'isoformat'):
+        value = value.isoformat(sep=' ') if hasattr(value, 'time') else value.isoformat()
+    return str(value)[:width]
+
+
 def _derived_file_name(stored_path, original_path=None):
     """Derive a display/restore name without storing legacy file_name."""
     path = str(stored_path or original_path or "").replace("\\", "/")

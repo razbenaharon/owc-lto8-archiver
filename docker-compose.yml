@@ -2,12 +2,17 @@ services:
   db:
     image: postgres:17
     container_name: lto_pg
+    restart: unless-stopped
+    # Keep PostgreSQL from starving the archiver/robocopy under heavy Phase-3
+    # sync + maintenance load; size to the workstation's RAM.
+    mem_limit: 6g
     environment:
       POSTGRES_DB: lto_archive
       POSTGRES_USER: lto
       POSTGRES_PASSWORD: ${PGPASSWORD:-change_me_local}
     ports:
-      - "5432:5432"
+      # Loopback only — the catalog must not be reachable from the LAN.
+      - "127.0.0.1:5432:5432"
     volumes:
       - lto_pgdata:/var/lib/postgresql/data
       - ./scripts/pg_init:/docker-entrypoint-initdb.d:ro

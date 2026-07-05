@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .db import _fmt_ts
 from .inspector_repository import InspectorRepository
 
 
@@ -275,7 +276,7 @@ class FileTableModel(QAbstractTableModel):
             if key == "is_packed":
                 return "yes" if value else "no"
             if key == "backup_date":
-                return (value or "")[:19]
+                return _fmt_ts(value)
             return "" if value is None else str(value)
         if role == Qt.TextAlignmentRole and key in ("file_id", "file_size_bytes"):
             return Qt.AlignRight | Qt.AlignVCenter
@@ -748,7 +749,7 @@ class ManageWidget(QWidget):
             cap = tape["total_capacity"] or 0
             pct = (used / (cap * 1024 ** 3) * 100) if cap else 0
             values = [
-                tape["tape_id"], label, (tape["date_formatted"] or "")[:19],
+                tape["tape_id"], label, _fmt_ts(tape["date_formatted"]),
                 cap or "", _fmt_bytes(used),
                 self.db.count_tape_file_records(label), f"{pct:.1f}%"]
             for col, value in enumerate(values):
@@ -826,8 +827,8 @@ class ManageWidget(QWidget):
         for row, item in enumerate(rows):
             values = [
                 item["kind"], item["session_id"], item["session_label"],
-                item["status"], item["mode"], (item["created_at"] or "")[:19],
-                (item["completed_at"] or "")[:19], item["chunks"],
+                item["status"], item["mode"], _fmt_ts(item["created_at"]),
+                _fmt_ts(item["completed_at"]), item["chunks"],
                 f"{item['manifest_rows']:,}", _fmt_bytes(item["manifest_bytes"] or 0),
                 f"{item['file_records']:,}"]
             for col, value in enumerate(values):

@@ -16,6 +16,8 @@ staging/
 restored/
 backup_logs/
 storage_map_logs/
+storage_map/logs/
+storage_map/index.html
 db_backups/
 lto_archive*.db
 

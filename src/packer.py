@@ -403,10 +403,19 @@ class LTOPacker:
                     source_name, src, e, "pack",
                     session_id=session_id, chunk_index=chunk_index)
 
-        if files_in_current_zip > 0:
+        if zipf is not None:
             zipf.close()
-            _progress_done()
-            print(f"\n -> Sealed {bundle_prefix}_{zip_idx:03d}.zip ({files_in_current_zip} files)")
+            if files_in_current_zip > 0:
+                _progress_done()
+                print(f"\n -> Sealed {bundle_prefix}_{zip_idx:03d}.zip ({files_in_current_zip} files)")
+            else:
+                # The last bundle was opened but every candidate file failed:
+                # drop the empty ZIP so it is neither leaked as an open handle
+                # nor copied to tape as a stray artifact.
+                try:
+                    os.remove(zip_path)
+                except OSError:
+                    pass
 
         _progress_done()
         print(f"\n[PACKER] {done_label}: {total_packed} packed | {total_loose} loose.")

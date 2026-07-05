@@ -8,7 +8,7 @@ except ImportError:  # optional dependency — priority/affinity degrade gracefu
 
 from .config import ConfigManager
 from .constants import CONFIG_FILE
-from .db import DatabaseManager, create_database_manager
+from .db import DatabaseManager, _fmt_ts, create_database_manager
 from .ltfs import TapeManager
 from .orchestrators import LocalOrchestrator, RemoteOrchestrator
 from .pg_backup import create_database_backup
@@ -88,7 +88,7 @@ def _print_tapes_table(db):
     print(f"\n{'ID':>4}  {'Volume Label':<25}  {'Initialized':<19}  Space")
     print("-" * 80)
     for t in tapes:
-        date_s  = (t['date_formatted'] or '')[:19]
+        date_s  = _fmt_ts(t['date_formatted'])
         cap_gb  = t['total_capacity']
         used_b  = t['used_space'] or 0
         used_gb = used_b / 1024**3
@@ -148,7 +148,7 @@ def _db_management_menu(db):
             print(f"  Path:      {rec['original_path']}")
             print(f"  Size:      {rec['file_size_bytes']:,} bytes")
             print(f"  Tape:      {rec['tape_label']}")
-            print(f"  Backed up: {(rec['backup_date'] or '')[:19]}")
+            print(f"  Backed up: {_fmt_ts(rec['backup_date'])}")
             confirm = input("Type 'yes' to delete this record: ").strip()
             if confirm.lower() == 'yes':
                 db.delete_file(file_id)
@@ -257,6 +257,9 @@ def main():
             added_exclusion = _prepare_robocopy_exclusion()
             try:
                 retriever.run()
+            except RuntimeError as e:
+                # e.g. tape-verify cancelled — return to the menu, don't exit.
+                print(str(e))
             finally:
                 if added_exclusion:
                     _remove_robocopy_exclusion()
@@ -293,7 +296,7 @@ def main():
                 print(f"\n{'ID':>4}  {'Volume Label':<25}  {'Initialized':<19}  {'Used / Capacity':<22}  Space")
                 print("-" * 95)
                 for t in tapes:
-                    date_s  = (t['date_formatted'] or '')[:19]
+                    date_s  = _fmt_ts(t['date_formatted'])
                     cap_gb  = t['total_capacity']
                     used_b  = t['used_space'] or 0
                     used_gb = used_b / 1024**3

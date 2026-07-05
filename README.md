@@ -13,6 +13,7 @@ Licensed under the [MIT License](LICENSE) — © 2026 Raz Ben Aharon. Free to us
 - **Multi-tape support** — tracks multiple tapes; prompts you to swap tapes during restore when needed
 - **Remote archive** — fetch files from a remote SSH host into local staging, pack them, and stream them to LTO
 - **Database Inspector GUI** — standalone PySide6 app for lazy browsing, searching, and managing the tape/file index without touching the CLI
+- **Storage Map** - run `python storage_map/create_dashboard.py` to launch a scan, then `python storage_map/check_status_create_dashboard.py --open` later to create `storage_map/index.html`
 
 ## Requirements
 
@@ -79,6 +80,10 @@ python run.py --backup-db
 
 # Database Inspector GUI (requires PySide6)
 python inspect_db.py
+
+# Storage Map dashboard (optional rich/plotly visualizers)
+python storage_map/create_dashboard.py
+python storage_map/check_status_create_dashboard.py --open
 ```
 
 ### Main Menu

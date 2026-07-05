@@ -94,6 +94,10 @@ class ConfigManager:
             'use_mbuffer':           'true',
             'mbuffer_size':          '2G',
         }
+        self.config['TELEGRAM'] = {
+            'enabled': 'false',
+            'timeout_seconds': '10',
+        }
         with open(self.config_path, 'w', encoding='utf-8') as f:
             self.config.write(f)
 
@@ -222,3 +226,38 @@ class ConfigManager:
     @property
     def mbuffer_size(self):
         return self.config.get('PERFORMANCE', 'mbuffer_size', fallback='2G').strip()
+
+    @property
+    def telegram_enabled(self):
+        return self.config.get('TELEGRAM', 'enabled', fallback='false').strip().lower() in (
+            '1', 'true', 'yes', 'on')
+
+    @property
+    def telegram_timeout_seconds(self):
+        raw = self.config.get('TELEGRAM', 'timeout_seconds',
+                              fallback='10').strip()
+        try:
+            value = int(float(raw))
+        except ValueError:
+            return 10
+        return max(1, value)
+
+    @property
+    def telegram_bot_token(self):
+        value = (os.environ.get('TELEGRAM_BOT_TOKEN')
+                 or self.env.get('TELEGRAM_BOT_TOKEN')
+                 or self.config.get('TELEGRAM', 'bot_token', fallback='', raw=True))
+        value = (value or '').strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+            value = value[1:-1]
+        return value
+
+    @property
+    def telegram_chat_id(self):
+        value = (os.environ.get('TELEGRAM_CHAT_ID')
+                 or self.env.get('TELEGRAM_CHAT_ID')
+                 or self.config.get('TELEGRAM', 'chat_id', fallback='', raw=True))
+        value = (value or '').strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+            value = value[1:-1]
+        return value
