@@ -1,5 +1,6 @@
-# JetBrains Idea
+# Editor config — personal, not tracked in the repo
 .idea/
+.vscode/
 .claude
 
 # Python bytecode cache
