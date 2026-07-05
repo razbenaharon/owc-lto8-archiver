@@ -6,11 +6,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 try:
+    import psycopg
     from psycopg import errors
     from psycopg.rows import dict_row
+    from psycopg_pool import PoolTimeout
 except ImportError:  # pragma: no cover - handled by require_psycopg at runtime
+    psycopg = None
     errors = None
     dict_row = None
+    PoolTimeout = None
 
 from .catalog_query import contains_pattern, prefix_pattern, substring_pattern
 from .catalog_v3 import catalog_directory_chain, catalog_file_name
@@ -168,16 +172,27 @@ class PgDatabaseManager:
             conn.commit()
 
     def _transaction(self, operation, description, attempts=5):
+        # Serialization conflicts and deadlocks retry quickly; OperationalError
+        # and PoolTimeout (connection drops, Docker DB restarts) back off longer
+        # so a restarting server can come back. Every write routed through here
+        # is an idempotent keyed upsert/update, so re-running a batch whose
+        # commit outcome is unknown converges to the same state.
+        retryable = (errors.SerializationFailure, errors.DeadlockDetected,
+                     psycopg.OperationalError, PoolTimeout)
         for attempt in range(1, attempts + 1):
             try:
                 with self._pool.connection() as conn:
                     with conn.transaction():
                         return operation(conn)
-            except (errors.SerializationFailure, errors.DeadlockDetected):
+            except retryable as e:
                 if attempt == attempts:
                     raise
-                wait_s = min(5, attempt)
-                print(f"[DB] Transaction conflict during {description}; "
+                if isinstance(e, (errors.SerializationFailure,
+                                  errors.DeadlockDetected)):
+                    wait_s = min(5, attempt)
+                else:
+                    wait_s = min(30, 2 ** attempt)
+                print(f"[DB] {type(e).__name__} during {description}; "
                       f"retrying in {wait_s}s ({attempt}/{attempts})...")
                 time.sleep(wait_s)
 
@@ -1192,14 +1207,16 @@ class PgDatabaseManager:
                    FROM files_index WHERE tape_label=%s""",
                 (new_label,),
             ).fetchall()
-            for row in rows:
-                conn.execute(
+            # executemany pipelines the statements — one round-trip flight
+            # instead of one per file record (hours at catalog scale).
+            with conn.cursor() as cur:
+                cur.executemany(
                     "UPDATE files_index SET record_key=%s WHERE file_id=%s",
-                    (_file_record_key(
+                    ((_file_record_key(
                         row["original_path"], new_label,
                         row["local_session_id"], row["local_chunk_index"],
                         row["source_host"]),
-                     row["file_id"]),
+                      row["file_id"]) for row in rows),
                 )
             conn.execute(
                 "UPDATE remote_sessions SET tape_label=%s WHERE tape_label=%s",
@@ -1518,8 +1535,14 @@ class PgDatabaseManager:
         })
         if compact:
             with self._pool.connection() as conn:
-                conn.execute("VACUUM (ANALYZE)")
-                conn.commit()
+                # VACUUM cannot run inside a transaction block, and pooled
+                # connections open one implicitly on first execute.
+                previous = conn.autocommit
+                conn.autocommit = True
+                try:
+                    conn.execute("VACUUM (ANALYZE)")
+                finally:
+                    conn.autocommit = previous
         return result
 
     def close(self):

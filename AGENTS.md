@@ -32,7 +32,7 @@ in a PostgreSQL catalog (see `docker-compose.yml` and `scripts/sql/`).
 
 ```powershell
 python -m pip install -r requirements.txt          # set up / update the environment
-$files = @(Get-ChildItem src -Filter *.py | ForEach-Object { $_.FullName }) + @((Resolve-Path run.py).Path, (Resolve-Path inspect_db.py).Path); python -m py_compile @files  # syntax check before handoff
+$files = @(Get-ChildItem src -Filter *.py | ForEach-Object { $_.FullName }) + @(Get-ChildItem storage_map -Filter *.py | ForEach-Object { $_.FullName }) + @((Resolve-Path run.py).Path, (Resolve-Path inspect_db.py).Path); python -m py_compile @files  # syntax check before handoff
 python run.py                                        # run the main application
 python inspect_db.py                                # run the database inspector
 ```
@@ -82,12 +82,14 @@ resolved with one multi-row upsert per tree depth
 (`PgDatabaseManager._ensure_directories`) instead of one round-trip per file.
 Dedup lookups use the unique `record_key` index.
 
-## Storage Map & Analytics (`storage_map.py`)
+## Storage Map & Analytics (`storage_map/`)
 
 A self-contained, two-stage remote disk-usage mapper for the lab servers,
 **decoupled from the tape pipeline** (it does not touch `src/cli.py`,
-`lto_archive.db`, or the LTFS drive). It lives at the top of the package
-dependency graph in `src/storage_map.py` with a root runner `storage_map.py`.
+`lto_archive.db`, or the LTFS drive). It lives in the `storage_map/` package:
+`storage_map/create_dashboard.py` launches scans and exits, while
+`storage_map/check_status_create_dashboard.py` checks status and builds the
+dashboard when scans are done. Internal code lives in `storage_map/lib/`.
 
 - **Stage 1 — `scan` (fire-and-forget).** Connects to each configured server
   over SSH (reusing `remote_transport._ssh_run`), launches a low-priority
@@ -97,12 +99,13 @@ dependency graph in `src/storage_map.py` with a root runner `storage_map.py`.
   `du`.
 - **Stage 1.5 — `status` / `fetch`.** `status` checks each server's remote
   completion sentinel; `fetch` SCPs the finished raw log to
-  `storage_map_logs/<server>_<ts>.rawlog` (+ a `<server>_latest.rawlog` pointer)
+  `storage_map/logs/<server>_<ts>.rawlog` (+ a `<server>_latest.rawlog` pointer)
   via `remote_transport._scp_fetch_file`.
 - **Stage 2 — `view` / `treemap`.** Parse a *local* raw log only (never the
   disks again): `parse_size` normalizes `du -h` units to bytes and `parse_raw_log`
   builds a Mount → user/project → sub-folder tree, rendered as a Rich terminal
-  dashboard (`view`) or an interactive Plotly HTML treemap (`treemap`). `rich`
+  dashboard (`view`), full HTML dashboard (`dashboard`), or interactive Plotly
+  HTML treemap (`treemap`). `rich`
   and `plotly` are **optional** — each visualizer prints a `pip install` hint if
   its library is missing.
 
@@ -110,10 +113,12 @@ Mount points and servers are **config-driven, never hardcoded** — see the
 `[STORAGE_MAP]` / `[STORAGE_MAP:<name>]` sections in `config.ini`
 (`config.example.ini` documents them). SSH user/password default to the
 `[REMOTE]` account (secret still in `.env`). Output lands in
-`storage_map_logs/` (gitignored like `backup_logs/`).
+`storage_map/logs/` and generated `storage_map/index.html` (gitignored like
+`backup_logs/`).
 
-Typical nightly use (Windows Task Scheduler): schedule `python storage_map.py
-scan` at night and, hours later, `python storage_map.py fetch --treemap`. Unit
+Typical nightly use (Windows Task Scheduler): schedule
+`python storage_map/create_dashboard.py` at night and, hours later,
+`python storage_map/check_status_create_dashboard.py --open`. Unit
 tests: `tests/test_storage_map.py` (pure parser + launcher-script coverage, no
 hardware/network).
 

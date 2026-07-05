@@ -27,6 +27,7 @@ from .remote_transport import _remote_tar_fetch, _ssh_run
 from .reporting import _write_source_missing_only_log
 from .runtime import CANCEL, _acquire_tape_io_lock, _fmt_eta, _phase, _priority_class, _progress_done, _progress_line, _release_tape_io_lock, _status, compute_affinity_sets, pin_current_process, unpin_current_process
 from .skipped import SkippedFileTracker
+from .telegram_notify import TelegramNotifier
 from .ui import ConsoleUI
 
 
@@ -129,6 +130,7 @@ class LocalOrchestrator:
         self.db = db
         self.ui = ui or ConsoleUI()
         self.skipped_tracker = skipped_tracker or SkippedFileTracker()
+        self.notifier = TelegramNotifier.from_config(cfg)
         self.source_dir = cfg.source_dir
         self.staging_dir = cfg.staging_dir
         self.fill_pct = cfg.staging_fill_pct
@@ -372,6 +374,7 @@ class LocalOrchestrator:
                     self.db,
                     self.cfg.ibm_eject_cmd,
                     log_dir=self.cfg.backup_log_dir,
+                    notifier=self.notifier,
                 ).run(
                     source=pack_dir,
                     tape_drive=self.cfg.lto_drive,
@@ -397,6 +400,7 @@ class LocalOrchestrator:
             self.db,
             self.cfg.ibm_eject_cmd,
             log_dir=self.cfg.backup_log_dir,
+            notifier=self.notifier,
         ).eject_tape(self.cfg.lto_drive)
         return True
 
@@ -552,6 +556,7 @@ class LocalOrchestrator:
                     self.db,
                     self.cfg.ibm_eject_cmd,
                     log_dir=self.cfg.backup_log_dir,
+                    notifier=self.notifier,
                 ).run(
                     source=source,
                     tape_drive=self.cfg.lto_drive,
@@ -571,6 +576,7 @@ class LocalOrchestrator:
             self.db,
             self.cfg.ibm_eject_cmd,
             log_dir=self.cfg.backup_log_dir,
+            notifier=self.notifier,
         ).eject_tape(self.cfg.lto_drive)
         return True
 
@@ -678,6 +684,7 @@ class RemoteOrchestrator:
         self.db           = db
         self.ui           = ui or ConsoleUI()
         self.skipped_tracker = skipped_tracker or SkippedFileTracker()
+        self.notifier     = TelegramNotifier.from_config(cfg)
         self.remote_host  = cfg.remote_host
         self.remote_user  = cfg.remote_user
         self.remote_password = cfg.remote_password
@@ -977,10 +984,14 @@ class RemoteOrchestrator:
                            f"{self.staging_max_bytes / 1024**3:.0f} GB")
         print(f"[WARNING] {LTFS_WRITE_WARNING}")
 
-        chunk_files_map = {ci: self.db.get_chunk_files(session_id, ci)
-                           for ci in pending_chunks}
-        planned = {ci: sum(r['file_size_bytes'] for r in chunk_files_map[ci])
-                   for ci in pending_chunks}
+        # Only per-chunk byte totals stay resident. Materializing every pending
+        # chunk's file rows up front holds the whole session manifest in RAM
+        # (GBs for multi-million-file sessions); the producer re-reads each
+        # chunk's rows from the catalog just before staging it.
+        planned = {}
+        for ci in pending_chunks:
+            planned[ci] = sum(int(r['file_size_bytes'] or 0)
+                              for r in self.db.get_chunk_files(session_id, ci))
 
         ready_q       = queue.Queue(maxsize=self.prefetch_ahead)
         stop_pipeline = threading.Event()
@@ -994,7 +1005,8 @@ class RemoteOrchestrator:
                     self._await_staging_capacity(planned[ci], stop_pipeline)
                     if CANCEL.is_set() or stop_pipeline.is_set():
                         break
-                    desc = self._stage_chunk(session_id, ci, chunk_files_map[ci])
+                    desc = self._stage_chunk(
+                        session_id, ci, self.db.get_chunk_files(session_id, ci))
                     if desc is None:
                         if not CANCEL.is_set():
                             self._producer_err = f"chunk {ci + 1} could not be staged"
@@ -1260,6 +1272,7 @@ class RemoteOrchestrator:
                 desc.get('source_missing_files') or [],
                 source_host=self.remote_host.split('.', 1)[0],
                 source_path=self.remote_session_path,
+                notifier=self.notifier,
             )
             self.db.update_chunk_status(session_id, chunk_index, 'done')
             self._cleanup_dir(desc['fetch_dir'])
@@ -1271,6 +1284,7 @@ class RemoteOrchestrator:
                     self.db,
                     self.cfg.ibm_eject_cmd,
                     log_dir=self.cfg.backup_log_dir,
+                    notifier=self.notifier,
                 ).eject_tape(self.cfg.lto_drive)
             return True
 
@@ -1291,7 +1305,8 @@ class RemoteOrchestrator:
             backup_cls(self.db, self.cfg.ibm_eject_cmd,
                        tape_priority=self.tape_priority,
                        tape_affinity=self.tape_cores,
-                       log_dir=self.cfg.backup_log_dir).run(
+                       log_dir=self.cfg.backup_log_dir,
+                       notifier=self.notifier).run(
                 source=pack_dir,
                 tape_drive=self.cfg.lto_drive,
                 tape_label=tape_label,
@@ -1694,9 +1709,14 @@ class RemoteOrchestrator:
         def _mon():
             prev_bytes = 0
             prev_time  = time.time()
-            while not stop_evt.wait(2):
+            interval   = 2
+            while not stop_evt.wait(interval):
+                walk_start = time.time()
                 cur   = _dir_tree_size(fetch_dir)
                 now   = time.time()
+                # Rewalking a chunk with many small files is itself expensive;
+                # keep the scan overhead under ~10% of the monitor's cycle.
+                interval = min(30, max(2, (now - walk_start) * 10))
                 dt    = now - prev_time
                 speed = ((cur - prev_bytes) / 1024**2) / dt if dt > 0 else 0
                 pct   = (cur / total_bytes * 100) if total_bytes else 0

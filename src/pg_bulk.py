@@ -64,6 +64,9 @@ def make_pool(conninfo=None, *, min_size=2, max_size=8, pool_timeout=5,
         open=False,
         timeout=pool_timeout,
         reconnect_timeout=reconnect_timeout,
+        # Validate connections on checkout so a Docker DB restart mid-run
+        # surfaces as a fresh connection, not a stale-socket OperationalError.
+        check=ConnectionPool.check_connection,
     )
     try:
         pool.open(wait=True, timeout=pool_timeout)

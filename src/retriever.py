@@ -12,8 +12,9 @@ try:
 except ImportError:  # optional dependency — priority/affinity degrade gracefully
     psutil = None
 
-from .db import DatabaseManager
+from .db import DatabaseManager, _fmt_ts
 from .ltfs import get_volume_label
+from .packer import StagingSpaceError, ensure_staging_space
 from .robocopy import _robocopy_file
 from .runtime import _acquire_tape_io_lock, _release_tape_io_lock
 
@@ -161,7 +162,7 @@ class LTORetriever:
             print("-" * 65)
             for i, s in enumerate(sessions, 1):
                 size_s = f"{(s['total_bytes'] or 0) / 1024**3:.2f} GB"
-                print(f"{i:>3}  {s['session_date']:<12}  {s['tape_label']:<25}  {s['file_count']:>6}  {size_s}")
+                print(f"{i:>3}  {str(s['session_date']):<12}  {s['tape_label']:<25}  {s['file_count']:>6}  {size_s}")
             print()
             try:
                 idx = int(input("Select session # (0 = cancel): ").strip())
@@ -241,7 +242,7 @@ class LTORetriever:
         print("-" * 112)
         for row in results:
             size_s = f"{(row['file_size_bytes'] or 0)/1024**2:.1f} MB"
-            date_s = (row['backup_date'] or '')[:19]
+            date_s = _fmt_ts(row['backup_date'])
             host_s = row.get('source_host') or 'so02'
             print(f"{row['file_id']:>7}  {row['file_name']:<42}  "
                   f"{size_s:>10}  {date_s:<20}  {host_s:<8}  "
@@ -311,6 +312,27 @@ class LTORetriever:
                 raise RuntimeError(
                     f"[RESTORE] Cancelled: tape '{required_label}' was not mounted.")
 
+    def _bundle_staging_space_ok(self, tape_zip_path):
+        """Check the staging disk can hold a bundle ZIP before reading it off
+        tape. The size probe is an LTFS metadata read, so it takes the tape
+        lock like every other tape access."""
+        _acquire_tape_io_lock(f"stat {os.path.basename(tape_zip_path)}")
+        try:
+            try:
+                bundle_size = os.path.getsize(tape_zip_path)
+            except OSError:
+                bundle_size = 0
+        finally:
+            _release_tape_io_lock()
+        try:
+            ensure_staging_space(
+                self.staging_dir, bundle_size,
+                context=f"restore bundle {os.path.basename(tape_zip_path)}")
+        except StagingSpaceError as e:
+            print(f"[ERROR] {e}")
+            return False
+        return True
+
     def _restore_loose(self, record, restore_base=None):
         src = record['stored_path']
         dst = self._destination_for_record(record, restore_base=restore_base)
@@ -358,6 +380,8 @@ class LTORetriever:
         print(f"[RESTORE] Step 1/3: Copying ZIP from tape to staging...")
 
         os.makedirs(self.staging_dir, exist_ok=True)
+        if not self._bundle_staging_space_ok(tape_zip_path):
+            return
         _acquire_tape_io_lock(f"restore {os.path.basename(tape_zip_path)}")
         try:
             ok = _robocopy_file(tape_zip_path, local_zip)
@@ -396,6 +420,8 @@ class LTORetriever:
         local_zip = os.path.join(self.staging_dir, os.path.basename(tape_zip_path))
         print(f"\n[RESTORE] Copying {os.path.basename(tape_zip_path)} from tape to staging...")
         os.makedirs(self.staging_dir, exist_ok=True)
+        if not self._bundle_staging_space_ok(tape_zip_path):
+            return
         _acquire_tape_io_lock(f"restore {os.path.basename(tape_zip_path)}")
         try:
             ok = _robocopy_file(tape_zip_path, local_zip)

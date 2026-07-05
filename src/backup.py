@@ -17,6 +17,7 @@ from .ltfs import _ensure_lto_drive_ready
 from .reporting import append_backup_summary_row
 from .robocopy import _parse_robocopy_summary, _run_robocopy_tuned
 from .runtime import CANCEL, _acquire_tape_io_lock, _fmt_eta, _phase, _progress_done, _progress_line, _release_tape_io_lock
+from .telegram_notify import notify_backup_summary
 
 
 def _tape_destination_root(source, tape_drive, tape_parent_dir=None):
@@ -33,12 +34,14 @@ def _tape_destination_root(source, tape_drive, tape_parent_dir=None):
 
 class LTOBackup:
     def __init__(self, db: DatabaseManager, ibm_eject_cmd: str,
-                 tape_priority=None, tape_affinity=None, log_dir=None):
+                 tape_priority=None, tape_affinity=None, log_dir=None,
+                 notifier=None):
         self.db            = db
         self.ibm_eject_cmd = ibm_eject_cmd
         self.tape_priority = tape_priority   # psutil priority class for robocopy
         self.tape_affinity = tape_affinity   # consumer (tape-writer) core set
         self.log_dir       = log_dir or BACKUP_LOG_DIR
+        self.notifier      = notifier
 
     def _write_backup_log(self, details, packer_metadata, loose_map,
                           recovered_direct_existing, skipped_existing,
@@ -49,8 +52,10 @@ class LTOBackup:
             details.setdefault(
                 'backup_mode',
                 'staged/packed' if packer_metadata is not None else 'direct')
-            return append_backup_summary_row(
+            path = append_backup_summary_row(
                 self.log_dir or BACKUP_LOG_DIR, details, robocopy_result)
+            notify_backup_summary(self.notifier, details, robocopy_result)
+            return path
         except Exception as e:
             print(f"[REPORT] Warning: could not update CSV summary: {e}")
             return None
@@ -187,6 +192,23 @@ class LTOBackup:
             # DIRECT path — files are written loose to tape; skipping an extra
             # full-file read keeps the tape from waiting.
             print("[BACKUP] Walking source files...")
+            # One indexed-paths query replaces a per-file record lookup on
+            # resume; the per-file fallback remains for sessionless callers.
+            direct_indexed = None
+            if local_session_id is not None and local_chunk_index is not None:
+                direct_indexed = self.db.get_local_indexed_original_paths(
+                    local_session_id, local_chunk_index, tape_label)
+
+            def _already_indexed(path):
+                if direct_indexed is not None:
+                    return path in direct_indexed
+                return self.db.file_record_exists(
+                    path, tape_label,
+                    local_session_id=local_session_id,
+                    local_chunk_index=local_chunk_index,
+                    source_host=source_host,
+                )
+
             for root, _, files in os.walk(source):
                 rel_folder  = os.path.relpath(root, source)
                 dest_folder = os.path.join(tape_root, rel_folder)
@@ -198,12 +220,7 @@ class LTOBackup:
                         try:
                             if os.path.getsize(src) == os.path.getsize(dst):
                                 skipped += 1
-                                if not self.db.file_record_exists(
-                                    src, tape_label,
-                                    local_session_id=local_session_id,
-                                    local_chunk_index=local_chunk_index,
-                                    source_host=source_host,
-                                ):
+                                if not _already_indexed(src):
                                     recovered_direct_existing.append({
                                         'file_name': file,
                                         'original_path': src,

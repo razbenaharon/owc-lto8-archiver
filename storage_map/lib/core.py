@@ -40,10 +40,18 @@ import shlex
 import sys
 from datetime import datetime
 
-from .config import ConfigManager
-from .constants import PROJECT_ROOT
-from .paths import _clean_remote_path, _config_list, _safe_log_token
-from .remote_transport import _scp_fetch_file, _ssh_run
+from src.config import ConfigManager
+from src.constants import PROJECT_ROOT
+from src.paths import _clean_remote_path, _config_list, _safe_log_token
+from src.remote_transport import _scp_fetch_file, _ssh_run
+from src.telegram_notify import (
+    TelegramNotifier,
+    format_storage_dashboard_summary,
+    format_storage_fetch_summary,
+    format_storage_scan_summary,
+    format_storage_status_summary,
+    send_best_effort,
+)
 
 # Optional visualization dependencies — the scanner and parser work without
 # either; each visualizer degrades to a helpful "pip install ..." message.
@@ -96,8 +104,9 @@ class ServerConfig:
 class StorageMapConfig:
     """Parsed ``[STORAGE_MAP]`` settings plus the per-server targets."""
 
-    def __init__(self, output_dir, depth, poll_timeout, servers):
+    def __init__(self, output_dir, dashboard_dir, depth, poll_timeout, servers):
         self.output_dir = output_dir
+        self.dashboard_dir = dashboard_dir
         self.depth = depth
         self.poll_timeout = poll_timeout
         self.servers = servers
@@ -124,8 +133,13 @@ def load_storage_map_config(cfg):
             f"the servers and mount points to map (see config.example.ini)."
         )
 
-    raw_out = conf.get(CONFIG_SECTION, 'output_dir', fallback='storage_map_logs').strip()
+    raw_out = conf.get(CONFIG_SECTION, 'output_dir',
+                       fallback='storage_map/logs').strip()
     output_dir = raw_out if os.path.isabs(raw_out) else os.path.join(PROJECT_ROOT, raw_out)
+
+    raw_dash = conf.get(CONFIG_SECTION, 'dashboard_dir',
+                        fallback='storage_map').strip()
+    dashboard_dir = raw_dash if os.path.isabs(raw_dash) else os.path.join(PROJECT_ROOT, raw_dash)
 
     depth = _safe_int(conf.get(CONFIG_SECTION, 'scan_depth', fallback='2'), 2)
     poll_timeout = _safe_int(
@@ -156,7 +170,7 @@ def load_storage_map_config(cfg):
     if not servers:
         raise RuntimeError(
             f"[{CONFIG_SECTION}] defines no servers. Set e.g. 'servers = so01, so02'.")
-    return StorageMapConfig(output_dir, depth, poll_timeout, servers)
+    return StorageMapConfig(output_dir, dashboard_dir, depth, poll_timeout, servers)
 
 
 def _mount_list(raw):
@@ -203,6 +217,10 @@ def _remote_launcher_script(server, depth):
         qm = q(mount)
         lines.append('printf "##### MOUNT: %s #####\\n" ' + qm)
         lines.append(
+            f"df -B1 -P {qm} 2>>\"$DIR/scan.err\" | "
+            "awk 'NR==2 {printf \"##### DF: %s %s %s %s #####\\n\", "
+            "$2, $3, $4, $5}' || true")
+        lines.append(
             f'$PRE du -x -h --max-depth={int(depth)} '
             f"--exclude='/proc/*' --exclude='/sys/*' {qm} "
             f'2>>"$DIR/scan.err" || true')
@@ -233,11 +251,13 @@ def _remote_launch_command(server, depth):
     )
 
 
-def scan(smcfg, servers):
+def scan(smcfg, servers, notifier=None):
     """Stage 1: launch the remote scan on each server and return immediately."""
     os.makedirs(smcfg.output_dir, exist_ok=True)
     started_at = datetime.now().isoformat(timespec='seconds')
     failures = 0
+    launched = []
+    failed = []
     for srv in servers:
         print(f"[SCAN] Launching background scan on {srv.name} ({srv.host}) "
               f"for {len(srv.mounts)} mount(s)...")
@@ -246,17 +266,20 @@ def scan(smcfg, servers):
                           password=srv.password, timeout=120)
         if result.returncode != 0 or 'LAUNCHED' not in (result.stdout or ''):
             failures += 1
+            failed.append(srv.name)
             err = (result.stderr or '').strip() or (result.stdout or '').strip()
             print(f"[SCAN] FAILED to launch on {srv.name}: {err}")
             continue
         _write_manifest(smcfg, srv, started_at)
+        launched.append(srv.name)
         print(f"[SCAN] {srv.name}: scan running detached under nohup/setsid. "
               f"SSH session no longer required.")
 
     print("\n[SCAN] Fire-and-forget complete. The scan(s) continue on the "
           "server(s) after this process exits.")
-    print("[SCAN] Run 'python storage_map.py status' to check progress, then "
-          "'python storage_map.py fetch --view' to pull and visualize.")
+    print("[SCAN] Run 'python storage_map/check_status_create_dashboard.py' "
+          "later to check progress and build the dashboard when ready.")
+    send_best_effort(notifier, format_storage_scan_summary(launched, failed))
     return 1 if failures else 0
 
 
@@ -282,6 +305,24 @@ def _write_manifest(smcfg, server, started_at):
         print(f"[SCAN] Warning: could not write manifest for {server.name}: {exc}")
 
 
+def _read_manifest(smcfg, server):
+    try:
+        with open(_manifest_path(smcfg, server), encoding='utf-8') as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def _update_manifest(smcfg, server, data):
+    if not data:
+        return
+    try:
+        with open(_manifest_path(smcfg, server), 'w', encoding='utf-8') as fh:
+            json.dump(data, fh, indent=2)
+    except OSError as exc:  # pragma: no cover - disk/permission edge
+        print(f"[STATUS] Warning: could not update manifest for {server.name}: {exc}")
+
+
 # --------------------------------------------------------------------------- #
 # Stage 1.5 — status / fetch                                                  #
 # --------------------------------------------------------------------------- #
@@ -300,7 +341,7 @@ def _remote_status(server):
     return out[-1].strip()
 
 
-def status(smcfg, servers):
+def status(smcfg, servers, notifier=None):
     """Report per-server scan status without fetching anything."""
     any_pending = False
     for srv in servers:
@@ -308,26 +349,46 @@ def status(smcfg, servers):
         started = _manifest_started(smcfg, srv)
         suffix = f" (launched {started})" if started else ""
         print(f"[STATUS] {srv.name:<8} {state}{suffix}")
+        _notify_status_change(smcfg, srv, state, notifier)
         if state in ('PENDING', 'UNREACHABLE'):
             any_pending = True
     return 1 if any_pending else 0
 
 
+def _notify_status_change(smcfg, server, state, notifier=None):
+    if notifier is None or not getattr(notifier, 'enabled', True):
+        return False
+    if state not in ('DONE', 'UNREACHABLE', 'MISSING'):
+        return False
+    manifest = _read_manifest(smcfg, server)
+    if not manifest:
+        return False
+    if manifest.get('last_notified_status') == state:
+        return False
+    manifest['last_notified_status'] = state
+    _update_manifest(smcfg, server, manifest)
+    return send_best_effort(
+        notifier,
+        format_storage_status_summary(
+            server.name, state, manifest.get('started_at')))
+
+
 def _manifest_started(smcfg, server):
-    try:
-        with open(_manifest_path(smcfg, server), encoding='utf-8') as fh:
-            return json.load(fh).get('started_at')
-    except (OSError, ValueError):
-        return None
+    manifest = _read_manifest(smcfg, server)
+    return (manifest or {}).get('started_at')
 
 
-def fetch(smcfg, servers, do_view=False, do_treemap=False, top=15, open_html=False):
+def fetch(smcfg, servers, do_view=False, do_treemap=False, do_dashboard=False,
+          top=15, open_html=False, notifier=None):
     """SCP the finished raw log(s) locally; optionally render afterwards."""
     os.makedirs(smcfg.output_dir, exist_ok=True)
     fetched = []
+    skipped = []
+    failed = []
     for srv in servers:
         state = _remote_status(srv)
         if state != 'DONE':
+            skipped.append(f"{srv.name}({state})")
             print(f"[FETCH] {srv.name}: scan not finished (status={state}); "
                   f"skipping. Try again later.")
             continue
@@ -338,6 +399,7 @@ def fetch(smcfg, servers, do_view=False, do_treemap=False, top=15, open_html=Fal
         rc = _scp_fetch_file(srv.user, srv.host, remote_out, dated,
                              password=srv.password)
         if rc != 0 or not os.path.exists(dated) or os.path.getsize(dated) == 0:
+            failed.append(srv.name)
             print(f"[FETCH] {srv.name}: failed to retrieve raw log (scp rc={rc}).")
             continue
         latest = _latest_path(smcfg, srv.name)
@@ -347,13 +409,23 @@ def fetch(smcfg, servers, do_view=False, do_treemap=False, top=15, open_html=Fal
 
     if not fetched:
         print("[FETCH] No completed scans were retrieved.")
+        send_best_effort(
+            notifier,
+            format_storage_fetch_summary(fetched, skipped, failed))
         return 1
 
+    rendered = [s for s in servers if s.name in fetched]
+    render_results = {}
     if do_view:
-        view(smcfg, [s for s in servers if s.name in fetched], top=top)
+        render_results['view'] = view(smcfg, rendered, top=top)
     if do_treemap:
-        treemap(smcfg, [s for s in servers if s.name in fetched],
-                open_html=open_html)
+        render_results['treemap'] = treemap(smcfg, rendered, open_html=open_html)
+    if do_dashboard:
+        render_results['dashboard'] = dashboard(
+            smcfg, rendered, open_html=open_html, notifier=None)
+    send_best_effort(
+        notifier,
+        format_storage_fetch_summary(fetched, skipped, failed, render_results))
     return 0
 
 
@@ -402,13 +474,33 @@ class Node:
 class MountTree:
     """One mount point's hierarchy: mount -> user/project -> sub-folder."""
 
-    def __init__(self, mount, root):
+    def __init__(self, mount, root, capacity_bytes=None, used_bytes=None,
+                 free_bytes=None):
         self.mount = mount
         self.root = root
+        self.capacity_bytes = capacity_bytes
+        self.used_bytes = used_bytes
+        self.free_bytes = free_bytes
 
     @property
     def total(self):
         return self.root.size if self.root else 0
+
+    @property
+    def has_capacity(self):
+        return bool(self.capacity_bytes and self.free_bytes is not None)
+
+    @property
+    def free_percent(self):
+        if not self.has_capacity:
+            return None
+        return self.free_bytes / self.capacity_bytes * 100
+
+    @property
+    def used_percent(self):
+        if not self.has_capacity:
+            return None
+        return 100 - self.free_percent
 
 
 class ScanResult:
@@ -430,7 +522,7 @@ def parse_raw_log(path, server_name=None):
     """Read a raw log file and build a :class:`ScanResult`."""
     host = generated_at = ''
     depth = 0
-    sections = []  # list[(mount, [(size, path), ...])]
+    sections = []  # list[dict(mount, entries, capacity_bytes, used_bytes, free_bytes)]
     current = None
 
     with open(path, encoding='utf-8', errors='replace') as fh:
@@ -440,8 +532,22 @@ def parse_raw_log(path, server_name=None):
             # generic comment-header branch below.
             marker = re.match(r'#####\s*MOUNT:\s*(.+?)\s*#####$', line)
             if marker:
-                current = (marker.group(1).strip(), [])
+                current = {
+                    'mount': marker.group(1).strip(),
+                    'entries': [],
+                    'capacity_bytes': None,
+                    'used_bytes': None,
+                    'free_bytes': None,
+                }
                 sections.append(current)
+                continue
+            df_marker = re.match(
+                r'#####\s*DF:\s*(\d+)\s+(\d+)\s+(\d+)\s+([0-9]+%?)\s*#####$',
+                line)
+            if df_marker and current is not None:
+                current['capacity_bytes'] = int(df_marker.group(1))
+                current['used_bytes'] = int(df_marker.group(2))
+                current['free_bytes'] = int(df_marker.group(3))
                 continue
             if line.strip() == '##### END #####':
                 continue
@@ -464,10 +570,12 @@ def parse_raw_log(path, server_name=None):
             if len(parts) != 2:
                 continue
             size_token, entry_path = parts[0].strip(), parts[1].strip()
-            current[1].append((parse_size(size_token), entry_path))
+            current['entries'].append((parse_size(size_token), entry_path))
 
-    mounts = [MountTree(mount, _build_tree(entries, mount))
-              for mount, entries in sections]
+    mounts = [MountTree(sec['mount'], _build_tree(sec['entries'], sec['mount']),
+                        sec['capacity_bytes'], sec['used_bytes'],
+                        sec['free_bytes'])
+              for sec in sections]
     name = server_name or (host.split('.')[0] if host else os.path.basename(path))
     return ScanResult(name, host, generated_at, depth, mounts)
 
@@ -551,12 +659,20 @@ def view(smcfg, servers, top=15):
                         title_style="dim")
         summary.add_column("Mount", style="bold")
         summary.add_column("Used", justify="right")
-        summary.add_column("Share", justify="right")
+        summary.add_column("Free", justify="right")
+        summary.add_column("Left", justify="right")
         grand = res.total or 1
         for mt in sorted(res.mounts, key=lambda m: m.total, reverse=True):
+            if mt.has_capacity:
+                free_text = human(mt.free_bytes)
+                pct_text = f"{mt.free_percent:5.1f}%"
+            else:
+                free_text = "n/a"
+                pct_text = f"{mt.total / grand * 100:5.1f}% of scanned"
             summary.add_row(mt.mount,
                             f"[{_size_style(mt.total)}]{human(mt.total)}[/]",
-                            f"{mt.total / grand * 100:5.1f}%")
+                            free_text,
+                            pct_text)
         console.print(summary)
 
         for mt in sorted(res.mounts, key=lambda m: m.total, reverse=True):
@@ -593,53 +709,87 @@ def _plain_children(folder, top, indent):
         _plain_children(child, top, indent + 1)
 
 
-def treemap(smcfg, servers, open_html=False):
-    """Build an interactive Plotly treemap HTML from local raw logs."""
-    results = _load_results(smcfg, servers)
-    if not results:
-        return 1
+# Categorical hue per top-level mount (validated data-viz palette). Area encodes
+# magnitude; color encodes *identity* (which mount), so a mount and all its
+# descendants share one hue and the drill-down stays visually coherent.
+MOUNT_HUES = ['#2a78d6', '#1baf7a', '#eda100', '#008300',
+              '#4a3aa7', '#e34948', '#e87ba4', '#eb6834']
+_SERVER_HUE = '#52514e'  # neutral ink for the per-server root tile
+
+
+def build_treemap_figure(results):
+    """Build the interactive Plotly treemap :class:`~plotly.graph_objects.Figure`.
+
+    Shared by ``treemap`` (standalone HTML) and the dashboard so both render an
+    identical, consistently-coloured drill-down. Returns ``None`` when Plotly is
+    unavailable so callers can degrade gracefully.
+    """
     if not _HAVE_PLOTLY:
-        print("[TREEMAP] Plotly is not installed. Run: pip install plotly")
-        return 1
+        return None
 
-    ids, labels, parents, values, customdata = [], [], [], [], []
+    ids, labels, parents, values, customdata, colors = [], [], [], [], [], []
 
-    def add(node_id, label, parent_id, size):
+    def add(node_id, label, parent_id, size, color):
         ids.append(node_id)
         labels.append(label)
         parents.append(parent_id)
         values.append(size)
         customdata.append(human(size))
+        colors.append(color)
 
-    def walk(server_id, folder, parent_id, label=None):
+    def walk(server_id, folder, parent_id, color, label=None):
         # branchvalues='total' requires parent >= sum(children); du rounding can
         # violate that by a hair, so reconcile upward.
         child_sum = 0
         node_id = f"{server_id}\x1f{folder.path}"
-        add(node_id, label or folder.name, parent_id, max(folder.size, 0))
+        add(node_id, label or folder.name, parent_id, max(folder.size, 0), color)
         for child in folder.children:
-            child_sum += walk(server_id, child, node_id)
+            child_sum += walk(server_id, child, node_id, color)
         reconciled = max(folder.size, child_sum)
         values[ids.index(node_id)] = reconciled
         return reconciled
 
     for res in results:
         server_id = f"srv\x1f{res.server}"
-        add(server_id, res.server, "", 0)
+        add(server_id, res.server, "", 0, _SERVER_HUE)
         server_total = 0
-        for mt in res.mounts:
+        for idx, mt in enumerate(res.mounts):
+            hue = MOUNT_HUES[idx % len(MOUNT_HUES)]
             # Label the mount root with its full path (e.g. '/strg/E'), not just
             # the basename, so mounts are recognizable in the treemap.
-            server_total += walk(server_id, mt.root, server_id, label=mt.mount)
+            server_total += walk(server_id, mt.root, server_id, hue, label=mt.mount)
         values[ids.index(server_id)] = max(server_total, 1)
 
     fig = go.Figure(go.Treemap(
         ids=ids, labels=labels, parents=parents, values=values,
         customdata=customdata, branchvalues='total',
+        marker=dict(colors=colors, line=dict(width=1, color='rgba(255,255,255,0.28)')),
+        tiling=dict(pad=2),
+        textfont=dict(color='#ffffff', size=13,
+                      family='system-ui, -apple-system, "Segoe UI", sans-serif'),
         texttemplate="%{label}<br>%{customdata}",
         hovertemplate="%{label}<br>%{customdata}<extra></extra>",
         maxdepth=3,
+        pathbar=dict(visible=True, textfont=dict(color='#898781', size=13)),
     ))
+    fig.update_layout(
+        margin=dict(t=8, l=8, r=8, b=8),
+        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+        height=560,
+    )
+    return fig
+
+
+def treemap(smcfg, servers, open_html=False):
+    """Build an interactive Plotly treemap HTML from local raw logs."""
+    results = _load_results(smcfg, servers)
+    if not results:
+        return 1
+    fig = build_treemap_figure(results)
+    if fig is None:
+        print("[TREEMAP] Plotly is not installed. Run: pip install plotly")
+        return 1
+
     servers_label = ', '.join(r.server for r in results)
     fig.update_layout(
         title=f"Storage Map — {servers_label}  "
@@ -654,6 +804,27 @@ def treemap(smcfg, servers, open_html=False):
     print(f"[TREEMAP] Interactive treemap written -> {out_html}")
     if open_html and os.name == 'nt':
         os.startfile(out_html)  # noqa: S606 - opening our own generated report
+    return 0
+
+
+def dashboard(smcfg, servers, open_html=False, notifier=None):
+    """Build the self-contained HTML dashboard from local raw logs."""
+    from .dashboard import render_dashboard
+
+    results = _load_results(smcfg, servers)
+    if not results:
+        send_best_effort(
+            notifier,
+            format_storage_dashboard_summary([s.name for s in servers], failed=True))
+        return 1
+    fig = build_treemap_figure(results)  # None if Plotly is absent -> no treemap
+    out_html = render_dashboard(results, fig, smcfg.dashboard_dir)
+    print(f"[DASHBOARD] Storage dashboard written -> {out_html}")
+    if open_html and os.name == 'nt':
+        os.startfile(out_html)  # noqa: S606 - opening our own generated report
+    send_best_effort(
+        notifier,
+        format_storage_dashboard_summary([r.server for r in results], out_html))
     return 0
 
 
@@ -691,9 +862,11 @@ def main(argv=None):
                          help="Render the Rich dashboard after fetching.")
     p_fetch.add_argument('--treemap', action='store_true',
                          help="Build the Plotly HTML treemap after fetching.")
+    p_fetch.add_argument('--dashboard', action='store_true',
+                         help="Build the full HTML dashboard after fetching.")
     p_fetch.add_argument('--top', type=int, default=15)
     p_fetch.add_argument('--open', action='store_true',
-                         help="Open the generated HTML treemap.")
+                         help="Open the generated HTML report(s).")
 
     p_view = sub.add_parser('view', help="Stage 2: Rich terminal dashboard.")
     p_view.add_argument('--top', type=int, default=15)
@@ -701,23 +874,32 @@ def main(argv=None):
     p_tree = sub.add_parser('treemap', help="Stage 2: Plotly HTML treemap.")
     p_tree.add_argument('--open', action='store_true')
 
+    p_dash = sub.add_parser('dashboard',
+                            help="Stage 2: build the self-contained HTML dashboard.")
+    p_dash.add_argument('--open', action='store_true',
+                        help="Open the generated dashboard in the browser.")
+
     args = parser.parse_args(argv)
 
     cfg = ConfigManager()
     smcfg = load_storage_map_config(cfg)
     servers = _select_servers(smcfg, args.server)
+    notifier = TelegramNotifier.from_config(cfg)
 
     command = args.command or 'scan'  # default action for Task Scheduler
     if command == 'scan':
-        return scan(smcfg, servers)
+        return scan(smcfg, servers, notifier=notifier)
     if command == 'status':
-        return status(smcfg, servers)
+        return status(smcfg, servers, notifier=notifier)
     if command == 'fetch':
         return fetch(smcfg, servers, do_view=args.view, do_treemap=args.treemap,
-                     top=args.top, open_html=args.open)
+                     do_dashboard=args.dashboard, top=args.top,
+                     open_html=args.open, notifier=notifier)
     if command == 'view':
         return view(smcfg, servers, top=args.top)
     if command == 'treemap':
         return treemap(smcfg, servers, open_html=args.open)
+    if command == 'dashboard':
+        return dashboard(smcfg, servers, open_html=args.open, notifier=notifier)
     parser.print_help()
     return 2

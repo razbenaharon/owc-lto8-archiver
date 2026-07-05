@@ -10,6 +10,7 @@ import os
 from datetime import datetime
 
 from .constants import BACKUP_LOG_DIR
+from .telegram_notify import notify_backup_summary
 
 
 SUMMARY_CSV = 'SUMMARY.csv'
@@ -40,14 +41,21 @@ SUMMARY_COLUMNS = [
     'files_failed',
     'already_on_tape',
     'source_missing_files',
-    'skipped_files_count',
-    'skipped_files_report',
     'records_inserted',
     'records_updated',
     'records_skipped',
     'tape_used_after_bytes',
     'robocopy_exit_code',
     'robocopy_speed_mbs',
+    # Legacy maintenance columns. Keep them in-place so old SUMMARY.csv files
+    # can be migrated without shifting later backup fields.
+    'before_bytes',
+    'after_bytes',
+    'reduction_pct',
+    # Newer skipped-file report columns are appended only; inserting them in the
+    # middle of an existing CSV corrupts positional readers.
+    'skipped_files_count',
+    'skipped_files_report',
 ]
 
 
@@ -70,17 +78,137 @@ def _blank_row():
     return {column: '' for column in SUMMARY_COLUMNS}
 
 
+def _float_or_none(value):
+    try:
+        return float(str(value).replace(',', ''))
+    except (TypeError, ValueError):
+        return None
+
+
+def _int_or_none(value):
+    try:
+        return int(float(str(value).replace(',', '')))
+    except (TypeError, ValueError):
+        return None
+
+
+def _summary_columns(existing_header=None):
+    """Canonical columns plus any unknown columns already present on disk."""
+    columns = list(SUMMARY_COLUMNS)
+    for column in existing_header or []:
+        if column and column not in columns:
+            columns.append(column)
+    return columns
+
+
+def _looks_like_shifted_skipped_row(header, row):
+    """Detect rows written after skipped columns were inserted mid-schema.
+
+    The old on-disk header did not have skipped_files_count/report. Rows written
+    by the newer writer shifted records/tape/speed fields two positions right,
+    making tape_used_after_bytes appear as robocopy_speed_mbs.
+    """
+    if 'skipped_files_count' in header or 'skipped_files_report' in header:
+        return False
+    if row.get('record_type') != 'backup' or row.get('operation') != 'backup':
+        return False
+
+    speed = _float_or_none(row.get('robocopy_speed_mbs'))
+    exit_code = _int_or_none(row.get('before_bytes'))
+    shifted_speed = _float_or_none(row.get('after_bytes'))
+    if speed is None or exit_code is None or shifted_speed is None:
+        return False
+    if not (0 <= exit_code <= 16):
+        return False
+    return speed > 10000 and 0 <= shifted_speed < 10000
+
+
+def _repair_shifted_skipped_row(row):
+    repaired = dict(row)
+    repaired['skipped_files_count'] = row.get('records_inserted', '')
+    repaired['skipped_files_report'] = row.get('records_updated', '')
+    repaired['records_inserted'] = row.get('records_skipped', '')
+    repaired['records_updated'] = row.get('tape_used_after_bytes', '')
+    repaired['records_skipped'] = row.get('robocopy_exit_code', '')
+    repaired['tape_used_after_bytes'] = row.get('robocopy_speed_mbs', '')
+    repaired['robocopy_exit_code'] = row.get('before_bytes', '')
+    repaired['robocopy_speed_mbs'] = row.get('after_bytes', '')
+    repaired['before_bytes'] = ''
+    repaired['after_bytes'] = ''
+    repaired['reduction_pct'] = ''
+    return repaired
+
+
+def _migrate_summary_schema(path):
+    """Normalize SUMMARY.csv to the current append-safe schema in-place."""
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return list(SUMMARY_COLUMNS)
+
+    with open(path, encoding='utf-8', newline='') as handle:
+        raw_rows = list(csv.reader(handle))
+    if not raw_rows:
+        return list(SUMMARY_COLUMNS)
+
+    header = raw_rows[0]
+    columns = _summary_columns(header)
+    out_rows = []
+    changed = header != columns
+    extra_count = 0
+
+    for raw in raw_rows[1:]:
+        row = {column: '' for column in columns}
+        for idx, value in enumerate(raw):
+            if idx < len(header):
+                row[header[idx]] = value
+            else:
+                extra_count += 1
+                extra_col = f'extra_{extra_count}'
+                if extra_col not in columns:
+                    columns.append(extra_col)
+                    for existing in out_rows:
+                        existing[extra_col] = ''
+                row[extra_col] = value
+                changed = True
+
+        if _looks_like_shifted_skipped_row(header, row):
+            row = _repair_shifted_skipped_row(row)
+            changed = True
+        out_rows.append(row)
+
+    if changed:
+        tmp_path = path + '.tmp'
+        with open(tmp_path, 'w', encoding='utf-8', newline='') as handle:
+            writer = csv.DictWriter(handle, fieldnames=columns)
+            writer.writeheader()
+            for row in out_rows:
+                writer.writerow({column: row.get(column, '') for column in columns})
+        try:
+            os.replace(tmp_path, path)
+        except PermissionError as exc:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise PermissionError(
+                f"Could not update {path}. Close it in Excel or any other "
+                "viewer, then retry."
+            ) from exc
+
+    return columns
+
+
 def _append_row(log_dir, row):
     """Write a single fully-keyed row to SUMMARY.csv, creating it if needed."""
     log_dir = os.path.abspath(log_dir or BACKUP_LOG_DIR)
     os.makedirs(log_dir, exist_ok=True)
     path = os.path.join(log_dir, SUMMARY_CSV)
     write_header = not os.path.exists(path) or os.path.getsize(path) == 0
+    columns = list(SUMMARY_COLUMNS) if write_header else _migrate_summary_schema(path)
     with open(path, 'a', encoding='utf-8', newline='') as handle:
-        writer = csv.DictWriter(handle, fieldnames=SUMMARY_COLUMNS)
+        writer = csv.DictWriter(handle, fieldnames=columns)
         if write_header:
             writer.writeheader()
-        writer.writerow(row)
+        writer.writerow({column: row.get(column, '') for column in columns})
     return path
 
 
@@ -143,7 +271,8 @@ def append_backup_summary_row(log_dir=None, details=None, robocopy_result=None):
 
 def _write_source_missing_only_log(log_dir, session_id, chunk_index,
                                    tape_label, missing_files,
-                                   source_host='', source_path=''):
+                                   source_host='', source_path='',
+                                   notifier=None):
     details = {
         'status': 'completed_without_tape_write',
         'source_host': source_host,
@@ -163,7 +292,9 @@ def _write_source_missing_only_log(log_dir, session_id, chunk_index,
         'record_counts': {},
         'rc_sum': {},
     }
-    return append_backup_summary_row(log_dir, details, None)
+    path = append_backup_summary_row(log_dir, details, None)
+    notify_backup_summary(notifier, details, None)
+    return path
 
 
 def generate_backup_summary(log_dir=None, output_name=SUMMARY_CSV):
@@ -174,4 +305,6 @@ def generate_backup_summary(log_dir=None, output_name=SUMMARY_CSV):
     if not os.path.exists(path):
         with open(path, 'w', encoding='utf-8', newline='') as handle:
             csv.DictWriter(handle, fieldnames=SUMMARY_COLUMNS).writeheader()
+    elif output_name == SUMMARY_CSV:
+        _migrate_summary_schema(path)
     return path

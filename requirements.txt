@@ -12,7 +12,7 @@ PySide6>=6.7
 psycopg[binary,pool]>=3.2
 #
 # Optional — only needed for the Storage Map & Analytics visualizers
-# (storage_map.py). The scanner and parser run without them; each visualizer
+# (storage_map/*.py helpers). The scanner and parser run without them; each visualizer
 # degrades to a helpful "pip install ..." hint when its library is missing.
 rich>=13        # Stage 2: color-coded terminal dashboard
 plotly>=5       # Stage 2: interactive drill-down HTML treemap
