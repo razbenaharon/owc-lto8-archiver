@@ -8,9 +8,9 @@ try:
 except ImportError:  # optional dependency — priority/affinity degrade gracefully
     psutil = None
 
-from .constants import (BUFFER_SIZE, LOCAL_STAGING_RESERVE_BYTES,
-                        LOCAL_TAPE_BUDGET_BYTES, ROOT_FILES_GROUP,
-                        _auto_pack_decision)
+from .constants import (LOCAL_STAGING_RESERVE_BYTES, LOCAL_TAPE_BUDGET_BYTES,
+                        ROOT_FILES_GROUP, TAPE_BUDGET_LABEL,
+                        ZIP_BUNDLE_FILL_FACTOR, _auto_pack_decision)
 from .robocopy import _robocopy_file
 from .runtime import _progress_done, _progress_line
 from .skipped import SkippedFileTracker
@@ -170,9 +170,10 @@ class LTOAnalyzer:
 
                 if size > budget_bytes:
                     raise RuntimeError(
-                        "[FATAL] Single file exceeds the 11.5 TB tape safety "
-                        "limit. Spanning one file across tapes is unsupported; "
-                        "manually split it with CLI utilities before archiving:\n"
+                        f"[FATAL] Single file exceeds the {TAPE_BUDGET_LABEL} "
+                        "tape safety limit. Spanning one file across tapes is "
+                        "unsupported; manually split it with CLI utilities "
+                        "before archiving:\n"
                         f"        {path}\n"
                         f"        Size: {size / 1000**4:.2f} TB"
                     )
@@ -197,8 +198,8 @@ class LTOAnalyzer:
         for entry in entries:
             if entry['size_bytes'] > budget_bytes:
                 raise RuntimeError(
-                    "[FATAL] Top-level directory exceeds the 11.5 TB tape "
-                    "budget and cannot be split automatically:\n"
+                    f"[FATAL] Top-level directory exceeds the {TAPE_BUDGET_LABEL} "
+                    "tape budget and cannot be split automatically:\n"
                     f"        {entry['name']} ({entry['size_bytes'] / 1000**4:.2f} TB)"
                 )
 
@@ -255,10 +256,10 @@ class LTOAnalyzer:
                 print(f"Tape {idx}{label}: {planned / 1024**4:.2f} TiB planned | "
                       f"DB occupied {occupied / 1024**4:.2f} TiB | "
                       f"after archive {resulting / 1024**4:.2f} TiB "
-                      f"({pct:.1f}% of 11.5 TB budget)")
+                      f"({pct:.1f}% of {TAPE_BUDGET_LABEL} budget)")
             else:
                 print(f"Tape {idx}{label}: {planned / 1024**4:.2f} TiB "
-                      f"({pct:.1f}% of 11.5 TB budget)")
+                      f"({pct:.1f}% of {TAPE_BUDGET_LABEL} budget)")
             for entry in sorted(chunk, key=lambda e: e['name'].lower()):
                 print(f"  - {entry['name']}  {entry['size_bytes'] / 1024**3:.2f} GiB")
         print("-" * 60)
@@ -325,6 +326,12 @@ class LTOPacker:
                 if fsize_mb < threshold_mb:
                     budget.consume(fsize, context=file)
                     zip_rel = rel.replace('\\', '/')
+                    # Read the whole file BEFORE opening the ZIP entry: a
+                    # source I/O error mid-copy would otherwise seal a
+                    # truncated member into the bundle that ships to tape.
+                    # Peak memory is bounded by zip_threshold_mb.
+                    with open(src, 'rb') as fsrc:
+                        payload = fsrc.read()
                     if zipf is None:
                         zip_path = os.path.join(
                             dest, f"{bundle_prefix}_{zip_idx:03d}.zip")
@@ -332,7 +339,8 @@ class LTOPacker:
                             zip_path, 'w', zipfile.ZIP_STORED, allowZip64=True)
                     if (files_in_current_zip > 0 and
                             current_zip_size + fsize >
-                            self.max_zip_size_gb * 1024**3 * 0.99):
+                            self.max_zip_size_gb * 1024**3 *
+                            ZIP_BUNDLE_FILL_FACTOR):
                         zipf.close()
                         _progress_done()
                         print(f"\n -> Sealed {bundle_prefix}_{zip_idx:03d}.zip ({files_in_current_zip} files)")
@@ -343,12 +351,9 @@ class LTOPacker:
                         files_in_current_zip = 0
 
                     container = f"{bundle_prefix}_{zip_idx:03d}.zip"
-                    with open(src, 'rb') as fsrc, zipf.open(zip_rel, 'w', force_zip64=True) as zdst:
-                        while True:
-                            buf = fsrc.read(BUFFER_SIZE)
-                            if not buf:
-                                break
-                            zdst.write(buf)
+                    with zipf.open(zip_rel, 'w', force_zip64=True) as zdst:
+                        zdst.write(payload)
+                    del payload
                     current_zip_size     += fsize
                     files_in_current_zip += 1
                     total_packed         += 1
@@ -422,28 +427,44 @@ class LTOPacker:
         return metadata
 
     def run(self, source, dest, threshold_mb, skipped_tracker=None,
-            source_name='local', session_id=None, chunk_index=None):
+            source_name='local', session_id=None, chunk_index=None,
+            on_existing='ask'):
         """
         Pack small files into ZIP bundles; copy large files loose.
 
+        on_existing controls what happens when dest already holds files:
+            'ask'   — interactive prompt (CLI flows only; requires a real stdin)
+            'clean' — delete the stale staging and repack (pipeline threads:
+                      they must never block on stdin, and a failed rmtree
+                      raises so the chunk stays resumable)
+            'reuse' — keep the existing staging, return []
+
         Returns:
             list of dicts  — full metadata (staged backup ready for DB)
-            []             — user chose to use existing staging (no new metadata)
+            []             — existing staging reused (no new metadata)
             None           — user aborted
         """
         if os.path.exists(dest) and os.listdir(dest):
-            print(f"\n[WARNING] Staging directory is not empty: {dest}")
-            print("1. Delete staging and repack from scratch")
-            print("2. Use existing staged files (packed-file DB records will be skipped)")
-            choice = input("Choose (1/2): ").strip()
-            if choice == '2':
-                print("[PACKER] Using existing staging. DB metadata for packed files will not be generated.")
-                return []
-            elif choice == '1':
-                print("[PACKER] Cleaning staging directory...")
+            if on_existing == 'clean':
+                print(f"[PACKER] Cleaning stale staging directory: {dest}")
                 shutil.rmtree(dest)
+            elif on_existing == 'reuse':
+                print("[PACKER] Using existing staging. DB metadata for "
+                      "packed files will not be generated.")
+                return []
             else:
-                return None
+                print(f"\n[WARNING] Staging directory is not empty: {dest}")
+                print("1. Delete staging and repack from scratch")
+                print("2. Use existing staged files (packed-file DB records will be skipped)")
+                choice = input("Choose (1/2): ").strip()
+                if choice == '2':
+                    print("[PACKER] Using existing staging. DB metadata for packed files will not be generated.")
+                    return []
+                elif choice == '1':
+                    print("[PACKER] Cleaning staging directory...")
+                    shutil.rmtree(dest)
+                else:
+                    return None
 
         os.makedirs(dest, exist_ok=True)
 

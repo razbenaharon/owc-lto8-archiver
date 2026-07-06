@@ -12,6 +12,14 @@ from .constants import BACKUP_LOG_DIR, CONFIG_FILE, PROJECT_ROOT
 from .paths import _clean_config_path, _clean_remote_path, _config_list
 
 
+def _strip_quotes(value):
+    """Trim whitespace and one pair of matching surrounding quotes."""
+    value = (value or '').strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        value = value[1:-1]
+    return value
+
+
 def _load_env_file(path):
     """Parse a simple KEY=VALUE .env file into a dict.
 
@@ -121,13 +129,10 @@ class ConfigManager:
         return self.config.get('DATABASE', 'user', fallback='lto').strip()
     @property
     def pg_password(self):
-        value = (os.environ.get('PGPASSWORD')
-                 or self.env.get('PGPASSWORD')
-                 or self.config.get('DATABASE', 'password', fallback='', raw=True))
-        value = (value or '').strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
-            value = value[1:-1]
-        return value
+        return _strip_quotes(
+            os.environ.get('PGPASSWORD')
+            or self.env.get('PGPASSWORD')
+            or self.config.get('DATABASE', 'password', fallback='', raw=True))
     @property
     def pg_sslmode(self):
         return self.config.get('DATABASE', 'sslmode', fallback='prefer').strip()
@@ -169,13 +174,10 @@ class ConfigManager:
     @property
     def remote_password(self):
         # Priority: process env var > .env file > config.ini (kept empty in git).
-        value = (os.environ.get('REMOTE_PASSWORD')
-                 or self.env.get('REMOTE_PASSWORD')
-                 or self.config.get('REMOTE', 'remote_password', fallback='', raw=True))
-        value = (value or '').strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
-            value = value[1:-1]
-        return value
+        return _strip_quotes(
+            os.environ.get('REMOTE_PASSWORD')
+            or self.env.get('REMOTE_PASSWORD')
+            or self.config.get('REMOTE', 'remote_password', fallback='', raw=True))
     @property
     def remote_path(self):      return _clean_remote_path(self.config.get('REMOTE', 'remote_path', fallback=''))
     @property
@@ -244,20 +246,14 @@ class ConfigManager:
 
     @property
     def telegram_bot_token(self):
-        value = (os.environ.get('TELEGRAM_BOT_TOKEN')
-                 or self.env.get('TELEGRAM_BOT_TOKEN')
-                 or self.config.get('TELEGRAM', 'bot_token', fallback='', raw=True))
-        value = (value or '').strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
-            value = value[1:-1]
-        return value
+        return _strip_quotes(
+            os.environ.get('TELEGRAM_BOT_TOKEN')
+            or self.env.get('TELEGRAM_BOT_TOKEN')
+            or self.config.get('TELEGRAM', 'bot_token', fallback='', raw=True))
 
     @property
     def telegram_chat_id(self):
-        value = (os.environ.get('TELEGRAM_CHAT_ID')
-                 or self.env.get('TELEGRAM_CHAT_ID')
-                 or self.config.get('TELEGRAM', 'chat_id', fallback='', raw=True))
-        value = (value or '').strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
-            value = value[1:-1]
-        return value
+        return _strip_quotes(
+            os.environ.get('TELEGRAM_CHAT_ID')
+            or self.env.get('TELEGRAM_CHAT_ID')
+            or self.config.get('TELEGRAM', 'chat_id', fallback='', raw=True))

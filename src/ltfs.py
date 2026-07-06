@@ -7,7 +7,7 @@ try:
 except ImportError:  # optional dependency — priority/affinity degrade gracefully
     psutil = None
 
-from .constants import LTFS_DIR
+from .constants import DEFAULT_TAPE_CAPACITY_GB, LTFS_DIR
 from .db import DatabaseManager
 from .runtime import _acquire_tape_io_lock, _release_tape_io_lock
 
@@ -18,9 +18,11 @@ def get_volume_label(drive_path):
     try:
         try:
             drive_letter = drive_path.rstrip(":\\/")
+            # 'vol' is a cmd.exe builtin; invoke the shell explicitly instead
+            # of shell=True with an args list (a Windows-specific footgun).
             result = subprocess.run(
-                ['vol', f'{drive_letter}:'],
-                capture_output=True, text=True, shell=True
+                ['cmd', '/c', 'vol', f'{drive_letter}:'],
+                capture_output=True, text=True
             )
             for line in result.stdout.splitlines():
                 line = line.strip()
@@ -29,6 +31,38 @@ def get_volume_label(drive_path):
         except Exception:
             pass
         return None
+    finally:
+        _release_tape_io_lock()
+
+
+def _eject_tape_unlocked(tape_drive, ibm_eject_cmd=None):
+    """Run LtfsCmdEject.exe for a drive. Caller must hold the tape I/O lock."""
+    drive_arg = tape_drive.rstrip(":\\")
+    exe       = ibm_eject_cmd or os.path.join(LTFS_DIR, 'LtfsCmdEject.exe')
+    exe_dir   = os.path.dirname(exe) or LTFS_DIR
+    cmd       = [exe, drive_arg]
+    print("\n" + "#" * 60)
+    print("[LTO] FINALIZING: Ejecting tape...")
+    print("[LTO] PLEASE WAIT — this can take 1-2 minutes.")
+    print("#" * 60)
+    try:
+        result = subprocess.run(cmd, check=True, text=True, capture_output=True,
+                                cwd=exe_dir)
+        print("[LTO] Tape ejected successfully!")
+        if result.stdout:
+            print(result.stdout)
+    except subprocess.CalledProcessError as e:
+        print(f"[ERROR] Eject failed: {e.stderr}")
+        print(f"Try manually: cd /d \"{LTFS_DIR}\" && LtfsCmdEject.exe {drive_arg}")
+    except FileNotFoundError:
+        print(f"[ERROR] LtfsCmdEject.exe not found in: {LTFS_DIR}")
+
+
+def eject_tape_drive(tape_drive, ibm_eject_cmd=None):
+    """Safely eject a tape, serialized against all other tape I/O."""
+    _acquire_tape_io_lock(f"eject {tape_drive}")
+    try:
+        return _eject_tape_unlocked(tape_drive, ibm_eject_cmd)
     finally:
         _release_tape_io_lock()
 
@@ -196,8 +230,9 @@ class TapeManager:
             if result.stdout:
                 print(result.stdout)
 
-            cap      = input("Tape capacity in GB (default 12288 for 12 TB, Enter to skip): ").strip()
-            capacity = int(cap) if cap.isdigit() else 12288
+            cap      = input(f"Tape capacity in GB (default {DEFAULT_TAPE_CAPACITY_GB} "
+                             "for 12 TB, Enter to skip): ").strip()
+            capacity = int(cap) if cap.isdigit() else DEFAULT_TAPE_CAPACITY_GB
             self.db.replace_formatted_tape(
                 label, capacity, previous_labels=[old_label, manual_old_label])
         except subprocess.CalledProcessError as e:
@@ -213,8 +248,9 @@ class TapeManager:
         label = input("Volume label of tape to register: ").strip()
         if not label:
             return
-        cap      = input("Capacity in GB (default 12288 for 12 TB, Enter to skip): ").strip()
-        capacity = int(cap) if cap.isdigit() else 12288
+        cap      = input(f"Capacity in GB (default {DEFAULT_TAPE_CAPACITY_GB} "
+                         "for 12 TB, Enter to skip): ").strip()
+        capacity = int(cap) if cap.isdigit() else DEFAULT_TAPE_CAPACITY_GB
         self.db.register_tape(label, capacity)
 
     def check_tape(self):
@@ -255,50 +291,6 @@ class TapeManager:
         except FileNotFoundError:
             print(f"[ERROR] LtfsCmdDrives.exe not found in: {LTFS_DIR}")
 
-    def _legacy_eject_tape_unlocked(self):
-        """Run LtfsCmdEject.exe to safely eject the tape."""
-        drive_arg = self.tape_drive.rstrip(":\\")
-        exe       = self.ibm_eject_cmd or os.path.join(LTFS_DIR, 'LtfsCmdEject.exe')
-        exe_dir   = os.path.dirname(exe) or LTFS_DIR
-        cmd       = [exe, drive_arg]
-        print("\n" + "#" * 60)
-        print("[LTO] Ejecting tape...")
-        print("[LTO] PLEASE WAIT — this can take 1-2 minutes.")
-        print("#" * 60)
-        try:
-            result = subprocess.run(cmd, check=True, text=True, capture_output=True,
-                                    cwd=exe_dir)
-            print("[LTO] Tape ejected successfully!")
-            if result.stdout:
-                print(result.stdout)
-        except subprocess.CalledProcessError as e:
-            print(f"[ERROR] Eject failed: {e.stderr}")
-            print(f"Try manually: cd /d \"{LTFS_DIR}\" && LtfsCmdEject.exe {drive_arg}")
-        except FileNotFoundError:
-            print(f"[ERROR] LtfsCmdEject.exe not found in: {LTFS_DIR}")
-
-
     def eject_tape(self):
         """Run LtfsCmdEject.exe to safely eject the tape."""
-        drive_arg = self.tape_drive.rstrip(":\\")
-        exe       = self.ibm_eject_cmd or os.path.join(LTFS_DIR, 'LtfsCmdEject.exe')
-        exe_dir   = os.path.dirname(exe) or LTFS_DIR
-        cmd       = [exe, drive_arg]
-        print("\n" + "#" * 60)
-        print("[LTO] Ejecting tape...")
-        print("[LTO] PLEASE WAIT - this can take 1-2 minutes.")
-        print("#" * 60)
-        _acquire_tape_io_lock(f"eject {self.tape_drive}")
-        try:
-            result = subprocess.run(cmd, check=True, text=True, capture_output=True,
-                                    cwd=exe_dir)
-            print("[LTO] Tape ejected successfully!")
-            if result.stdout:
-                print(result.stdout)
-        except subprocess.CalledProcessError as e:
-            print(f"[ERROR] Eject failed: {e.stderr}")
-            print(f"Try manually: cd /d \"{LTFS_DIR}\" && LtfsCmdEject.exe {drive_arg}")
-        except FileNotFoundError:
-            print(f"[ERROR] LtfsCmdEject.exe not found in: {LTFS_DIR}")
-        finally:
-            _release_tape_io_lock()
+        return eject_tape_drive(self.tape_drive, self.ibm_eject_cmd)

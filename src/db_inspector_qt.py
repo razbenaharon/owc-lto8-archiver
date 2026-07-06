@@ -85,6 +85,34 @@ class RepositoryWorker(QRunnable):
         self.signals.finished.emit(self.token, result)
 
 
+class _DbTaskSignals(QObject):
+    finished = Signal(object)
+    failed = Signal(str)
+
+
+class DbWriteTask(QRunnable):
+    """Run a blocking PgDatabaseManager write off the UI thread.
+
+    Heavy maintenance ops (rename_tape rebuilds every record_key of a tape;
+    cleanup runs VACUUM) used to freeze the event loop for minutes at catalog
+    scale. The manager is connection-pool backed, so it is thread-safe here.
+    """
+
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+        self.signals = _DbTaskSignals()
+
+    @Slot()
+    def run(self):
+        try:
+            result = self.fn()
+        except Exception as exc:
+            self.signals.failed.emit(str(exc))
+            return
+        self.signals.finished.emit(result)
+
+
 class TreeNode:
     def __init__(self, name, kind, parent=None, tape_label=None,
                  directory_id=None, normalized_path=None):
@@ -485,8 +513,9 @@ class BrowseWidget(QWidget):
                 f"Delete {len(ids)} file record(s)? This cannot be undone."
         ) != QMessageBox.Yes:
             return
-        for file_id in ids:
-            self.db.delete_file(file_id)
+        # One transaction (also reconciles tapes.used_space) instead of one
+        # commit per record.
+        self.db.delete_files(ids)
         self.reload_page()
 
     def _context_menu(self, pos):
@@ -652,8 +681,7 @@ class SearchWidget(QWidget):
                 f"Delete {len(ids)} file record(s)? This cannot be undone."
         ) != QMessageBox.Yes:
             return
-        for file_id in ids:
-            self.db.delete_file(file_id)
+        self.db.delete_files(ids)
         self.load_page(self.cursor_stack[self.page_index])
 
     def _show_error(self, message):
@@ -734,6 +762,34 @@ class ManageWidget(QWidget):
         self.refresh_tapes()
         self.refresh_sessions()
 
+    def _write_buttons(self):
+        return (self.rename_btn, self.capacity_btn, self.recalc_btn,
+                self.wipe_btn, self.delete_tape_btn, self.refresh_btn,
+                self.delete_session_btn, self.cleanup_btn)
+
+    def _run_db_task(self, fn, on_done=None):
+        """Run a DB write in the thread pool with the write buttons disabled."""
+        for button in self._write_buttons():
+            button.setEnabled(False)
+
+        def _restore_buttons():
+            for button in self._write_buttons():
+                button.setEnabled(True)
+
+        def _ok(result):
+            _restore_buttons()
+            if on_done:
+                on_done(result)
+
+        def _fail(message):
+            _restore_buttons()
+            self._show_error(message)
+
+        task = DbWriteTask(fn)
+        task.signals.finished.connect(_ok)
+        task.signals.failed.connect(_fail)
+        self.pool.start(task)
+
     def selected_tape(self):
         row = self.tapes_table.currentRow()
         if row < 0:
@@ -762,8 +818,10 @@ class ManageWidget(QWidget):
             return
         new_label, ok = QInputDialog.getText(self, "Rename Tape", "New label:")
         if ok and new_label:
-            self.db.rename_tape(label, new_label.strip())
-            self.refresh()
+            target = new_label.strip()
+            self._run_db_task(
+                lambda: self.db.rename_tape(label, target),
+                on_done=lambda _result: self.refresh())
 
     def set_capacity(self):
         label = self.selected_tape()
@@ -772,14 +830,16 @@ class ManageWidget(QWidget):
         value, ok = QInputDialog.getDouble(
             self, "Set Capacity", "Capacity GB:", decimals=2, minValue=0.01)
         if ok:
-            self.db.update_tape_capacity(label, value)
-            self.refresh()
+            self._run_db_task(
+                lambda: self.db.update_tape_capacity(label, value),
+                on_done=lambda _result: self.refresh())
 
     def recalculate_used(self):
         label = self.selected_tape()
         if label:
-            self.db.recalculate_tape_used_space(label)
-            self.refresh()
+            self._run_db_task(
+                lambda: self.db.recalculate_tape_used_space(label),
+                on_done=lambda _result: self.refresh())
 
     def wipe_tape_files(self):
         label = self.selected_tape()
@@ -789,16 +849,18 @@ class ManageWidget(QWidget):
         if QMessageBox.question(
                 self, "Wipe File Records",
                 f"Delete {count:,} file record(s) for {label}?") == QMessageBox.Yes:
-            self.db.delete_files_for_tape(label)
-            self.refresh()
+            self._run_db_task(
+                lambda: self.db.delete_files_for_tape(label),
+                on_done=lambda _result: self.refresh())
 
     def delete_tape(self):
         label = self.selected_tape()
         if label and QMessageBox.question(
                 self, "Delete Tape",
                 f"Delete tape {label} and all file records?") == QMessageBox.Yes:
-            self.db.delete_tape(label)
-            self.refresh()
+            self._run_db_task(
+                lambda: self.db.delete_tape(label),
+                on_done=lambda _result: self.refresh())
 
     def refresh_sessions(self):
         self._sessions_token += 1
@@ -856,17 +918,25 @@ class ManageWidget(QWidget):
                 self, "Delete Session",
                 f"Delete {kind} session {session_id}?") != QMessageBox.Yes:
             return
-        self.db.delete_session(kind, session_id)
-        self.refresh_sessions()
+        self._run_db_task(
+            lambda: self.db.delete_session(kind, session_id),
+            on_done=lambda _result: self.refresh_sessions())
 
     def cleanup_sessions(self):
         summary = self._cleanup_summary or self.db.get_unreferenced_remote_data_summary()
         if QMessageBox.question(
                 self, "Clean Unused Session Data",
-                f"Delete unused plans/snapshots?\n\n{summary}") == QMessageBox.Yes:
-            result = self.db.cleanup_unreferenced_remote_data(compact=True)
+                f"Delete unused plans/snapshots?\n\n{summary}") != QMessageBox.Yes:
+            return
+
+        def done(result):
             QMessageBox.information(self, "Cleanup Complete", str(result))
             self.refresh_sessions()
+
+        # compact=True runs VACUUM (ANALYZE) — never on the UI thread.
+        self._run_db_task(
+            lambda: self.db.cleanup_unreferenced_remote_data(compact=True),
+            on_done=done)
 
     def _show_error(self, message):
         QMessageBox.critical(self, "Database Error", message)
