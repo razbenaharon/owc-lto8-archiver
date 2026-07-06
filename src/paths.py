@@ -62,6 +62,37 @@ def _config_list(value):
     return items
 
 
+_DEFAULT_CLUSTER_BYTES = 4096
+
+
+def _volume_cluster_size(path):
+    """Allocation unit (bytes) of the volume containing path.
+
+    Files consume whole clusters on disk, so planners that budget staging
+    space must round each file up to this unit ("size on disk") or a chunk
+    of many small files can allocate several times its logical byte total.
+    Falls back to 4096 when the volume cannot be queried."""
+    if os.name == 'nt':
+        import ctypes
+        root = os.path.splitdrive(os.path.abspath(path))[0]
+        if root:
+            spc = ctypes.c_ulong(0)
+            bps = ctypes.c_ulong(0)
+            free = ctypes.c_ulong(0)
+            total = ctypes.c_ulong(0)
+            ok = ctypes.windll.kernel32.GetDiskFreeSpaceW(
+                ctypes.c_wchar_p(root + '\\'),
+                ctypes.byref(spc), ctypes.byref(bps),
+                ctypes.byref(free), ctypes.byref(total))
+            if ok and spc.value and bps.value:
+                return spc.value * bps.value
+        return _DEFAULT_CLUSTER_BYTES
+    try:
+        return os.statvfs(path).f_frsize or _DEFAULT_CLUSTER_BYTES
+    except (OSError, AttributeError):
+        return _DEFAULT_CLUSTER_BYTES
+
+
 def _dir_tree_size(path):
     """Total size in bytes of every file under path (0 if missing/unreadable)."""
     total = 0

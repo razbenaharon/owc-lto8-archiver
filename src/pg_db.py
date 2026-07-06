@@ -915,9 +915,11 @@ class PgDatabaseManager:
     def get_chunk_size_summary(self, session_id, chunk_index=None):
         """Per-chunk byte totals without materializing millions of file rows.
 
-        Returns ``{chunk_index: (planned_bytes, present_bytes)}`` where
-        ``planned_bytes`` counts every planned file and ``present_bytes``
-        excludes files already known to be ``source_missing``.
+        Returns ``{chunk_index: (planned_bytes, present_bytes, file_count)}``
+        where ``planned_bytes`` counts every planned file, ``present_bytes``
+        excludes files already known to be ``source_missing``, and
+        ``file_count`` counts every planned file (the staging-capacity gate
+        uses it to estimate per-file cluster rounding on disk).
         """
         where = "s.session_id=%s"
         params = [session_id]
@@ -930,7 +932,8 @@ class PgDatabaseManager:
                            COALESCE(SUM(sf.file_size_bytes), 0) AS planned_bytes,
                            COALESCE(SUM(sf.file_size_bytes) FILTER (
                                WHERE COALESCE(st.status, '') != 'source_missing'
-                           ), 0) AS present_bytes
+                           ), 0) AS present_bytes,
+                           COUNT(*) AS file_count
                     FROM remote_sessions s
                     JOIN remote_plan_files pf ON pf.plan_id=s.plan_id
                     JOIN remote_snapshot_files sf
@@ -943,7 +946,8 @@ class PgDatabaseManager:
             ).fetchall()
         return {
             row["chunk_index"]: (int(row["planned_bytes"]),
-                                 int(row["present_bytes"]))
+                                 int(row["present_bytes"]),
+                                 int(row["file_count"]))
             for row in rows
         }
 

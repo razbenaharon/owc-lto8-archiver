@@ -13,7 +13,7 @@ except ImportError:  # optional dependency — priority/affinity degrade gracefu
     psutil = None
 
 from .paths import _safe_remote_relpath
-from .runtime import CANCEL, _apply_proc_tuning, register_proc, unregister_proc
+from .runtime import CANCEL, _apply_proc_tuning, _kill_proc_tree, register_proc, unregister_proc
 
 
 def _has_command(name):
@@ -289,7 +289,7 @@ def _ssh_stream_command(remote_user, remote_host, command, password='', cipher='
 
 def _remote_tar_fetch(remote_user, remote_host, remote_base, rel_paths, local_dest_dir,
                       password='', cipher='', use_mbuffer=False, mbuffer_size='2G',
-                      fetch_cores=None):
+                      fetch_cores=None, abort_evt=None):
     """Fetch many remote files in one tar stream over SSH.
 
     rel_paths must be relative to remote_base and use POSIX separators.
@@ -301,6 +301,9 @@ def _remote_tar_fetch(remote_user, remote_host, remote_base, rel_paths, local_de
                      large RAM ring smooths the tar->ssh handoff against jitter.
       fetch_cores  — pin the ssh/tar children to these cores, isolating SSH
                      decryption from the tape-writer's cores.
+      abort_evt    — optional event; when set (e.g. by the staging watchdog),
+                     the ssh and tar process trees are killed so the caller is
+                     never left blocked on a wedged stream.
     """
     if not rel_paths:
         return True, ''
@@ -318,10 +321,16 @@ def _remote_tar_fetch(remote_user, remote_host, remote_base, rel_paths, local_de
         return False, str(e)
 
     # -b 512 -> 256 KiB records: fewer syscalls than tar's tiny default block.
+    # --sparse keeps hole regions out of the stream so a sparse remote file
+    # is not shipped (and locally written) at its fully-expanded size.
+    # --no-recursion: every -T entry is a scanned regular file; without it a
+    # corrupt entry that names a directory makes tar mirror that entire tree
+    # (a one-line truncated scan record once ballooned a 100 GB chunk to
+    # ~900 GB of unplanned data this way).
     # Missing inputs are reported on stderr but do not abort the stream; the
     # caller verifies every expected local file and records exact omissions.
     tar_core = (
-        f"tar -C {shlex.quote(remote_base)} -b 512 "
+        f"tar -C {shlex.quote(remote_base)} -b 512 --sparse --no-recursion "
         "--ignore-failed-read -cf - --null -T -"
     )
     if use_mbuffer:
@@ -385,6 +394,21 @@ def _remote_tar_fetch(remote_user, remote_host, remote_base, rel_paths, local_de
         _apply_proc_tuning(tar_proc, affinity=fetch_cores, label='tar-extract')
         ssh_proc.stdout.close()
 
+        if abort_evt is not None:
+            # Watchdog: an abort request must be able to unwedge the blocking
+            # communicate() below even when the stream itself has stalled
+            # (e.g. staging disk exhausted). Exits on its own once both
+            # processes finish normally.
+            def _abort_watch():
+                while not abort_evt.wait(1):
+                    if (tar_proc.poll() is not None
+                            and ssh_proc.poll() is not None):
+                        return
+                _kill_proc_tree(tar_proc)
+                _kill_proc_tree(ssh_proc)
+            threading.Thread(target=_abort_watch, name='fetch-abort-watch',
+                             daemon=True).start()
+
         file_list = ''.join(f'{rel}\0' for rel in safe_paths).encode('utf-8')
         try:
             ssh_proc.stdin.write(file_list)
@@ -407,6 +431,9 @@ def _remote_tar_fetch(remote_user, remote_host, remote_base, rel_paths, local_de
 
     if CANCEL.is_set():
         return False, "cancelled"
+    if abort_evt is not None and abort_evt.is_set():
+        return False, ("fetch aborted by the staging watchdog "
+                       "(chunk overran its plan or staging disk space ran low)")
 
     ssh_err_text = b''.join(ssh_stderr).decode('utf-8', errors='replace').strip()
     tar_err_text = (tar_stderr or b'').decode('utf-8', errors='replace').strip()

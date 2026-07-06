@@ -23,16 +23,20 @@ from .constants import (DEFAULT_TAPE_CAPACITY_GB, LOCAL_STAGING_RESERVE_BYTES,
 from .db import _apply_canonical_remote_paths
 from .ltfs import _ensure_lto_drive_ready, get_volume_label
 from .packer import LTOAnalyzer, LTOPacker, ensure_staging_space
-from .paths import _LEGACY_PATH_LIMIT, _dir_tree_size, _disambiguate_local_rel, _exceeds_legacy_path_limit, _long, _remote_fetch_base_and_rel, _reserved_name_component, _winsafe_extracted_rel
+from .paths import _LEGACY_PATH_LIMIT, _dir_tree_size, _disambiguate_local_rel, _exceeds_legacy_path_limit, _long, _remote_fetch_base_and_rel, _reserved_name_component, _volume_cluster_size, _winsafe_extracted_rel
 from .remote_transport import _remote_tar_fetch, _ssh_run
 from .reporting import _write_source_missing_only_log
 from .runtime import CANCEL, _acquire_tape_io_lock, _fmt_eta, _phase, _priority_class, _progress_done, _progress_line, _release_tape_io_lock, _status, compute_affinity_sets, pin_current_process, unpin_current_process
 from .skipped import SkippedFileTracker
-from .telegram_notify import TelegramNotifier
+from .telegram_notify import TelegramNotifier, send_best_effort
 from .ui import ConsoleUI
 
 
 _FIND_WARNING_RE = re.compile(r"^find:\s+[\"'`‘](.*?)[\"'`’]:\s*(.*)$")
+
+# A fetch this far past its planned bytes gets one loud alert; the hard
+# abort threshold is the configurable fetch_overrun_abort_factor.
+_FETCH_OVERRUN_WARN_FACTOR = 1.10
 
 
 class RemoteScanner:
@@ -82,6 +86,16 @@ class RemoteScanner:
                 f"[REMOTE] Scan completed with warnings (find exit {result.returncode}); "
                 "inaccessible paths were recorded in the skipped-file report."
             )
+        if stdout and not stdout.endswith('\0'):
+            # find terminates every record with NUL; a different tail means the
+            # stream was cut mid-record. The fragment is rejected below (its
+            # truncated path cannot sit under a scan root), never planned.
+            self.ui.warning(
+                "[REMOTE] Scan stream ended mid-record (truncated transfer?); "
+                "the partial record was discarded and recorded as skipped."
+            )
+        roots = [posixpath.normpath(p.replace('\\', '/').strip())
+                 for p in scan_paths]
         manifest = []
         for record in stdout.split('\0'):
             if not record:
@@ -91,33 +105,62 @@ class RemoteScanner:
                 continue
             size_s, path = parts
             try:
-                manifest.append((path, int(size_s)))
+                size = int(size_s)
             except ValueError:
                 self.skipped_tracker.add(
                     'remote', path, f"invalid find size token: {size_s}", 'scan')
+                continue
+            # Every legitimate record lies under (or is) a scan root. Anything
+            # else is a corrupt/truncated record; planning it is dangerous — a
+            # path like '/strg' names a directory and would make the fetch tar
+            # stream an entire unplanned tree.
+            norm = posixpath.normpath(path)
+            if not any(norm == root or norm.startswith(root + '/')
+                       for root in roots):
+                self.skipped_tracker.add(
+                    'remote', path,
+                    "scan record outside scan roots (truncated stream?)",
+                    'scan')
+                continue
+            manifest.append((path, size))
         return manifest
 
 
 class ChunkPlanner:
-    """Greedy largest-first chunk planner."""
+    """Greedy largest-first chunk planner.
 
-    def __init__(self, budget_bytes):
+    Bin-packs on each file's estimated on-disk footprint — logical size
+    rounded up to the staging volume's allocation unit, times a safety
+    padding factor — so a chunk's *physical* staging footprint stays within
+    budget even when logical sizes understate "size on disk" (cluster
+    rounding on small files, filesystem metadata, files that grow after the
+    scan). The manifest's logical sizes are preserved in the plan."""
+
+    def __init__(self, budget_bytes, alloc_unit=1, padding_factor=1.0):
         self.budget_bytes = budget_bytes
+        self.alloc_unit = max(1, int(alloc_unit))
+        self.padding_factor = max(1.0, padding_factor)
+
+    def footprint(self, fsize):
+        """Estimated bytes a file of logical size fsize allocates on disk."""
+        clusters = max(1, -(-int(fsize) // self.alloc_unit))
+        return int(clusters * self.alloc_unit * self.padding_factor)
 
     def plan(self, manifest):
         chunks = []
         current = []
-        cur_sz = 0
+        cur_fp = 0
         for remote_path, fsize in sorted(manifest, key=lambda x: x[1], reverse=True):
-            if fsize > self.budget_bytes:
+            fp = self.footprint(fsize)
+            if fp > self.budget_bytes:
                 chunks.append([(remote_path, fsize)])
                 continue
-            if cur_sz + fsize > self.budget_bytes and current:
+            if cur_fp + fp > self.budget_bytes and current:
                 chunks.append(current)
                 current = []
-                cur_sz = 0
+                cur_fp = 0
             current.append((remote_path, fsize))
-            cur_sz += fsize
+            cur_fp += fp
         if current:
             chunks.append(current)
         return chunks
@@ -688,6 +731,8 @@ class RemoteOrchestrator:
         self.chunk_cap_bytes   = int(cfg.chunk_cap_gb * 1024**3)
         self.staging_max_bytes = int(cfg.staging_max_gb * 1024**3)
         self.prefetch_ahead    = cfg.prefetch_chunks_ahead
+        self.staging_padding   = cfg.staging_padding_factor
+        self.fetch_abort_factor = cfg.fetch_overrun_abort_factor
         self.ssh_cipher        = cfg.ssh_cipher
         self.ssh_timeout       = cfg.ssh_command_timeout_seconds
         self.use_mbuffer       = cfg.use_mbuffer
@@ -928,12 +973,17 @@ class RemoteOrchestrator:
         """Greedy largest-first bin-packing into chunks that fit staging budget.
         Files larger than the budget get their own single-file chunk."""
         budget = self._chunk_budget()
+        planner = ChunkPlanner(
+            budget,
+            alloc_unit=_volume_cluster_size(self.staging_dir),
+            padding_factor=self.staging_padding,
+        )
         for remote_path, fsize in sorted(manifest, key=lambda x: x[1], reverse=True):
-            if fsize > budget:
+            if planner.footprint(fsize) > budget:
                 print(f"[WARN] File exceeds staging budget "
                       f"({fsize/1024**3:.2f} GB > {budget/1024**3:.2f} GB), "
                       f"placing in dedicated chunk: {os.path.basename(remote_path)}")
-        return ChunkPlanner(budget).plan(manifest)
+        return planner.plan(manifest)
 
     # ------------------------------------------------------------------
     # Pipeline execution
@@ -998,7 +1048,7 @@ class RemoteOrchestrator:
         # over the wire for large sessions); the producer still re-reads each
         # chunk's rows from the catalog just before staging it.
         size_summary = self.db.get_chunk_size_summary(session_id)
-        planned = {ci: size_summary.get(ci, (0, 0))[0] for ci in pending_chunks}
+        planned = {ci: size_summary.get(ci, (0, 0, 0)) for ci in pending_chunks}
 
         ready_q       = queue.Queue(maxsize=self.prefetch_ahead)
         stop_pipeline = threading.Event()
@@ -1009,7 +1059,9 @@ class RemoteOrchestrator:
                 for ci in pending_chunks:
                     if CANCEL.is_set() or stop_pipeline.is_set():
                         break
-                    self._await_staging_capacity(planned[ci], stop_pipeline)
+                    planned_bytes, _, planned_files = planned[ci]
+                    self._await_staging_capacity(
+                        planned_bytes, planned_files, stop_pipeline)
                     if CANCEL.is_set() or stop_pipeline.is_set():
                         break
                     desc = self._stage_chunk(
@@ -1099,11 +1151,21 @@ class RemoteOrchestrator:
     # Producer: fetch + pack a chunk onto staging  (runs off the main thread)
     # ------------------------------------------------------------------
 
-    def _await_staging_capacity(self, planned_bytes, stop_evt):
+    def _physical_estimate(self, logical_bytes, file_count):
+        """Upper-bound staging footprint for a set of files: logical bytes
+        plus one allocation cluster per file (size-on-disk rounding), times
+        the configured padding factor."""
+        cluster = _volume_cluster_size(self.staging_dir)
+        return int((logical_bytes + file_count * cluster) * self.staging_padding)
+
+    def _await_staging_capacity(self, planned_bytes, planned_files, stop_evt):
         """Block until there is room to stage another chunk without breaching the
         staging cap or starving the disk. Accounts for the ~2x transient
-        footprint while a chunk is packed (fetch_dir + pack_dir coexist)."""
-        need  = 2 * planned_bytes          # peak while fetch + pack dirs coexist
+        footprint while a chunk is packed (fetch_dir + pack_dir coexist),
+        sized on the estimated physical (allocated) footprint rather than
+        the plan's logical byte total."""
+        # peak while fetch + pack dirs coexist
+        need  = 2 * self._physical_estimate(planned_bytes, planned_files)
         floor = LOCAL_STAGING_RESERVE_BYTES
         warned = False
         while not (CANCEL.is_set() or stop_evt.is_set()):
@@ -1299,8 +1361,8 @@ class RemoteOrchestrator:
             return True
 
         # present_bytes excludes files marked source_missing during the fetch.
-        _, planned_bytes = self.db.get_chunk_size_summary(
-            session_id, chunk_index).get(chunk_index, (0, 0))
+        _, planned_bytes, _ = self.db.get_chunk_size_summary(
+            session_id, chunk_index).get(chunk_index, (0, 0, 0))
         if not self._ensure_remote_chunk_fits_tape(
                 tape_label, planned_bytes, chunk_index):
             self.db.update_chunk_status(session_id, chunk_index, 'backup_failed')
@@ -1485,8 +1547,10 @@ class RemoteOrchestrator:
                            f"(cipher={self.ssh_cipher or 'default'}, "
                            f"mbuffer={'on' if self.use_mbuffer else 'off'})")
 
-            fetch_stop = threading.Event()
-            self._start_fetch_monitor(fetch_stop, fetch_dir, todo_bytes)
+            fetch_stop  = threading.Event()
+            fetch_abort = threading.Event()
+            self._start_fetch_monitor(fetch_stop, fetch_abort, fetch_dir,
+                                      todo_bytes)
 
             pending_by_base = defaultdict(list)
             for row, remote_base, rel, local_rel, local_path in pending:
@@ -1507,6 +1571,7 @@ class RemoteOrchestrator:
                         use_mbuffer=self.use_mbuffer,
                         mbuffer_size=self.mbuffer_size,
                         fetch_cores=self.fetch_cores,
+                        abort_evt=fetch_abort,
                     )
                     if not ok:
                         if CANCEL.is_set():
@@ -1523,7 +1588,8 @@ class RemoteOrchestrator:
                 # extract them onto the primary's path), so fetch each alone
                 # into an isolated dir and move it to its disambiguated name.
                 if collisions and not self._fetch_collisions(
-                        session_id, collisions, fetch_dir, source_missing_files):
+                        session_id, collisions, fetch_dir,
+                        source_missing_files, fetch_abort):
                     return False, source_missing_files, fetched_file_count
             finally:
                 fetch_stop.set()
@@ -1616,7 +1682,7 @@ class RemoteOrchestrator:
         return True, source_missing_files, fetched_file_count
 
     def _fetch_collisions(self, session_id, collisions, fetch_dir,
-                          source_missing_files):
+                          source_missing_files, abort_evt=None):
         """Fetch files whose sanitized name clashed with another file's.
 
         Each is streamed alone into a private temp dir (where bsdtar writes it
@@ -1643,6 +1709,7 @@ class RemoteOrchestrator:
                     use_mbuffer=self.use_mbuffer,
                     mbuffer_size=self.mbuffer_size,
                     fetch_cores=self.fetch_cores,
+                    abort_evt=abort_evt,
                 )
                 if not ok:
                     if CANCEL.is_set():
@@ -1708,12 +1775,28 @@ class RemoteOrchestrator:
         finally:
             shutil.rmtree(_long(collide_root), ignore_errors=True)
 
-    def _start_fetch_monitor(self, stop_evt, fetch_dir, total_bytes):
-        """Live remote->PC throughput: watch the fetch dir grow on disk."""
+    def _start_fetch_monitor(self, stop_evt, abort_evt, fetch_dir, total_bytes):
+        """Live remote->PC throughput, plus a staging watchdog.
+
+        Progress is the fetch dir's logical growth. The watchdog fires
+        abort_evt — killing the tar stream — before an overrunning chunk can
+        exhaust the staging disk and wedge the pipeline: either when free
+        space on the staging volume reaches the reserve floor, or when the
+        chunk exceeds its planned bytes by fetch_overrun_abort_factor. Any
+        overrun past the warn threshold is reported loudly (the plan's sizes
+        come from the scan, so a growing or sparse-expanded remote file shows
+        up here first)."""
+        abort_factor = self.fetch_abort_factor
+
+        def _alarm(msg):
+            print(f"\n[FETCH][ALERT] {msg}")
+            send_best_effort(self.notifier, f"[FETCH] {msg}")
+
         def _mon():
             prev_bytes = 0
             prev_time  = time.time()
             interval   = 2
+            overrun_warned = False
             while not stop_evt.wait(interval):
                 walk_start = time.time()
                 cur   = _dir_tree_size(fetch_dir)
@@ -1727,12 +1810,47 @@ class RemoteOrchestrator:
                 remaining = max(0, total_bytes - cur)
                 eta = remaining / (speed * 1024**2) if speed > 0 else None
                 _progress_line(
-                    f"[FETCH] {min(pct, 100):.1f}% | {speed:.1f} MB/s | "
+                    f"[FETCH] {pct:.1f}% | {speed:.1f} MB/s | "
                     f"{cur / 1024**3:.1f}/{total_bytes / 1024**3:.1f} GB | "
                     f"ETA {_fmt_eta(eta)}"
                 )
                 prev_bytes = cur
                 prev_time  = now
+
+                if (total_bytes and not overrun_warned
+                        and cur > total_bytes * _FETCH_OVERRUN_WARN_FACTOR):
+                    overrun_warned = True
+                    _alarm(
+                        f"chunk overrun: {cur / 1024**3:.1f} GB fetched of "
+                        f"{total_bytes / 1024**3:.1f} GB planned — a remote "
+                        "file likely grew after the scan. The fetch continues "
+                        "but is watched for a hard overrun."
+                    )
+
+                try:
+                    free = shutil.disk_usage(self.staging_dir).free
+                except OSError:
+                    free = None
+                if free is not None and free <= LOCAL_STAGING_RESERVE_BYTES:
+                    _alarm(
+                        f"aborting fetch: staging free space is down to "
+                        f"{free / 1024**3:.1f} GB (reserve floor "
+                        f"{LOCAL_STAGING_RESERVE_BYTES / 1024**3:.0f} GB). "
+                        "The chunk stays resumable."
+                    )
+                    abort_evt.set()
+                    return
+                if (total_bytes and abort_factor
+                        and cur > total_bytes * abort_factor):
+                    _alarm(
+                        f"aborting fetch: {cur / 1024**3:.1f} GB fetched "
+                        f"exceeds {abort_factor:.1f}x the planned "
+                        f"{total_bytes / 1024**3:.1f} GB "
+                        "(fetch_overrun_abort_factor). The chunk stays "
+                        "resumable; re-scan so the plan matches the source."
+                    )
+                    abort_evt.set()
+                    return
         threading.Thread(target=_mon, name='fetch-monitor', daemon=True).start()
 
     # ------------------------------------------------------------------

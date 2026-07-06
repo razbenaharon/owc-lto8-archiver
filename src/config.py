@@ -101,6 +101,8 @@ class ConfigManager:
             'ssh_command_timeout_seconds': '3600',
             'use_mbuffer':           'true',
             'mbuffer_size':          '2G',
+            'staging_padding_factor':      '1.15',
+            'fetch_overrun_abort_factor':  '2.0',
         }
         self.config['TELEGRAM'] = {
             'enabled': 'false',
@@ -228,6 +230,26 @@ class ConfigManager:
     @property
     def mbuffer_size(self):
         return self.config.get('PERFORMANCE', 'mbuffer_size', fallback='2G').strip()
+    @property
+    def staging_padding_factor(self):
+        raw = self.config.get('PERFORMANCE', 'staging_padding_factor',
+                              fallback='1.15').strip()
+        try:
+            value = float(raw)
+        except ValueError:
+            return 1.15
+        return max(1.0, value)
+    @property
+    def fetch_overrun_abort_factor(self):
+        """Abort a fetch when it exceeds its planned bytes by this factor
+        (0 disables the hard abort; the overrun warning always fires)."""
+        raw = self.config.get('PERFORMANCE', 'fetch_overrun_abort_factor',
+                              fallback='2.0').strip()
+        try:
+            value = float(raw)
+        except ValueError:
+            return 2.0
+        return 0.0 if value <= 0 else max(1.0, value)
 
     @property
     def telegram_enabled(self):
