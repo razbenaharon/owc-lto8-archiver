@@ -108,7 +108,10 @@ class ParseRawLogTests(unittest.TestCase):
             result = parse_raw_log(path)
 
         mount = next(m for m in result.mounts if m.mount == "/strg/E")
-        self.assertIn("50.0% left", _mount_value_text(mount, result.total))
+        text = _mount_value_text(mount, result.total)
+        self.assertIn("1.0 TiB used", text)
+        self.assertIn("1.0 TiB left", text)
+        self.assertIn("50.0% left", text)
         self.assertAlmostEqual(_mount_bar_width(mount, result.total), 50.0)
 
 

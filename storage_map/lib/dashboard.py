@@ -85,7 +85,13 @@ def _kpi(value, label, accent=False):
 
 def _mount_value_text(mt, fallback_total):
     if mt.has_capacity:
-        return f'{human(mt.free_bytes)} left · {mt.free_percent:.1f}% left'
+        used_bytes = mt.used_bytes
+        if used_bytes is None:
+            used_bytes = max(0, mt.capacity_bytes - mt.free_bytes)
+        return (
+            f'{human(used_bytes)} used · '
+            f'{human(mt.free_bytes)} left · {mt.free_percent:.1f}% left'
+        )
     return f'{human(mt.total)} used · left n/a'
 
 

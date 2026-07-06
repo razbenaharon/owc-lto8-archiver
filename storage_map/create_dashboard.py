@@ -10,6 +10,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from src.constants import PROJECT_ROOT
 from src.config import ConfigManager
 from src.telegram_notify import TelegramNotifier
 from storage_map.lib.core import _select_servers, load_storage_map_config, scan
@@ -22,6 +23,7 @@ def main(argv=None):
                         help="Server name(s) from config, comma-separated, or all.")
     args = parser.parse_args(argv)
 
+    os.chdir(PROJECT_ROOT)
     cfg = ConfigManager()
     smcfg = load_storage_map_config(cfg)
     servers = _select_servers(smcfg, args.server)
