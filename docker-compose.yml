@@ -23,12 +23,17 @@ services:
       - "max_connections=50"
       - "-c"
       - "shared_buffers=2GB"
+      # Sized against mem_limit (6g): maintenance_work_mem is a real
+      # allocation per maintenance worker, so 2GB of it on top of 2GB
+      # shared_buffers + work_mem risked a cgroup OOM kill during large GIN
+      # index builds; effective_cache_size is planner advice and must not
+      # exceed what the capped container can actually cache.
       - "-c"
-      - "effective_cache_size=6GB"
+      - "effective_cache_size=4GB"
       - "-c"
       - "work_mem=64MB"
       - "-c"
-      - "maintenance_work_mem=2GB"
+      - "maintenance_work_mem=1GB"
       - "-c"
       - "max_wal_size=8GB"
       - "-c"

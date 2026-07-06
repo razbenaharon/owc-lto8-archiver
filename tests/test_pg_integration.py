@@ -278,6 +278,111 @@ class PgIntegrationTests(unittest.TestCase):
                 "VALUES ('ck-run', 'TXCK', 'remote', %s, now())",
                 (good_local,))
 
+    # -- review fixes: catalog write-path hardening ---------------------------
+
+    def test_rename_tape_repoints_local_chunk_assignments(self):
+        # local_chunks_manifest.tape_label is ON DELETE SET NULL; before the
+        # fix, rename_tape forgot this table and the old tape's DELETE silently
+        # wiped every in-flight chunk assignment.
+        self.db.register_tape("TRN1")
+        session_id = self.db.create_local_session(
+            "RN_SESSION", "/rn", [[{"name": "top", "size_bytes": 5}]], "pack")
+        self.db.assign_local_chunk_tape(session_id, 0, "TRN1")
+        self.db.rename_tape("TRN1", "TRN2")
+        rows = self._query(
+            "SELECT tape_label FROM local_chunks_manifest WHERE session_id=%s",
+            (session_id,))
+        self.assertEqual([r["tape_label"] for r in rows], ["TRN2"])
+
+    def test_create_local_session_is_idempotent_on_label(self):
+        # An ambiguous-commit retry re-runs the create; the label upsert must
+        # converge on the committed session without duplicating the manifest.
+        chunks = [[{"name": "top", "size_bytes": 5}]]
+        first = self.db.create_local_session("IDEM_L", "/idem", chunks, "pack")
+        second = self.db.create_local_session("IDEM_L", "/idem", chunks, "pack")
+        self.assertEqual(first, second)
+        count = self._query(
+            "SELECT COUNT(*) AS n FROM local_chunks_manifest "
+            "WHERE session_id=%s", (first,))[0]["n"]
+        self.assertEqual(count, 1)
+
+    def test_create_remote_session_with_plan_is_atomic_and_idempotent(self):
+        self.db.register_tape("TRP")
+        rows = [
+            (0, "/plan/a.bin", "a.bin", 10),
+            (1, "/plan/b.bin", "b.bin", 20),
+        ]
+        sid = self.db.create_remote_session_with_plan(
+            "PLAN_S", "host.example", "user", "/plan", "TRP", "C:/stage",
+            rows=rows)
+        session = self.db.get_remote_session(sid)
+        self.assertEqual(session["total_files"], 2)
+        self.assertEqual(session["total_bytes"], 30)
+        self.assertEqual(session["chunk_count"], 2)
+        self.assertEqual(self.db.get_pending_chunks(sid), [0, 1])
+        # Retrying the same create converges instead of duplicating.
+        again = self.db.create_remote_session_with_plan(
+            "PLAN_S", "host.example", "user", "/plan", "TRP", "C:/stage",
+            rows=rows)
+        self.assertEqual(sid, again)
+        self.assertEqual(self.db.count_chunks(sid), 2)
+
+    def test_chunk_size_summary_matches_rows(self):
+        self.db.register_tape("TCS")
+        rows = [
+            (0, "/cs/a.bin", "a.bin", 7),
+            (0, "/cs/b.bin", "b.bin", 5),
+            (1, "/cs/c.bin", "c.bin", 11),
+        ]
+        sid = self.db.create_remote_session_with_plan(
+            "CS_S", "host.example", "user", "/cs", "TCS", "C:/stage",
+            rows=rows)
+        summary = self.db.get_chunk_size_summary(sid)
+        self.assertEqual(summary[0], (12, 12))
+        self.assertEqual(summary[1], (11, 11))
+        # source_missing files drop out of present_bytes, not planned_bytes.
+        manifest_id = self.db.get_chunk_files(sid, 0)[0]["manifest_id"]
+        self.db.update_manifest_row(
+            manifest_id, session_id=sid, status="source_missing")
+        planned, present = self.db.get_chunk_size_summary(sid, 0)[0]
+        self.assertEqual(planned, 12)
+        self.assertEqual(present, 5)
+
+    def test_delete_files_batch_reconciles_used_space(self):
+        self.db.register_tape("TDEL")
+        self.db.bulk_upsert_files([
+            self._loose("/del/a.bin", "TDEL", size=100),
+            self._loose("/del/b.bin", "TDEL", size=50),
+        ])
+        self.db.recalculate_tape_used_space("TDEL")
+        ids = [r["file_id"] for r in self.db.search_catalog(tape_label="TDEL")]
+        self.assertEqual(self.db.delete_files([ids[0]]), 1)
+        tape = self.db.get_tape("TDEL")
+        remaining = self._query(
+            "SELECT COALESCE(SUM(file_size_bytes),0) AS n FROM files_index "
+            "WHERE tape_label=%s", ("TDEL",))[0]["n"]
+        self.assertEqual(tape["used_space"], remaining)
+        with self.assertRaisesRegex(RuntimeError, "File record not found"):
+            self.db.delete_file(999_999_999)
+
+    def test_search_catalog_keyset_pagination(self):
+        self.db.register_tape("TKS")
+        self.db.bulk_upsert_files(
+            [self._loose(f"/ks/f{i:02d}.bin", "TKS") for i in range(5)])
+        seen = []
+        after = 0
+        while True:
+            page = self.db.search_catalog(
+                tape_label="TKS", limit=2, after_id=after)
+            if not page:
+                break
+            ids = [r["file_id"] for r in page]
+            self.assertEqual(ids, sorted(ids))
+            seen.extend(ids)
+            after = ids[-1]
+        self.assertEqual(len(seen), 5)
+        self.assertEqual(len(set(seen)), 5)
+
     # -- §1.2 backslash-safe remote manifest --------------------------------
 
     def test_remote_manifest_accepts_backslash_in_path(self):

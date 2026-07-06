@@ -2,6 +2,7 @@
 import os
 import re
 import shutil
+import uuid
 import zipfile
 import posixpath
 import ntpath
@@ -16,7 +17,7 @@ from .db import DatabaseManager, _fmt_ts
 from .ltfs import get_volume_label
 from .packer import StagingSpaceError, ensure_staging_space
 from .robocopy import _robocopy_file
-from .runtime import _acquire_tape_io_lock, _release_tape_io_lock
+from .runtime import CANCEL, _acquire_tape_io_lock, _release_tape_io_lock
 
 
 RESTORE_PAGE_SIZE = 250
@@ -115,6 +116,38 @@ class LTORetriever:
         safe_rel = self._safe_restore_relpath(rel_path or record['file_name'])
         return self._unique_dest_path(os.path.join(self.restore_dir, safe_rel))
 
+    @staticmethod
+    def _copy_file_to(src, dst):
+        """Copy ``src`` so it lands exactly at ``dst``, honoring a renamed
+        basename.
+
+        robocopy always writes ``dst_dir/<src basename>`` — it cannot rename
+        during a copy — so handing it a collision-renamed target used to
+        silently overwrite the existing same-named file instead. Copy into a
+        scratch subdir of the destination (same volume), then atomically
+        move the file to its real name."""
+        dst_dir = os.path.dirname(os.path.abspath(dst))
+        scratch = os.path.join(dst_dir, f".restore_tmp_{uuid.uuid4().hex[:12]}")
+        os.makedirs(scratch, exist_ok=True)
+        try:
+            landed = os.path.join(scratch, os.path.basename(src))
+            if not _robocopy_file(src, landed):
+                return False
+            if CANCEL.is_set():
+                # A cancelled robocopy can exit "successfully" with a partial
+                # file — never publish it to the restore directory.
+                return False
+            os.replace(landed, dst)
+            return True
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    @staticmethod
+    def _check_cancelled():
+        if CANCEL.is_set():
+            raise RuntimeError("[RESTORE] Cancelled by user; "
+                               "partially restored files were kept.")
+
     def run(self):
         print("\n--- RETRIEVER: Search & Restore ---")
         print("1. Search by filename / wildcard  (e.g. *.mov, IMG_*)")
@@ -125,6 +158,7 @@ class LTORetriever:
         opt = input("Option (1-5): ").strip()
 
         fetch_page = None
+        fetch_after = None      # keyset pager for ALL-restores (O(n), not O(n^2))
         total_results = 0
         restore_base = None
 
@@ -139,6 +173,9 @@ class LTORetriever:
             fetch_page = lambda offset: self.db.search_files(
                 name_q, date_from, date_to,
                 limit=RESTORE_PAGE_SIZE, offset=offset)
+            fetch_after = lambda after_id: self.db.search_files(
+                name_q, date_from, date_to,
+                limit=RESTORE_PAGE_SIZE, after_id=after_id)
 
         elif opt == '4':
             dir_q = input("Original directory path (partial ok): ").strip()
@@ -147,6 +184,8 @@ class LTORetriever:
             total_results = self.db.count_by_directory(dir_q)
             fetch_page = lambda offset: self.db.search_by_directory(
                 dir_q, limit=RESTORE_PAGE_SIZE, offset=offset)
+            fetch_after = lambda after_id: self.db.search_by_directory(
+                dir_q, limit=RESTORE_PAGE_SIZE, after_id=after_id)
             first_page = fetch_page(0)
             if first_page:
                 directory_root = self._infer_directory_root(dir_q, first_page)
@@ -175,6 +214,9 @@ class LTORetriever:
             fetch_page = lambda offset: self.db.search_by_session(
                 s['session_date'], s['tape_label'],
                 limit=RESTORE_PAGE_SIZE, offset=offset)
+            fetch_after = lambda after_id: self.db.search_by_session(
+                s['session_date'], s['tape_label'],
+                limit=RESTORE_PAGE_SIZE, after_id=after_id)
 
         else:
             return
@@ -214,7 +256,7 @@ class LTORetriever:
                     if confirm != 'RESTORE ALL':
                         print("[ABORTED]")
                         continue
-                self._restore_all_pages(fetch_page, total_results,
+                self._restore_all_pages(fetch_after, total_results,
                                         restore_base=restore_base)
                 return
             try:
@@ -250,16 +292,19 @@ class LTORetriever:
         print(f"\nShowing {page_start:,}-{page_end:,} of "
               f"{total_results:,} matching file(s)")
 
-    def _restore_all_pages(self, fetch_page, total_results, restore_base=None):
-        offset = 0
+    def _restore_all_pages(self, fetch_after, total_results, restore_base=None):
+        # Keyset pagination on file_id: OFFSET paging re-scans every skipped
+        # row, which turns a large ALL-restore into an O(n^2) query series.
+        after_id = 0
         restored = 0
-        while offset < total_results:
-            page = fetch_page(offset)
+        while True:
+            self._check_cancelled()
+            page = fetch_after(after_id)
             if not page:
                 break
             self._restore_many(page, restore_base=restore_base)
             restored += len(page)
-            offset += RESTORE_PAGE_SIZE
+            after_id = page[-1]['file_id']
         print(f"\n[RESTORE] Requested {total_results:,}; processed "
               f"{restored:,} file(s).")
 
@@ -273,12 +318,14 @@ class LTORetriever:
             by_tape[r['tape_label']].append(r)
 
         for tape_label, tape_records in by_tape.items():
+            self._check_cancelled()
             self._verify_tape(tape_label)
 
             loose  = [r for r in tape_records if not r['is_packed']]
             packed = [r for r in tape_records if r['is_packed']]
 
             for record in loose:
+                self._check_cancelled()
                 self._restore_loose(record, restore_base=restore_base)
                 done += 1
                 print(f"[RESTORE] Progress: {done}/{total}")
@@ -289,6 +336,7 @@ class LTORetriever:
                 by_container[r['container_name']].append(r)
 
             for container_path, container_records in by_container.items():
+                self._check_cancelled()
                 self._restore_packed_bulk(container_path, container_records,
                                           restore_base=restore_base)
                 done += len(container_records)
@@ -337,11 +385,13 @@ class LTORetriever:
         src = record['stored_path']
         dst = self._destination_for_record(record, restore_base=restore_base)
         print(f"\n[RESTORE] Copying loose file: {record['file_name']}")
+        os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
         _acquire_tape_io_lock(f"restore {record['file_name']}")
         try:
-            ok = _robocopy_file(src, dst)
+            ok = self._copy_file_to(src, dst)
         finally:
             _release_tape_io_lock()
+        self._check_cancelled()
         if ok:
             print(f"[RESTORE] Saved to: {dst}")
         else:

@@ -11,7 +11,6 @@ import os
 PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(PACKAGE_DIR)
 
-BUFFER_SIZE = 1024 * 1024 * 16  # 16 MB read buffer
 CONFIG_FILE = "config.ini"      # relative; runners chdir(PROJECT_ROOT)
 LTFS_DIR = r'C:\Program Files\IBM\LTFS'  # IBM LTFS tools must run from this directory
 BACKUP_LOG_DIR = os.path.join(PROJECT_ROOT, 'backup_logs')
@@ -33,6 +32,15 @@ LTFS_WRITE_WARNING = (
 TAPE_PLAN_NOMINAL_BYTES = 11 * 1024**4          # 11 TiB nominal (binary basis)
 TAPE_PLAN_HEADROOM = 0.95                        # leave 5% for LTFS overhead
 LOCAL_TAPE_BUDGET_BYTES = int(TAPE_PLAN_NOMINAL_BYTES * TAPE_PLAN_HEADROOM)
+# Human label for the budget above; keeps operator messages in sync with the
+# actual constant instead of hardcoding "11.5 TB" strings around the codebase.
+TAPE_BUDGET_LABEL = f"{LOCAL_TAPE_BUDGET_BYTES / 1000**4:.1f} TB"
+# Default registered capacity for a fresh LTO-8 cartridge (decimal-GB figure
+# used verbatim in prompts and stored in tapes.total_capacity).
+DEFAULT_TAPE_CAPACITY_GB = 12288
+# Seal a bundle ZIP slightly before max_zip_size_gb so the ZIP central
+# directory and per-entry headers never push it past the configured cap.
+ZIP_BUNDLE_FILL_FACTOR = 0.99
 ROOT_FILES_GROUP = "_ROOT_FILES"
 # Fallback source-host label for catalog rows that predate per-host tracking or
 # were written without an explicit source. Kept as the historical primary remote

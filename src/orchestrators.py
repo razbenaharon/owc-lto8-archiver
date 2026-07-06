@@ -16,8 +16,9 @@ except ImportError:  # optional dependency — priority/affinity degrade gracefu
     psutil = None
 
 from .backup import LTOBackup, _NoEjectBackup
-from .constants import (LOCAL_STAGING_RESERVE_BYTES, LOCAL_TAPE_BUDGET_BYTES,
-                        LTFS_WRITE_WARNING, ROOT_FILES_GROUP,
+from .constants import (DEFAULT_TAPE_CAPACITY_GB, LOCAL_STAGING_RESERVE_BYTES,
+                        LOCAL_TAPE_BUDGET_BYTES, LTFS_WRITE_WARNING,
+                        ROOT_FILES_GROUP, TAPE_BUDGET_LABEL,
                         _auto_pack_decision)
 from .db import _apply_canonical_remote_paths
 from .ltfs import _ensure_lto_drive_ready, get_volume_label
@@ -135,6 +136,14 @@ class LocalOrchestrator:
         self.staging_dir = cfg.staging_dir
         self.fill_pct = cfg.staging_fill_pct
 
+    def _backup_writer(self, cls=_NoEjectBackup):
+        return cls(
+            self.db,
+            self.cfg.ibm_eject_cmd,
+            log_dir=self.cfg.backup_log_dir,
+            notifier=self.notifier,
+        )
+
     def run(self):
         try:
             source_dir = os.path.abspath(self.source_dir)
@@ -198,7 +207,7 @@ class LocalOrchestrator:
         tape_label = get_volume_label(self.cfg.lto_drive)
         if not tape_label:
             print("[TAPE] No mounted volume label detected; the plan assumes the "
-                  "first tape has the full 11.5 TB safety budget.")
+                  f"first tape has the full {TAPE_BUDGET_LABEL} safety budget.")
             return {
                 'tape_label': None,
                 'used_bytes': 0,
@@ -228,7 +237,7 @@ class LocalOrchestrator:
         if available_bytes <= 0:
             raise RuntimeError(
                 f"[TAPE] Mounted tape '{tape_label}' has no capacity remaining "
-                "under the 11.5 TB safety budget."
+                f"under the {TAPE_BUDGET_LABEL} safety budget."
             )
         return {
             'tape_label': tape_label,
@@ -370,12 +379,7 @@ class LocalOrchestrator:
                     session['session_id'], chunk_index, tape_label,
                     batch_name, pack_dir
                 )
-                _NoEjectBackup(
-                    self.db,
-                    self.cfg.ibm_eject_cmd,
-                    log_dir=self.cfg.backup_log_dir,
-                    notifier=self.notifier,
-                ).run(
+                self._backup_writer().run(
                     source=pack_dir,
                     tape_drive=self.cfg.lto_drive,
                     tape_label=tape_label,
@@ -396,12 +400,7 @@ class LocalOrchestrator:
                 self._cleanup_dir(pack_dir)
 
         self.db.update_local_chunk_status(session['session_id'], chunk_index, 'backed_up')
-        LTOBackup(
-            self.db,
-            self.cfg.ibm_eject_cmd,
-            log_dir=self.cfg.backup_log_dir,
-            notifier=self.notifier,
-        ).eject_tape(self.cfg.lto_drive)
+        self._backup_writer(LTOBackup).eject_tape(self.cfg.lto_drive)
         return True
 
     def _prepare_tape_for_chunk(self, session, chunk_index, entries):
@@ -432,7 +431,7 @@ class LocalOrchestrator:
                           "and is not empty. Register it first or use a blank tape.")
                     return None
                 print(f"[TAPE] Registering fresh tape '{tape_label}'.")
-                self.db.register_tape(tape_label, 12288)
+                self.db.register_tape(tape_label, DEFAULT_TAPE_CAPACITY_GB)
             elif not root_empty or record_count > 0:
                 print(f"[TAPE] Appending to registered tape '{tape_label}' "
                       f"({record_count} indexed file record(s) already present).")
@@ -552,12 +551,7 @@ class LocalOrchestrator:
                     raise RuntimeError(f"Direct source directory not found: {source}")
                 print(f"\n[LOCAL] Direct backup: {entry['top_level_dir']} "
                       f"({entry['dir_size_bytes'] / 1024**3:.2f} GiB)")
-                _NoEjectBackup(
-                    self.db,
-                    self.cfg.ibm_eject_cmd,
-                    log_dir=self.cfg.backup_log_dir,
-                    notifier=self.notifier,
-                ).run(
+                self._backup_writer().run(
                     source=source,
                     tape_drive=self.cfg.lto_drive,
                     tape_label=tape_label,
@@ -572,12 +566,7 @@ class LocalOrchestrator:
             return False
 
         self.db.update_local_chunk_status(session['session_id'], chunk_index, 'backed_up')
-        LTOBackup(
-            self.db,
-            self.cfg.ibm_eject_cmd,
-            log_dir=self.cfg.backup_log_dir,
-            notifier=self.notifier,
-        ).eject_tape(self.cfg.lto_drive)
+        self._backup_writer(LTOBackup).eject_tape(self.cfg.lto_drive)
         return True
 
     def _make_batches(self, files):
@@ -711,6 +700,16 @@ class RemoteOrchestrator:
         self._staged_lock  = threading.Lock()
         self._producer_err = None              # first fatal producer error, if any
 
+    def _backup_writer(self, cls=LTOBackup):
+        return cls(
+            self.db,
+            self.cfg.ibm_eject_cmd,
+            tape_priority=self.tape_priority,
+            tape_affinity=self.tape_cores,
+            log_dir=self.cfg.backup_log_dir,
+            notifier=self.notifier,
+        )
+
     # ------------------------------------------------------------------
     # Public entry point
     # ------------------------------------------------------------------
@@ -839,8 +838,11 @@ class RemoteOrchestrator:
 
         if not self.db.tape_exists(tape_label):
             print(f"[TAPE] '{tape_label}' not in database. Registering...")
-            cap = input("Tape capacity in GB (default 12288 for 12 TB, Enter to skip): ").strip()
-            self.db.register_tape(tape_label, int(cap) if cap.isdigit() else 12288)
+            cap = input(f"Tape capacity in GB (default {DEFAULT_TAPE_CAPACITY_GB} "
+                        "for 12 TB, Enter to skip): ").strip()
+            self.db.register_tape(
+                tape_label,
+                int(cap) if cap.isdigit() else DEFAULT_TAPE_CAPACITY_GB)
 
         if replacing_session:
             self.db.update_remote_session(
@@ -849,27 +851,23 @@ class RemoteOrchestrator:
             )
             print(f"[REMOTE] Abandoned session: {replacing_session['session_label']}")
 
-        session_id = self.db.create_remote_session(
+        rows = []
+        for chunk_idx, chunk_files in enumerate(chunks):
+            for remote_fpath, fsize in chunk_files:
+                rows.append((chunk_idx, remote_fpath,
+                              os.path.basename(remote_fpath), fsize))
+        # One transaction: the session only becomes visible together with its
+        # chunk plan, so a crash here can never leave a plan-less 'active'
+        # session that a later resume would silently mark 'completed'.
+        session_id = self.db.create_remote_session_with_plan(
             session_label=session_label,
             remote_host=self.remote_host,
             remote_user=self.remote_user,
             remote_path=self.remote_session_path,
             tape_label=tape_label,
             staging_dir=self.staging_dir,
+            rows=rows,
         )
-        self.db.update_remote_session(
-            session_id,
-            total_files=len(manifest),
-            total_bytes=total_bytes,
-            chunk_count=len(chunks),
-        )
-
-        rows = []
-        for chunk_idx, chunk_files in enumerate(chunks):
-            for remote_fpath, fsize in chunk_files:
-                rows.append((chunk_idx, remote_fpath,
-                              os.path.basename(remote_fpath), fsize))
-        self.db.insert_remote_manifest_batch(session_id, rows)
 
         self._run_session(session_id)
 
@@ -955,6 +953,17 @@ class RemoteOrchestrator:
         total_chunks   = self.db.count_chunks(session_id)
         done_count     = total_chunks - len(pending_chunks)
 
+        if total_chunks == 0:
+            # A session without a plan archived nothing; recording it as
+            # 'completed' would fabricate provenance in the catalog.
+            print("[REMOTE] Session has no planned chunks; marking it "
+                  "abandoned. Start a fresh session to archive.")
+            self.db.update_remote_session(
+                session_id, status='abandoned',
+                completed_at=datetime.now().isoformat()
+            )
+            return
+
         if not pending_chunks:
             print("[REMOTE] All chunks already completed.")
             self.db.update_remote_session(
@@ -984,14 +993,12 @@ class RemoteOrchestrator:
                            f"{self.staging_max_bytes / 1024**3:.0f} GB")
         print(f"[WARNING] {LTFS_WRITE_WARNING}")
 
-        # Only per-chunk byte totals stay resident. Materializing every pending
-        # chunk's file rows up front holds the whole session manifest in RAM
-        # (GBs for multi-million-file sessions); the producer re-reads each
+        # Only per-chunk byte totals stay resident. One GROUP BY aggregate
+        # replaces the former per-chunk full-row fetches (millions of rows
+        # over the wire for large sessions); the producer still re-reads each
         # chunk's rows from the catalog just before staging it.
-        planned = {}
-        for ci in pending_chunks:
-            planned[ci] = sum(int(r['file_size_bytes'] or 0)
-                              for r in self.db.get_chunk_files(session_id, ci))
+        size_summary = self.db.get_chunk_size_summary(session_id)
+        planned = {ci: size_summary.get(ci, (0, 0))[0] for ci in pending_chunks}
 
         ready_q       = queue.Queue(maxsize=self.prefetch_ahead)
         stop_pipeline = threading.Event()
@@ -1048,6 +1055,11 @@ class RemoteOrchestrator:
                 ci          = desc['chunk_index']
                 eject_after = (ci == last_chunk)
                 if not self._write_chunk(session_id, desc, tape_label, eject_after):
+                    if not CANCEL.is_set():
+                        # A failed chunk is re-fetched and repacked on resume,
+                        # so its staged copy only wastes staging space — free
+                        # it now. On cancel, skip the rmtree so exit is quick.
+                        self._discard_desc(desc)
                     failed = True
                     break
                 completed += 1
@@ -1171,13 +1183,15 @@ class RemoteOrchestrator:
 
         # --- PACK (small files -> ZIP, large files staged loose) ---
         self.db.update_chunk_status(session_id, chunk_index, 'packing')
-        # Hand the packer a clean dest so it never hits its interactive prompt
-        # from this worker thread.
         self._cleanup_dir(pack_dir)
         _phase('PACK', f"Packing chunk {chunk_index + 1}: "
                        f"small files -> ZIP, large files staged loose")
         pack_start = time.perf_counter()
         try:
+            # on_existing='clean': this runs on the producer thread, which must
+            # never block on the packer's interactive stdin prompt. If the dest
+            # cannot be cleaned, the packer raises and the chunk stays
+            # resumable instead of the pipeline deadlocking.
             metadata = LTOPacker(self.cfg.max_zip_size_gb).run(
                 source=fetch_dir,
                 dest=pack_dir,
@@ -1186,6 +1200,7 @@ class RemoteOrchestrator:
                 source_name='remote',
                 session_id=session_id,
                 chunk_index=chunk_index,
+                on_existing='clean',
             )
         except Exception as e:
             print(f"[REMOTE] Packer error: {e}")
@@ -1280,19 +1295,12 @@ class RemoteOrchestrator:
             if log_path:
                 print(f"[REMOTE] Source-missing CSV summary: {log_path}")
             if eject_after:
-                LTOBackup(
-                    self.db,
-                    self.cfg.ibm_eject_cmd,
-                    log_dir=self.cfg.backup_log_dir,
-                    notifier=self.notifier,
-                ).eject_tape(self.cfg.lto_drive)
+                self._backup_writer().eject_tape(self.cfg.lto_drive)
             return True
 
-        planned_bytes = sum(
-            int(row['file_size_bytes'] or 0)
-            for row in self.db.get_chunk_files(session_id, chunk_index)
-            if row['status'] != 'source_missing'
-        )
+        # present_bytes excludes files marked source_missing during the fetch.
+        _, planned_bytes = self.db.get_chunk_size_summary(
+            session_id, chunk_index).get(chunk_index, (0, 0))
         if not self._ensure_remote_chunk_fits_tape(
                 tape_label, planned_bytes, chunk_index):
             self.db.update_chunk_status(session_id, chunk_index, 'backup_failed')
@@ -1302,11 +1310,7 @@ class RemoteOrchestrator:
         # _NoEjectBackup keeps the tape mounted; eject only after the final chunk.
         backup_cls = LTOBackup if eject_after else _NoEjectBackup
         try:
-            backup_cls(self.db, self.cfg.ibm_eject_cmd,
-                       tape_priority=self.tape_priority,
-                       tape_affinity=self.tape_cores,
-                       log_dir=self.cfg.backup_log_dir,
-                       notifier=self.notifier).run(
+            self._backup_writer(backup_cls).run(
                 source=pack_dir,
                 tape_drive=self.cfg.lto_drive,
                 tape_label=tape_label,

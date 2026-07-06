@@ -20,6 +20,13 @@ from .runtime import _terminate_all_procs, install_cancel_handler, reset_cancel,
 
 
 def run_archiver(cfg: ConfigManager, db: DatabaseManager):
+    # Cross-process single-writer guard: the in-process tape I/O lock cannot
+    # stop a second `python run.py` instance from interleaving tape writes.
+    try:
+        db.acquire_archiver_lock()
+    except RuntimeError as e:
+        print(str(e))
+        return
     added_exclusion = _prepare_robocopy_exclusion()
     reset_cancel()
     install_cancel_handler()
@@ -42,6 +49,7 @@ def run_archiver(cfg: ConfigManager, db: DatabaseManager):
         _cleanup_askpass_helpers()
         if added_exclusion:
             _remove_robocopy_exclusion()
+        db.release_archiver_lock()
 
 
 def run_remote_archiver(cfg, db):
@@ -56,6 +64,11 @@ def run_remote_archiver(cfg, db):
             os.startfile(cfg_abs)
         return
 
+    try:
+        db.acquire_archiver_lock()
+    except RuntimeError as e:
+        print(str(e))
+        return
     added_exclusion = _prepare_robocopy_exclusion()
     reset_cancel()
     install_cancel_handler()
@@ -77,6 +90,7 @@ def run_remote_archiver(cfg, db):
         _cleanup_askpass_helpers()
         if added_exclusion:
             _remove_robocopy_exclusion()
+        db.release_archiver_lock()
 
 
 def _print_tapes_table(db):
@@ -255,12 +269,22 @@ def main():
 
         elif choice == '2':
             added_exclusion = _prepare_robocopy_exclusion()
+            # Same cancel discipline as the archive flows: without a handler,
+            # Ctrl+C would exit the menu while a registered robocopy child
+            # kept reading the tape unsupervised.
+            reset_cancel()
+            install_cancel_handler()
             try:
                 retriever.run()
             except RuntimeError as e:
                 # e.g. tape-verify cancelled — return to the menu, don't exit.
                 print(str(e))
+            except KeyboardInterrupt:
+                print("\n[RESTORE] Interrupted.")
             finally:
+                _terminate_all_procs()
+                uninstall_cancel_handler()
+                reset_cancel()
                 if added_exclusion:
                     _remove_robocopy_exclusion()
 
@@ -288,28 +312,7 @@ def main():
                 tape_mgr.eject_tape()
 
         elif choice == '4':
-            tapes = db.list_tapes()
-            if not tapes:
-                print("[DB] No tapes registered yet.")
-            else:
-                BAR_W = 24
-                print(f"\n{'ID':>4}  {'Volume Label':<25}  {'Initialized':<19}  {'Used / Capacity':<22}  Space")
-                print("-" * 95)
-                for t in tapes:
-                    date_s  = _fmt_ts(t['date_formatted'])
-                    cap_gb  = t['total_capacity']
-                    used_b  = t['used_space'] or 0
-                    used_gb = used_b / 1024**3
-
-                    if cap_gb:
-                        pct    = min(used_gb / cap_gb, 1.0)
-                        filled = round(pct * BAR_W)
-                        bar    = '█' * filled + '░' * (BAR_W - filled)
-                        space_s = f"[{bar}] {pct*100:.1f}%  {used_gb:.1f}/{cap_gb:.0f} GiB"
-                    else:
-                        space_s = f"{used_gb:.1f} GiB used  (no capacity set)"
-
-                    print(f"{t['tape_id']:>4}  {t['volume_label']:<25}  {date_s:<19}  {space_s}")
+            _print_tapes_table(db)
 
         elif choice == '5':
             cfg_abs = os.path.abspath(CONFIG_FILE)
