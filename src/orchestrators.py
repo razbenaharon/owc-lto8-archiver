@@ -733,6 +733,7 @@ class RemoteOrchestrator:
         self.prefetch_ahead    = cfg.prefetch_chunks_ahead
         self.staging_padding   = cfg.staging_padding_factor
         self.fetch_abort_factor = cfg.fetch_overrun_abort_factor
+        self.heartbeat_secs    = cfg.telegram_heartbeat_minutes * 60
         self.ssh_cipher        = cfg.ssh_cipher
         self.ssh_timeout       = cfg.ssh_command_timeout_seconds
         self.use_mbuffer       = cfg.use_mbuffer
@@ -1139,6 +1140,10 @@ class RemoteOrchestrator:
             msg = self._producer_err or "a chunk failed during tape write"
             print(f"\n[REMOTE] Pipeline stopped: {msg}. "
                   f"Re-run to resume from the failed chunk.")
+            send_best_effort(
+                self.notifier,
+                f"[PIPELINE] STOPPED: {msg}. Re-run to resume from the "
+                "failed chunk.")
             return
         if completed == len(pending_chunks):
             self.db.update_remote_session(
@@ -1146,6 +1151,10 @@ class RemoteOrchestrator:
                 completed_at=datetime.now().isoformat()
             )
             print("\n[REMOTE] Session complete. All chunks archived to tape.")
+            send_best_effort(
+                self.notifier,
+                f"[PIPELINE] Session complete — all {total_chunks} chunk(s) "
+                "archived to tape.")
 
     # ------------------------------------------------------------------
     # Producer: fetch + pack a chunk onto staging  (runs off the main thread)
@@ -1428,11 +1437,19 @@ class RemoteOrchestrator:
     # ------------------------------------------------------------------
 
     def _start_pipeline_heartbeat(self, stop_evt, ready_q, total_chunks):
-        """Print a periodic line showing the producer staying ahead of the tape."""
+        """Print a periodic line showing the producer staying ahead of the tape.
+
+        Every telegram_heartbeat_minutes it also sends an all-is-well Telegram
+        message with the same pipeline state, so a long unattended run that
+        stops making progress is noticed by silence-plus-alerts rather than by
+        checking the console."""
+        hb_secs = self.heartbeat_secs
+
         def _beat():
             last_msg = None
             last_print = 0
             quiet_interval = 30
+            last_hb = time.time()
             while not stop_evt.wait(5):
                 with self._staged_lock:
                     staged_gb = self._staged_bytes / 1024**3
@@ -1452,6 +1469,17 @@ class RemoteOrchestrator:
                     _status('PIPELINE', msg)
                     last_msg = msg
                     last_print = now
+                if hb_secs and (now - last_hb) >= hb_secs:
+                    last_hb = now
+                    try:
+                        free_gb = (shutil.disk_usage(self.staging_dir).free
+                                   / 1024**3)
+                        free_txt = f" | staging free {free_gb:.0f} GB"
+                    except OSError:
+                        free_txt = ""
+                    send_best_effort(
+                        self.notifier,
+                        f"[PIPELINE] heartbeat — running: {msg}{free_txt}")
         threading.Thread(target=_beat, name='pipeline-heartbeat',
                          daemon=True).start()
 
