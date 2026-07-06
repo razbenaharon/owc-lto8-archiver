@@ -338,15 +338,17 @@ class PgIntegrationTests(unittest.TestCase):
             "CS_S", "host.example", "user", "/cs", "TCS", "C:/stage",
             rows=rows)
         summary = self.db.get_chunk_size_summary(sid)
-        self.assertEqual(summary[0], (12, 12))
-        self.assertEqual(summary[1], (11, 11))
-        # source_missing files drop out of present_bytes, not planned_bytes.
+        self.assertEqual(summary[0], (12, 12, 2))
+        self.assertEqual(summary[1], (11, 11, 1))
+        # source_missing files drop out of present_bytes, not planned_bytes
+        # or file_count.
         manifest_id = self.db.get_chunk_files(sid, 0)[0]["manifest_id"]
         self.db.update_manifest_row(
             manifest_id, session_id=sid, status="source_missing")
-        planned, present = self.db.get_chunk_size_summary(sid, 0)[0]
+        planned, present, count = self.db.get_chunk_size_summary(sid, 0)[0]
         self.assertEqual(planned, 12)
         self.assertEqual(present, 5)
+        self.assertEqual(count, 2)
 
     def test_delete_files_batch_reconciles_used_space(self):
         self.db.register_tape("TDEL")
