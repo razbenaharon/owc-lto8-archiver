@@ -123,10 +123,16 @@ class PgDatabaseManager:
     This covers the live local archive/restore/catalog workflows.
     """
 
+    # Session-level advisory lock key ('LTO8'): cross-process single-writer
+    # guard for tape-write runs. The in-process tape I/O lock cannot stop a
+    # second `python run.py` instance; this can.
+    ARCHIVER_LOCK_KEY = 0x4C544F38
+
     def __init__(self, conninfo, *, init_schema=True, pool=None):
         require_psycopg()
         self.db_path = conninfo
         self._pool = None
+        self._lock_conn = None
         self._pool = pool or make_pool(conninfo, min_size=1, max_size=8,
                                        row_factory=dict_row)
         try:
@@ -144,6 +150,7 @@ class PgDatabaseManager:
             "002_postgres_indexes.sql",
             "003_postgres_constraints.sql",
             "004_postgres_archive_runs_sessions.sql",
+            "005_postgres_session_label_unique.sql",
         )
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
@@ -282,27 +289,33 @@ class PgDatabaseManager:
         for (tape_label, normalized_path), (parent_path, name) in specs.items():
             by_depth[normalized_path.count("/")].append(
                 (tape_label, normalized_path, parent_path, name))
+        # libpq caps a single statement at 65,535 bind parameters (4 per row).
+        # Slicing each level keeps the upsert safe even if DB_UPSERT_BATCH_SIZE
+        # is ever raised past that ceiling.
+        max_rows = 5000
         for depth in sorted(by_depth):
             level = by_depth[depth]
-            values = []
-            params = []
-            for tape_label, normalized_path, parent_path, name in level:
-                parent_id = (resolved.get((tape_label, parent_path))
-                             if parent_path is not None else None)
-                values.append("(%s, %s, %s, %s)")
-                params.extend([tape_label, parent_id, name, normalized_path])
-            rows = conn.execute(
-                "INSERT INTO catalog_directories "
-                "(tape_label, parent_id, name, normalized_path) "
-                f"VALUES {', '.join(values)} "
-                "ON CONFLICT (tape_label, normalized_path) DO UPDATE "
-                "SET name = EXCLUDED.name "
-                "RETURNING directory_id, tape_label, normalized_path",
-                params,
-            ).fetchall()
-            for row in rows:
-                resolved[(row["tape_label"], row["normalized_path"])] = (
-                    row["directory_id"])
+            for start in range(0, len(level), max_rows):
+                values = []
+                params = []
+                for tape_label, normalized_path, parent_path, name in (
+                        level[start:start + max_rows]):
+                    parent_id = (resolved.get((tape_label, parent_path))
+                                 if parent_path is not None else None)
+                    values.append("(%s, %s, %s, %s)")
+                    params.extend([tape_label, parent_id, name, normalized_path])
+                rows = conn.execute(
+                    "INSERT INTO catalog_directories "
+                    "(tape_label, parent_id, name, normalized_path) "
+                    f"VALUES {', '.join(values)} "
+                    "ON CONFLICT (tape_label, normalized_path) DO UPDATE "
+                    "SET name = EXCLUDED.name "
+                    "RETURNING directory_id, tape_label, normalized_path",
+                    params,
+                ).fetchall()
+                for row in rows:
+                    resolved[(row["tape_label"], row["normalized_path"])] = (
+                        row["directory_id"])
         return resolved
 
     def _normalize_file_records(self, conn, records):
@@ -519,15 +532,24 @@ class PgDatabaseManager:
         now = _now_utc()
 
         def operation(conn):
+            # Upsert on the timestamped label so a connection-loss retry whose
+            # first COMMIT actually landed converges on the committed session
+            # instead of creating a duplicate (with a duplicate manifest).
             row = conn.execute(
                 """INSERT INTO local_sessions
                    (session_label, source_dir, total_chunks, backup_mode,
                     created_at, status)
                    VALUES (%s, %s, %s, %s, %s, 'active')
-                   RETURNING session_id""",
+                   ON CONFLICT (session_label) DO UPDATE
+                       SET session_label = EXCLUDED.session_label
+                   RETURNING session_id, (xmax = 0) AS inserted""",
                 (session_label, source_dir, len(chunks), backup_mode, now),
             ).fetchone()
             session_id = row["session_id"]
+            if not row["inserted"]:
+                # Session + manifest were committed atomically by the earlier
+                # attempt; re-inserting the manifest would duplicate it.
+                return session_id
             rows = []
             for chunk_index, entries in enumerate(chunks):
                 for entry in entries:
@@ -653,23 +675,68 @@ class PgDatabaseManager:
 
         self._transaction(operation, "update local manifest")
 
+    @staticmethod
+    def _upsert_remote_session(conn, session_label, remote_host, remote_user,
+                               remote_path, tape_label, staging_dir, now):
+        """Insert a remote session, converging on the timestamped label.
+
+        The ON CONFLICT arm makes an ambiguous-commit retry return the already
+        committed session instead of creating a duplicate 'active' row.
+        """
+        return conn.execute(
+            """INSERT INTO remote_sessions
+               (session_label, remote_host, remote_user, remote_path,
+                tape_label, staging_dir, created_at, status)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, 'active')
+               ON CONFLICT (session_label) DO UPDATE
+                   SET session_label = EXCLUDED.session_label
+               RETURNING session_id""",
+            (session_label, remote_host, remote_user, remote_path,
+             tape_label, staging_dir, now),
+        ).fetchone()["session_id"]
+
     def create_remote_session(self, session_label, remote_host, remote_user,
                               remote_path, tape_label, staging_dir):
         now = _now_utc()
 
         def operation(conn):
-            row = conn.execute(
-                """INSERT INTO remote_sessions
-                   (session_label, remote_host, remote_user, remote_path,
-                    tape_label, staging_dir, created_at, status)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, 'active')
-                   RETURNING session_id""",
-                (session_label, remote_host, remote_user, remote_path,
-                 tape_label, staging_dir, now),
-            ).fetchone()
-            return row["session_id"]
+            return self._upsert_remote_session(
+                conn, session_label, remote_host, remote_user, remote_path,
+                tape_label, staging_dir, now)
 
         return self._transaction(operation, "create remote session")
+
+    def create_remote_session_with_plan(self, session_label, remote_host,
+                                        remote_user, remote_path, tape_label,
+                                        staging_dir, rows):
+        """Create a remote session and persist its plan in ONE transaction.
+
+        A session must never become visible without its chunk plan: the old
+        three-transaction flow (create -> set totals -> insert manifest) could
+        crash in between, leaving an 'active' session with zero chunks that a
+        later resume silently marked 'completed'.
+        """
+        rows = list(rows)
+        by_path = self._validate_remote_manifest_rows(rows)
+        chunk_count = len({int(row[0]) for row in rows})
+        total_bytes = sum(int(row[3]) for row in rows)
+        now = _now_utc()
+
+        def operation(conn):
+            session_id = self._upsert_remote_session(
+                conn, session_label, remote_host, remote_user, remote_path,
+                tape_label, staging_dir, now)
+            conn.execute(
+                """UPDATE remote_sessions
+                   SET total_files=%s, total_bytes=%s, chunk_count=%s
+                   WHERE session_id=%s""",
+                (len(rows), total_bytes, chunk_count, session_id),
+            )
+            self._persist_remote_plan(
+                conn, session_id, remote_host, remote_path, rows, by_path, now)
+            return session_id
+
+        return self._transaction(operation, "create remote session with plan")
 
     def update_remote_session(self, session_id, **kwargs):
         if not kwargs:
@@ -705,12 +772,9 @@ class PgDatabaseManager:
                 (session_id,),
             ).fetchone())
 
-    def insert_remote_manifest_batch(self, session_id, rows):
-        """Persist a canonical snapshot and reusable chunk plan."""
-        rows = list(rows)
-        session = self.get_remote_session(session_id)
-        if not session:
-            raise RuntimeError(f"[DB] Remote session not found: {session_id}")
+    @staticmethod
+    def _validate_remote_manifest_rows(rows):
+        """Validate (chunk, path, name, size) rows; return {canonical: size}."""
         by_path = {}
         for chunk_index, remote_path, _file_name, size in rows:
             canonical = _canonical_remote_path(remote_path)
@@ -723,91 +787,107 @@ class PgDatabaseManager:
                     f"[DB] Conflicting sizes for remote SOURCE path: {canonical}")
         if len(by_path) != len(rows):
             raise RuntimeError("[DB] Duplicate canonical paths in remote snapshot")
+        return by_path
 
-        snapshot_fp = _snapshot_fingerprint(
-            session["remote_host"], session["remote_path"], by_path)
-        plan_fp = _plan_fingerprint(snapshot_fp, rows)
-        chunk_indexes = sorted({int(row[0]) for row in rows})
+    def insert_remote_manifest_batch(self, session_id, rows):
+        """Persist a canonical snapshot and reusable chunk plan."""
+        rows = list(rows)
+        session = self.get_remote_session(session_id)
+        if not session:
+            raise RuntimeError(f"[DB] Remote session not found: {session_id}")
+        by_path = self._validate_remote_manifest_rows(rows)
         now = _now_utc()
 
         def operation(conn):
-            conn.execute(
-                """INSERT INTO remote_snapshots
-                   (remote_host, remote_path, fingerprint, total_files,
-                    total_bytes, created_at)
-                   VALUES (%s, %s, %s, %s, %s, %s)
-                   ON CONFLICT (fingerprint) DO NOTHING""",
-                (session["remote_host"], session["remote_path"], snapshot_fp,
-                 len(rows), sum(int(row[3]) for row in rows), now),
-            )
-            snapshot_id = conn.execute(
-                "SELECT snapshot_id FROM remote_snapshots WHERE fingerprint=%s",
-                (snapshot_fp,),
-            ).fetchone()["snapshot_id"]
-            existing = conn.execute(
-                """SELECT COUNT(*) AS n FROM remote_snapshot_files
-                   WHERE snapshot_id=%s""",
-                (snapshot_id,),
-            ).fetchone()["n"]
-            if not existing:
-                with conn.cursor() as cur:
-                    cur.executemany(
-                        """INSERT INTO remote_snapshot_files
-                           (snapshot_id, remote_path, file_size_bytes)
-                           VALUES (%s, %s, %s)""",
-                        ((snapshot_id, path, size)
-                         for path, size in by_path.items()),
-                    )
-            conn.execute(
-                """INSERT INTO remote_plans
-                   (snapshot_id, fingerprint, chunk_count, created_at)
-                   VALUES (%s, %s, %s, %s)
-                   ON CONFLICT (fingerprint) DO NOTHING""",
-                (snapshot_id, plan_fp, len(chunk_indexes), now),
-            )
-            plan_id = conn.execute(
-                "SELECT plan_id FROM remote_plans WHERE fingerprint=%s",
-                (plan_fp,),
-            ).fetchone()["plan_id"]
-            existing = conn.execute(
-                "SELECT COUNT(*) AS n FROM remote_plan_files WHERE plan_id=%s",
-                (plan_id,),
-            ).fetchone()["n"]
-            if not existing:
-                ids = {
-                    row["remote_path"]: row["snapshot_file_id"]
-                    for row in conn.execute(
-                        """SELECT remote_path, snapshot_file_id
-                           FROM remote_snapshot_files
-                           WHERE snapshot_id=%s""",
-                        (snapshot_id,),
-                    ).fetchall()
-                }
-                with conn.cursor() as cur:
-                    cur.executemany(
-                        """INSERT INTO remote_plan_files
-                           (plan_id, snapshot_file_id, chunk_index, ordinal)
-                           VALUES (%s, %s, %s, %s)""",
-                        ((plan_id, ids[_canonical_remote_path(row[1])],
-                          int(row[0]), ordinal)
-                         for ordinal, row in enumerate(rows)),
-                    )
-            conn.execute(
-                "UPDATE remote_sessions SET plan_id=%s WHERE session_id=%s",
-                (plan_id, session_id),
-            )
-            with conn.cursor() as cur:
-                cur.executemany(
-                    """INSERT INTO remote_chunks
-                       (session_id, chunk_index, status, updated_at)
-                       VALUES (%s, %s, 'pending', %s)
-                       ON CONFLICT (session_id, chunk_index) DO NOTHING""",
-                    ((session_id, chunk_index, now)
-                     for chunk_index in chunk_indexes),
-                )
-            return plan_id
+            return self._persist_remote_plan(
+                conn, session_id, session["remote_host"],
+                session["remote_path"], rows, by_path, now)
 
         return self._transaction(operation, "insert remote manifest batch")
+
+    def _persist_remote_plan(self, conn, session_id, remote_host, remote_path,
+                             rows, by_path, now):
+        """Persist snapshot/plan/chunk rows for a session (idempotent by
+        fingerprint, so it is safe inside the ambiguous-commit retry loop)."""
+        snapshot_fp = _snapshot_fingerprint(remote_host, remote_path, by_path)
+        plan_fp = _plan_fingerprint(snapshot_fp, rows)
+        chunk_indexes = sorted({int(row[0]) for row in rows})
+
+        conn.execute(
+            """INSERT INTO remote_snapshots
+               (remote_host, remote_path, fingerprint, total_files,
+                total_bytes, created_at)
+               VALUES (%s, %s, %s, %s, %s, %s)
+               ON CONFLICT (fingerprint) DO NOTHING""",
+            (remote_host, remote_path, snapshot_fp,
+             len(rows), sum(int(row[3]) for row in rows), now),
+        )
+        snapshot_id = conn.execute(
+            "SELECT snapshot_id FROM remote_snapshots WHERE fingerprint=%s",
+            (snapshot_fp,),
+        ).fetchone()["snapshot_id"]
+        existing = conn.execute(
+            """SELECT COUNT(*) AS n FROM remote_snapshot_files
+               WHERE snapshot_id=%s""",
+            (snapshot_id,),
+        ).fetchone()["n"]
+        if not existing:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    """INSERT INTO remote_snapshot_files
+                       (snapshot_id, remote_path, file_size_bytes)
+                       VALUES (%s, %s, %s)""",
+                    ((snapshot_id, path, size)
+                     for path, size in by_path.items()),
+                )
+        conn.execute(
+            """INSERT INTO remote_plans
+               (snapshot_id, fingerprint, chunk_count, created_at)
+               VALUES (%s, %s, %s, %s)
+               ON CONFLICT (fingerprint) DO NOTHING""",
+            (snapshot_id, plan_fp, len(chunk_indexes), now),
+        )
+        plan_id = conn.execute(
+            "SELECT plan_id FROM remote_plans WHERE fingerprint=%s",
+            (plan_fp,),
+        ).fetchone()["plan_id"]
+        existing = conn.execute(
+            "SELECT COUNT(*) AS n FROM remote_plan_files WHERE plan_id=%s",
+            (plan_id,),
+        ).fetchone()["n"]
+        if not existing:
+            ids = {
+                row["remote_path"]: row["snapshot_file_id"]
+                for row in conn.execute(
+                    """SELECT remote_path, snapshot_file_id
+                       FROM remote_snapshot_files
+                       WHERE snapshot_id=%s""",
+                    (snapshot_id,),
+                ).fetchall()
+            }
+            with conn.cursor() as cur:
+                cur.executemany(
+                    """INSERT INTO remote_plan_files
+                       (plan_id, snapshot_file_id, chunk_index, ordinal)
+                       VALUES (%s, %s, %s, %s)""",
+                    ((plan_id, ids[_canonical_remote_path(row[1])],
+                      int(row[0]), ordinal)
+                     for ordinal, row in enumerate(rows)),
+                )
+        conn.execute(
+            "UPDATE remote_sessions SET plan_id=%s WHERE session_id=%s",
+            (plan_id, session_id),
+        )
+        with conn.cursor() as cur:
+            cur.executemany(
+                """INSERT INTO remote_chunks
+                   (session_id, chunk_index, status, updated_at)
+                   VALUES (%s, %s, 'pending', %s)
+                   ON CONFLICT (session_id, chunk_index) DO NOTHING""",
+                ((session_id, chunk_index, now)
+                 for chunk_index in chunk_indexes),
+            )
+        return plan_id
 
     def get_chunk_files(self, session_id, chunk_index):
         with self._pool.connection() as conn:
@@ -831,6 +911,41 @@ class PgDatabaseManager:
                    ORDER BY pf.ordinal""",
                 (session_id, chunk_index),
             ).fetchall())
+
+    def get_chunk_size_summary(self, session_id, chunk_index=None):
+        """Per-chunk byte totals without materializing millions of file rows.
+
+        Returns ``{chunk_index: (planned_bytes, present_bytes)}`` where
+        ``planned_bytes`` counts every planned file and ``present_bytes``
+        excludes files already known to be ``source_missing``.
+        """
+        where = "s.session_id=%s"
+        params = [session_id]
+        if chunk_index is not None:
+            where += " AND pf.chunk_index=%s"
+            params.append(chunk_index)
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                f"""SELECT pf.chunk_index,
+                           COALESCE(SUM(sf.file_size_bytes), 0) AS planned_bytes,
+                           COALESCE(SUM(sf.file_size_bytes) FILTER (
+                               WHERE COALESCE(st.status, '') != 'source_missing'
+                           ), 0) AS present_bytes
+                    FROM remote_sessions s
+                    JOIN remote_plan_files pf ON pf.plan_id=s.plan_id
+                    JOIN remote_snapshot_files sf
+                      ON sf.snapshot_file_id=pf.snapshot_file_id
+                    LEFT JOIN remote_file_state st ON st.session_id=s.session_id
+                      AND st.plan_file_id=pf.plan_file_id
+                    WHERE {where}
+                    GROUP BY pf.chunk_index""",
+                params,
+            ).fetchall()
+        return {
+            row["chunk_index"]: (int(row["planned_bytes"]),
+                                 int(row["present_bytes"]))
+            for row in rows
+        }
 
     def update_manifest_row(self, manifest_id, session_id=None, **kwargs):
         if session_id is None:
@@ -1222,6 +1337,13 @@ class PgDatabaseManager:
                 "UPDATE remote_sessions SET tape_label=%s WHERE tape_label=%s",
                 (new_label, old_label),
             )
+            # local_chunks_manifest.tape_label is ON DELETE SET NULL: without
+            # this repoint, deleting the old tape row silently wipes the chunk
+            # assignments of every in-flight local session.
+            conn.execute(
+                "UPDATE local_chunks_manifest SET tape_label=%s WHERE tape_label=%s",
+                (new_label, old_label),
+            )
             conn.execute("DELETE FROM tapes WHERE volume_label=%s", (old_label,))
 
         self._transaction(operation, f"rename tape {old_label}")
@@ -1246,10 +1368,11 @@ class PgDatabaseManager:
         return bool(stats["inserted"])
 
     def search_files(self, name_query=None, date_from=None, date_to=None,
-                     limit=None, offset=None, source_host=None):
+                     limit=None, offset=None, source_host=None, after_id=None):
         return self.search_catalog(
             name_query=name_query, date_from=date_from, date_to=date_to,
-            limit=limit, offset=offset, source_host=source_host)
+            limit=limit, offset=offset, source_host=source_host,
+            after_id=after_id)
 
     @staticmethod
     def _catalog_filter(name_query=None, tape_label=None, date_from=None,
@@ -1282,15 +1405,21 @@ class PgDatabaseManager:
 
     def search_catalog(self, name_query=None, tape_label=None,
                        date_from=None, date_to=None, limit=None, offset=None,
-                       source_host=None):
+                       source_host=None, after_id=None):
         where, params = self._catalog_filter(
             name_query, tape_label, date_from, date_to, source_host)
+        if after_id is not None:
+            # Keyset pagination for bulk consumers (restore-all): OFFSET paging
+            # rescans every skipped row, which is O(n^2) over a large result.
+            where.append("f.file_id > %s")
+            params.append(int(after_id))
         sql = self._catalog_select() + " WHERE " + " AND ".join(where)
-        sql += " ORDER BY f.original_path, f.catalog_name"
+        sql += (" ORDER BY f.file_id" if after_id is not None
+                else " ORDER BY f.original_path, f.catalog_name")
         if limit is not None:
             sql += " LIMIT %s"
             params.append(int(limit))
-            if offset is not None:
+            if offset is not None and after_id is None:
                 sql += " OFFSET %s"
                 params.append(int(offset))
         with self._pool.connection() as conn:
@@ -1311,7 +1440,7 @@ class PgDatabaseManager:
         return rows[0] if rows else None
 
     def search_by_directory(self, dir_path, limit=None, offset=None,
-                            source_host=None):
+                            source_host=None, after_id=None):
         needle = dir_path.strip().rstrip("/\\")
         if not needle:
             return []
@@ -1321,6 +1450,15 @@ class PgDatabaseManager:
         if source_host:
             where += " AND f.source_host = %s"
             params.append(_short_source_host(source_host))
+        if after_id is not None:
+            where += " AND f.file_id > %s"
+            params.append(int(after_id))
+            sql = self._catalog_select() + " WHERE " + where
+            sql += " ORDER BY f.file_id LIMIT %s"
+            params.append(int(limit or 250))
+            with self._pool.connection() as conn:
+                rows = conn.execute(sql, params).fetchall()
+            return [self._hydrate_file_row(row) for row in rows]
         if limit is None:
             return self._catalog_rows(where, params, "f.original_path")
         sql = self._catalog_select() + " WHERE " + where
@@ -1357,11 +1495,21 @@ class PgDatabaseManager:
                 ORDER BY session_date DESC
             """).fetchall())
 
-    def search_by_session(self, session_date, tape_label, limit=None, offset=None):
+    def search_by_session(self, session_date, tape_label, limit=None,
+                          offset=None, after_id=None):
         where = """f.catalog_backup_date >= %s::date
                    AND f.catalog_backup_date < (%s::date + INTERVAL '1 day')
                    AND f.tape_label = %s"""
         params = [session_date, session_date, tape_label]
+        if after_id is not None:
+            where += " AND f.file_id > %s"
+            params.append(int(after_id))
+            sql = self._catalog_select() + " WHERE " + where
+            sql += " ORDER BY f.file_id LIMIT %s"
+            params.append(int(limit or 250))
+            with self._pool.connection() as conn:
+                rows = conn.execute(sql, params).fetchall()
+            return [self._hydrate_file_row(row) for row in rows]
         if limit is None:
             return self._catalog_rows(where, params, "f.original_path")
         sql = self._catalog_select() + " WHERE " + where
@@ -1391,12 +1539,42 @@ class PgDatabaseManager:
             ).fetchall()
         return [row["source_host"] for row in rows if row["source_host"]]
 
-    def delete_file(self, file_id):
-        def operation(conn):
-            cur = conn.execute("DELETE FROM files_index WHERE file_id=%s", (file_id,))
-            self._require_updated(cur, f"[DB] File record not found: {file_id}")
+    def delete_files(self, file_ids):
+        """Delete file records in ONE transaction and reconcile used_space.
 
-        self._transaction(operation, f"delete file record {file_id}")
+        Replaces the per-row delete loop (one transaction per record) and fixes
+        the ``tapes.used_space`` drift a single-record delete used to leave
+        behind until the next full recalculation.
+        """
+        ids = sorted({int(file_id) for file_id in file_ids})
+        if not ids:
+            return 0
+
+        def operation(conn):
+            rows = conn.execute(
+                "DELETE FROM files_index WHERE file_id = ANY(%s) "
+                "RETURNING tape_label",
+                (ids,),
+            ).fetchall()
+            labels = sorted({row["tape_label"] for row in rows})
+            if labels:
+                conn.execute(
+                    """UPDATE tapes t
+                       SET used_space = COALESCE(
+                           (SELECT SUM(f.file_size_bytes) FROM files_index f
+                            WHERE f.tape_label = t.volume_label), 0)
+                       WHERE t.volume_label = ANY(%s)""",
+                    (labels,),
+                )
+            return len(rows)
+
+        return self._transaction(
+            operation, f"delete {len(ids)} file record(s)")
+
+    def delete_file(self, file_id):
+        removed = self.delete_files([file_id])
+        if not removed:
+            raise RuntimeError(f"[DB] File record not found: {file_id}")
 
     def delete_session(self, kind, session_id):
         kind = (kind or "").strip().lower()
@@ -1545,7 +1723,53 @@ class PgDatabaseManager:
                     conn.autocommit = previous
         return result
 
+    def acquire_archiver_lock(self):
+        """Take the cross-process single-writer lock for a tape-write run.
+
+        Rides a dedicated pooled connection (session-level advisory locks
+        survive commits) that stays pinned until ``release_archiver_lock``.
+        Raises RuntimeError when another archiver instance holds it.
+        """
+        if self._lock_conn is not None:
+            return
+        conn = self._pool.getconn()
+        try:
+            conn.autocommit = True
+            locked = conn.execute(
+                "SELECT pg_try_advisory_lock(%s) AS locked",
+                (self.ARCHIVER_LOCK_KEY,),
+            ).fetchone()["locked"]
+        except Exception:
+            self._pool.putconn(conn)
+            raise
+        if not locked:
+            self._pool.putconn(conn)
+            raise RuntimeError(
+                "[LOCK] Another archiver instance already holds the "
+                "tape-writer lock. Only one tape-write run may be active at "
+                "a time; finish or close the other instance and retry."
+            )
+        self._lock_conn = conn
+
+    def release_archiver_lock(self):
+        conn = self._lock_conn
+        self._lock_conn = None
+        if conn is None:
+            return
+        try:
+            conn.execute(
+                "SELECT pg_advisory_unlock(%s)", (self.ARCHIVER_LOCK_KEY,))
+        except Exception:
+            pass  # dropping the session releases the lock anyway
+        try:
+            conn.autocommit = False
+            if self._pool is not None:
+                self._pool.putconn(conn)
+        except Exception:
+            pass
+
     def close(self):
+        self.release_archiver_lock()
         if self._pool is not None:
             self._pool.close()
             self._pool = None

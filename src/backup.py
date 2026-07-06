@@ -1,8 +1,8 @@
 """LTOBackup and _NoEjectBackup tape writers."""
 import os
+import re
 import time
 import threading
-import subprocess
 from datetime import datetime
 from collections import defaultdict
 
@@ -11,13 +11,20 @@ try:
 except ImportError:  # optional dependency — priority/affinity degrade gracefully
     psutil = None
 
-from .constants import BACKUP_LOG_DIR, LTFS_DIR, LTFS_WRITE_WARNING
+from .constants import BACKUP_LOG_DIR, LTFS_WRITE_WARNING
 from .db import DatabaseManager
-from .ltfs import _ensure_lto_drive_ready
+from .ltfs import _ensure_lto_drive_ready, eject_tape_drive
 from .reporting import append_backup_summary_row
 from .robocopy import _parse_robocopy_summary, _run_robocopy_tuned
 from .runtime import CANCEL, _acquire_tape_io_lock, _fmt_eta, _phase, _progress_done, _progress_line, _release_tape_io_lock
 from .telegram_notify import notify_backup_summary
+
+
+# Robocopy error lines look like "2024/01/01 12:00:00 ERROR 32 (0x00000020)
+# Copying File ...". Matching the full shape (instead of the substring
+# "ERROR ") keeps a source path that merely contains the word from failing
+# the whole run.
+_ROBOCOPY_ERROR_RE = re.compile(r'ERROR \d+ \(0x[0-9A-Fa-f]{8}\)')
 
 
 def _tape_destination_root(source, tape_drive, tape_parent_dir=None):
@@ -60,35 +67,8 @@ class LTOBackup:
             print(f"[REPORT] Warning: could not update CSV summary: {e}")
             return None
 
-    def _legacy_eject_tape_unlocked(self, tape_drive):
-        print("\n" + "#" * 60)
-        print("[LTO] FINALIZING: Ejecting tape...")
-        print("[LTO] PLEASE WAIT — this can take 1-2 minutes.")
-        print("#" * 60)
-
-        drive_arg = tape_drive.rstrip(":\\")
-        exe       = self.ibm_eject_cmd or os.path.join(LTFS_DIR, 'LtfsCmdEject.exe')
-        exe_dir   = os.path.dirname(exe) or LTFS_DIR
-        cmd       = [exe, drive_arg]
-
-        try:
-            result = subprocess.run(cmd, check=True, text=True, capture_output=True,
-                                    cwd=exe_dir)
-            print("[LTO] Tape ejected successfully!")
-            if result.stdout:
-                print(result.stdout)
-        except subprocess.CalledProcessError as e:
-            print(f"[ERROR] Eject failed: {e.stderr}")
-            print(f"Try manually: cd /d \"{LTFS_DIR}\" && LtfsCmdEject.exe {drive_arg}")
-        except FileNotFoundError:
-            print(f"[ERROR] LtfsCmdEject.exe not found in: {LTFS_DIR}")
-
     def eject_tape(self, tape_drive):
-        _acquire_tape_io_lock(f"eject {tape_drive}")
-        try:
-            return self._legacy_eject_tape_unlocked(tape_drive)
-        finally:
-            _release_tape_io_lock()
+        return eject_tape_drive(tape_drive, self.ibm_eject_cmd)
 
     def run(self, source, tape_drive, tape_label, packer_metadata=None,
             exclude_file_paths=None, exclude_dir_paths=None,
@@ -324,7 +304,7 @@ class LTOBackup:
         critical_robocopy_failure = (
             rc.returncode >= 8 or
             rc_sum.get('files_failed', 0) > 0 or
-            'ERROR ' in rc_output or
+            _ROBOCOPY_ERROR_RE.search(rc_output) is not None or
             'RETRY LIMIT EXCEEDED' in rc_output
         )
         if critical_robocopy_failure:
