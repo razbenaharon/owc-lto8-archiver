@@ -664,13 +664,18 @@ def view(smcfg, servers, top=15):
         grand = res.total or 1
         for mt in sorted(res.mounts, key=lambda m: m.total, reverse=True):
             if mt.has_capacity:
+                used_bytes = mt.used_bytes
+                if used_bytes is None:
+                    used_bytes = max(0, mt.capacity_bytes - mt.free_bytes)
+                used_text = human(used_bytes)
                 free_text = human(mt.free_bytes)
                 pct_text = f"{mt.free_percent:5.1f}%"
             else:
+                used_text = human(mt.total)
                 free_text = "n/a"
                 pct_text = f"{mt.total / grand * 100:5.1f}% of scanned"
             summary.add_row(mt.mount,
-                            f"[{_size_style(mt.total)}]{human(mt.total)}[/]",
+                            f"[{_size_style(mt.total)}]{used_text}[/]",
                             free_text,
                             pct_text)
         console.print(summary)
