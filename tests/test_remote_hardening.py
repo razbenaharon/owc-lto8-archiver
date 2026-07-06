@@ -60,6 +60,10 @@ class RemoteStagingSafetyTests(unittest.TestCase):
                     {"file_size_bytes": 1000, "status": "source_missing"},
                 ]
 
+            def get_chunk_size_summary(self, session_id, chunk_index=None):
+                # planned counts every file; present excludes source_missing.
+                return {0: (2000, 1000)}
+
             def get_tape(self, label):
                 return {"total_capacity": 1 / 1024**3}
 
