@@ -107,6 +107,7 @@ class ConfigManager:
         self.config['TELEGRAM'] = {
             'enabled': 'false',
             'timeout_seconds': '10',
+            'heartbeat_minutes': '30',
         }
         with open(self.config_path, 'w', encoding='utf-8') as f:
             self.config.write(f)
@@ -265,6 +266,18 @@ class ConfigManager:
         except ValueError:
             return 10
         return max(1, value)
+
+    @property
+    def telegram_heartbeat_minutes(self):
+        """Interval for periodic all-is-well pipeline notifications
+        (0 disables the heartbeat; alerts still fire)."""
+        raw = self.config.get('TELEGRAM', 'heartbeat_minutes',
+                              fallback='30').strip()
+        try:
+            value = float(raw)
+        except ValueError:
+            return 30.0
+        return max(0.0, value)
 
     @property
     def telegram_bot_token(self):
