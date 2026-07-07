@@ -1,0 +1,24 @@
+{
+  "typeCheckingMode": "basic",
+  "pythonVersion": "3.8",
+  "venvPath": ".",
+  "venv": ".venv",
+  "include": [
+    "run.py",
+    "inspect_db.py",
+    "src",
+    "storage_map",
+    "tests"
+  ],
+  "exclude": [
+    "**/__pycache__",
+    ".git",
+    ".pytest_cache",
+    ".venv",
+    "backup_logs",
+    "db_backups",
+    "Framework & Drivers",
+    "storage_map/logs",
+    "storage_map/index.html"
+  ]
+}

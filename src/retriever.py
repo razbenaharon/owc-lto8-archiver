@@ -7,24 +7,28 @@ import zipfile
 import posixpath
 import ntpath
 from collections import defaultdict
+from typing import TYPE_CHECKING
 
 try:
     import psutil
 except ImportError:  # optional dependency — priority/affinity degrade gracefully
     psutil = None
 
-from .db import DatabaseManager, _fmt_ts
+from .db import _fmt_ts
 from .ltfs import get_volume_label
 from .packer import StagingSpaceError, ensure_staging_space
 from .robocopy import _robocopy_file
 from .runtime import CANCEL, _acquire_tape_io_lock, _release_tape_io_lock
+
+if TYPE_CHECKING:
+    from .pg_db import PgDatabaseManager
 
 
 RESTORE_PAGE_SIZE = 250
 
 
 class LTORetriever:
-    def __init__(self, db: DatabaseManager, tape_drive: str,
+    def __init__(self, db: "PgDatabaseManager", tape_drive: str,
                  staging_dir: str, restore_dir: str):
         self.db          = db
         self.tape_drive  = tape_drive
@@ -450,6 +454,9 @@ class LTORetriever:
                 if err:
                     print(f"[ERROR] {err}")
                     return
+                if entry is None:
+                    print("[ERROR] ZIP entry could not be resolved.")
+                    return
                 if warn:
                     print(f"[WARN] {warn}")
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -492,6 +499,9 @@ class LTORetriever:
                         zip_names, stored_in_zip, record['file_name'])
                     if err:
                         print(f"[ERROR] {err}")
+                        continue
+                    if entry is None:
+                        print(f"[ERROR] {record['file_name']}: ZIP entry could not be resolved.")
                         continue
                     if warn:
                         print(f"[WARN] {warn}")

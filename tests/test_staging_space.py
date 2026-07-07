@@ -36,6 +36,7 @@ class StagingSpaceTests(unittest.TestCase):
             with mock.patch("src.packer._robocopy_file", return_value=True):
                 metadata = packer.LTOPacker(max_zip_size_gb=1).run(
                     source, dest, threshold_mb=0)
+            assert metadata is not None
             self.assertEqual(len(metadata), 1)
             self.assertFalse(metadata[0]["is_packed"])
             self.assertNotIn("file_hash", metadata[0])
@@ -52,6 +53,7 @@ class StagingSpaceTests(unittest.TestCase):
                 handle.write(b"hello")
             metadata = packer.LTOPacker(max_zip_size_gb=1).run(
                 source, dest, threshold_mb=1)
+            assert metadata is not None
             self.assertEqual(len(metadata), 1)
             self.assertTrue(metadata[0]["is_packed"])
             self.assertNotIn("file_hash", metadata[0])
@@ -91,6 +93,7 @@ class StagingSpaceTests(unittest.TestCase):
             self.assertEqual(metadata, [])
             self.assertEqual(tracker.count(), 1)
             report = tracker.write_csv(tmp)
+            assert report is not None
             with open(report, encoding="utf-8") as handle:
                 text = handle.read()
             self.assertIn("missing.txt", text)

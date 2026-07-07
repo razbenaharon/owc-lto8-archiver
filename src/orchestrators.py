@@ -4,11 +4,14 @@ import time
 import queue
 import shutil
 import threading
+import subprocess
+import codecs
 import shlex
 import posixpath
 import re
 from datetime import datetime
 from collections import defaultdict
+from typing import Dict, Optional, Type
 
 try:
     import psutil
@@ -24,7 +27,7 @@ from .db import _apply_canonical_remote_paths
 from .ltfs import _ensure_lto_drive_ready, get_volume_label
 from .packer import LTOAnalyzer, LTOPacker, ensure_staging_space
 from .paths import _LEGACY_PATH_LIMIT, _dir_tree_size, _disambiguate_local_rel, _exceeds_legacy_path_limit, _long, _remote_fetch_base_and_rel, _reserved_name_component, _volume_cluster_size, _winsafe_extracted_rel
-from .remote_transport import _remote_tar_fetch, _ssh_run
+from .remote_transport import _remote_tar_fetch, _ssh_run, _ssh_stream_command
 from .reporting import _write_source_missing_only_log
 from .runtime import CANCEL, _acquire_tape_io_lock, _fmt_eta, _phase, _priority_class, _progress_done, _progress_line, _release_tape_io_lock, _status, compute_affinity_sets, pin_current_process, unpin_current_process
 from .skipped import SkippedFileTracker
@@ -37,6 +40,7 @@ _FIND_WARNING_RE = re.compile(r"^find:\s+[\"'`‘](.*?)[\"'`’]:\s*(.*)$")
 # A fetch this far past its planned bytes gets one loud alert; the hard
 # abort threshold is the configurable fetch_overrun_abort_factor.
 _FETCH_OVERRUN_WARN_FACTOR = 1.10
+_FIND_PATH_QUOTES = "\"'`\u2018\u2019\u201c\u201d\ufffd?"
 
 
 class RemoteScanner:
@@ -52,6 +56,12 @@ class RemoteScanner:
         self.ui = ui or ConsoleUI()
 
     def _record_find_warnings(self, stderr):
+        def clean_find_path(path):
+            path = (path or '').strip(_FIND_PATH_QUOTES)
+            for marker in ("ג€˜", "ג€™", "ג€�", "ג€?"):
+                path = path.removeprefix(marker).removesuffix(marker)
+            return path.strip(_FIND_PATH_QUOTES)
+
         for line in (stderr or '').splitlines():
             line = line.strip()
             if not line:
@@ -59,13 +69,16 @@ class RemoteScanner:
             match = _FIND_WARNING_RE.match(line)
             if match:
                 path, reason = match.groups()
+                path = clean_find_path(path)
+            elif line.startswith("find:") and ": " in line:
+                path, reason = line[len("find:"):].strip().rsplit(": ", 1)
+                path = clean_find_path(path)
             else:
                 path, reason = line, "remote find warning"
             self.skipped_tracker.add('remote', path, reason, 'scan')
 
-    def scan(self, scan_paths):
-        quoted_paths = ' '.join(shlex.quote(path) for path in scan_paths)
-        find_cmd = f"find {quoted_paths} -type f -printf '%s %p\\0'"
+    def _scan_one(self, scan_path):
+        find_cmd = f"find {shlex.quote(scan_path)} -type f -printf '%s %p\\0'"
         result = _ssh_run(
             self.remote_user,
             self.remote_host,
@@ -76,7 +89,17 @@ class RemoteScanner:
         )
         stdout = result.stdout or ''
         stderr = (result.stderr or '').strip()
-        if result.returncode == 255 or (result.returncode != 0 and not stdout.strip()):
+        if result.returncode == 124:
+            if stderr:
+                self._record_find_warnings(stderr)
+            raise RuntimeError(
+                f"[REMOTE] SSH scan timed out while scanning {scan_path!r}. "
+                "The partial find output was discarded so an incomplete backup "
+                "session cannot be created. Increase "
+                "[PERFORMANCE] ssh_command_timeout_seconds or split the "
+                "selection into smaller runs, then start a fresh session."
+            )
+        if result.returncode == 255:
             raise RuntimeError(
                 f"[REMOTE] SSH scan failed (exit {result.returncode}):\n{stderr}"
             )
@@ -86,6 +109,12 @@ class RemoteScanner:
                 f"[REMOTE] Scan completed with warnings (find exit {result.returncode}); "
                 "inaccessible paths were recorded in the skipped-file report."
             )
+            if not stdout.strip():
+                return []
+        elif result.returncode != 0 and not stdout.strip():
+            raise RuntimeError(
+                f"[REMOTE] SSH scan failed (exit {result.returncode}):\n{stderr}"
+            )
         if stdout and not stdout.endswith('\0'):
             # find terminates every record with NUL; a different tail means the
             # stream was cut mid-record. The fragment is rejected below (its
@@ -94,8 +123,7 @@ class RemoteScanner:
                 "[REMOTE] Scan stream ended mid-record (truncated transfer?); "
                 "the partial record was discarded and recorded as skipped."
             )
-        roots = [posixpath.normpath(p.replace('\\', '/').strip())
-                 for p in scan_paths]
+        root = posixpath.normpath(scan_path.replace('\\', '/').strip())
         manifest = []
         for record in stdout.split('\0'):
             if not record:
@@ -115,8 +143,7 @@ class RemoteScanner:
             # path like '/strg' names a directory and would make the fetch tar
             # stream an entire unplanned tree.
             norm = posixpath.normpath(path)
-            if not any(norm == root or norm.startswith(root + '/')
-                       for root in roots):
+            if not (norm == root or norm.startswith(root + '/')):
                 self.skipped_tracker.add(
                     'remote', path,
                     "scan record outside scan roots (truncated stream?)",
@@ -124,6 +151,148 @@ class RemoteScanner:
                 continue
             manifest.append((path, size))
         return manifest
+
+    def scan(self, scan_paths):
+        manifest = []
+        for scan_path in scan_paths:
+            self.ui.info(f"[REMOTE] Scanning {scan_path} ...")
+            manifest.extend(self._scan_one(scan_path))
+        return manifest
+
+
+class StreamingRemoteScanner(RemoteScanner):
+    """Yield remote find records as they arrive over a long-lived SSH stream."""
+
+    def __init__(self, remote_user, remote_host, remote_password='',
+                 skipped_tracker=None, ui=None, cipher=''):
+        super().__init__(
+            remote_user,
+            remote_host,
+            remote_password=remote_password,
+            timeout=None,
+            skipped_tracker=skipped_tracker,
+            ui=ui,
+        )
+        self.cipher = cipher
+
+    def _parse_record(self, record, root):
+        parts = record.split(' ', 1)
+        if len(parts) != 2:
+            return None
+        size_s, path = parts
+        try:
+            size = int(size_s)
+        except ValueError:
+            self.skipped_tracker.add(
+                'remote', path, f"invalid find size token: {size_s}", 'scan')
+            return None
+        norm = posixpath.normpath(path)
+        if not (norm == root or norm.startswith(root + '/')):
+            self.skipped_tracker.add(
+                'remote', path,
+                "scan record outside scan roots (truncated stream?)",
+                'scan')
+            return None
+        return path, size
+
+    def iter_scan(self, scan_paths, stop_evt=None):
+        for scan_path in scan_paths:
+            if stop_evt is not None and stop_evt.is_set():
+                return
+            yield from self._iter_scan_one(scan_path, stop_evt=stop_evt)
+
+    def _iter_scan_one(self, scan_path, stop_evt=None):
+        self.ui.info(f"[REMOTE] Streaming scan {scan_path} ...")
+        root = posixpath.normpath(scan_path.replace('\\', '/').strip())
+        find_cmd = f"find {shlex.quote(scan_path)} -type f -printf '%s %p\\0'"
+        ssh_cmd, env, err = _ssh_stream_command(
+            self.remote_user,
+            self.remote_host,
+            find_cmd,
+            password=self.remote_password,
+            cipher=self.cipher,
+        )
+        if err:
+            raise RuntimeError(f"[REMOTE] SSH scan failed: {err}")
+        if ssh_cmd is None:
+            raise RuntimeError("[REMOTE] SSH scan failed: no command produced")
+
+        proc = subprocess.Popen(
+            ssh_cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
+        stderr_chunks = []
+
+        def _drain_stderr():
+            try:
+                while True:
+                    chunk = proc.stderr.read(65536) if proc.stderr else b''
+                    if not chunk:
+                        return
+                    stderr_chunks.append(chunk)
+            except OSError:
+                return
+
+        stderr_thread = threading.Thread(
+            target=_drain_stderr, name='streaming-find-stderr', daemon=True)
+        stderr_thread.start()
+
+        decoder = codecs.getincrementaldecoder('utf-8')('replace')
+        buffer = ''
+        saw_record = False
+        try:
+            while True:
+                if stop_evt is not None and stop_evt.is_set():
+                    proc.terminate()
+                    break
+                chunk = proc.stdout.read(65536) if proc.stdout else b''
+                if not chunk:
+                    break
+                buffer += decoder.decode(chunk)
+                while '\0' in buffer:
+                    record, buffer = buffer.split('\0', 1)
+                    if not record:
+                        continue
+                    parsed = self._parse_record(record, root)
+                    if parsed is not None:
+                        saw_record = True
+                        yield parsed
+            tail = decoder.decode(b'', final=True)
+            if tail:
+                buffer += tail
+            if buffer:
+                self.ui.warning(
+                    "[REMOTE] Scan stream ended mid-record (truncated transfer?); "
+                    "the partial record was discarded and recorded as skipped."
+                )
+                self._parse_record(buffer, root)
+        finally:
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            stderr_thread.join(timeout=5)
+
+        stderr = b''.join(stderr_chunks).decode('utf-8', errors='replace').strip()
+        if proc.returncode == 255:
+            raise RuntimeError(
+                f"[REMOTE] SSH scan failed (exit {proc.returncode}):\n{stderr}"
+            )
+        if proc.returncode != 0 and stderr:
+            self._record_find_warnings(stderr)
+            self.ui.warning(
+                f"[REMOTE] Streaming scan completed with warnings "
+                f"(find exit {proc.returncode}); inaccessible paths were "
+                "recorded in the skipped-file report."
+            )
+        elif proc.returncode != 0 and not saw_record:
+            raise RuntimeError(
+                f"[REMOTE] SSH scan failed (exit {proc.returncode}):\n{stderr}"
+            )
 
 
 class ChunkPlanner:
@@ -166,6 +335,43 @@ class ChunkPlanner:
         return chunks
 
 
+class StreamingChunkBuilder:
+    """Build threshold-sized chunks in discovery order."""
+
+    def __init__(self, budget_bytes, alloc_unit=1, padding_factor=1.0):
+        self.planner = ChunkPlanner(
+            budget_bytes, alloc_unit=alloc_unit, padding_factor=padding_factor)
+        self.current = []
+        self.current_fp = 0
+
+    def add(self, remote_path, fsize):
+        fp = self.planner.footprint(fsize)
+        if fp > self.planner.budget_bytes:
+            chunks = []
+            if self.current:
+                chunks.append(self.current)
+                self.current = []
+                self.current_fp = 0
+            chunks.append([(remote_path, fsize)])
+            return chunks
+        if self.current and self.current_fp + fp > self.planner.budget_bytes:
+            ready = self.current
+            self.current = [(remote_path, fsize)]
+            self.current_fp = fp
+            return [ready]
+        self.current.append((remote_path, fsize))
+        self.current_fp += fp
+        return []
+
+    def flush(self):
+        if not self.current:
+            return []
+        ready = self.current
+        self.current = []
+        self.current_fp = 0
+        return [ready]
+
+
 class LocalOrchestrator:
     """Persistent local multi-tape archive workflow."""
 
@@ -180,6 +386,7 @@ class LocalOrchestrator:
         self.fill_pct = cfg.staging_fill_pct
 
     def _backup_writer(self, cls=_NoEjectBackup):
+        # type: (Type[LTOBackup]) -> LTOBackup
         return cls(
             self.db,
             self.cfg.ibm_eject_cmd,
@@ -716,7 +923,7 @@ class RemoteOrchestrator:
         self.db           = db
         self.ui           = ui or ConsoleUI()
         self.skipped_tracker = skipped_tracker or SkippedFileTracker()
-        self.notifier     = TelegramNotifier.from_config(cfg)
+        self.notifier = TelegramNotifier.from_config(cfg)  # type: Optional[TelegramNotifier]
         self.remote_host  = cfg.remote_host
         self.remote_user  = cfg.remote_user
         self.remote_password = cfg.remote_password
@@ -848,6 +1055,16 @@ class RemoteOrchestrator:
                   "data. A new session appends its own directory set to the "
                   "tape; existing data is not overwritten.")
 
+        if not self.db.tape_exists(tape_label):
+            print(f"[TAPE] '{tape_label}' not in database. Registering...")
+            cap = input(f"Tape capacity in GB (default {DEFAULT_TAPE_CAPACITY_GB} "
+                        "for 12 TB, Enter to skip): ").strip()
+            self.db.register_tape(
+                tape_label,
+                int(cap) if cap.isdigit() else DEFAULT_TAPE_CAPACITY_GB)
+
+        tape_context = self._remote_tape_capacity_context(tape_label)
+
         ts            = datetime.now().strftime('%Y%m%d_%H%M%S')
         session_label = f"REMOTE_{self.remote_host.split('.')[0]}_{ts}"
 
@@ -860,20 +1077,7 @@ class RemoteOrchestrator:
             for path in self.remote_scan_paths:
                 print(f"  - {path}")
 
-        manifest = self._scan_remote()
-        if not manifest:
-            print("[REMOTE] No files found on remote host. Aborting.")
-            return
-
-        total_bytes = sum(sz for _, sz in manifest)
-        print(f"[REMOTE] Found {len(manifest)} file(s) "
-              f"({total_bytes / 1024**3:.2f} GB total).")
-
-        chunks = self._bin_pack(manifest)
-        print(f"[REMOTE] Split into {len(chunks)} chunk(s) "
-              f"(staging budget: {self._chunk_budget() / 1024**3:.2f} GB each).")
-
-        if not self._confirm_start(tape_label, len(manifest), total_bytes, len(chunks)):
+        if not self._confirm_start(tape_label, tape_context):
             if replacing_session:
                 print("[REMOTE] Cancelled before creating backup session. "
                       f"Previous session remains resumable: "
@@ -882,14 +1086,14 @@ class RemoteOrchestrator:
                 print("[REMOTE] Cancelled before creating backup session.")
             return
 
-        if not self.db.tape_exists(tape_label):
-            print(f"[TAPE] '{tape_label}' not in database. Registering...")
-            cap = input(f"Tape capacity in GB (default {DEFAULT_TAPE_CAPACITY_GB} "
-                        "for 12 TB, Enter to skip): ").strip()
-            self.db.register_tape(
-                tape_label,
-                int(cap) if cap.isdigit() else DEFAULT_TAPE_CAPACITY_GB)
-
+        session_id = self.db.create_remote_streaming_session(
+            session_label=session_label,
+            remote_host=self.remote_host,
+            remote_user=self.remote_user,
+            remote_path=self.remote_session_path,
+            tape_label=tape_label,
+            staging_dir=self.staging_dir,
+        )
         if replacing_session:
             self.db.update_remote_session(
                 replacing_session['session_id'],
@@ -897,25 +1101,7 @@ class RemoteOrchestrator:
             )
             print(f"[REMOTE] Abandoned session: {replacing_session['session_label']}")
 
-        rows = []
-        for chunk_idx, chunk_files in enumerate(chunks):
-            for remote_fpath, fsize in chunk_files:
-                rows.append((chunk_idx, remote_fpath,
-                              os.path.basename(remote_fpath), fsize))
-        # One transaction: the session only becomes visible together with its
-        # chunk plan, so a crash here can never leave a plan-less 'active'
-        # session that a later resume would silently mark 'completed'.
-        session_id = self.db.create_remote_session_with_plan(
-            session_label=session_label,
-            remote_host=self.remote_host,
-            remote_user=self.remote_user,
-            remote_path=self.remote_session_path,
-            tape_label=tape_label,
-            staging_dir=self.staging_dir,
-            rows=rows,
-        )
-
-        self._run_session(session_id)
+        self._run_streaming_session(session_id)
 
     def _resolve_tape_label(self):
         detected = get_volume_label(self.cfg.lto_drive)
@@ -926,20 +1112,49 @@ class RemoteOrchestrator:
         label = input("Enter tape Volume Label manually (or Enter to cancel): ").strip()
         return label if label else None
 
-    def _confirm_start(self, tape_label, file_count, total_bytes, chunk_count):
+    def _confirm_start(self, tape_label, tape_context):
         if not self.confirm_before_backup:
             return True
         print("\n[REMOTE] Approval required before backup starts.")
         print(f"  Host : {self.remote_user}@{self.remote_host}")
         print(f"  Tape : {tape_label}")
         print(f"  Base : {self.remote_path}")
-        print(f"  Files: {file_count} ({total_bytes / 1024**3:.2f} GB)")
-        print(f"  Plan : {chunk_count} chunk(s)")
+        print(f"  Mode : continuous streaming scan -> fetch/pack -> tape")
+        print(f"  Chunk: target up to {self._chunk_budget() / 1024**3:.2f} GiB")
+        print(f"  Stage: prefetch {self.prefetch_ahead} ahead, cap "
+              f"{self.staging_max_bytes / 1024**3:.0f} GiB")
+        print(f"  Tape : {tape_context['available_bytes'] / 1024**3:.2f} GiB "
+              "available under the DB safety budget")
         print("  Paths:")
         for path in self.remote_scan_paths:
             print(f"    - {path}")
         choice = input("Type 'yes' to start writing to tape: ").strip().lower()
         return choice == 'yes'
+
+    def _remote_tape_capacity_context(self, tape_label, session_id=None):
+        tape = self.db.get_tape(tape_label)
+        if not tape:
+            raise RuntimeError(f"[DB] Tape '{tape_label}' is not registered.")
+        used_bytes = self.db.recalculate_tape_used_space(tape_label)
+        capacity_bytes = LOCAL_TAPE_BUDGET_BYTES
+        if tape['total_capacity']:
+            capacity_bytes = min(
+                capacity_bytes, int(tape['total_capacity'] * 1024**3))
+        reserved_bytes = 0
+        if session_id is not None and hasattr(
+                self.db, 'get_pending_remote_reserved_bytes'):
+            reserved_bytes = self.db.get_pending_remote_reserved_bytes(session_id)
+        available_bytes = max(0, capacity_bytes - used_bytes - reserved_bytes)
+        print(f"[TAPE] '{tape_label}': DB occupied "
+              f"{used_bytes / 1024**3:.2f} GiB; "
+              f"reserved pending {reserved_bytes / 1024**3:.2f} GiB; "
+              f"streaming available {available_bytes / 1024**3:.2f} GiB.")
+        return {
+            'used_bytes': used_bytes,
+            'capacity_bytes': capacity_bytes,
+            'reserved_bytes': reserved_bytes,
+            'available_bytes': available_bytes,
+        }
 
     # ------------------------------------------------------------------
     # Remote scanning
@@ -990,6 +1205,260 @@ class RemoteOrchestrator:
     # Pipeline execution
     # ------------------------------------------------------------------
 
+    def _run_streaming_session(self, session_id):
+        """Scan, persist, stage, and write chunks as one continuous pipeline."""
+        session_row = self.db.get_remote_session(session_id)
+        tape_label = session_row['tape_label']
+        if not _ensure_lto_drive_ready(self.cfg.lto_drive):
+            return
+
+        self._staged_bytes = 0
+        self._producer_err = None
+        self._producer_chunk = None
+        self._consumer_chunk = None
+
+        if self.fetch_cores:
+            pin_current_process(self.fetch_cores, label='fetch/pack')
+
+        _phase('PIPELINE', "Continuous remote stream to tape | "
+                           f"prefetch {self.prefetch_ahead} ahead | "
+                           f"staging cap {self.staging_max_bytes / 1024**3:.0f} GB")
+        print(f"[WARNING] {LTFS_WRITE_WARNING}")
+
+        chunk_q = queue.Queue(maxsize=max(1, self.prefetch_ahead * 2))
+        ready_q = queue.Queue(maxsize=self.prefetch_ahead)
+        stop_pipeline = threading.Event()
+        hb_stop = threading.Event()
+        SENTINEL = object()
+
+        tape_context = self._remote_tape_capacity_context(
+            tape_label, session_id=session_id)
+        remaining_lock = threading.Lock()
+        remaining_bytes: Dict[str, int] = {'value': tape_context['available_bytes']}
+        next_chunk_index: Dict[str, int] = {'value': (
+            self.db.get_next_remote_chunk_index(session_id)
+            if hasattr(self.db, 'get_next_remote_chunk_index')
+            else self.db.count_chunks(session_id)
+        )}
+        scan_stats: Dict[str, int] = {'chunks': 0, 'files': 0, 'bytes': 0}
+        scan_error: Dict[str, Optional[str]] = {'message': None}
+
+        def _queue_put(q, item):
+            while not (CANCEL.is_set() or stop_pipeline.is_set()):
+                try:
+                    q.put(item, timeout=1)
+                    return True
+                except queue.Full:
+                    continue
+            return False
+
+        def _force_put(q, item):
+            while True:
+                try:
+                    q.put(item, timeout=1)
+                    return
+                except queue.Full:
+                    if CANCEL.is_set():
+                        return
+
+        def _chunk_rows(chunk_index, chunk_files):
+            return [
+                (chunk_index, remote_fpath, os.path.basename(remote_fpath), fsize)
+                for remote_fpath, fsize in chunk_files
+            ]
+
+        def _append_chunk(chunk_files):
+            if hasattr(self.db, 'get_remote_existing_snapshot_paths'):
+                existing = self.db.get_remote_existing_snapshot_paths(
+                    session_id, [remote_fpath for remote_fpath, _ in chunk_files])
+                chunk_files = [
+                    (remote_fpath, fsize)
+                    for remote_fpath, fsize in chunk_files
+                    if remote_fpath.replace('\\', '/') not in existing
+                ]
+                if not chunk_files:
+                    return True
+            logical_bytes = sum(fsize for _, fsize in chunk_files)
+            with remaining_lock:
+                if logical_bytes > remaining_bytes['value']:
+                    msg = (
+                        f"next remote chunk needs {logical_bytes / 1024**3:.2f} GiB, "
+                        f"but only {remaining_bytes['value'] / 1024**3:.2f} GiB "
+                        "remains on the mounted tape under the DB safety budget"
+                    )
+                    scan_error['message'] = msg
+                    self.db.mark_remote_scan_error(session_id, msg)
+                    print(f"[TAPE] {msg}. Stopping before overfill.")
+                    stop_pipeline.set()
+                    return False
+
+            chunk_index = next_chunk_index['value']
+            result = self.db.append_remote_streaming_chunk(
+                session_id, chunk_index, _chunk_rows(chunk_index, chunk_files))
+            inserted_files = int(result.get('inserted_files', 0))
+            inserted_bytes = int(result.get('inserted_bytes', 0))
+            if inserted_files == 0:
+                return True
+
+            with remaining_lock:
+                remaining_bytes['value'] = max(
+                    0, remaining_bytes['value'] - inserted_bytes)
+            next_chunk_index['value'] += 1
+            scan_stats['chunks'] += 1
+            scan_stats['files'] += inserted_files
+            scan_stats['bytes'] += inserted_bytes
+            _status('SCAN', f"Chunk {chunk_index + 1} planned: "
+                            f"{inserted_files:,} file(s), "
+                            f"{inserted_bytes / 1024**3:.2f} GiB")
+            return _queue_put(chunk_q, chunk_index)
+
+        def _scanner_planner():
+            try:
+                for ci in self.db.get_pending_chunks(session_id):
+                    if not _queue_put(chunk_q, ci):
+                        return
+
+                budget = self._chunk_budget()
+                builder = StreamingChunkBuilder(
+                    budget,
+                    alloc_unit=_volume_cluster_size(self.staging_dir),
+                    padding_factor=self.staging_padding,
+                )
+                scanner = StreamingRemoteScanner(
+                    self.remote_user,
+                    self.remote_host,
+                    remote_password=self.remote_password,
+                    skipped_tracker=self.skipped_tracker,
+                    ui=self.ui,
+                    cipher=self.ssh_cipher,
+                )
+                for remote_fpath, fsize in scanner.iter_scan(
+                        self.remote_scan_paths, stop_evt=stop_pipeline):
+                    if CANCEL.is_set() or stop_pipeline.is_set():
+                        return
+                    for chunk in builder.add(remote_fpath, fsize):
+                        if not _append_chunk(chunk):
+                            return
+                for chunk in builder.flush():
+                    if not _append_chunk(chunk):
+                        return
+                if not (CANCEL.is_set() or stop_pipeline.is_set()):
+                    self.db.mark_remote_scan_complete(session_id)
+                    _status('SCAN', f"Complete: {scan_stats['chunks']:,} new "
+                                    f"chunk(s), {scan_stats['files']:,} file(s), "
+                                    f"{scan_stats['bytes'] / 1024**3:.2f} GiB")
+            except Exception as e:
+                scan_error['message'] = str(e)
+                self.db.mark_remote_scan_error(session_id, str(e))
+                self._producer_err = str(e)
+                stop_pipeline.set()
+            finally:
+                _force_put(chunk_q, SENTINEL)
+
+        def _stager():
+            try:
+                while not (CANCEL.is_set() or stop_pipeline.is_set()):
+                    item = chunk_q.get()
+                    if item is SENTINEL:
+                        break
+                    ci = item
+                    summary = self.db.get_chunk_size_summary(
+                        session_id, ci).get(ci, (0, 0, 0))
+                    planned_bytes, _, planned_files = summary
+                    self._await_staging_capacity(
+                        planned_bytes, planned_files, stop_pipeline)
+                    if CANCEL.is_set() or stop_pipeline.is_set():
+                        break
+                    desc = self._stage_chunk(
+                        session_id, ci, self.db.get_chunk_files(session_id, ci))
+                    if desc is None:
+                        if not CANCEL.is_set():
+                            self._producer_err = (
+                                f"chunk {ci + 1} could not be staged")
+                        stop_pipeline.set()
+                        break
+                    if not _queue_put(ready_q, desc):
+                        self._discard_desc(desc)
+                        break
+            except Exception as e:
+                self._producer_err = str(e)
+                stop_pipeline.set()
+            finally:
+                _force_put(ready_q, SENTINEL)
+
+        scanner_thread = threading.Thread(
+            target=_scanner_planner, name='streaming-scanner', daemon=True)
+        stager_thread = threading.Thread(
+            target=_stager, name='streaming-stager', daemon=True)
+        scanner_thread.start()
+        stager_thread.start()
+        self._start_pipeline_heartbeat(hb_stop, ready_q, "streaming")
+
+        completed = 0
+        failed = False
+        try:
+            while True:
+                desc = ready_q.get()
+                if desc is SENTINEL:
+                    break
+                if CANCEL.is_set():
+                    self._discard_desc(desc)
+                    break
+                if not self._write_chunk(
+                        session_id, desc, tape_label, eject_after=False):
+                    if not CANCEL.is_set():
+                        self._discard_desc(desc)
+                    failed = True
+                    stop_pipeline.set()
+                    break
+                completed += 1
+        finally:
+            stop_pipeline.set()
+            hb_stop.set()
+            try:
+                while True:
+                    leftover = ready_q.get_nowait()
+                    if leftover is not SENTINEL:
+                        self._discard_desc(leftover)
+            except queue.Empty:
+                pass
+            scanner_thread.join(timeout=15)
+            stager_thread.join(timeout=15)
+            if self.fetch_cores:
+                unpin_current_process()
+
+        if CANCEL.is_set():
+            print("\n[ABORTED] Stopped by user. Session saved - re-run option 6 "
+                  "to resume from the interrupted chunk.")
+            return
+        if failed or self._producer_err or scan_error['message']:
+            msg = self._producer_err or scan_error['message'] or (
+                "a chunk failed during tape write")
+            print(f"\n[REMOTE] Streaming pipeline stopped: {msg}. "
+                  "Re-run to resume when the condition is fixed.")
+            send_best_effort(
+                self.notifier,
+                f"[PIPELINE] STOPPED: {msg}. Re-run to resume.")
+            return
+
+        session_row = self.db.get_remote_session(session_id)
+        if session_row and session_row.get('scan_complete'):
+            pending = self.db.get_pending_chunks(session_id)
+            if not pending:
+                self.db.update_remote_session(
+                    session_id, status='completed',
+                    completed_at=datetime.now().isoformat()
+                )
+                self._backup_writer(LTOBackup).eject_tape(self.cfg.lto_drive)
+                print("\n[REMOTE] Session complete. All streamed chunks archived.")
+                send_best_effort(
+                    self.notifier,
+                    f"[PIPELINE] Session complete - {completed} chunk(s) "
+                    "written in this run.")
+            else:
+                print(f"\n[REMOTE] Scan complete; {len(pending)} chunk(s) "
+                      "remain pending. Re-run to resume.")
+
     def _run_session(self, session_id):
         """Stream pending chunks to tape with a deep-prefetch pipeline.
 
@@ -1000,6 +1469,9 @@ class RemoteOrchestrator:
         tape never starves on the network (no shoe-shining)."""
         session_row    = self.db.get_remote_session(session_id)
         tape_label     = session_row['tape_label']
+        if not session_row.get('scan_complete', True):
+            self._run_streaming_session(session_id)
+            return
         pending_chunks = self.db.get_pending_chunks(session_id)
         total_chunks   = self.db.count_chunks(session_id)
         done_count     = total_chunks - len(pending_chunks)

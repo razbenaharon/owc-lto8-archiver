@@ -14,25 +14,34 @@ with ``PGPASSWORD=change_me_local``.
 import unittest
 import uuid
 from pathlib import Path
+from typing import Any, TYPE_CHECKING, cast
 
-try:
+if TYPE_CHECKING:
     import psycopg
     from psycopg import errors
     from psycopg.rows import dict_row
-except ImportError:  # pragma: no cover - skipped when psycopg is absent
-    psycopg = None
-    errors = None
-    dict_row = None
+else:
+    try:
+        import psycopg
+        from psycopg import errors
+        from psycopg.rows import dict_row
+    except ImportError:  # pragma: no cover - skipped when psycopg is absent
+        psycopg = None
+        errors = None
+        dict_row = None
 
 from src.pg_bulk import build_conninfo
+
+
+def _connect(*args, **kwargs) -> Any:
+    return cast(Any, psycopg.connect(*args, **kwargs))
 
 
 def _pg_available():
     if psycopg is None:
         return False
     try:
-        with psycopg.connect(build_conninfo(dbname="postgres"),
-                             connect_timeout=3):
+        with _connect(build_conninfo(dbname="postgres"), connect_timeout=3):
             return True
     except Exception:
         return False
@@ -45,8 +54,8 @@ class PgIntegrationTests(unittest.TestCase):
         from src.pg_db import PgDatabaseManager
 
         cls.dbname = f"lto_test_{uuid.uuid4().hex[:12]}"
-        with psycopg.connect(build_conninfo(dbname="postgres"),
-                             autocommit=True) as conn:
+        with _connect(build_conninfo(dbname="postgres"),
+                      autocommit=True) as conn:
             conn.execute(f'CREATE DATABASE "{cls.dbname}"')
         cls.conninfo = build_conninfo(dbname=cls.dbname)
         cls.db = PgDatabaseManager(cls.conninfo)
@@ -57,8 +66,8 @@ class PgIntegrationTests(unittest.TestCase):
             cls.db.close()
         except Exception:
             pass
-        with psycopg.connect(build_conninfo(dbname="postgres"),
-                             autocommit=True) as conn:
+        with _connect(build_conninfo(dbname="postgres"),
+                      autocommit=True) as conn:
             conn.execute(
                 "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
                 "WHERE datname = %s AND pid <> pg_backend_pid()",
@@ -68,12 +77,12 @@ class PgIntegrationTests(unittest.TestCase):
     # -- helpers -------------------------------------------------------------
 
     def _query(self, sql, params=()):
-        with psycopg.connect(self.conninfo, autocommit=True,
-                             row_factory=dict_row) as conn:
+        with _connect(self.conninfo, autocommit=True,
+                      row_factory=cast(Any, dict_row)) as conn:
             return conn.execute(sql, params).fetchall()
 
     def _exec(self, sql, params=()):
-        with psycopg.connect(self.conninfo, autocommit=True) as conn:
+        with _connect(self.conninfo, autocommit=True) as conn:
             conn.execute(sql, params)
 
     @staticmethod
@@ -96,7 +105,8 @@ class PgIntegrationTests(unittest.TestCase):
             self._loose("/srv/data/report_2024.txt", "TA"),
             self._loose("/srv/data/reportX2024.txt", "TA"),
         ])
-        hits = self.db.search_catalog(name_query="report_2024", tape_label="TA")
+        hits = cast(Any, self.db.search_catalog(
+            name_query="report_2024", tape_label="TA"))
         self.assertEqual([h["file_name"] for h in hits], ["report_2024.txt"])
         self.assertEqual(self.db.count_search_files("report_2024"), 1)
 
@@ -109,7 +119,8 @@ class PgIntegrationTests(unittest.TestCase):
         ])
         movs = self.db.search_catalog(name_query="*.mov", tape_label="TB")
         self.assertEqual(len(movs), 2)
-        clips = self.db.search_catalog(name_query="clip_*", tape_label="TB")
+        clips = cast(Any, self.db.search_catalog(
+            name_query="clip_*", tape_label="TB"))
         self.assertEqual(
             sorted(m["file_name"] for m in clips),
             ["clip_alpha.mov", "clip_beta.mov"])
@@ -120,7 +131,7 @@ class PgIntegrationTests(unittest.TestCase):
             self._loose("/mnt/data_2024/a.txt", "TF"),
             self._loose("/mnt/dataX2024/b.txt", "TF"),
         ])
-        hits = self.db.search_by_directory("/mnt/data_2024")
+        hits = cast(Any, self.db.search_by_directory("/mnt/data_2024"))
         self.assertEqual([h["file_name"] for h in hits], ["a.txt"])
         self.assertEqual(self.db.count_by_directory("/mnt/data_2024"), 1)
 
@@ -315,7 +326,7 @@ class PgIntegrationTests(unittest.TestCase):
         sid = self.db.create_remote_session_with_plan(
             "PLAN_S", "host.example", "user", "/plan", "TRP", "C:/stage",
             rows=rows)
-        session = self.db.get_remote_session(sid)
+        session = cast(Any, self.db.get_remote_session(sid))
         self.assertEqual(session["total_files"], 2)
         self.assertEqual(session["total_bytes"], 30)
         self.assertEqual(session["chunk_count"], 2)
@@ -350,6 +361,41 @@ class PgIntegrationTests(unittest.TestCase):
         self.assertEqual(present, 5)
         self.assertEqual(count, 2)
 
+    def test_remote_streaming_session_appends_chunks_idempotently(self):
+        self.db.register_tape("TSTR")
+        sid = self.db.create_remote_streaming_session(
+            "STREAM_S", "host.example", "user", "/stream", "TSTR",
+            "C:/stage")
+        session = cast(Any, self.db.get_remote_session(sid))
+        self.assertFalse(session["scan_complete"])
+        self.assertEqual(session["total_files"], 0)
+        self.assertEqual(self.db.count_chunks(sid), 0)
+
+        first = self.db.append_remote_streaming_chunk(sid, 0, [
+            (0, "/stream/a.bin", "a.bin", 10),
+            (0, "/stream/b.bin", "b.bin", 20),
+        ])
+        self.assertEqual(first, {"inserted_files": 2, "inserted_bytes": 30})
+        self.assertEqual(self.db.get_pending_chunks(sid), [0])
+        self.assertEqual(self.db.get_next_remote_chunk_index(sid), 1)
+        self.assertEqual(self.db.get_chunk_size_summary(sid)[0], (30, 30, 2))
+
+        dup = self.db.append_remote_streaming_chunk(sid, 1, [
+            (1, "/stream/a.bin", "a.bin", 10),
+            (1, "/stream/c.bin", "c.bin", 5),
+        ])
+        self.assertEqual(dup, {"inserted_files": 1, "inserted_bytes": 5})
+        self.assertEqual(self.db.get_pending_chunks(sid), [0, 1])
+        self.assertEqual(self.db.get_chunk_size_summary(sid)[1], (5, 5, 1))
+
+        files = self.db.get_chunk_files(sid, 1)
+        self.assertEqual([row["remote_path"] for row in files],
+                         ["/stream/c.bin"])
+        self.assertEqual(self.db.get_pending_remote_reserved_bytes(sid), 35)
+        self.db.mark_remote_scan_complete(sid)
+        session = cast(Any, self.db.get_remote_session(sid))
+        self.assertTrue(session["scan_complete"])
+
     def test_delete_files_batch_reconciles_used_space(self):
         self.db.register_tape("TDEL")
         self.db.bulk_upsert_files([
@@ -357,9 +403,10 @@ class PgIntegrationTests(unittest.TestCase):
             self._loose("/del/b.bin", "TDEL", size=50),
         ])
         self.db.recalculate_tape_used_space("TDEL")
-        ids = [r["file_id"] for r in self.db.search_catalog(tape_label="TDEL")]
+        ids = [r["file_id"] for r in cast(
+            Any, self.db.search_catalog(tape_label="TDEL"))]
         self.assertEqual(self.db.delete_files([ids[0]]), 1)
-        tape = self.db.get_tape("TDEL")
+        tape = cast(Any, self.db.get_tape("TDEL"))
         remaining = self._query(
             "SELECT COALESCE(SUM(file_size_bytes),0) AS n FROM files_index "
             "WHERE tape_label=%s", ("TDEL",))[0]["n"]
@@ -374,8 +421,8 @@ class PgIntegrationTests(unittest.TestCase):
         seen = []
         after = 0
         while True:
-            page = self.db.search_catalog(
-                tape_label="TKS", limit=2, after_id=after)
+            page = cast(Any, self.db.search_catalog(
+                tape_label="TKS", limit=2, after_id=after))
             if not page:
                 break
             ids = [r["file_id"] for r in page]
@@ -409,14 +456,14 @@ class PgArchiveRunsMigrationTests(unittest.TestCase):
 
     def setUp(self):
         self.dbname = f"lto_mig_{uuid.uuid4().hex[:12]}"
-        with psycopg.connect(build_conninfo(dbname="postgres"),
-                             autocommit=True) as conn:
+        with _connect(build_conninfo(dbname="postgres"),
+                      autocommit=True) as conn:
             conn.execute(f'CREATE DATABASE "{self.dbname}"')
         self.conninfo = build_conninfo(dbname=self.dbname)
 
     def tearDown(self):
-        with psycopg.connect(build_conninfo(dbname="postgres"),
-                             autocommit=True) as conn:
+        with _connect(build_conninfo(dbname="postgres"),
+                      autocommit=True) as conn:
             conn.execute(
                 "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
                 "WHERE datname = %s AND pid <> pg_backend_pid()",
@@ -459,8 +506,8 @@ class PgArchiveRunsMigrationTests(unittest.TestCase):
         """)
 
     def test_migration_backfills_and_drops_legacy_column(self):
-        with psycopg.connect(self.conninfo, autocommit=True,
-                             row_factory=dict_row) as conn:
+        with _connect(self.conninfo, autocommit=True,
+                      row_factory=cast(Any, dict_row)) as conn:
             self._build_legacy_schema(conn)
             conn.execute(self._migration_sql())
 
@@ -492,7 +539,7 @@ class PgArchiveRunsMigrationTests(unittest.TestCase):
                 "VALUES ('bad', 'T', 'local', 424242, now())")
 
     def test_migration_is_idempotent(self):
-        with psycopg.connect(self.conninfo, autocommit=True) as conn:
+        with _connect(self.conninfo, autocommit=True) as conn:
             self._build_legacy_schema(conn)
             conn.execute(self._migration_sql())
             # Re-applying on the already-migrated schema must be a no-op.
@@ -504,13 +551,13 @@ class PgArchiveRunsMigrationTests(unittest.TestCase):
 
     @staticmethod
     def _exec_on(conninfo, sql, params=()):
-        with psycopg.connect(conninfo, autocommit=True) as conn:
+        with _connect(conninfo, autocommit=True) as conn:
             conn.execute(sql, params)
 
     @staticmethod
     def _query_on(conninfo, sql, params=()):
-        with psycopg.connect(conninfo, autocommit=True,
-                             row_factory=dict_row) as conn:
+        with _connect(conninfo, autocommit=True,
+                      row_factory=cast(Any, dict_row)) as conn:
             return conn.execute(sql, params).fetchall()
 
 

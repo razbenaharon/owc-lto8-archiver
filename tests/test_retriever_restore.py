@@ -9,6 +9,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from typing import Any, cast
 
 from src import retriever as retriever_mod
 from src.retriever import LTORetriever
@@ -34,7 +35,7 @@ class RestoreCollisionTests(unittest.TestCase):
         os.makedirs(self.tape)
         os.makedirs(self.restore)
         self.retriever = LTORetriever(
-            db=None, tape_drive="D:\\",
+            db=cast(Any, None), tape_drive="D:\\",
             staging_dir=os.path.join(self.tmp, "staging"),
             restore_dir=self.restore)
         self._orig_robocopy = retriever_mod._robocopy_file

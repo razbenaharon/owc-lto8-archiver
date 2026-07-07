@@ -6,6 +6,7 @@
 # Python bytecode cache
 __pycache__/
 *.pyc
+pyright-report.*
 
 # Virtual environment
 venv/

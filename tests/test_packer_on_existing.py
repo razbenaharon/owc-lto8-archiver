@@ -50,6 +50,7 @@ class PackerOnExistingTests(unittest.TestCase):
         metadata = LTOPacker(max_zip_size_gb=1).run(
             source=self.source, dest=self.dest, threshold_mb=100,
             on_existing="clean")
+        assert metadata is not None
 
         self.assertFalse(os.path.exists(os.path.join(self.dest, "stale.bin")))
         self.assertEqual([m["file_name"] for m in metadata], ["a.txt"])

@@ -1,14 +1,20 @@
 """High-throughput PostgreSQL ingest helpers."""
 import os
+from typing import TYPE_CHECKING
 
-try:
+if TYPE_CHECKING:
     import psycopg
     from psycopg.conninfo import make_conninfo
     from psycopg_pool import ConnectionPool
-except ImportError:  # pragma: no cover - exercised only when PG extras missing
-    psycopg = None
-    make_conninfo = None
-    ConnectionPool = None
+else:
+    try:
+        import psycopg
+        from psycopg.conninfo import make_conninfo
+        from psycopg_pool import ConnectionPool
+    except ImportError:  # pragma: no cover - exercised only when PG extras missing
+        psycopg = None
+        make_conninfo = None
+        ConnectionPool = None
 
 
 def require_psycopg():
@@ -44,10 +50,10 @@ def build_conninfo(
 
 
 def _conninfo_with_timeout(conninfo, connect_timeout):
+    conninfo = conninfo or build_conninfo()
     if not connect_timeout:
         return conninfo
-    return make_conninfo(conninfo or build_conninfo(),
-                         connect_timeout=int(connect_timeout))
+    return make_conninfo(conninfo, connect_timeout=int(connect_timeout))
 
 
 def make_pool(conninfo=None, *, min_size=2, max_size=8, pool_timeout=5,

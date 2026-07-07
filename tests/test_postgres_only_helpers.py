@@ -1,5 +1,5 @@
 import unittest
-from datetime import timezone
+from datetime import datetime, timezone
 
 from src.catalog_v3 import catalog_directory_chain, catalog_file_name
 from src.db import DatabaseManager, _apply_canonical_remote_paths, _file_record_key
@@ -60,6 +60,8 @@ class PostgresOnlyHelperTests(unittest.TestCase):
 
     def test_session_timestamp_strings_are_coerced_to_utc(self):
         value = _coerce_timestamptz("2026-07-02T09:30:00")
+        self.assertIsInstance(value, datetime)
+        assert isinstance(value, datetime)
         self.assertIsNotNone(value.tzinfo)
         self.assertEqual(value.utcoffset(), timezone.utc.utcoffset(value))
 
@@ -67,6 +69,8 @@ class PostgresOnlyHelperTests(unittest.TestCase):
         cursor = {"catalog_name": "a.txt", "file_id": 10}
         _order, cursor_sql, _columns = InspectorRepository._sort_parts(
             "name", cursor)
+        self.assertIsNotNone(cursor_sql)
+        assert cursor_sql is not None
         self.assertIn("%s", cursor_sql[0])
         self.assertNotIn("?", cursor_sql[0])
 

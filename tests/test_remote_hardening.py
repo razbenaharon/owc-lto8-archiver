@@ -6,7 +6,13 @@ from types import SimpleNamespace
 from unittest import mock
 
 from src.constants import LOCAL_STAGING_RESERVE_BYTES
-from src.orchestrators import ChunkPlanner, RemoteOrchestrator, RemoteScanner
+from src.orchestrators import (
+    ChunkPlanner,
+    RemoteOrchestrator,
+    RemoteScanner,
+    StreamingChunkBuilder,
+    StreamingRemoteScanner,
+)
 from src.remote_transport import (
     _ASKPASS_HELPERS,
     _cleanup_askpass_helpers,
@@ -116,6 +122,31 @@ class ChunkPlannerFootprintTests(unittest.TestCase):
         self.assertEqual(chunks, [[("/f/a", 5)]])
 
 
+class StreamingChunkBuilderTests(unittest.TestCase):
+    def test_emits_chunk_at_threshold(self):
+        builder = StreamingChunkBuilder(100, alloc_unit=1, padding_factor=1.0)
+        self.assertEqual(builder.add("/f/a", 60), [])
+        self.assertEqual(builder.add("/f/b", 50), [[("/f/a", 60)]])
+        self.assertEqual(builder.flush(), [[("/f/b", 50)]])
+
+    def test_oversized_file_gets_dedicated_chunk(self):
+        builder = StreamingChunkBuilder(100, alloc_unit=1, padding_factor=1.0)
+        self.assertEqual(builder.add("/f/a", 20), [])
+        self.assertEqual(
+            builder.add("/f/huge", 120),
+            [[("/f/a", 20)], [("/f/huge", 120)]],
+        )
+        self.assertEqual(builder.flush(), [])
+
+    def test_applies_cluster_padding(self):
+        builder = StreamingChunkBuilder(
+            10 * 4096, alloc_unit=4096, padding_factor=1.0)
+        for idx in range(10):
+            self.assertEqual(builder.add(f"/f/{idx}", 1), [])
+        self.assertEqual(builder.add("/f/10", 1),
+                         [[(f"/f/{idx}", 1) for idx in range(10)]])
+
+
 class FetchWatchdogTests(unittest.TestCase):
     def _orchestrator(self):
         orch = RemoteOrchestrator.__new__(RemoteOrchestrator)
@@ -192,6 +223,7 @@ class RemotePasswordSafetyTests(unittest.TestCase):
                 "user", "host", "tar", password="secret")
         self.assertIsNone(cmd)
         self.assertIsNone(env)
+        assert err is not None
         self.assertIn("disabled", err)
 
 
@@ -225,13 +257,50 @@ class RemoteScannerTests(unittest.TestCase):
             stdout="10 /strg/E/data/ok.txt\0931839 /strg",
             stderr="",
         )
-        with mock.patch("src.orchestrators._ssh_run", return_value=result):
+        empty = SimpleNamespace(returncode=0, stdout="", stderr="")
+        with mock.patch("src.orchestrators._ssh_run",
+                        side_effect=[result, empty]):
             manifest = scanner.scan(["/strg/E/data", "/strg/D/data"])
         self.assertEqual(manifest, [("/strg/E/data/ok.txt", 10)])
         self.assertEqual(tracker.count(), 1)
         item = tracker.items()[0]
         self.assertEqual(item.path, "/strg")
         self.assertIn("outside scan roots", item.reason)
+
+    def test_permission_denied_empty_root_is_skipped_and_next_root_continues(self):
+        tracker = SkippedFileTracker()
+        scanner = RemoteScanner(
+            "user", "host", skipped_tracker=tracker, timeout=10)
+        denied = SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="find: ג€˜/data/privateג€™: Permission denied",
+        )
+        ok = SimpleNamespace(
+            returncode=0,
+            stdout="12 /data/public/ok.txt\0",
+            stderr="",
+        )
+        with mock.patch("src.orchestrators._ssh_run",
+                        side_effect=[denied, ok]):
+            manifest = scanner.scan(["/data/private", "/data/public"])
+        self.assertEqual(manifest, [("/data/public/ok.txt", 12)])
+        self.assertEqual(tracker.count(), 1)
+        self.assertEqual(tracker.items()[0].path, "/data/private")
+        self.assertIn("Permission denied", tracker.items()[0].reason)
+
+    def test_timeout_discards_partial_scan_and_fails_session_creation(self):
+        tracker = SkippedFileTracker()
+        scanner = RemoteScanner(
+            "user", "host", skipped_tracker=tracker, timeout=10)
+        result = SimpleNamespace(
+            returncode=124,
+            stdout="10 /data/ok.txt\0",
+            stderr="SSH command timed out after 10s",
+        )
+        with mock.patch("src.orchestrators._ssh_run", return_value=result):
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                scanner.scan(["/data"])
 
     def test_scan_accepts_single_file_scan_root(self):
         tracker = SkippedFileTracker()
@@ -243,6 +312,76 @@ class RemoteScannerTests(unittest.TestCase):
             manifest = scanner.scan(["/data/one.bin"])
         self.assertEqual(manifest, [("/data/one.bin", 7)])
         self.assertEqual(tracker.count(), 0)
+
+
+class _ChunkPipe:
+    def __init__(self, chunks):
+        self.chunks = list(chunks)
+
+    def read(self, _size=-1):
+        if not self.chunks:
+            return b""
+        return self.chunks.pop(0)
+
+
+class _FakePopen:
+    def __init__(self, stdout_chunks, stderr=b"", returncode=0):
+        self.stdout = _ChunkPipe(stdout_chunks)
+        self.stderr = _ChunkPipe([stderr] if stderr else [])
+        self.returncode = returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = -15
+
+    def kill(self):
+        self.returncode = -9
+
+
+class StreamingRemoteScannerTests(unittest.TestCase):
+    def test_parses_records_split_across_reads(self):
+        scanner = StreamingRemoteScanner("user", "host")
+        proc = _FakePopen([b"10 /data/a", b".bin\0", b"12 /data/b.bin\0"])
+        with mock.patch("src.orchestrators._ssh_stream_command",
+                        return_value=(["ssh"], None, None)), \
+             mock.patch("src.orchestrators.subprocess.Popen",
+                        return_value=proc):
+            rows = list(scanner.iter_scan(["/data"]))
+        self.assertEqual(rows, [("/data/a.bin", 10), ("/data/b.bin", 12)])
+
+    def test_rejects_record_outside_scan_root(self):
+        tracker = SkippedFileTracker()
+        scanner = StreamingRemoteScanner("user", "host",
+                                         skipped_tracker=tracker)
+        proc = _FakePopen([b"10 /data/ok.bin\0", b"99 /strg\0"])
+        with mock.patch("src.orchestrators._ssh_stream_command",
+                        return_value=(["ssh"], None, None)), \
+             mock.patch("src.orchestrators.subprocess.Popen",
+                        return_value=proc):
+            rows = list(scanner.iter_scan(["/data"]))
+        self.assertEqual(rows, [("/data/ok.bin", 10)])
+        self.assertEqual(tracker.count(), 1)
+        self.assertIn("outside scan roots", tracker.items()[0].reason)
+
+    def test_nonzero_find_with_warning_keeps_valid_rows(self):
+        tracker = SkippedFileTracker()
+        scanner = StreamingRemoteScanner("user", "host",
+                                         skipped_tracker=tracker)
+        proc = _FakePopen(
+            [b"10 /data/ok.bin\0"],
+            stderr="find: '/data/private': Permission denied\n".encode(),
+            returncode=1,
+        )
+        with mock.patch("src.orchestrators._ssh_stream_command",
+                        return_value=(["ssh"], None, None)), \
+             mock.patch("src.orchestrators.subprocess.Popen",
+                        return_value=proc):
+            rows = list(scanner.iter_scan(["/data"]))
+        self.assertEqual(rows, [("/data/ok.bin", 10)])
+        self.assertEqual(tracker.count(), 1)
+        self.assertEqual(tracker.items()[0].path, "/data/private")
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ Licensed under the [MIT License](LICENSE) — © 2026 Raz Ben Aharon. Free to us
 - **Remote archive** — fetch files from a remote SSH host into local staging, pack them, and stream them to LTO
 - **Database Inspector GUI** — standalone PySide6 app for lazy browsing, searching, and managing the tape/file index without touching the CLI
 - **Storage Map** - run `python storage_map/create_dashboard.py` to launch a scan, then `python storage_map/check_status_create_dashboard.py --open` later to create `storage_map/index.html`
+- **Storage Map v2 (interactive)** - run `python storage_map/serve.py --open` for a local web dashboard with in-app scan/status/fetch buttons and a **tape-coverage** view matching each server's top-level directories, plus depth 2 inside `shared-data`, against the archive database
 
 ## Requirements
 
@@ -84,6 +85,9 @@ python inspect_db.py
 # Storage Map dashboard (optional rich/plotly visualizers)
 python storage_map/create_dashboard.py
 python storage_map/check_status_create_dashboard.py --open
+
+# Storage Map v2 — interactive web dashboard (requires fastapi/uvicorn)
+python storage_map/serve.py --open
 ```
 
 ### Main Menu

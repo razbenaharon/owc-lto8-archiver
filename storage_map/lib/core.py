@@ -74,6 +74,9 @@ except ImportError:  # pragma: no cover - exercised only when plotly is absent
 # writes its output, error log, launcher script, and completion sentinel.
 REMOTE_SCAN_DIR = '.storage_map/current'
 CONFIG_SECTION = 'STORAGE_MAP'
+TOP_LAYER_DEPTH = 1
+SHARED_DATA_DEPTH = 2
+SHARED_DATA_DIR = 'shared-data'
 
 # Human-readable size suffixes emitted by ``du -h`` (binary / base-1024).
 _UNIT_FACTORS = {
@@ -141,7 +144,13 @@ def load_storage_map_config(cfg):
                         fallback='storage_map').strip()
     dashboard_dir = raw_dash if os.path.isabs(raw_dash) else os.path.join(PROJECT_ROOT, raw_dash)
 
-    depth = _safe_int(conf.get(CONFIG_SECTION, 'scan_depth', fallback='2'), 2)
+    requested_depth = _safe_int(
+        conf.get(CONFIG_SECTION, 'scan_depth', fallback=str(SHARED_DATA_DEPTH)),
+        SHARED_DATA_DEPTH)
+    depth = max(TOP_LAYER_DEPTH, min(requested_depth, SHARED_DATA_DEPTH))
+    if requested_depth != depth:
+        print(f"[STORAGE_MAP] scan_depth={requested_depth} is outside the "
+              f"supported top-layer/shared-data view; using scan_depth={depth}.")
     poll_timeout = _safe_int(
         conf.get(CONFIG_SECTION, 'poll_timeout_seconds', fallback='14400'), 14400)
 
@@ -185,6 +194,14 @@ def _safe_int(value, default):
         return default
 
 
+def _shared_data_child(mount):
+    """Return the shared-data child path for a configured POSIX mount."""
+    mount = (mount or '').rstrip('/') or '/'
+    if mount == '/':
+        return '/' + SHARED_DATA_DIR
+    return mount + '/' + SHARED_DATA_DIR
+
+
 # --------------------------------------------------------------------------- #
 # Stage 1 — Scanner (fire-and-forget)                                         #
 # --------------------------------------------------------------------------- #
@@ -198,6 +215,8 @@ def _remote_launcher_script(server, depth):
     its own filesystem so the other mounts are not double-counted.
     """
     q = shlex.quote
+    depth = max(TOP_LAYER_DEPTH,
+                min(_safe_int(depth, SHARED_DATA_DEPTH), SHARED_DATA_DEPTH))
     lines = [
         'DIR="$HOME/' + REMOTE_SCAN_DIR + '"',
         'mkdir -p "$DIR"',
@@ -221,9 +240,18 @@ def _remote_launcher_script(server, depth):
             "awk 'NR==2 {printf \"##### DF: %s %s %s %s #####\\n\", "
             "$2, $3, $4, $5}' || true")
         lines.append(
-            f'$PRE du -x -h --max-depth={int(depth)} '
+            # -B1 emits exact byte counts (parse_size handles bare integers);
+            # human-readable rounding (-h) is too lossy for tape-coverage math.
+            f'$PRE du -x -B1 --max-depth={TOP_LAYER_DEPTH} '
             f"--exclude='/proc/*' --exclude='/sys/*' {qm} "
             f'2>>"$DIR/scan.err" || true')
+        if depth >= SHARED_DATA_DEPTH:
+            shared = q(_shared_data_child(mount))
+            lines.append(
+                f'if [ -d {shared} ]; then $PRE du -x -B1 '
+                f'--max-depth={TOP_LAYER_DEPTH} '
+                f"--exclude='/proc/*' --exclude='/sys/*' {shared} "
+                f'2>>"$DIR/scan.err" || true; fi')
     lines.append(r'printf "##### END #####\n"')
     lines.append('} > "$DIR/scan.out" 2>>"$DIR/scan.err"')
     # The sentinel is written last, so its presence means the whole run finished.
@@ -472,7 +500,7 @@ class Node:
 
 
 class MountTree:
-    """One mount point's hierarchy: mount -> user/project -> sub-folder."""
+    """One mount hierarchy: top layer, plus one extra level in shared-data."""
 
     def __init__(self, mount, root, capacity_bytes=None, used_bytes=None,
                  free_bytes=None):
@@ -492,15 +520,18 @@ class MountTree:
 
     @property
     def free_percent(self):
-        if not self.has_capacity:
+        capacity_bytes = self.capacity_bytes
+        free_bytes = self.free_bytes
+        if not capacity_bytes or free_bytes is None:
             return None
-        return self.free_bytes / self.capacity_bytes * 100
+        return free_bytes / capacity_bytes * 100
 
     @property
     def used_percent(self):
-        if not self.has_capacity:
+        free_percent = self.free_percent
+        if free_percent is None:
             return None
-        return 100 - self.free_percent
+        return 100 - free_percent
 
 
 class ScanResult:
@@ -572,12 +603,17 @@ def parse_raw_log(path, server_name=None):
             size_token, entry_path = parts[0].strip(), parts[1].strip()
             current['entries'].append((parse_size(size_token), entry_path))
 
-    mounts = [MountTree(sec['mount'], _build_tree(sec['entries'], sec['mount']),
-                        sec['capacity_bytes'], sec['used_bytes'],
-                        sec['free_bytes'])
-              for sec in sections]
+    effective_depth = (SHARED_DATA_DEPTH if depth <= 0
+                       else min(depth, SHARED_DATA_DEPTH))
+    mounts = []
+    for sec in sections:
+        root = _build_tree(sec['entries'], sec['mount'])
+        _limit_tree_depth(root, effective_depth)
+        mounts.append(MountTree(sec['mount'], root,
+                                sec['capacity_bytes'], sec['used_bytes'],
+                                sec['free_bytes']))
     name = server_name or (host.split('.')[0] if host else os.path.basename(path))
-    return ScanResult(name, host, generated_at, depth, mounts)
+    return ScanResult(name, host, generated_at, effective_depth, mounts)
 
 
 def _build_tree(entries, mount):
@@ -606,6 +642,24 @@ def _build_tree(entries, mount):
         else:
             node.size = size
     return root
+
+
+def _limit_tree_depth(node, max_depth, depth=0):
+    """Keep top-level dirs, plus one extra level inside shared-data."""
+    path_limit = _visible_depth_limit(node.path, max_depth)
+    if depth >= path_limit:
+        node.children = []
+        return
+    for child in node.children:
+        _limit_tree_depth(child, max_depth, depth + 1)
+
+
+def _visible_depth_limit(path, max_depth):
+    limit = min(max_depth, SHARED_DATA_DEPTH)
+    parts = [p for p in (path or '').strip('/').split('/') if p]
+    if SHARED_DATA_DIR in parts:
+        return limit
+    return min(limit, TOP_LAYER_DEPTH)
 
 
 # --------------------------------------------------------------------------- #

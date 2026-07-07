@@ -119,6 +119,8 @@ CREATE TABLE IF NOT EXISTS remote_sessions (
     total_bytes   BIGINT DEFAULT 0 CHECK (total_bytes >= 0),
     chunk_count   INTEGER DEFAULT 0 CHECK (chunk_count >= 0),
     plan_id       BIGINT REFERENCES remote_plans(plan_id),
+    scan_complete BOOLEAN NOT NULL DEFAULT TRUE,
+    scan_error    TEXT,
     created_at    TIMESTAMPTZ NOT NULL,
     completed_at  TIMESTAMPTZ,
     status        TEXT NOT NULL DEFAULT 'active'

@@ -1,9 +1,10 @@
 """Storage Map dashboard renderer — turn parsed scans into one HTML page.
 
-This is the presentation layer for :mod:`storage_map.lib.core`. It takes the already
-parsed :class:`~storage_map.lib.core.ScanResult` objects (mount -> project -> folder
-trees with byte sizes) and emits a single, self-contained ``index.html``: no
-external assets, no network needed to view it (the Plotly runtime is embedded).
+This is the presentation layer for :mod:`storage_map.lib.core`. It takes the
+already parsed :class:`~storage_map.lib.core.ScanResult` objects (mount ->
+immediate child, plus one extra level inside shared-data) and emits a single,
+self-contained ``index.html``: no external assets, no network needed to view it
+(the Plotly runtime is embedded).
 
 Design follows the project's data-viz guidance:
   * Disk usage is a *magnitude*, so the bar marks use one flat sequential hue —
@@ -44,7 +45,7 @@ def _e(text):
 
 
 def _leaves(node, mount, acc):
-    """Collect the deepest folders (no children) under ``node``, tagged w/ mount."""
+    """Collect visible folders under ``node``, tagged w/ mount."""
     if not node.children:
         acc.append((node, mount))
         return

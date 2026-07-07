@@ -1,0 +1,9 @@
+BEGIN;
+
+ALTER TABLE remote_sessions
+    ADD COLUMN IF NOT EXISTS scan_complete BOOLEAN NOT NULL DEFAULT TRUE;
+
+ALTER TABLE remote_sessions
+    ADD COLUMN IF NOT EXISTS scan_error TEXT;
+
+COMMIT;

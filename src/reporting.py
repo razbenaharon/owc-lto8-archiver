@@ -8,6 +8,7 @@ names: only run-level aggregate statistics.
 import csv
 import os
 from datetime import datetime
+from typing import Any, Dict
 
 from .constants import BACKUP_LOG_DIR
 from .telegram_notify import notify_backup_summary
@@ -75,6 +76,7 @@ def _seconds(value):
 
 
 def _blank_row():
+    # type: () -> Dict[str, Any]
     return {column: '' for column in SUMMARY_COLUMNS}
 
 

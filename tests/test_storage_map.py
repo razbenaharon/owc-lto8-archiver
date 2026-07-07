@@ -19,7 +19,8 @@ from storage_map.lib.core import (
 from storage_map.lib.dashboard import _mount_bar_width, _mount_value_text
 
 
-# A small du -h --max-depth=2 raw log covering two mounts, using tabs like du.
+# A small legacy du --max-depth=2 raw log; parsing trims non-shared-data
+# folders to the top layer.
 SAMPLE_RAWLOG = "\n".join([
     "# storage-map raw log",
     "# server: so01.iem.technion.ac.il",
@@ -95,8 +96,13 @@ class ParseRawLogTests(unittest.TestCase):
         self.assertEqual(by_mount["/strg/E"].total, 1024**4)
         self.assertEqual(by_mount["/strg/E"].capacity_bytes, 2 * 1024**4)
         self.assertEqual(by_mount["/strg/E"].free_bytes, 1024**4)
-        self.assertAlmostEqual(by_mount["/strg/E"].free_percent, 50.0)
+        free_percent = by_mount["/strg/E"].free_percent
+        assert free_percent is not None
+        self.assertAlmostEqual(free_percent, 50.0)
         self.assertEqual(by_mount["/data"].total, 2 * 1024**3)
+        alice = next(c for c in by_mount["/strg/E"].root.children
+                     if c.name == "alice")
+        self.assertEqual(alice.children, [])
         # Grand total aggregates across mounts.
         self.assertEqual(result.total, 1024**4 + 2 * 1024**3)
 
@@ -126,9 +132,13 @@ class RemoteLauncherScriptTests(unittest.TestCase):
         # Low-priority, metadata-only, depth-limited, sentinel-terminated.
         self.assertIn("ionice", script)
         self.assertIn("nice", script)
+        # Byte-exact du output (not -h) so tape-coverage math is precise.
+        self.assertIn("du -x -B1", script)
         self.assertIn("df -B1 -P", script)
         self.assertIn("##### DF:", script)
-        self.assertIn("--max-depth=2", script)
+        self.assertIn("--max-depth=1", script)
+        self.assertIn("/strg/E/shared-data", script)
+        self.assertNotIn("--max-depth=2", script)
         self.assertIn("scan.sentinel", script)
 
 

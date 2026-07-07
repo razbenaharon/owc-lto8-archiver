@@ -1,5 +1,6 @@
 """Main menu, archiver entry points, DB management submenu."""
 import os
+from typing import TYPE_CHECKING
 
 try:
     import psutil
@@ -8,7 +9,7 @@ except ImportError:  # optional dependency — priority/affinity degrade gracefu
 
 from .config import ConfigManager
 from .constants import CONFIG_FILE
-from .db import DatabaseManager, _fmt_ts, create_database_manager
+from .db import _fmt_ts, create_database_manager
 from .ltfs import TapeManager
 from .orchestrators import LocalOrchestrator, RemoteOrchestrator
 from .pg_backup import create_database_backup
@@ -18,8 +19,11 @@ from .robocopy import _prepare_robocopy_exclusion, _remove_robocopy_exclusion
 from .remote_transport import _cleanup_askpass_helpers
 from .runtime import _terminate_all_procs, install_cancel_handler, reset_cancel, uninstall_cancel_handler, unpin_current_process
 
+if TYPE_CHECKING:
+    from .pg_db import PgDatabaseManager
 
-def run_archiver(cfg: ConfigManager, db: DatabaseManager):
+
+def run_archiver(cfg: ConfigManager, db: "PgDatabaseManager"):
     # Cross-process single-writer guard: the in-process tape I/O lock cannot
     # stop a second `python run.py` instance from interleaving tape writes.
     try:
@@ -52,7 +56,7 @@ def run_archiver(cfg: ConfigManager, db: DatabaseManager):
         db.release_archiver_lock()
 
 
-def run_remote_archiver(cfg, db):
+def run_remote_archiver(cfg: ConfigManager, db: "PgDatabaseManager"):
     """Menu option 6: pull files from a remote host and archive to LTO tape."""
     if not cfg.remote_host or not cfg.remote_user or not cfg.remote_path:
         print("\n[REMOTE] The [REMOTE] section in config.ini is incomplete.")

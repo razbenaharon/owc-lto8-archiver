@@ -1,0 +1,108 @@
+/* Storage Map v2 — same validated palette/tokens as the v1 static dashboard
+   (storage_map/lib/dashboard.py), extended with action-bar, badge and
+   coverage-table styles. Light/dark swap through the custom properties. */
+:root {
+  --plane:#f9f9f7; --surface:#fcfcfb;
+  --ink:#0b0b0b; --ink-2:#52514e; --muted:#898781;
+  --grid:#e1e0d9; --border:rgba(11,11,11,0.10);
+  --series:#2a78d6; --track:#ecebe4;
+  --status-good:#0ca30c; --status-warn:#fab219; --status-crit:#d03b3b;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --plane:#0d0d0d; --surface:#1a1a19;
+    --ink:#ffffff; --ink-2:#c3c2b7; --muted:#898781;
+    --grid:#2c2c2a; --border:rgba(255,255,255,0.10);
+    --series:#3987e5; --track:#26261f;
+  }
+}
+* { box-sizing:border-box; }
+body {
+  margin:0; background:var(--plane); color:var(--ink);
+  font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+  font-size:15px; line-height:1.45;
+}
+.wrap { max-width:1180px; margin:0 auto; padding:32px 24px 64px; }
+header.top { display:flex; justify-content:space-between; align-items:flex-end;
+  gap:20px; flex-wrap:wrap; margin-bottom:8px; }
+header.top h1 { margin:0 0 4px; font-size:26px; letter-spacing:-0.01em; }
+header.top .sub { color:var(--ink-2); font-size:14px; }
+
+/* --- action bar ---------------------------------------------------------- */
+.actions { display:flex; gap:10px; flex-wrap:wrap; }
+.actions button {
+  background:var(--surface); color:var(--ink); border:1px solid var(--border);
+  border-radius:10px; padding:8px 14px; font-size:13.5px; font-weight:600;
+  font-family:inherit; cursor:pointer;
+}
+.actions button:hover:not(:disabled) { border-color:var(--series); }
+.actions button.primary { background:var(--series); color:#fff; border-color:transparent; }
+.actions button:disabled { opacity:0.5; cursor:default; }
+#statusline { color:var(--ink-2); font-size:13px; margin:10px 0 2px; min-height:20px; }
+#statusline .err { color:var(--status-crit); }
+
+/* --- KPIs & panels (as v1) ----------------------------------------------- */
+.kpi-row { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+  gap:14px; margin:20px 0 8px; }
+.kpi { background:var(--surface); border:1px solid var(--border);
+  border-radius:12px; padding:16px 18px; }
+.kpi-accent { border-color:var(--series); }
+.kpi-value { font-size:22px; font-weight:650; letter-spacing:-0.01em; }
+.kpi-label { color:var(--muted); font-size:12.5px; text-transform:uppercase;
+  letter-spacing:0.04em; margin-top:2px; }
+.panel { background:var(--surface); border:1px solid var(--border);
+  border-radius:16px; padding:22px 24px; margin-top:22px; }
+.panel-head { display:flex; justify-content:space-between; align-items:flex-start;
+  gap:20px; flex-wrap:wrap; margin-bottom:6px; }
+.panel-head h2 { margin:0; font-size:19px; }
+.panel-sub { color:var(--ink-2); font-size:13px; margin-top:2px; }
+.panel-grid { display:grid; grid-template-columns:1fr 1fr; gap:28px; margin-top:16px; }
+@media (max-width:760px){ .panel-grid { grid-template-columns:1fr; } }
+.chart-block h3 { margin:0 0 12px; font-size:14px; font-weight:600; }
+.chart-block h3 .muted { color:var(--muted); font-weight:400; }
+.bars { display:flex; flex-direction:column; gap:9px; }
+.bar-row { display:grid; grid-template-columns:150px 1fr auto; align-items:center;
+  gap:12px; }
+.bar-label { font-size:13px; overflow:hidden; text-overflow:ellipsis;
+  white-space:nowrap; }
+.bar-track { height:12px; background:var(--track); border-radius:6px; overflow:hidden; }
+.bar-fill { height:100%; border-radius:6px; min-width:3px; }
+.bar-value { font-size:12.5px; color:var(--ink-2); white-space:nowrap;
+  font-variant-numeric:tabular-nums; }
+.treemap { margin-top:8px; min-height:200px; }
+.muted { color:var(--muted); }
+.placeholder { color:var(--muted); font-size:13.5px; padding:14px 2px; }
+footer { color:var(--muted); font-size:12.5px; margin-top:28px; text-align:center; }
+
+/* --- coverage tables ------------------------------------------------------ */
+.cov-mount { margin-top:18px; }
+.cov-mount h3 { margin:0 0 8px; font-size:14px; font-weight:600; }
+.cov-scroll { overflow-x:auto; }
+table.cov { width:100%; border-collapse:collapse; font-size:13.5px; }
+table.cov th {
+  text-align:left; color:var(--muted); font-size:11.5px; font-weight:600;
+  text-transform:uppercase; letter-spacing:0.04em;
+  border-bottom:1px solid var(--grid); padding:6px 10px;
+}
+table.cov td { padding:6px 10px; border-bottom:1px solid var(--grid); }
+table.cov tr:last-child td { border-bottom:none; }
+table.cov td.num, table.cov th.num { text-align:right;
+  font-variant-numeric:tabular-nums; white-space:nowrap; }
+table.cov td.dir { max-width:380px; overflow:hidden; text-overflow:ellipsis;
+  white-space:nowrap; }
+table.cov tr.depth-0 td.dir { font-weight:650; }
+.cov-bar { display:inline-flex; align-items:center; gap:8px; }
+.cov-track { width:64px; height:8px; background:var(--track); border-radius:4px;
+  overflow:hidden; flex:none; }
+.cov-fill { height:100%; border-radius:4px; background:var(--series); min-width:2px; }
+
+/* Status badges: reserved status colors, always paired with a text label so
+   state is never carried by color alone. */
+.badge { display:inline-flex; align-items:center; gap:6px; font-size:12px;
+  font-weight:600; color:var(--ink-2); white-space:nowrap; }
+.badge::before { content:""; width:8px; height:8px; border-radius:50%;
+  background:var(--muted); flex:none; }
+.badge.full::before { background:var(--status-good); }
+.badge.partial::before { background:var(--status-warn); }
+.badge.none::before { background:var(--status-crit); }
+.badge.tape_only::before { background:var(--muted); }

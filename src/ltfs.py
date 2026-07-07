@@ -1,6 +1,7 @@
 """LTFS drive readiness, volume labels, TapeManager."""
 import os
 import subprocess
+from typing import TYPE_CHECKING
 
 try:
     import psutil
@@ -8,8 +9,10 @@ except ImportError:  # optional dependency — priority/affinity degrade gracefu
     psutil = None
 
 from .constants import DEFAULT_TAPE_CAPACITY_GB, LTFS_DIR
-from .db import DatabaseManager
 from .runtime import _acquire_tape_io_lock, _release_tape_io_lock
+
+if TYPE_CHECKING:
+    from .pg_db import PgDatabaseManager
 
 
 def get_volume_label(drive_path):
@@ -138,7 +141,7 @@ def _ensure_lto_drive_ready(tape_drive, prefix="[TAPE]"):
 
 
 class TapeManager:
-    def __init__(self, db: DatabaseManager, tape_drive: str, ibm_eject_cmd=None):
+    def __init__(self, db: "PgDatabaseManager", tape_drive: str, ibm_eject_cmd=None):
         self.db            = db
         self.tape_drive    = tape_drive
         self.ibm_eject_cmd = ibm_eject_cmd
