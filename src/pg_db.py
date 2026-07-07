@@ -1,20 +1,28 @@
 """PostgreSQL DatabaseManager implementation for the archive catalog."""
 import hashlib
+import os
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, List, Optional, TYPE_CHECKING
 
-try:
+if TYPE_CHECKING:
     import psycopg
     from psycopg import errors
     from psycopg.rows import dict_row
     from psycopg_pool import PoolTimeout
-except ImportError:  # pragma: no cover - handled by require_psycopg at runtime
-    psycopg = None
-    errors = None
-    dict_row = None
-    PoolTimeout = None
+else:
+    try:
+        import psycopg
+        from psycopg import errors
+        from psycopg.rows import dict_row
+        from psycopg_pool import PoolTimeout
+    except ImportError:  # pragma: no cover - handled by require_psycopg at runtime
+        psycopg = None
+        errors = None
+        dict_row = None
+        PoolTimeout = None
 
 from .catalog_query import contains_pattern, prefix_pattern, substring_pattern
 from .catalog_v3 import catalog_directory_chain, catalog_file_name
@@ -90,6 +98,15 @@ def _plan_fingerprint(snapshot_fingerprint, rows):
     return digest.digest()
 
 
+def _streaming_fingerprint(kind, session_id):
+    digest = hashlib.sha256()
+    for value in ("remote-streaming", kind, int(session_id)):
+        raw = str(value).encode("utf-8", errors="surrogatepass")
+        digest.update(len(raw).to_bytes(8, "big"))
+        digest.update(raw)
+    return digest.digest()
+
+
 def _now_utc():
     return datetime.now(timezone.utc)
 
@@ -131,10 +148,9 @@ class PgDatabaseManager:
     def __init__(self, conninfo, *, init_schema=True, pool=None):
         require_psycopg()
         self.db_path = conninfo
-        self._pool = None
-        self._lock_conn = None
-        self._pool = pool or make_pool(conninfo, min_size=1, max_size=8,
-                                       row_factory=dict_row)
+        self._lock_conn: Optional[Any] = None
+        self._pool: Any = pool or make_pool(
+            conninfo, min_size=1, max_size=8, row_factory=dict_row)
         try:
             if init_schema:
                 self._init_schema()
@@ -151,6 +167,7 @@ class PgDatabaseManager:
             "003_postgres_constraints.sql",
             "004_postgres_archive_runs_sessions.sql",
             "005_postgres_session_label_unique.sql",
+            "006_postgres_remote_streaming.sql",
         )
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
@@ -178,7 +195,7 @@ class PgDatabaseManager:
                 """)
             conn.commit()
 
-    def _transaction(self, operation, description, attempts=5):
+    def _transaction(self, operation, description, attempts=5) -> Any:
         # Serialization conflicts and deadlocks retry quickly; OperationalError
         # and PoolTimeout (connection drops, Docker DB restarts) back off longer
         # so a restarting server can come back. Every write routed through here
@@ -202,6 +219,7 @@ class PgDatabaseManager:
                 print(f"[DB] {type(e).__name__} during {description}; "
                       f"retrying in {wait_s}s ({attempt}/{attempts})...")
                 time.sleep(wait_s)
+        raise RuntimeError(f"[DB] Transaction attempts exhausted: {description}")
 
     @staticmethod
     def _require_updated(cur, message):
@@ -706,6 +724,52 @@ class PgDatabaseManager:
 
         return self._transaction(operation, "create remote session")
 
+    def create_remote_streaming_session(self, session_label, remote_host,
+                                        remote_user, remote_path, tape_label,
+                                        staging_dir):
+        """Create an active remote session whose plan can grow by chunk."""
+        now = _now_utc()
+
+        def operation(conn):
+            session_id = self._upsert_remote_session(
+                conn, session_label, remote_host, remote_user, remote_path,
+                tape_label, staging_dir, now)
+            snapshot_fp = _streaming_fingerprint("snapshot", session_id)
+            plan_fp = _streaming_fingerprint("plan", session_id)
+            conn.execute(
+                """INSERT INTO remote_snapshots
+                   (remote_host, remote_path, fingerprint, total_files,
+                    total_bytes, created_at)
+                   VALUES (%s, %s, %s, 0, 0, %s)
+                   ON CONFLICT (fingerprint) DO NOTHING""",
+                (remote_host, remote_path, snapshot_fp, now),
+            )
+            snapshot_id = conn.execute(
+                "SELECT snapshot_id FROM remote_snapshots WHERE fingerprint=%s",
+                (snapshot_fp,),
+            ).fetchone()["snapshot_id"]
+            conn.execute(
+                """INSERT INTO remote_plans
+                   (snapshot_id, fingerprint, chunk_count, created_at)
+                   VALUES (%s, %s, 0, %s)
+                   ON CONFLICT (fingerprint) DO NOTHING""",
+                (snapshot_id, plan_fp, now),
+            )
+            plan_id = conn.execute(
+                "SELECT plan_id FROM remote_plans WHERE fingerprint=%s",
+                (plan_fp,),
+            ).fetchone()["plan_id"]
+            conn.execute(
+                """UPDATE remote_sessions
+                   SET plan_id=%s, scan_complete=FALSE, scan_error=NULL
+                   WHERE session_id=%s""",
+                (plan_id, session_id),
+            )
+            return session_id
+
+        return self._transaction(
+            operation, "create remote streaming session")
+
     def create_remote_session_with_plan(self, session_label, remote_host,
                                         remote_user, remote_path, tape_label,
                                         staging_dir, rows):
@@ -804,6 +868,117 @@ class PgDatabaseManager:
                 session["remote_path"], rows, by_path, now)
 
         return self._transaction(operation, "insert remote manifest batch")
+
+    def append_remote_streaming_chunk(self, session_id, chunk_index, rows):
+        """Append one discovered chunk to a streaming remote session.
+
+        Duplicate canonical remote paths already present in the session
+        snapshot are ignored so an incomplete streaming scan can be resumed by
+        rescanning from the beginning.
+        """
+        rows = list(rows)
+        by_path = self._validate_remote_manifest_rows(rows)
+        now = _now_utc()
+
+        def operation(conn):
+            session = conn.execute(
+                """SELECT s.*, p.snapshot_id
+                   FROM remote_sessions s
+                   JOIN remote_plans p ON p.plan_id=s.plan_id
+                   WHERE s.session_id=%s
+                   FOR UPDATE OF s""",
+                (session_id,),
+            ).fetchone()
+            if not session:
+                raise RuntimeError(f"[DB] Remote session not found: {session_id}")
+            if not session["plan_id"]:
+                raise RuntimeError(
+                    f"[DB] Remote session {session_id} has no streaming plan")
+
+            existing = {
+                row["remote_path"]
+                for row in conn.execute(
+                    """SELECT remote_path
+                       FROM remote_snapshot_files
+                       WHERE snapshot_id=%s AND remote_path = ANY(%s)""",
+                    (session["snapshot_id"], list(by_path.keys())),
+                ).fetchall()
+            }
+            filtered = [
+                (int(chunk_index), path, os.path.basename(path), size)
+                for path, size in by_path.items()
+                if path not in existing
+            ]
+            if not filtered:
+                return {"inserted_files": 0, "inserted_bytes": 0}
+
+            with conn.cursor() as cur:
+                cur.executemany(
+                    """INSERT INTO remote_snapshot_files
+                       (snapshot_id, remote_path, file_size_bytes)
+                       VALUES (%s, %s, %s)
+                       ON CONFLICT (snapshot_id, remote_path) DO NOTHING""",
+                    ((session["snapshot_id"], path, int(size))
+                     for _, path, _, size in filtered),
+                )
+
+            ids = {
+                row["remote_path"]: row["snapshot_file_id"]
+                for row in conn.execute(
+                    """SELECT remote_path, snapshot_file_id
+                       FROM remote_snapshot_files
+                       WHERE snapshot_id=%s AND remote_path = ANY(%s)""",
+                    (session["snapshot_id"], [row[1] for row in filtered]),
+                ).fetchall()
+            }
+            with conn.cursor() as cur:
+                cur.executemany(
+                    """INSERT INTO remote_plan_files
+                       (plan_id, snapshot_file_id, chunk_index, ordinal)
+                       VALUES (%s, %s, %s, %s)
+                       ON CONFLICT (plan_id, snapshot_file_id) DO NOTHING""",
+                    ((session["plan_id"], ids[path], int(chunk_index), ordinal)
+                     for ordinal, (_, path, _, _) in enumerate(filtered)),
+                )
+                cur.execute(
+                    """INSERT INTO remote_chunks
+                       (session_id, chunk_index, status, updated_at)
+                       VALUES (%s, %s, 'pending', %s)
+                       ON CONFLICT (session_id, chunk_index) DO NOTHING""",
+                    (session_id, int(chunk_index), now),
+                )
+
+            inserted_files = len(filtered)
+            inserted_bytes = sum(int(row[3]) for row in filtered)
+            conn.execute(
+                """UPDATE remote_sessions
+                   SET total_files=total_files + %s,
+                       total_bytes=total_bytes + %s,
+                       chunk_count=GREATEST(chunk_count, %s)
+                   WHERE session_id=%s""",
+                (inserted_files, inserted_bytes, int(chunk_index) + 1,
+                 session_id),
+            )
+            conn.execute(
+                """UPDATE remote_snapshots
+                   SET total_files=total_files + %s,
+                       total_bytes=total_bytes + %s
+                   WHERE snapshot_id=%s""",
+                (inserted_files, inserted_bytes, session["snapshot_id"]),
+            )
+            conn.execute(
+                """UPDATE remote_plans
+                   SET chunk_count=GREATEST(chunk_count, %s)
+                   WHERE plan_id=%s""",
+                (int(chunk_index) + 1, session["plan_id"]),
+            )
+            return {
+                "inserted_files": inserted_files,
+                "inserted_bytes": inserted_bytes,
+            }
+
+        return self._transaction(
+            operation, f"append streaming remote chunk {chunk_index + 1}")
 
     def _persist_remote_plan(self, conn, session_id, remote_host, remote_path,
                              rows, by_path, now):
@@ -1098,6 +1273,60 @@ class PgDatabaseManager:
                 "SELECT COUNT(*) AS n FROM remote_chunks WHERE session_id=%s",
                 (session_id,),
             ).fetchone()["n"]
+
+    def get_next_remote_chunk_index(self, session_id):
+        with self._pool.connection() as conn:
+            value = conn.execute(
+                """SELECT COALESCE(MAX(chunk_index) + 1, 0) AS next_index
+                   FROM remote_chunks WHERE session_id=%s""",
+                (session_id,),
+            ).fetchone()["next_index"]
+        return int(value)
+
+    def get_remote_existing_snapshot_paths(self, session_id, paths):
+        paths = [_canonical_remote_path(path) for path in paths]
+        if not paths:
+            return set()
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                """SELECT sf.remote_path
+                   FROM remote_sessions s
+                   JOIN remote_plans p ON p.plan_id=s.plan_id
+                   JOIN remote_snapshot_files sf
+                    ON sf.snapshot_id=p.snapshot_id
+                   WHERE s.session_id=%s AND sf.remote_path = ANY(%s)""",
+                (session_id, paths),
+            ).fetchall()
+        return {row["remote_path"] for row in rows}
+
+    def get_pending_remote_reserved_bytes(self, session_id):
+        with self._pool.connection() as conn:
+            value = conn.execute(
+                """SELECT COALESCE(SUM(sf.file_size_bytes), 0) AS n
+                   FROM remote_sessions s
+                   JOIN remote_chunks c ON c.session_id=s.session_id
+                   JOIN remote_plan_files pf ON pf.plan_id=s.plan_id
+                    AND pf.chunk_index=c.chunk_index
+                   JOIN remote_snapshot_files sf
+                    ON sf.snapshot_file_id=pf.snapshot_file_id
+                   WHERE s.session_id=%s AND c.status!='done'""",
+                (session_id,),
+            ).fetchone()["n"]
+        return int(value)
+
+    def mark_remote_scan_complete(self, session_id):
+        self.update_remote_session(
+            session_id,
+            scan_complete=True,
+            scan_error=None,
+        )
+
+    def mark_remote_scan_error(self, session_id, message):
+        self.update_remote_session(
+            session_id,
+            scan_complete=False,
+            scan_error=(message or "")[:1000],
+        )
 
     def count_tape_file_records(self, tape_label):
         with self._pool.connection() as conn:
@@ -1450,7 +1679,7 @@ class PgDatabaseManager:
             return []
         where = ("(f.original_path ILIKE %s ESCAPE '\\' "
                  "OR f.original_path ILIKE %s ESCAPE '\\')")
-        params = [prefix_pattern(needle), substring_pattern(needle)]
+        params: List[Any] = [prefix_pattern(needle), substring_pattern(needle)]
         if source_host:
             where += " AND f.source_host = %s"
             params.append(_short_source_host(source_host))
@@ -1478,7 +1707,7 @@ class PgDatabaseManager:
             return 0
         where = ("(f.original_path ILIKE %s ESCAPE '\\' "
                  "OR f.original_path ILIKE %s ESCAPE '\\')")
-        params = [prefix_pattern(needle), substring_pattern(needle)]
+        params: List[Any] = [prefix_pattern(needle), substring_pattern(needle)]
         if source_host:
             where += " AND f.source_host = %s"
             params.append(_short_source_host(source_host))

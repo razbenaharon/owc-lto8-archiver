@@ -80,6 +80,7 @@ def _openssh_askpass_env(password):
 
 def _ssh_run(remote_user, remote_host, command, capture=True, password='',
              timeout=None):
+    # type: (...) -> "subprocess.CompletedProcess[str]"
     """Run a command on the remote host.
 
     Blank password uses normal OpenSSH key auth. A configured password uses
@@ -114,10 +115,10 @@ def _ssh_run(remote_user, remote_host, command, capture=True, password='',
                     )
                 except subprocess.TimeoutExpired as e:
                     return subprocess.CompletedProcess(
-                        ssh_cmd, 124, e.stdout or '',
+                        ssh_cmd, 124, (e.stdout if isinstance(e.stdout, str) else ''),
                         f"SSH command timed out after {timeout}s")
             try:
-                return subprocess.run(ssh_cmd, env=env, timeout=timeout)
+                return subprocess.run(ssh_cmd, env=env, timeout=timeout, text=True)
             except subprocess.TimeoutExpired:
                 return subprocess.CompletedProcess(
                     ssh_cmd, 124, '', f"SSH command timed out after {timeout}s")
@@ -146,11 +147,12 @@ def _ssh_run(remote_user, remote_host, command, capture=True, password='',
                     )
                 except subprocess.TimeoutExpired as e:
                     return subprocess.CompletedProcess(
-                        ssh_cmd, 124, e.stdout or '',
+                        ssh_cmd, 124, (e.stdout if isinstance(e.stdout, str) else ''),
                         f"SSH command timed out after {timeout}s")
             try:
                 return subprocess.run(
-                    ssh_cmd, stdin=subprocess.DEVNULL, env=env, timeout=timeout)
+                    ssh_cmd, stdin=subprocess.DEVNULL, env=env, timeout=timeout,
+                    text=True)
             except subprocess.TimeoutExpired:
                 return subprocess.CompletedProcess(
                     ssh_cmd, 124, '', f"SSH command timed out after {timeout}s")
@@ -185,10 +187,10 @@ def _ssh_run(remote_user, remote_host, command, capture=True, password='',
             )
         except subprocess.TimeoutExpired as e:
             return subprocess.CompletedProcess(
-                ssh_cmd, 124, e.stdout or '',
+                ssh_cmd, 124, (e.stdout if isinstance(e.stdout, str) else ''),
                 f"SSH command timed out after {timeout}s")
     try:
-        return subprocess.run(ssh_cmd, timeout=timeout)
+        return subprocess.run(ssh_cmd, timeout=timeout, text=True)
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(
             ssh_cmd, 124, '', f"SSH command timed out after {timeout}s")
@@ -350,6 +352,7 @@ def _remote_tar_fetch(remote_user, remote_host, remote_base, rel_paths, local_de
     )
     if err:
         return False, err
+    assert ssh_cmd is not None
 
     # Local extract: read the stream as-is. A tar stream is a 512-byte-record
     # byte stream over the pipe, so the remote -b 512 does not need to be matched
@@ -384,15 +387,17 @@ def _remote_tar_fetch(remote_user, remote_host, remote_base, rel_paths, local_de
         )
         stderr_thread.start()
 
+        ssh_stdout = ssh_proc.stdout
+        assert ssh_stdout is not None
         tar_proc = subprocess.Popen(
             tar_cmd,
-            stdin=ssh_proc.stdout,
+            stdin=ssh_stdout,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
         register_proc(tar_proc)
         _apply_proc_tuning(tar_proc, affinity=fetch_cores, label='tar-extract')
-        ssh_proc.stdout.close()
+        ssh_stdout.close()
 
         if abort_evt is not None:
             # Watchdog: an abort request must be able to unwedge the blocking
@@ -410,9 +415,11 @@ def _remote_tar_fetch(remote_user, remote_host, remote_base, rel_paths, local_de
                              daemon=True).start()
 
         file_list = ''.join(f'{rel}\0' for rel in safe_paths).encode('utf-8')
+        ssh_stdin = ssh_proc.stdin
+        assert ssh_stdin is not None
         try:
-            ssh_proc.stdin.write(file_list)
-            ssh_proc.stdin.close()
+            ssh_stdin.write(file_list)
+            ssh_stdin.close()
         except OSError:
             pass
 

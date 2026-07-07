@@ -93,7 +93,7 @@ dashboard when scans are done. Internal code lives in `storage_map/lib/`.
 
 - **Stage 1 — `scan` (fire-and-forget).** Connects to each configured server
   over SSH (reusing `remote_transport._ssh_run`), launches a low-priority
-  `ionice -c3 nice -n19 du -x -h --max-depth=2` per mount under
+  `ionice -c3 nice -n19 du -x -B1 --max-depth=2` per mount under
   `nohup`/`setsid`, then exits immediately. The scan keeps running on the server
   after the SSH session closes — no live connection is held for the ~hours-long
   `du`.
@@ -102,12 +102,26 @@ dashboard when scans are done. Internal code lives in `storage_map/lib/`.
   `storage_map/logs/<server>_<ts>.rawlog` (+ a `<server>_latest.rawlog` pointer)
   via `remote_transport._scp_fetch_file`.
 - **Stage 2 — `view` / `treemap`.** Parse a *local* raw log only (never the
-  disks again): `parse_size` normalizes `du -h` units to bytes and `parse_raw_log`
+  disks again): `parse_size` normalizes du size tokens (byte-exact `-B1`
+  integers, plus legacy `-h` units) to bytes and `parse_raw_log`
   builds a Mount → user/project → sub-folder tree, rendered as a Rich terminal
   dashboard (`view`), full HTML dashboard (`dashboard`), or interactive Plotly
   HTML treemap (`treemap`). `rich`
   and `plotly` are **optional** — each visualizer prints a `pip install` hint if
   its library is missing.
+- **v2 — interactive web dashboard (`python storage_map/serve.py [--open]`).**
+  A FastAPI + uvicorn app (`storage_map/webapp/`) that serves the same
+  overview/treemap live from the fetched raw logs, adds in-browser action
+  buttons (start scan / check status / fetch & rebuild), and a **tape-coverage
+  table** matching each mount's directories (mount + `match_depth` levels,
+  default 2 — never individual files) against the PostgreSQL catalog: one
+  read-only aggregation of `files_index.original_path` prefixes
+  (`webapp/coverage.py`), cached in `storage_map/logs/coverage_cache.json`
+  and refreshed only via the "Refresh DB coverage" button. Binds to
+  `127.0.0.1:8765` by default (`web_host`/`web_port`/`match_depth`/`host_map`
+  keys in `[STORAGE_MAP]`, all optional). `fastapi`/`uvicorn` are optional
+  dependencies used only by v2; the v1 scripts keep working without them.
+  Tests: `tests/test_storage_map_webapp.py`.
 
 Mount points and servers are **config-driven, never hardcoded** — see the
 `[STORAGE_MAP]` / `[STORAGE_MAP:<name>]` sections in `config.ini`

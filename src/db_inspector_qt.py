@@ -2,6 +2,7 @@
 import os
 import subprocess
 import sys
+from typing import Any, Dict
 
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -20,6 +21,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QComboBox,
     QDialog,
@@ -176,28 +178,28 @@ class ArchiveTreeModel(QAbstractItemModel):
     def columnCount(self, parent=QModelIndex()):
         return 1
 
-    def data(self, index, role=Qt.DisplayRole):
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid():
             return None
         node = index.internalPointer()
-        if role == Qt.DisplayRole:
+        if role == Qt.ItemDataRole.DisplayRole:
             return node.name
-        if role == Qt.ToolTipRole:
+        if role == Qt.ItemDataRole.ToolTipRole:
             if node.kind == "tape":
                 return f"Tape: {node.tape_label}"
             if node.kind == "dir":
                 return node.normalized_path
         return None
 
-    def headerData(self, section, orientation, role=Qt.DisplayRole):
-        if orientation == Qt.Horizontal and role == Qt.DisplayRole:
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
             return "Archive"
         return None
 
     def flags(self, index):
         if not index.isValid():
-            return Qt.NoItemFlags
-        return Qt.ItemIsEnabled | Qt.ItemIsSelectable
+            return Qt.ItemFlag.NoItemFlags
+        return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
 
     def hasChildren(self, parent=QModelIndex()):
         node = self.node_from_index(parent)
@@ -292,13 +294,13 @@ class FileTableModel(QAbstractTableModel):
     def columnCount(self, parent=QModelIndex()):
         return len(self.columns)
 
-    def data(self, index, role=Qt.DisplayRole):
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid():
             return None
         row = self.rows[index.row()]
         key = self.columns[index.column()][0]
         value = row.get(key)
-        if role == Qt.DisplayRole:
+        if role == Qt.ItemDataRole.DisplayRole:
             if key == "file_size_bytes":
                 return _fmt_bytes(value)
             if key == "is_packed":
@@ -306,12 +308,12 @@ class FileTableModel(QAbstractTableModel):
             if key == "backup_date":
                 return _fmt_ts(value)
             return "" if value is None else str(value)
-        if role == Qt.TextAlignmentRole and key in ("file_id", "file_size_bytes"):
-            return Qt.AlignRight | Qt.AlignVCenter
+        if role == Qt.ItemDataRole.TextAlignmentRole and key in ("file_id", "file_size_bytes"):
+            return Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         return None
 
-    def headerData(self, section, orientation, role=Qt.DisplayRole):
-        if orientation == Qt.Horizontal and role == Qt.DisplayRole:
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
             return self.columns[section][1]
         return None
 
@@ -340,7 +342,7 @@ class FileDetailDialog(QDialog):
             lines.append(f"{key}: {record.get(key)}")
         text.setPlainText("\n".join(lines))
         layout.addWidget(text)
-        buttons = QDialogButtonBox(QDialogButtonBox.Close, self)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, self)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
@@ -359,7 +361,7 @@ class BrowseWidget(QWidget):
         self.has_more = False
 
         layout = QVBoxLayout(self)
-        splitter = QSplitter(Qt.Horizontal, self)
+        splitter = QSplitter(Qt.Orientation.Horizontal, self)
         layout.addWidget(splitter, 1)
 
         self.tree = QTreeView(splitter)
@@ -394,10 +396,10 @@ class BrowseWidget(QWidget):
         self.table = QTableView()
         self.table_model = FileTableModel(self)
         self.table.setModel(self.table_model)
-        self.table.setSelectionBehavior(QTableView.SelectRows)
-        self.table.setSelectionMode(QTableView.ExtendedSelection)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.doubleClicked.connect(lambda _idx: self.show_details())
-        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._context_menu)
         right_layout.addWidget(self.table, 1)
         splitter.addWidget(right)
@@ -511,7 +513,7 @@ class BrowseWidget(QWidget):
         if QMessageBox.question(
                 self, "Delete File Records",
                 f"Delete {len(ids)} file record(s)? This cannot be undone."
-        ) != QMessageBox.Yes:
+        ) != QMessageBox.StandardButton.Yes:
             return
         # One transaction (also reconciles tapes.used_space) instead of one
         # commit per record.
@@ -562,8 +564,8 @@ class SearchWidget(QWidget):
         self.table = QTableView()
         self.table_model = FileTableModel(self)
         self.table.setModel(self.table_model)
-        self.table.setSelectionBehavior(QTableView.SelectRows)
-        self.table.setSelectionMode(QTableView.ExtendedSelection)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.doubleClicked.connect(lambda _idx: self.show_details())
         layout.addWidget(self.table, 1)
 
@@ -679,7 +681,7 @@ class SearchWidget(QWidget):
         if QMessageBox.question(
                 self, "Delete File Records",
                 f"Delete {len(ids)} file record(s)? This cannot be undone."
-        ) != QMessageBox.Yes:
+        ) != QMessageBox.StandardButton.Yes:
             return
         self.db.delete_files(ids)
         self.load_page(self.cursor_stack[self.page_index])
@@ -723,8 +725,8 @@ class ManageWidget(QWidget):
         self.tapes_table.setHorizontalHeaderLabels([
             "ID", "Volume Label", "Initialized", "Capacity GB",
             "Used", "Files", "Used %"])
-        self.tapes_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.tapes_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.tapes_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.tapes_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         layout.addWidget(self.tapes_table, 1)
         self.rename_btn.clicked.connect(self.rename_tape)
         self.capacity_btn.clicked.connect(self.set_capacity)
@@ -749,8 +751,8 @@ class ManageWidget(QWidget):
         self.sessions_table.setHorizontalHeaderLabels([
             "Type", "ID", "Label", "Status", "Mode", "Created", "Completed",
             "Chunks", "Manifest Rows", "Manifest Size", "File Records"])
-        self.sessions_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.sessions_table.setSelectionMode(QTableWidget.SingleSelection)
+        self.sessions_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.sessions_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         layout.addWidget(self.sessions_table, 1)
         self.delete_session_btn.clicked.connect(self.delete_session)
         self.cleanup_btn.clicked.connect(self.cleanup_sessions)
@@ -794,7 +796,8 @@ class ManageWidget(QWidget):
         row = self.tapes_table.currentRow()
         if row < 0:
             return None
-        return self.tapes_table.item(row, 1).text()
+        item = self.tapes_table.item(row, 1)
+        return item.text() if item is not None else None
 
     def refresh_tapes(self):
         tapes = self.db.list_tapes()
@@ -848,7 +851,7 @@ class ManageWidget(QWidget):
         count = self.db.count_tape_file_records(label)
         if QMessageBox.question(
                 self, "Wipe File Records",
-                f"Delete {count:,} file record(s) for {label}?") == QMessageBox.Yes:
+                f"Delete {count:,} file record(s) for {label}?") == QMessageBox.StandardButton.Yes:
             self._run_db_task(
                 lambda: self.db.delete_files_for_tape(label),
                 on_done=lambda _result: self.refresh())
@@ -857,7 +860,7 @@ class ManageWidget(QWidget):
         label = self.selected_tape()
         if label and QMessageBox.question(
                 self, "Delete Tape",
-                f"Delete tape {label} and all file records?") == QMessageBox.Yes:
+                f"Delete tape {label} and all file records?") == QMessageBox.StandardButton.Yes:
             self._run_db_task(
                 lambda: self.db.delete_tape(label),
                 on_done=lambda _result: self.refresh())
@@ -905,10 +908,11 @@ class ManageWidget(QWidget):
         row = self.sessions_table.currentRow()
         if row < 0:
             return None, None
-        return (
-            self.sessions_table.item(row, 0).text(),
-            int(self.sessions_table.item(row, 1).text()),
-        )
+        kind_item = self.sessions_table.item(row, 0)
+        id_item = self.sessions_table.item(row, 1)
+        if kind_item is None or id_item is None:
+            return None, None
+        return kind_item.text(), int(id_item.text())
 
     def delete_session(self):
         kind, session_id = self.selected_session()
@@ -916,7 +920,7 @@ class ManageWidget(QWidget):
             return
         if QMessageBox.question(
                 self, "Delete Session",
-                f"Delete {kind} session {session_id}?") != QMessageBox.Yes:
+                f"Delete {kind} session {session_id}?") != QMessageBox.StandardButton.Yes:
             return
         self._run_db_task(
             lambda: self.db.delete_session(kind, session_id),
@@ -926,7 +930,7 @@ class ManageWidget(QWidget):
         summary = self._cleanup_summary or self.db.get_unreferenced_remote_data_summary()
         if QMessageBox.question(
                 self, "Clean Unused Session Data",
-                f"Delete unused plans/snapshots?\n\n{summary}") != QMessageBox.Yes:
+                f"Delete unused plans/snapshots?\n\n{summary}") != QMessageBox.StandardButton.Yes:
             return
 
         def done(result):
@@ -943,7 +947,7 @@ class ManageWidget(QWidget):
 
     def open_preflight_console(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        kwargs = {"cwd": root}
+        kwargs: Dict[str, Any] = {"cwd": root}
         if os.name == "nt":
             kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
         subprocess.Popen(
@@ -963,6 +967,7 @@ class DBInspectorQtApp(QMainWindow):
             repo.require_catalog_v3()
 
         tabs = QTabWidget(self)
+        self.tabs = tabs
         self.browse = BrowseWidget(db, db_path, self)
         self.search = SearchWidget(db, db_path, self)
         self.manage = ManageWidget(db, db_path, self)
@@ -983,7 +988,7 @@ class DBInspectorQtApp(QMainWindow):
             self.manage.refresh()
 
     def _tab_changed(self, index):
-        if self.centralWidget().widget(index) is self.manage and not self.manage._loaded:
+        if self.tabs.widget(index) is self.manage and not self.manage._loaded:
             self.manage.refresh()
 
 

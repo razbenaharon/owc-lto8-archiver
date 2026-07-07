@@ -5,6 +5,7 @@ import time
 import threading
 from datetime import datetime
 from collections import defaultdict
+from typing import TYPE_CHECKING
 
 try:
     import psutil
@@ -12,12 +13,14 @@ except ImportError:  # optional dependency — priority/affinity degrade gracefu
     psutil = None
 
 from .constants import BACKUP_LOG_DIR, LTFS_WRITE_WARNING
-from .db import DatabaseManager
 from .ltfs import _ensure_lto_drive_ready, eject_tape_drive
 from .reporting import append_backup_summary_row
 from .robocopy import _parse_robocopy_summary, _run_robocopy_tuned
 from .runtime import CANCEL, _acquire_tape_io_lock, _fmt_eta, _phase, _progress_done, _progress_line, _release_tape_io_lock
 from .telegram_notify import notify_backup_summary
+
+if TYPE_CHECKING:
+    from .pg_db import PgDatabaseManager
 
 
 # Robocopy error lines look like "2024/01/01 12:00:00 ERROR 32 (0x00000020)
@@ -40,7 +43,7 @@ def _tape_destination_root(source, tape_drive, tape_parent_dir=None):
 
 
 class LTOBackup:
-    def __init__(self, db: DatabaseManager, ibm_eject_cmd: str,
+    def __init__(self, db: "PgDatabaseManager", ibm_eject_cmd: str,
                  tape_priority=None, tape_affinity=None, log_dir=None,
                  notifier=None):
         self.db            = db
@@ -452,7 +455,7 @@ class LTOBackup:
         # /BYTES keeps robocopy byte counts parseable without reading LTFS
         # immediately after a write.
         copied_bytes = rc_sum['bytes_copied']
-        new_used = self.db.recalculate_tape_used_space(tape_label)
+        new_used = int(self.db.recalculate_tape_used_space(tape_label) or 0)
         print(f"[DB] Tape used space reconciled to {new_used / 1024**3:.3f} GB.")
 
         # ---------------------------------------------------------------

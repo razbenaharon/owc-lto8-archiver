@@ -68,7 +68,11 @@ def catalog_directory_chain(file_path, source_host=None):
     chain = []
     current = None
     for index, part in enumerate(parts[:-1]):
-        normalized = part if index == 0 else current + "/" + part
+        if index == 0:
+            normalized = part
+        else:
+            assert current is not None
+            normalized = current + "/" + part
         parent = current
         name = normalized if parent is None else part
         chain.append((normalized, parent, name))

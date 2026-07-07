@@ -1,11 +1,16 @@
 """Read-only, bounded PostgreSQL query layer for the database inspector."""
+from typing import Any, TYPE_CHECKING, cast
 
-try:
+if TYPE_CHECKING:
     import psycopg
     from psycopg.rows import dict_row
-except ImportError:  # pragma: no cover - optional until PG backend is selected
-    psycopg = None
-    dict_row = None
+else:
+    try:
+        import psycopg
+        from psycopg.rows import dict_row
+    except ImportError:  # pragma: no cover - optional until PG backend is selected
+        psycopg = None
+        dict_row = None
 
 from .catalog_query import prefix_pattern, substring_pattern
 from .db import _derived_file_name
@@ -27,11 +32,11 @@ class InspectorRepository:
         # it, psycopg's default deferred transaction would stay open for the
         # connection's lifetime ("idle in transaction"), pinning xmin and
         # blocking VACUUM while an inspector tab is left open.
-        self.conn = psycopg.connect(
-            db_path, autocommit=True, row_factory=dict_row)
+        self.conn: Any = psycopg.connect(
+            db_path, autocommit=True, row_factory=cast(Any, dict_row))
         self.conn.execute("SET default_transaction_read_only = on")
 
-    def _execute(self, sql, params=()):
+    def _execute(self, sql, params=()) -> Any:
         return self.conn.execute(sql, params)
 
     def close(self):
