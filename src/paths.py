@@ -4,10 +4,6 @@ import re
 import time
 import posixpath
 
-try:
-    import psutil
-except ImportError:  # optional dependency — priority/affinity degrade gracefully
-    psutil = None
 
 def _safe_log_token(value, default='item'):
     text = str(value or '').strip()

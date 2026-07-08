@@ -3,11 +3,6 @@ import os
 import shutil
 import zipfile
 
-try:
-    import psutil
-except ImportError:  # optional dependency — priority/affinity degrade gracefully
-    psutil = None
-
 from .constants import (LOCAL_STAGING_RESERVE_BYTES, LOCAL_TAPE_BUDGET_BYTES,
                         ROOT_FILES_GROUP, TAPE_BUDGET_LABEL,
                         ZIP_BUNDLE_FILL_FACTOR, _auto_pack_decision)

@@ -205,7 +205,16 @@ def _append_row(log_dir, row):
     os.makedirs(log_dir, exist_ok=True)
     path = os.path.join(log_dir, SUMMARY_CSV)
     write_header = not os.path.exists(path) or os.path.getsize(path) == 0
-    columns = list(SUMMARY_COLUMNS) if write_header else _migrate_summary_schema(path)
+    if write_header:
+        columns = list(SUMMARY_COLUMNS)
+    else:
+        # Fast path: when the on-disk header already matches the canonical
+        # schema, skip the full-file migration read — it re-parsed the entire
+        # (ever-growing) CSV on every appended row.
+        with open(path, encoding='utf-8', newline='') as handle:
+            header = next(csv.reader(handle), [])
+        columns = (list(SUMMARY_COLUMNS) if header == SUMMARY_COLUMNS
+                   else _migrate_summary_schema(path))
     with open(path, 'a', encoding='utf-8', newline='') as handle:
         writer = csv.DictWriter(handle, fieldnames=columns)
         if write_header:

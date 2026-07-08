@@ -1673,7 +1673,7 @@ class PgDatabaseManager:
         return rows[0] if rows else None
 
     def search_by_directory(self, dir_path, limit=None, offset=None,
-                            source_host=None, after_id=None):
+                            source_host=None, after_id=None, tape_label=None):
         needle = dir_path.strip().rstrip("/\\")
         if not needle:
             return []
@@ -1683,6 +1683,9 @@ class PgDatabaseManager:
         if source_host:
             where += " AND f.source_host = %s"
             params.append(_short_source_host(source_host))
+        if tape_label:
+            where += " AND f.tape_label = %s"
+            params.append(tape_label)
         if after_id is not None:
             where += " AND f.file_id > %s"
             params.append(int(after_id))

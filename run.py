@@ -44,6 +44,10 @@ if __name__ == "__main__":
             )
         main()
     except RuntimeError as e:
+        # Operator-facing errors are raised as RuntimeError with a readable
+        # message; set LTO_DEBUG=1 to get the full traceback for bug reports.
+        if os.environ.get('LTO_DEBUG'):
+            raise
         print(f"\n{e}")
     except KeyboardInterrupt:
         print("\n\n[ABORTED] User stopped the script.")

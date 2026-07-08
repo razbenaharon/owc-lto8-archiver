@@ -34,8 +34,12 @@ class RestoreCollisionTests(unittest.TestCase):
         self.restore = os.path.join(self.tmp, "restore")
         os.makedirs(self.tape)
         os.makedirs(self.restore)
+        # The fake tape lives in the tmp dir, so the configured drive must be
+        # the tmp dir's own drive — the retriever remaps the stored drive
+        # letter onto the configured LTFS drive before reading.
+        tmp_drive = os.path.splitdrive(os.path.abspath(self.tmp))[0] + "\\"
         self.retriever = LTORetriever(
-            db=cast(Any, None), tape_drive="D:\\",
+            db=cast(Any, None), tape_drive=tmp_drive,
             staging_dir=os.path.join(self.tmp, "staging"),
             restore_dir=self.restore)
         self._orig_robocopy = retriever_mod._robocopy_file

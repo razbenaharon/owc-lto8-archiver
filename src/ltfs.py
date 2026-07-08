@@ -3,11 +3,6 @@ import os
 import subprocess
 from typing import TYPE_CHECKING
 
-try:
-    import psutil
-except ImportError:  # optional dependency — priority/affinity degrade gracefully
-    psutil = None
-
 from .constants import DEFAULT_TAPE_CAPACITY_GB, LTFS_DIR
 from .runtime import _acquire_tape_io_lock, _release_tape_io_lock
 

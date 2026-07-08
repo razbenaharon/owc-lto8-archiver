@@ -13,7 +13,7 @@ from datetime import datetime
 
 try:
     from fastapi import Body, FastAPI, HTTPException
-    from fastapi.responses import FileResponse, Response
+    from fastapi.responses import FileResponse, JSONResponse, Response
     from fastapi.staticfiles import StaticFiles
 except ImportError as exc:  # pragma: no cover - dependency hint
     raise RuntimeError(
@@ -107,6 +107,27 @@ def create_app(cfg=None):
     app = FastAPI(title='Storage Map v2', docs_url=None, redoc_url=None)
     app.state.webcfg = webcfg
     app.state.smcfg = smcfg
+
+    @app.middleware('http')
+    async def _api_guard(request, call_next):
+        if request.url.path.startswith('/api/'):
+            # Auth: required on every API call when a token is configured
+            # (mandatory for non-loopback binds — see ensure_bind_safe).
+            if (webcfg.auth_token and
+                    request.headers.get('x-auth-token') != webcfg.auth_token):
+                return JSONResponse({'detail': 'unauthorized'},
+                                    status_code=401)
+            # CSRF: a cross-origin "simple" POST (text/plain, empty body)
+            # would otherwise fire actions like /api/scan from any web page
+            # the operator has open. Requiring application/json forces a CORS
+            # preflight, which same-origin app.js already satisfies.
+            if request.method == 'POST':
+                ctype = request.headers.get('content-type', '')
+                if not ctype.lower().startswith('application/json'):
+                    return JSONResponse(
+                        {'detail': 'Content-Type must be application/json'},
+                        status_code=415)
+        return await call_next(request)
 
     def _servers(requested=None):
         if not requested:

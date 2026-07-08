@@ -31,11 +31,17 @@ def main(argv=None):
         print("[WEB] uvicorn is not installed. Run: pip install fastapi uvicorn")
         return 1
     from storage_map.webapp.app import create_app
+    from storage_map.webapp.settings import ensure_bind_safe
 
     app = create_app()
     webcfg = app.state.webcfg
     host = args.host or webcfg.host
     port = args.port or webcfg.port
+    try:
+        ensure_bind_safe(host, webcfg)
+    except RuntimeError as exc:
+        print(exc)
+        return 1
 
     url = f"http://{'127.0.0.1' if host == '0.0.0.0' else host}:{port}/"
     print(f"[WEB] Storage Map v2 dashboard -> {url}")

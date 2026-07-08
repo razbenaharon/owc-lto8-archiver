@@ -138,6 +138,15 @@ class ReportingAndRobocopyTests(unittest.TestCase):
         self.assertEqual(parsed["bytes_copied"], 98765432)
         self.assertEqual(parsed["files_copied"], 1)
         self.assertAlmostEqual(parsed["speed_mbs"], 100.0)
+        self.assertTrue(parsed["summary_found"])
+
+    def test_robocopy_parser_flags_missing_summary(self):
+        # Output cut off before the "Files :" line (robocopy killed mid-run):
+        # the zeroed counters must not read as "no failures".
+        parsed = _parse_robocopy_summary(
+            "2026/07/03 08:12:43 ERROR 32 (0x00000020) Copying File x.bin\n")
+        self.assertFalse(parsed["summary_found"])
+        self.assertEqual(parsed["files_failed"], 0)
 
 
 if __name__ == "__main__":

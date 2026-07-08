@@ -9,11 +9,6 @@ import ntpath
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
-try:
-    import psutil
-except ImportError:  # optional dependency — priority/affinity degrade gracefully
-    psutil = None
-
 from .db import _fmt_ts
 from .ltfs import get_volume_label
 from .packer import StagingSpaceError, ensure_staging_space
@@ -100,6 +95,22 @@ class LTORetriever:
             parts.append(part)
         return os.path.join(*parts) if parts else ''
 
+    def _resolve_tape_path(self, path):
+        """Remap the catalog's stored drive letter to the configured LTFS drive.
+
+        ``stored_path``/``container_name`` were recorded as absolute paths on
+        whatever letter the LTFS volume had at archive time. The mount letter
+        is an OS assignment detail — the same cartridge can come back as E:\\
+        years later — so restores resolve against the drive configured now.
+        """
+        drive, rest = os.path.splitdrive(str(path or ''))
+        if not drive or not rest:
+            return path
+        current = os.path.splitdrive(os.path.abspath(self.tape_drive))[0]
+        if not current or drive.upper() == current.upper():
+            return path
+        return current + rest
+
     def _unique_dest_path(self, candidate):
         """Return a restore path under restore_dir that won't overwrite an
         existing file. Distinct source files that share a basename would
@@ -177,9 +188,9 @@ class LTORetriever:
             fetch_page = lambda offset: self.db.search_files(
                 name_q, date_from, date_to,
                 limit=RESTORE_PAGE_SIZE, offset=offset)
-            fetch_after = lambda after_id: self.db.search_files(
-                name_q, date_from, date_to,
-                limit=RESTORE_PAGE_SIZE, after_id=after_id)
+            fetch_after = lambda after_id, tape: self.db.search_catalog(
+                name_query=name_q, date_from=date_from, date_to=date_to,
+                tape_label=tape, limit=RESTORE_PAGE_SIZE, after_id=after_id)
 
         elif opt == '4':
             dir_q = input("Original directory path (partial ok): ").strip()
@@ -188,8 +199,9 @@ class LTORetriever:
             total_results = self.db.count_by_directory(dir_q)
             fetch_page = lambda offset: self.db.search_by_directory(
                 dir_q, limit=RESTORE_PAGE_SIZE, offset=offset)
-            fetch_after = lambda after_id: self.db.search_by_directory(
-                dir_q, limit=RESTORE_PAGE_SIZE, after_id=after_id)
+            fetch_after = lambda after_id, tape: self.db.search_by_directory(
+                dir_q, limit=RESTORE_PAGE_SIZE, after_id=after_id,
+                tape_label=tape)
             first_page = fetch_page(0)
             if first_page:
                 directory_root = self._infer_directory_root(dir_q, first_page)
@@ -218,9 +230,12 @@ class LTORetriever:
             fetch_page = lambda offset: self.db.search_by_session(
                 s['session_date'], s['tape_label'],
                 limit=RESTORE_PAGE_SIZE, offset=offset)
-            fetch_after = lambda after_id: self.db.search_by_session(
-                s['session_date'], s['tape_label'],
-                limit=RESTORE_PAGE_SIZE, after_id=after_id)
+            # A session is bound to one tape; return nothing for the others.
+            fetch_after = lambda after_id, tape: (
+                [] if tape and tape != s['tape_label']
+                else self.db.search_by_session(
+                    s['session_date'], s['tape_label'],
+                    limit=RESTORE_PAGE_SIZE, after_id=after_id))
 
         else:
             return
@@ -297,18 +312,25 @@ class LTORetriever:
               f"{total_results:,} matching file(s)")
 
     def _restore_all_pages(self, fetch_after, total_results, restore_base=None):
-        # Keyset pagination on file_id: OFFSET paging re-scans every skipped
-        # row, which turns a large ALL-restore into an O(n^2) query series.
-        after_id = 0
+        # One tape at a time: a multi-tape restore used to interleave tapes
+        # page by page, prompting a cartridge swap every RESTORE_PAGE_SIZE
+        # files. Within each tape, keyset pagination on file_id (OFFSET paging
+        # re-scans every skipped row — O(n^2) over a large result).
         restored = 0
-        while True:
-            self._check_cancelled()
-            page = fetch_after(after_id)
-            if not page:
-                break
-            self._restore_many(page, restore_base=restore_base)
-            restored += len(page)
-            after_id = page[-1]['file_id']
+        for tape in [t['volume_label'] for t in self.db.list_tapes()]:
+            after_id = 0
+            while True:
+                self._check_cancelled()
+                page = fetch_after(after_id, tape)
+                if not page:
+                    break
+                self._restore_many(page, restore_base=restore_base)
+                restored += len(page)
+                after_id = page[-1]['file_id']
+        if restored < total_results:
+            print(f"\n[RESTORE] Note: {total_results - restored:,} matching "
+                  "record(s) reference tapes that are no longer registered "
+                  "and were not restored.")
         print(f"\n[RESTORE] Requested {total_results:,}; processed "
               f"{restored:,} file(s).")
 
@@ -386,7 +408,7 @@ class LTORetriever:
         return True
 
     def _restore_loose(self, record, restore_base=None):
-        src = record['stored_path']
+        src = self._resolve_tape_path(record['stored_path'])
         dst = self._destination_for_record(record, restore_base=restore_base)
         print(f"\n[RESTORE] Copying loose file: {record['file_name']}")
         os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
@@ -426,7 +448,8 @@ class LTORetriever:
                             "refusing to guess.")
 
     def _restore_packed(self, record, restore_base=None):
-        tape_zip_path = record['container_name']   # full path of ZIP on tape
+        # Full path of the ZIP on tape, remapped to the current drive letter.
+        tape_zip_path = self._resolve_tape_path(record['container_name'])
         stored_in_zip = record['stored_path']       # relative path inside the ZIP
         local_zip     = os.path.join(self.staging_dir, os.path.basename(tape_zip_path))
 
@@ -474,6 +497,7 @@ class LTORetriever:
 
     def _restore_packed_bulk(self, tape_zip_path, records, restore_base=None):
         """Extract multiple files from a single ZIP bundle in one pass."""
+        tape_zip_path = self._resolve_tape_path(tape_zip_path)
         local_zip = os.path.join(self.staging_dir, os.path.basename(tape_zip_path))
         print(f"\n[RESTORE] Copying {os.path.basename(tape_zip_path)} from tape to staging...")
         os.makedirs(self.staging_dir, exist_ok=True)

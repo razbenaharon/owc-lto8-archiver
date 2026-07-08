@@ -304,11 +304,17 @@ class LTOBackup:
         rc_sum = _parse_robocopy_summary(rc.stdout)
 
         rc_output = (rc.stdout or '') + '\n' + (rc.stderr or '')
+        # robocopy prints an ERROR line for EVERY failed attempt, including
+        # transient errors it then retried successfully (/R:3 /W:10). The final
+        # summary counters are the authoritative verdict, so the raw ERROR-line
+        # scan only applies when robocopy died before printing its summary —
+        # otherwise a single recovered transient would abort a healthy chunk.
         critical_robocopy_failure = (
             rc.returncode >= 8 or
             rc_sum.get('files_failed', 0) > 0 or
-            _ROBOCOPY_ERROR_RE.search(rc_output) is not None or
-            'RETRY LIMIT EXCEEDED' in rc_output
+            'RETRY LIMIT EXCEEDED' in rc_output or
+            (not rc_sum.get('summary_found') and
+             _ROBOCOPY_ERROR_RE.search(rc_output) is not None)
         )
         if critical_robocopy_failure:
             copied_bytes = rc_sum.get('bytes_copied', 0)
@@ -417,10 +423,12 @@ class LTOBackup:
             record_counts['loose_records_skipped_existing'] += recovered_stats['skipped']
 
             def loose_staged_records():
+                # loose_map is built only from is_packed=False packer metadata,
+                # so generated bundle ZIPs can never appear here — no name
+                # filter is needed (one used to silently drop legitimate user
+                # files that happened to be named "Bundle_*.zip").
                 for rel_path, info in loose_map.items():
                     file = os.path.basename(info['src'])
-                    if file.startswith("Bundle_") and file.endswith(".zip"):
-                        continue
                     m = meta_by_rel.get(rel_path)
                     if m:
                         yield catalog_record(

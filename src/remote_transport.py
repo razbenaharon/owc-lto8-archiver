@@ -7,17 +7,33 @@ import tempfile
 import shlex
 import atexit
 
-try:
-    import psutil
-except ImportError:  # optional dependency — priority/affinity degrade gracefully
-    psutil = None
-
+from .constants import PROJECT_ROOT
 from .paths import _safe_remote_relpath
 from .runtime import CANCEL, _apply_proc_tuning, _kill_proc_tree, register_proc, unregister_proc
 
 
 def _has_command(name):
     return shutil.which(name) is not None
+
+
+def _hostkey_policy():
+    """Host-key trust policy for every SSH/SCP invocation.
+
+    The default, 'accept-new', trusts a host key on first contact (TOFU) —
+    adequate for a fixed lab fleet whose keys are already in known_hosts, but
+    a first-contact MITM window when they are not. Set
+    LTO_SSH_HOSTKEY_POLICY=yes (environment variable or .env) after
+    provisioning known_hosts (e.g. via ssh-keyscan) to pin keys strictly.
+    """
+    value = os.environ.get('LTO_SSH_HOSTKEY_POLICY', '').strip()
+    if not value:
+        from .config import _load_env_file
+        value = _load_env_file(os.path.join(PROJECT_ROOT, '.env')).get(
+            'LTO_SSH_HOSTKEY_POLICY', '').strip()
+    return value or 'accept-new'
+
+
+SSH_HOSTKEY_POLICY = _hostkey_policy()
 
 
 _ASKPASS_HELPERS = set()
@@ -96,7 +112,7 @@ def _ssh_run(remote_user, remote_host, command, capture=True, password='',
                 'ssh',
                 '-o', 'BatchMode=no',
                 '-o', 'PubkeyAuthentication=no',
-                '-o', 'StrictHostKeyChecking=accept-new',
+                '-o', f'StrictHostKeyChecking={SSH_HOSTKEY_POLICY}',
                 f'{remote_user}@{remote_host}',
                 command,
             ]
@@ -128,7 +144,7 @@ def _ssh_run(remote_user, remote_host, command, capture=True, password='',
                 '-o', 'BatchMode=no',
                 '-o', 'PubkeyAuthentication=no',
                 '-o', 'NumberOfPasswordPrompts=1',
-                '-o', 'StrictHostKeyChecking=accept-new',
+                '-o', f'StrictHostKeyChecking={SSH_HOSTKEY_POLICY}',
                 f'{remote_user}@{remote_host}',
                 command,
             ]
@@ -171,7 +187,7 @@ def _ssh_run(remote_user, remote_host, command, capture=True, password='',
     ssh_cmd = [
         'ssh',
         '-o', 'BatchMode=yes',
-        '-o', 'StrictHostKeyChecking=accept-new',
+        '-o', f'StrictHostKeyChecking={SSH_HOSTKEY_POLICY}',
         f'{remote_user}@{remote_host}',
         command,
     ]
@@ -257,7 +273,7 @@ def _ssh_stream_command(remote_user, remote_host, command, password='', cipher='
                 'ssh', *cipher_opts,
                 '-o', 'BatchMode=no',
                 '-o', 'PubkeyAuthentication=no',
-                '-o', 'StrictHostKeyChecking=accept-new',
+                '-o', f'StrictHostKeyChecking={SSH_HOSTKEY_POLICY}',
                 f'{remote_user}@{remote_host}',
                 command,
             ], env, None
@@ -267,7 +283,7 @@ def _ssh_stream_command(remote_user, remote_host, command, password='', cipher='
                 '-o', 'BatchMode=no',
                 '-o', 'PubkeyAuthentication=no',
                 '-o', 'NumberOfPasswordPrompts=1',
-                '-o', 'StrictHostKeyChecking=accept-new',
+                '-o', f'StrictHostKeyChecking={SSH_HOSTKEY_POLICY}',
                 f'{remote_user}@{remote_host}',
                 command,
             ], _openssh_askpass_env(password), None
@@ -283,7 +299,7 @@ def _ssh_stream_command(remote_user, remote_host, command, password='', cipher='
     return [
         'ssh', *cipher_opts,
         '-o', 'BatchMode=yes',
-        '-o', 'StrictHostKeyChecking=accept-new',
+        '-o', f'StrictHostKeyChecking={SSH_HOSTKEY_POLICY}',
         f'{remote_user}@{remote_host}',
         command,
     ], None, None
@@ -331,9 +347,13 @@ def _remote_tar_fetch(remote_user, remote_host, remote_base, rel_paths, local_de
     # ~900 GB of unplanned data this way).
     # Missing inputs are reported on stderr but do not abort the stream; the
     # caller verifies every expected local file and records exact omissions.
+    # LC_ALL=C pins tar's diagnostics to English: the recoverable-warning
+    # filter below matches the literal "Cannot stat: No such file or
+    # directory" text, and a localized remote would otherwise turn every
+    # legitimately-missing file into a fatal fetch error.
     tar_core = (
-        f"tar -C {shlex.quote(remote_base)} -b 512 --sparse --no-recursion "
-        "--ignore-failed-read -cf - --null -T -"
+        f"LC_ALL=C tar -C {shlex.quote(remote_base)} -b 512 --sparse "
+        "--no-recursion --ignore-failed-read -cf - --null -T -"
     )
     if use_mbuffer:
         # Use mbuffer only if it exists on the remote; otherwise fall back to a
