@@ -13,6 +13,7 @@ from src.orchestrators import (
     StreamingChunkBuilder,
     StreamingRemoteScanner,
 )
+from src.pipeline_types import StagedChunk
 from src.remote_transport import (
     _ASKPASS_HELPERS,
     _cleanup_askpass_helpers,
@@ -85,13 +86,13 @@ class RemoteStagingSafetyTests(unittest.TestCase):
         orch = self._orchestrator()
         orch.db = FakeDB()
         orch.cfg = SimpleNamespace(ibm_eject_cmd="", lto_drive="", backup_log_dir="")
-        desc = {
-            "chunk_index": 0,
-            "pack_dir": r"C:\stage\pack",
-            "fetch_dir": r"C:\stage\fetch",
-            "metadata": [{"is_packed": True}],
-            "staged_bytes": 0,
-        }
+        desc = StagedChunk(
+            chunk_index=0,
+            pack_dir=r"C:\stage\pack",
+            fetch_dir=r"C:\stage\fetch",
+            metadata=[{"is_packed": True}],
+            staged_bytes=0,
+        )
         self.assertFalse(orch._write_chunk(1, desc, "T1", eject_after=False))
         self.assertEqual(orch.db.statuses, ["backup_failed"])
 

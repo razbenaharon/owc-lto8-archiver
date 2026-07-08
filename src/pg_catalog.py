@@ -1,6 +1,6 @@
 """File-catalog method group: files_index, bundles, runs, search/counts."""
 from collections import defaultdict
-from typing import Any, List
+from typing import Any, Iterable, List
 
 from .catalog_query import contains_pattern, prefix_pattern, substring_pattern
 from .catalog_v3 import catalog_directory_chain, catalog_file_name
@@ -8,6 +8,7 @@ from .constants import DB_UPSERT_BATCH_SIZE, LEGACY_DEFAULT_SOURCE_HOST
 from .db import _derived_file_name, _file_record_key, _short_source_host
 from .pg_bulk import copy_rows
 from .pg_core import _as_utc, _now_utc, _rows
+from .pipeline_types import FileRecord
 from .runtime import CANCEL
 
 
@@ -293,7 +294,8 @@ class PgCatalogMixin:
             "skipped": total - inserted,
         }
 
-    def bulk_upsert_files(self, records, batch_size=DB_UPSERT_BATCH_SIZE,
+    def bulk_upsert_files(self, records: Iterable[FileRecord],
+                          batch_size=DB_UPSERT_BATCH_SIZE,
                           update_existing=True):
         totals = {"inserted": 0, "updated": 0, "skipped": 0}
         batch = []

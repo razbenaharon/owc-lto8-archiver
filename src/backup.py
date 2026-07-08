@@ -109,7 +109,12 @@ class LTOBackup:
             list of dicts  — staged backup with full metadata (from LTOPacker).
             []             — staged backup, existing staging, no per-file metadata.
             None           — direct backup from source directory.
+        stage_stats:
+            src.pipeline_types.StagedChunk from the remote pipeline (producer
+            timings + source-missing list), or None for local/direct runs.
         """
+        def _stat(name, default=None):
+            return getattr(stage_stats, name, default) if stage_stats else default
         print(f"\n[BACKUP] Starting... Tape: {tape_label} | Drive: {tape_drive}")
         if not _ensure_lto_drive_ready(tape_drive, prefix="[BACKUP]"):
             raise RuntimeError("LTO drive is not ready for backup.")
@@ -341,7 +346,7 @@ class LTOBackup:
                     'rc_sum': rc_sum,
                     'record_counts': {},
                     'source_missing_files':
-                        (stage_stats or {}).get('source_missing_files', []),
+                        _stat('source_missing_files', []),
                     'skipped_files_count':
                         skipped_tracker.count() if skipped_tracker else '',
                     'skipped_files_report':
@@ -499,12 +504,12 @@ class LTOBackup:
                 'rc_sum': rc_sum,
                 'record_counts': dict(record_counts),
                 'db_sync_seconds': db_sync_seconds,
-                'fetch_seconds': (stage_stats or {}).get('fetch_seconds'),
-                'fetch_bytes':   (stage_stats or {}).get('fetch_bytes'),
-                'pack_seconds':  (stage_stats or {}).get('pack_seconds'),
-                'pack_bytes':    (stage_stats or {}).get('pack_bytes'),
+                'fetch_seconds': _stat('fetch_seconds'),
+                'fetch_bytes':   _stat('fetch_bytes'),
+                'pack_seconds':  _stat('pack_seconds'),
+                'pack_bytes':    _stat('pack_bytes'),
                 'source_missing_files':
-                    (stage_stats or {}).get('source_missing_files', []),
+                    _stat('source_missing_files', []),
                 'skipped_files_count': skipped_count,
                 'skipped_files_report': skipped_report,
             },
@@ -525,7 +530,7 @@ class LTOBackup:
         print(f"Files Copied    : {rc_sum['files_copied']}")
         print(f"Files Skipped   : {rc_sum['files_skipped'] + skipped}")
         print(f"Source Missing  : "
-              f"{len((stage_stats or {}).get('source_missing_files', []))}")
+              f"{len(_stat('source_missing_files', []))}")
         print(f"Files Failed    : {rc_sum['files_failed']}")
         if rc_sum['elapsed']:
             print(f"Robocopy Time   : {rc_sum['elapsed']}")
