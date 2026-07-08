@@ -11,18 +11,28 @@ in a PostgreSQL catalog (see `docker-compose.yml` and `scripts/sql/`).
   `src.cli.main()`).
 - `inspect_db.py` — root runner for the GUI database inspector.
 - `src/` — internal package holding the application code, split into modules with
-  strictly downward dependencies: `constants` → `runtime` → `paths` →
-  `reporting`/`config`/`db` → `robocopy`/`remote_transport` → `ltfs` → `packer`
-  → `backup`/`retriever` → `orchestrators` → `cli`; `src/db_inspector_qt.py`
-  holds the GUI. Data files (`config.ini`, `.env`, `backup_logs/`) stay in the
-  project root; `src/constants.py` anchors paths to `PROJECT_ROOT`. The archive
-  catalog itself lives in PostgreSQL, not in a repo file.
+  strictly downward dependencies: `constants`/`pipeline_types` → `logsetup` →
+  `runtime` → `paths` → `reporting`/`config`/`db` →
+  `robocopy`/`remote_transport` → `ltfs` → `packer` → `scanning`/`planning` →
+  `backup`/`retriever` → `local_orchestrator`/`remote_orchestrator` →
+  `orchestrators` (re-export facade) → `cli`; `src/db_inspector_qt.py` holds
+  the GUI. The PostgreSQL layer is split the same way: `pg_bulk` → `pg_core`
+  → `pg_catalog`/`pg_sessions`/`pg_tapes` → `pg_db` (facade assembling
+  `PgDatabaseManager` from the mixins). Import the facades (`orchestrators`,
+  `pg_db`) from application code; in tests, `mock.patch` targets must name the
+  module a symbol is *used* in (e.g. `src.scanning._ssh_run`). Data files
+  (`config.ini`, `.env`, `backup_logs/`) stay in the project root;
+  `src/constants.py` anchors paths to `PROJECT_ROOT`. The archive catalog
+  itself lives in PostgreSQL, not in a repo file.
 - `config.ini` — local paths, tape drive settings, remote archive settings, and
   performance tuning. `.env` stores secrets (e.g. `remote_password`); keep it
   untracked and use `.env.example` as the template.
 - `backup_logs/` — holds the single `SUMMARY.csv`: the one statistics file for
   backup/tape-write sessions. No per-run log files and no per-file manifests are
-  written, so it never contains individual file names.
+  written, so it never contains individual file names. A rotating diagnostic
+  trace (`archiver.log`, via `src/logsetup.py`) also lives here: status lines
+  and full exception tracebacks tee into it, console output unchanged. It is
+  a debugging trace, not a statistics file — never parse it for reports.
 - `Framework & Drivers/` — installer assets and hardware documentation.
 - `scripts/sql/` — PostgreSQL schema/index/constraint migrations applied on
   startup by `PgDatabaseManager._init_schema`; `docker-compose.yml` runs the
