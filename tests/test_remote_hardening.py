@@ -40,7 +40,7 @@ class RemoteStagingSafetyTests(unittest.TestCase):
         planned = 100
         free = 2 * planned + LOCAL_STAGING_RESERVE_BYTES - 1
         usage = SimpleNamespace(total=free, used=0, free=free)
-        with mock.patch("src.orchestrators.shutil.disk_usage",
+        with mock.patch("src.remote_orchestrator.shutil.disk_usage",
                         return_value=usage):
             with self.assertRaisesRegex(RuntimeError, "Insufficient local staging"):
                 orch._await_staging_capacity(planned, 0, threading.Event())
@@ -53,7 +53,7 @@ class RemoteStagingSafetyTests(unittest.TestCase):
             orch.chunk_cap_bytes = 10**15
             free = LOCAL_STAGING_RESERVE_BYTES + 1234
             usage = SimpleNamespace(total=free, used=0, free=free)
-            with mock.patch("src.orchestrators.shutil.disk_usage",
+            with mock.patch("src.remote_orchestrator.shutil.disk_usage",
                             return_value=usage):
                 self.assertEqual(orch._chunk_budget(), 1234)
             self.assertTrue(os.path.isdir(orch.staging_dir))
@@ -160,8 +160,8 @@ class FetchWatchdogTests(unittest.TestCase):
         orch = self._orchestrator()
         stop, abort = threading.Event(), threading.Event()
         plenty = SimpleNamespace(total=10**12, used=0, free=10**12)
-        with mock.patch("src.orchestrators._dir_tree_size", return_value=300), \
-             mock.patch("src.orchestrators.shutil.disk_usage",
+        with mock.patch("src.remote_orchestrator._dir_tree_size", return_value=300), \
+             mock.patch("src.remote_orchestrator.shutil.disk_usage",
                         return_value=plenty):
             orch._start_fetch_monitor(stop, abort, r"C:\stage\_fetch", 100)
             self.assertTrue(abort.wait(timeout=15),
@@ -173,8 +173,8 @@ class FetchWatchdogTests(unittest.TestCase):
         stop, abort = threading.Event(), threading.Event()
         low = SimpleNamespace(total=10**12, used=0,
                               free=LOCAL_STAGING_RESERVE_BYTES - 1)
-        with mock.patch("src.orchestrators._dir_tree_size", return_value=10), \
-             mock.patch("src.orchestrators.shutil.disk_usage",
+        with mock.patch("src.remote_orchestrator._dir_tree_size", return_value=10), \
+             mock.patch("src.remote_orchestrator.shutil.disk_usage",
                         return_value=low):
             orch._start_fetch_monitor(stop, abort, r"C:\stage\_fetch", 100)
             self.assertTrue(abort.wait(timeout=15),
@@ -185,8 +185,8 @@ class FetchWatchdogTests(unittest.TestCase):
         orch = self._orchestrator()
         stop, abort = threading.Event(), threading.Event()
         plenty = SimpleNamespace(total=10**12, used=0, free=10**12)
-        with mock.patch("src.orchestrators._dir_tree_size", return_value=90), \
-             mock.patch("src.orchestrators.shutil.disk_usage",
+        with mock.patch("src.remote_orchestrator._dir_tree_size", return_value=90), \
+             mock.patch("src.remote_orchestrator.shutil.disk_usage",
                         return_value=plenty):
             orch._start_fetch_monitor(stop, abort, r"C:\stage\_fetch", 100)
             self.assertFalse(abort.wait(timeout=3))
@@ -237,7 +237,7 @@ class RemoteScannerTests(unittest.TestCase):
             stdout="10 /data/ok.txt\0",
             stderr="find: ‘/data/private’: Permission denied",
         )
-        with mock.patch("src.orchestrators._ssh_run", return_value=result):
+        with mock.patch("src.scanning._ssh_run", return_value=result):
             manifest = scanner.scan(["/data"])
         self.assertEqual(manifest, [("/data/ok.txt", 10)])
         self.assertEqual(tracker.count(), 1)
@@ -258,7 +258,7 @@ class RemoteScannerTests(unittest.TestCase):
             stderr="",
         )
         empty = SimpleNamespace(returncode=0, stdout="", stderr="")
-        with mock.patch("src.orchestrators._ssh_run",
+        with mock.patch("src.scanning._ssh_run",
                         side_effect=[result, empty]):
             manifest = scanner.scan(["/strg/E/data", "/strg/D/data"])
         self.assertEqual(manifest, [("/strg/E/data/ok.txt", 10)])
@@ -281,7 +281,7 @@ class RemoteScannerTests(unittest.TestCase):
             stdout="12 /data/public/ok.txt\0",
             stderr="",
         )
-        with mock.patch("src.orchestrators._ssh_run",
+        with mock.patch("src.scanning._ssh_run",
                         side_effect=[denied, ok]):
             manifest = scanner.scan(["/data/private", "/data/public"])
         self.assertEqual(manifest, [("/data/public/ok.txt", 12)])
@@ -298,7 +298,7 @@ class RemoteScannerTests(unittest.TestCase):
             stdout="10 /data/ok.txt\0",
             stderr="SSH command timed out after 10s",
         )
-        with mock.patch("src.orchestrators._ssh_run", return_value=result):
+        with mock.patch("src.scanning._ssh_run", return_value=result):
             with self.assertRaisesRegex(RuntimeError, "timed out"):
                 scanner.scan(["/data"])
 
@@ -308,7 +308,7 @@ class RemoteScannerTests(unittest.TestCase):
             "user", "host", skipped_tracker=tracker, timeout=10)
         result = SimpleNamespace(
             returncode=0, stdout="7 /data/one.bin\0", stderr="")
-        with mock.patch("src.orchestrators._ssh_run", return_value=result):
+        with mock.patch("src.scanning._ssh_run", return_value=result):
             manifest = scanner.scan(["/data/one.bin"])
         self.assertEqual(manifest, [("/data/one.bin", 7)])
         self.assertEqual(tracker.count(), 0)
@@ -344,9 +344,9 @@ class StreamingRemoteScannerTests(unittest.TestCase):
     def test_parses_records_split_across_reads(self):
         scanner = StreamingRemoteScanner("user", "host")
         proc = _FakePopen([b"10 /data/a", b".bin\0", b"12 /data/b.bin\0"])
-        with mock.patch("src.orchestrators._ssh_stream_command",
+        with mock.patch("src.scanning._ssh_stream_command",
                         return_value=(["ssh"], None, None)), \
-             mock.patch("src.orchestrators.subprocess.Popen",
+             mock.patch("src.scanning.subprocess.Popen",
                         return_value=proc):
             rows = list(scanner.iter_scan(["/data"]))
         self.assertEqual(rows, [("/data/a.bin", 10), ("/data/b.bin", 12)])
@@ -356,9 +356,9 @@ class StreamingRemoteScannerTests(unittest.TestCase):
         scanner = StreamingRemoteScanner("user", "host",
                                          skipped_tracker=tracker)
         proc = _FakePopen([b"10 /data/ok.bin\0", b"99 /strg\0"])
-        with mock.patch("src.orchestrators._ssh_stream_command",
+        with mock.patch("src.scanning._ssh_stream_command",
                         return_value=(["ssh"], None, None)), \
-             mock.patch("src.orchestrators.subprocess.Popen",
+             mock.patch("src.scanning.subprocess.Popen",
                         return_value=proc):
             rows = list(scanner.iter_scan(["/data"]))
         self.assertEqual(rows, [("/data/ok.bin", 10)])
@@ -374,9 +374,9 @@ class StreamingRemoteScannerTests(unittest.TestCase):
             stderr="find: '/data/private': Permission denied\n".encode(),
             returncode=1,
         )
-        with mock.patch("src.orchestrators._ssh_stream_command",
+        with mock.patch("src.scanning._ssh_stream_command",
                         return_value=(["ssh"], None, None)), \
-             mock.patch("src.orchestrators.subprocess.Popen",
+             mock.patch("src.scanning.subprocess.Popen",
                         return_value=proc):
             rows = list(scanner.iter_scan(["/data"]))
         self.assertEqual(rows, [("/data/ok.bin", 10)])
