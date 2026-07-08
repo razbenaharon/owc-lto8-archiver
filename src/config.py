@@ -3,11 +3,6 @@ import os
 import configparser
 from urllib.parse import quote
 
-try:
-    import psutil
-except ImportError:  # optional dependency — priority/affinity degrade gracefully
-    psutil = None
-
 from .constants import BACKUP_LOG_DIR, CONFIG_FILE, PROJECT_ROOT
 from .paths import _clean_config_path, _clean_remote_path, _config_list
 
@@ -112,12 +107,32 @@ class ConfigManager:
         with open(self.config_path, 'w', encoding='utf-8') as f:
             self.config.write(f)
 
+    def _get_float(self, section, key, fallback):
+        """Read a float option; a typo degrades to the default with a warning
+        at read time instead of an unhandled ValueError mid-run."""
+        raw = self.config.get(section, key, fallback=str(fallback))
+        try:
+            return float(str(raw).strip())
+        except ValueError:
+            print(f"[CONFIG] Invalid [{section}] {key} = {raw!r}; "
+                  f"using default {fallback}.")
+            return float(fallback)
+
     @property
-    def source_dir(self):    return _clean_config_path(self.config['PATHS']['source_dir'])
+    def source_dir(self):
+        return _clean_config_path(self.config.get(
+            'PATHS', 'source_dir',
+            fallback=os.path.join(PROJECT_ROOT, 'source')))
     @property
-    def staging_dir(self):   return _clean_config_path(self.config['PATHS']['staging_dir'])
+    def staging_dir(self):
+        return _clean_config_path(self.config.get(
+            'PATHS', 'staging_dir',
+            fallback=os.path.join(PROJECT_ROOT, 'staging')))
     @property
-    def restore_dir(self):   return _clean_config_path(self.config['PATHS']['restore_dir'])
+    def restore_dir(self):
+        return _clean_config_path(self.config.get(
+            'PATHS', 'restore_dir',
+            fallback=os.path.join(PROJECT_ROOT, 'restored')))
     @property
     def pg_host(self):
         return self.config.get('DATABASE', 'host', fallback='localhost').strip()
@@ -161,15 +176,20 @@ class ConfigManager:
         return _clean_config_path(self.config.get('PATHS', 'backup_log_dir',
                                                   fallback=BACKUP_LOG_DIR))
     @property
-    def lto_drive(self):     return _clean_config_path(self.config['HARDWARE']['lto_drive'])
+    def lto_drive(self):
+        return _clean_config_path(self.config.get(
+            'HARDWARE', 'lto_drive', fallback=r'D:\\'))
     @property
-    def ibm_eject_cmd(self): return _clean_config_path(self.config['HARDWARE'].get(
-                                 'ibm_eject_cmd',
-                                 r'C:\Program Files\IBM\LTFS\LtfsCmdEject.exe'))
+    def ibm_eject_cmd(self):
+        return _clean_config_path(self.config.get(
+            'HARDWARE', 'ibm_eject_cmd',
+            fallback=r'C:\Program Files\IBM\LTFS\LtfsCmdEject.exe'))
     @property
-    def zip_threshold_mb(self): return float(self.config['SETTINGS']['zip_threshold_mb'])
+    def zip_threshold_mb(self):
+        return self._get_float('SETTINGS', 'zip_threshold_mb', 100)
     @property
-    def max_zip_size_gb(self):  return float(self.config['SETTINGS']['max_zip_size_gb'])
+    def max_zip_size_gb(self):
+        return self._get_float('SETTINGS', 'max_zip_size_gb', 100)
     @property
     def remote_host(self):      return self.config.get('REMOTE', 'remote_host', fallback='')
     @property
@@ -195,18 +215,20 @@ class ConfigManager:
     def confirm_before_backup(self):
         return self.config.get('REMOTE', 'confirm_before_backup', fallback='true').strip().lower() in ('1', 'true', 'yes', 'on')
     @property
-    def staging_fill_pct(self): return float(self.config.get('REMOTE', 'staging_fill_pct', fallback='0.80'))
+    def staging_fill_pct(self):
+        return self._get_float('REMOTE', 'staging_fill_pct', 0.80)
 
     # --- [PERFORMANCE] : continuous-streaming pipeline tuning -----------------
     @property
     def chunk_cap_gb(self):
-        return float(self.config.get('PERFORMANCE', 'chunk_cap_gb', fallback='100'))
+        return self._get_float('PERFORMANCE', 'chunk_cap_gb', 100)
     @property
     def prefetch_chunks_ahead(self):
-        return max(1, int(float(self.config.get('PERFORMANCE', 'prefetch_chunks_ahead', fallback='2'))))
+        return max(1, int(self._get_float(
+            'PERFORMANCE', 'prefetch_chunks_ahead', 2)))
     @property
     def staging_max_gb(self):
-        return float(self.config.get('PERFORMANCE', 'staging_max_gb', fallback='350'))
+        return self._get_float('PERFORMANCE', 'staging_max_gb', 350)
     @property
     def robocopy_priority(self):
         return self.config.get('PERFORMANCE', 'robocopy_priority', fallback='high').strip().lower()

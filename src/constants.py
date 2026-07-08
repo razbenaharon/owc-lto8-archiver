@@ -38,6 +38,25 @@ TAPE_BUDGET_LABEL = f"{LOCAL_TAPE_BUDGET_BYTES / 1000**4:.1f} TB"
 # Default registered capacity for a fresh LTO-8 cartridge (decimal-GB figure
 # used verbatim in prompts and stored in tapes.total_capacity).
 DEFAULT_TAPE_CAPACITY_GB = 12288
+
+
+def tape_budget_bytes(total_capacity_gb, used_bytes, reserved_bytes=0):
+    """Return ``(capacity_bytes, available_bytes)`` for a registered tape.
+
+    ``total_capacity_gb`` is the ``tapes.total_capacity`` column — a
+    decimal-GB figure (see ``DEFAULT_TAPE_CAPACITY_GB``). The planning
+    capacity is the smaller of that and the ``LOCAL_TAPE_BUDGET_BYTES``
+    safety budget. Decimal GB replaces a previous GiB interpretation that
+    overstated capacity by ~7%; the change can only ever reject MORE, never
+    accept more than before.
+    """
+    capacity_bytes = LOCAL_TAPE_BUDGET_BYTES
+    if total_capacity_gb:
+        capacity_bytes = min(capacity_bytes,
+                             int(float(total_capacity_gb) * 1000**3))
+    available_bytes = max(
+        0, capacity_bytes - int(used_bytes) - int(reserved_bytes))
+    return capacity_bytes, available_bytes
 # Seal a bundle ZIP slightly before max_zip_size_gb so the ZIP central
 # directory and per-entry headers never push it past the configured cap.
 ZIP_BUNDLE_FILL_FACTOR = 0.99

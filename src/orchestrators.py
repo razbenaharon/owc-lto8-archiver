@@ -13,16 +13,11 @@ from datetime import datetime
 from collections import defaultdict
 from typing import Dict, Optional, Type
 
-try:
-    import psutil
-except ImportError:  # optional dependency — priority/affinity degrade gracefully
-    psutil = None
-
 from .backup import LTOBackup, _NoEjectBackup
 from .constants import (DEFAULT_TAPE_CAPACITY_GB, LOCAL_STAGING_RESERVE_BYTES,
                         LOCAL_TAPE_BUDGET_BYTES, LTFS_WRITE_WARNING,
                         ROOT_FILES_GROUP, TAPE_BUDGET_LABEL,
-                        _auto_pack_decision)
+                        _auto_pack_decision, tape_budget_bytes)
 from .db import _apply_canonical_remote_paths
 from .ltfs import _ensure_lto_drive_ready, get_volume_label
 from .packer import LTOAnalyzer, LTOPacker, ensure_staging_space
@@ -78,7 +73,9 @@ class RemoteScanner:
             self.skipped_tracker.add('remote', path, reason, 'scan')
 
     def _scan_one(self, scan_path):
-        find_cmd = f"find {shlex.quote(scan_path)} -type f -printf '%s %p\\0'"
+        # LC_ALL=C pins find's diagnostics to English so the warning parser
+        # stays locale-independent (filenames are bytes and unaffected).
+        find_cmd = f"LC_ALL=C find {shlex.quote(scan_path)} -type f -printf '%s %p\\0'"
         result = _ssh_run(
             self.remote_user,
             self.remote_host,
@@ -138,6 +135,18 @@ class RemoteScanner:
                 self.skipped_tracker.add(
                     'remote', path, f"invalid find size token: {size_s}", 'scan')
                 continue
+            # Linux filenames are bytes; the SSH capture decodes with
+            # errors='replace', so U+FFFD here means the original name was not
+            # valid UTF-8. Planning it would send a mangled name to the remote
+            # tar, which silently reports it "missing" — record the omission
+            # loudly at scan time instead so the operator can rename the file.
+            if '�' in path:
+                self.skipped_tracker.add(
+                    'remote', path,
+                    "filename is not valid UTF-8 and cannot be fetched "
+                    "faithfully; rename it on the source host to archive it",
+                    'scan')
+                continue
             # Every legitimate record lies under (or is) a scan root. Anything
             # else is a corrupt/truncated record; planning it is dangerous — a
             # path like '/strg' names a directory and would make the fetch tar
@@ -186,6 +195,15 @@ class StreamingRemoteScanner(RemoteScanner):
             self.skipped_tracker.add(
                 'remote', path, f"invalid find size token: {size_s}", 'scan')
             return None
+        # See RemoteScanner._scan_one: U+FFFD marks a non-UTF-8 filename that
+        # a fetch would silently drop as "source missing" — skip it loudly.
+        if '�' in path:
+            self.skipped_tracker.add(
+                'remote', path,
+                "filename is not valid UTF-8 and cannot be fetched "
+                "faithfully; rename it on the source host to archive it",
+                'scan')
+            return None
         norm = posixpath.normpath(path)
         if not (norm == root or norm.startswith(root + '/')):
             self.skipped_tracker.add(
@@ -204,7 +222,7 @@ class StreamingRemoteScanner(RemoteScanner):
     def _iter_scan_one(self, scan_path, stop_evt=None):
         self.ui.info(f"[REMOTE] Streaming scan {scan_path} ...")
         root = posixpath.normpath(scan_path.replace('\\', '/').strip())
-        find_cmd = f"find {shlex.quote(scan_path)} -type f -printf '%s %p\\0'"
+        find_cmd = f"LC_ALL=C find {shlex.quote(scan_path)} -type f -printf '%s %p\\0'"
         ssh_cmd, env, err = _ssh_stream_command(
             self.remote_user,
             self.remote_host,
@@ -476,11 +494,8 @@ class LocalOrchestrator:
             }
 
         used_bytes = self.db.recalculate_tape_used_space(tape_label)
-        capacity_bytes = LOCAL_TAPE_BUDGET_BYTES
-        if tape['total_capacity']:
-            capacity_bytes = min(
-                capacity_bytes, int(tape['total_capacity'] * 1024**3))
-        available_bytes = max(0, capacity_bytes - used_bytes)
+        _, available_bytes = tape_budget_bytes(
+            tape['total_capacity'], used_bytes)
         print(f"[TAPE] Mounted '{tape_label}': DB occupied "
               f"{used_bytes / 1024**4:.2f} TiB; safe remaining "
               f"{available_bytes / 1024**4:.2f} TiB.")
@@ -727,11 +742,8 @@ class LocalOrchestrator:
             return False
 
         used_bytes = self.db.recalculate_tape_used_space(tape_label)
-        capacity_bytes = LOCAL_TAPE_BUDGET_BYTES
-        if tape['total_capacity']:
-            capacity_bytes = min(
-                capacity_bytes, int(tape['total_capacity'] * 1024**3))
-        available_bytes = capacity_bytes - used_bytes
+        _, available_bytes = tape_budget_bytes(
+            tape['total_capacity'], used_bytes)
         if planned_bytes > available_bytes:
             print(f"[TAPE] '{tape_label}' does not have enough indexed "
                   f"capacity for this chunk ({planned_bytes / 1024**3:.2f} "
@@ -743,6 +755,16 @@ class LocalOrchestrator:
 
     def _collect_chunk_files(self, source_dir, entries):
         collected = []
+
+        def _append(path):
+            # A file deleted between planning and this run should be recorded
+            # as skipped, not crash the whole chunk on the stat call.
+            try:
+                collected.append(self._file_entry(source_dir, path))
+            except OSError as e:
+                print(f"[WARN] Cannot stat {path}: {e}")
+                self.skipped_tracker.add('local', path, e, 'collect')
+
         for entry in entries:
             top = entry['top_level_dir']
             if top == ROOT_FILES_GROUP:
@@ -752,12 +774,12 @@ class LocalOrchestrator:
                     raise RuntimeError(f"Cannot scan source root: {e}")
                 for item in scan:
                     if item.is_file():
-                        collected.append(self._file_entry(source_dir, item.path))
+                        _append(item.path)
             else:
                 root = os.path.join(source_dir, top)
                 for cur, _, files in os.walk(root):
                     for file in files:
-                        collected.append(self._file_entry(source_dir, os.path.join(cur, file)))
+                        _append(os.path.join(cur, file))
         return sorted(collected, key=lambda f: f['rel'].lower())
 
     def _file_entry(self, source_dir, path):
@@ -1136,15 +1158,12 @@ class RemoteOrchestrator:
         if not tape:
             raise RuntimeError(f"[DB] Tape '{tape_label}' is not registered.")
         used_bytes = self.db.recalculate_tape_used_space(tape_label)
-        capacity_bytes = LOCAL_TAPE_BUDGET_BYTES
-        if tape['total_capacity']:
-            capacity_bytes = min(
-                capacity_bytes, int(tape['total_capacity'] * 1024**3))
         reserved_bytes = 0
         if session_id is not None and hasattr(
                 self.db, 'get_pending_remote_reserved_bytes'):
             reserved_bytes = self.db.get_pending_remote_reserved_bytes(session_id)
-        available_bytes = max(0, capacity_bytes - used_bytes - reserved_bytes)
+        capacity_bytes, available_bytes = tape_budget_bytes(
+            tape['total_capacity'], used_bytes, reserved_bytes)
         print(f"[TAPE] '{tape_label}': DB occupied "
               f"{used_bytes / 1024**3:.2f} GiB; "
               f"reserved pending {reserved_bytes / 1024**3:.2f} GiB; "
@@ -1358,7 +1377,14 @@ class RemoteOrchestrator:
         def _stager():
             try:
                 while not (CANCEL.is_set() or stop_pipeline.is_set()):
-                    item = chunk_q.get()
+                    try:
+                        # A bounded wait keeps this thread responsive to a
+                        # cancellation that raced the scanner's sentinel put
+                        # (a bare get() would block forever if the sentinel
+                        # was dropped on a full queue during shutdown).
+                        item = chunk_q.get(timeout=1)
+                    except queue.Empty:
+                        continue
                     if item is SENTINEL:
                         break
                     ci = item
@@ -1891,11 +1917,8 @@ class RemoteOrchestrator:
             print(f"[DB] Tape '{tape_label}' is not registered.")
             return False
         used_bytes = self.db.recalculate_tape_used_space(tape_label)
-        capacity_bytes = LOCAL_TAPE_BUDGET_BYTES
-        if tape['total_capacity']:
-            capacity_bytes = min(
-                capacity_bytes, int(tape['total_capacity'] * 1024**3))
-        available_bytes = capacity_bytes - used_bytes
+        _, available_bytes = tape_budget_bytes(
+            tape['total_capacity'], used_bytes)
         if planned_bytes > available_bytes:
             print(f"[TAPE] Remote chunk {chunk_index + 1} does not fit on "
                   f"'{tape_label}' ({planned_bytes / 1024**3:.2f} GiB needed, "

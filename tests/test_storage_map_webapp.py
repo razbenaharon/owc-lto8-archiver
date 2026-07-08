@@ -219,7 +219,11 @@ class _FakeCfg:
 
 class WebAppApiTests(unittest.TestCase):
     def setUp(self):
-        from fastapi.testclient import TestClient
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:
+            self.skipTest("fastapi is not installed "
+                          "(optional storage_map v2 dependency)")
         from storage_map.webapp.app import create_app
 
         self._tmp = tempfile.TemporaryDirectory()
@@ -278,11 +282,11 @@ class WebAppApiTests(unittest.TestCase):
 
         with mock.patch("storage_map.webapp.app.core.scan",
                         side_effect=fake_scan):
-            self.assertEqual(self.client.post("/api/scan").status_code, 202)
+            self.assertEqual(self.client.post("/api/scan", json={}).status_code, 202)
             self.assertTrue(started.wait(5))
             # Same job and its conflicts are refused while running.
-            self.assertEqual(self.client.post("/api/scan").status_code, 409)
-            self.assertEqual(self.client.post("/api/fetch").status_code, 409)
+            self.assertEqual(self.client.post("/api/scan", json={}).status_code, 409)
+            self.assertEqual(self.client.post("/api/fetch", json={}).status_code, 409)
             release.set()
             job = self._wait_job("scan")
         self.assertEqual(job["state"], "done")
@@ -290,7 +294,7 @@ class WebAppApiTests(unittest.TestCase):
 
     def test_failed_fetch_is_reported_as_failed_job(self):
         with mock.patch("storage_map.webapp.app.core.fetch", return_value=1):
-            self.assertEqual(self.client.post("/api/fetch").status_code, 202)
+            self.assertEqual(self.client.post("/api/fetch", json={}).status_code, 202)
             job = self._wait_job("fetch")
         self.assertEqual(job["state"], "failed")
         self.assertIn("no completed scans", job["detail"])
@@ -300,6 +304,15 @@ class WebAppApiTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
         resp = self.client.post("/api/scan", json={"servers": ["nope"]})
         self.assertEqual(resp.status_code, 400)
+
+    def test_post_without_json_content_type_is_rejected(self):
+        # CSRF guard: a cross-origin "simple" POST (no JSON content type)
+        # must not be able to trigger SSH-launching actions.
+        resp = self.client.post("/api/scan")
+        self.assertEqual(resp.status_code, 415)
+        resp = self.client.post("/api/scan", content=b"",
+                                headers={"Content-Type": "text/plain"})
+        self.assertEqual(resp.status_code, 415)
 
     def test_coverage_refresh_writes_cache_and_coverage_uses_it(self):
         rows = [_db_row("so01", "/strg/D/shared-data/op", 600 * GIB, files=3)]
@@ -321,7 +334,7 @@ class WebAppApiTests(unittest.TestCase):
 
         with mock.patch("storage_map.webapp.app.CoverageRepository", FakeRepo):
             self.assertEqual(
-                self.client.post("/api/coverage/refresh").status_code, 202)
+                self.client.post("/api/coverage/refresh", json={}).status_code, 202)
             job = self._wait_job("coverage")
         self.assertEqual(job["state"], "done")
 

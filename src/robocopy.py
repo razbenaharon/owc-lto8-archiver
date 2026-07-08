@@ -4,12 +4,7 @@ import time
 import threading
 import subprocess
 
-try:
-    import psutil
-except ImportError:  # optional dependency — priority/affinity degrade gracefully
-    psutil = None
-
-from .runtime import _apply_proc_tuning, _progress_done, _progress_line, register_proc, unregister_proc
+from .runtime import CANCEL, _apply_proc_tuning, _progress_done, _progress_line, register_proc, unregister_proc
 
 
 def _robocopy_file(src, dst, display_name=None):
@@ -70,6 +65,13 @@ def _robocopy_file(src, dst, display_name=None):
     t.join(timeout=2)
     _progress_done()
 
+    # A robocopy killed by the cancel handler can exit with code 1 (the
+    # ordinary "files copied" success code — TerminateProcess on Windows sets
+    # exit code 1 when psutil is unavailable), leaving a truncated file that
+    # looks successfully copied. Gate on intent: a copy that ended while a
+    # cancellation was requested is never a success.
+    if CANCEL.is_set():
+        return False
     # robocopy exit codes < 8 indicate success (0=nothing done, 1=ok, 2-7=ok+extras)
     return proc.returncode < 8
 
@@ -101,11 +103,16 @@ def _parse_robocopy_summary(output):
     """
     Parse robocopy's captured stdout and return a dict with:
       files_copied, files_skipped, files_failed,
-      bytes_copied, speed_mbs, elapsed
+      bytes_copied, speed_mbs, elapsed, summary_found
+
+    ``summary_found`` records whether the final "Files :" summary line was
+    seen; when it is absent (robocopy died before printing its summary) the
+    zeroed counters must not be trusted as "no failures".
     """
     result = {
         'files_copied': 0, 'files_skipped': 0, 'files_failed': 0,
         'bytes_copied': 0, 'speed_mbs': 0.0, 'elapsed': '',
+        'summary_found': False,
     }
     output = output or ''
     for line in output.splitlines():
@@ -119,6 +126,7 @@ def _parse_robocopy_summary(output):
                 result['files_copied']  = int(parts[3])
                 result['files_skipped'] = int(parts[4])
                 result['files_failed']  = int(parts[6])
+                result['summary_found'] = True
             except (ValueError, IndexError):
                 pass
 

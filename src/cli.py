@@ -2,11 +2,6 @@
 import os
 from typing import TYPE_CHECKING
 
-try:
-    import psutil
-except ImportError:  # optional dependency — priority/affinity degrade gracefully
-    psutil = None
-
 from .config import ConfigManager
 from .constants import CONFIG_FILE
 from .db import _fmt_ts, create_database_manager
@@ -107,16 +102,18 @@ def _print_tapes_table(db):
     print("-" * 80)
     for t in tapes:
         date_s  = _fmt_ts(t['date_formatted'])
+        # total_capacity is stored in decimal GB (see DEFAULT_TAPE_CAPACITY_GB);
+        # convert used bytes with the same base so the bar compares like units.
         cap_gb  = t['total_capacity']
         used_b  = t['used_space'] or 0
-        used_gb = used_b / 1024**3
+        used_gb = used_b / 1000**3
         if cap_gb:
             pct     = min(used_gb / cap_gb, 1.0)
             filled  = round(pct * BAR_W)
             bar     = '█' * filled + '░' * (BAR_W - filled)
-            space_s = f"[{bar}] {pct*100:.1f}%  {used_gb:.1f}/{cap_gb:.0f} GiB"
+            space_s = f"[{bar}] {pct*100:.1f}%  {used_gb:.1f}/{cap_gb:.0f} GB"
         else:
-            space_s = f"{used_gb:.1f} GiB used  (no capacity set)"
+            space_s = f"{used_gb:.1f} GB used  (no capacity set)"
         print(f"{t['tape_id']:>4}  {t['volume_label']:<25}  {date_s:<19}  {space_s}")
     return tapes
 
