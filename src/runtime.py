@@ -10,6 +10,8 @@ try:
 except ImportError:  # optional dependency — priority/affinity degrade gracefully
     psutil = None
 
+from .logsetup import get_logger
+
 
 def _ts():
     """Wall-clock timestamp prefix for status lines."""
@@ -90,6 +92,7 @@ def _phase(tag, msg):
             _PROGRESS_ACTIVE = False
         print(f"\n[{_ts()}] ===== {tag}: {msg} =====")
         sys.stdout.flush()
+    get_logger().info("===== %s: %s =====", tag, msg)
 
 
 def _status(tag, msg):
@@ -101,6 +104,7 @@ def _status(tag, msg):
             _PROGRESS_ACTIVE = False
         print(f"[{_ts()}] [{tag}] {msg}")
         sys.stdout.flush()
+    get_logger().info("[%s] %s", tag, msg)
 
 
 CANCEL = threading.Event()        # set by the SIGINT handler; polled by workers
@@ -197,9 +201,11 @@ def _cancel_handler(signum, frame):
     """First Ctrl+C: cancel gracefully + kill active transfers. Second: hard exit."""
     if CANCEL.is_set():
         print("\n[ABORTED] Second interrupt — forcing immediate exit.")
+        get_logger().warning("second interrupt — forcing immediate exit")
         _terminate_all_procs()
         raise KeyboardInterrupt
     CANCEL.set()
+    get_logger().warning("cancellation requested (SIGINT/SIGBREAK)")
     print("\n\n[STOP] Cancellation requested — stopping safely "
           "(terminating active transfers).")
     print("[STOP] The session is saved; re-run to resume. "

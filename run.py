@@ -15,6 +15,7 @@ os.chdir(PROJECT_ROOT)
 
 from src.cli import main
 from src.config import ConfigManager
+from src.logsetup import configure_file_logging, get_logger
 from src.pg_backup import create_database_backup
 
 
@@ -31,6 +32,7 @@ if __name__ == "__main__":
     try:
         if "--backup-db" in sys.argv:
             cfg = ConfigManager()
+            configure_file_logging(cfg.backup_log_dir)
             path = create_database_backup(cfg)
             print(f"[DB BACKUP] PostgreSQL dump created: {path}")
             raise SystemExit(0)
@@ -45,7 +47,9 @@ if __name__ == "__main__":
         main()
     except RuntimeError as e:
         # Operator-facing errors are raised as RuntimeError with a readable
-        # message; set LTO_DEBUG=1 to get the full traceback for bug reports.
+        # message; the full traceback goes to backup_logs/archiver.log, and
+        # LTO_DEBUG=1 re-raises it onto the console for bug reports.
+        get_logger().exception("run.py stopped on error")
         if os.environ.get('LTO_DEBUG'):
             raise
         print(f"\n{e}")

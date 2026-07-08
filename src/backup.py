@@ -13,6 +13,7 @@ except ImportError:  # optional dependency — priority/affinity degrade gracefu
     psutil = None
 
 from .constants import BACKUP_LOG_DIR, LTFS_WRITE_WARNING
+from .logsetup import get_logger
 from .ltfs import _ensure_lto_drive_ready, eject_tape_drive
 from .reporting import append_backup_summary_row
 from .robocopy import _parse_robocopy_summary, _run_robocopy_tuned
@@ -67,6 +68,7 @@ class LTOBackup:
             notify_backup_summary(self.notifier, details, robocopy_result)
             return path
         except Exception as e:
+            get_logger().exception("could not update CSV summary")
             print(f"[REPORT] Warning: could not update CSV summary: {e}")
             return None
 

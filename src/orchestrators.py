@@ -19,6 +19,7 @@ from .constants import (DEFAULT_TAPE_CAPACITY_GB, LOCAL_STAGING_RESERVE_BYTES,
                         ROOT_FILES_GROUP, TAPE_BUDGET_LABEL,
                         _auto_pack_decision, tape_budget_bytes)
 from .db import _apply_canonical_remote_paths
+from .logsetup import get_logger
 from .ltfs import _ensure_lto_drive_ready, get_volume_label
 from .packer import LTOAnalyzer, LTOPacker, ensure_staging_space
 from .paths import _LEGACY_PATH_LIMIT, _dir_tree_size, _disambiguate_local_rel, _exceeds_legacy_path_limit, _long, _remote_fetch_base_and_rel, _reserved_name_component, _volume_cluster_size, _winsafe_extracted_rel
@@ -1367,6 +1368,7 @@ class RemoteOrchestrator:
                                     f"chunk(s), {scan_stats['files']:,} file(s), "
                                     f"{scan_stats['bytes'] / 1024**3:.2f} GiB")
             except Exception as e:
+                get_logger().exception("streaming scanner failed")
                 scan_error['message'] = str(e)
                 self.db.mark_remote_scan_error(session_id, str(e))
                 self._producer_err = str(e)
@@ -1407,6 +1409,7 @@ class RemoteOrchestrator:
                         self._discard_desc(desc)
                         break
             except Exception as e:
+                get_logger().exception("chunk stager failed")
                 self._producer_err = str(e)
                 stop_pipeline.set()
             finally:
@@ -1582,6 +1585,7 @@ class RemoteOrchestrator:
                         self._discard_desc(desc)
                         break
             except Exception as e:
+                get_logger().exception("prefetch producer failed")
                 self._producer_err = str(e)
             finally:
                 ready_q.put(SENTINEL)
