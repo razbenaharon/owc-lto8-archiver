@@ -16,7 +16,9 @@ services:
     volumes:
       - lto_pgdata:/var/lib/postgresql/data
       - ./scripts/pg_init:/docker-entrypoint-initdb.d:ro
-    shm_size: "1gb"
+    # /dev/shm is sized well above the migration-local 512MB GIN build budget:
+    # 2GB shared_buffers + 512MB maintenance_work_mem + ~1.5GB overhead/headroom.
+    shm_size: "4gb"
     command:
       - "postgres"
       - "-c"

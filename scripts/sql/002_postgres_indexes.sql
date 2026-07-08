@@ -84,10 +84,17 @@ CREATE INDEX IF NOT EXISTS idx_remote_sessions_active_source
     ON remote_sessions(remote_host, remote_path, session_id DESC)
     WHERE status = 'active';
 
+-- Trigram GIN builds can briefly exceed their maintenance budget before
+-- spilling. Keep this below Docker's /dev/shm ceiling so PostgreSQL spills to
+-- temp files before the container reaches a hard shared-memory limit.
+SET LOCAL maintenance_work_mem = '512MB';
+
 CREATE INDEX IF NOT EXISTS idx_files_catalog_name_trgm
     ON files_index USING gin (catalog_name gin_trgm_ops);
 
 CREATE INDEX IF NOT EXISTS idx_files_original_path_trgm
     ON files_index USING gin (original_path gin_trgm_ops);
+
+RESET maintenance_work_mem;
 
 COMMIT;
