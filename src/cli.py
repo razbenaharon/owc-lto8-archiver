@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 from .config import ConfigManager
 from .constants import CONFIG_FILE
 from .db import _fmt_ts, create_database_manager
+from .logsetup import configure_file_logging, get_logger
 from .ltfs import TapeManager
 from .orchestrators import LocalOrchestrator, RemoteOrchestrator
 from .pg_backup import create_database_backup
@@ -34,6 +35,7 @@ def run_archiver(cfg: ConfigManager, db: "PgDatabaseManager"):
     try:
         LocalOrchestrator(cfg, db).run()
     except RuntimeError as e:
+        get_logger().exception("local archive run stopped")
         print(str(e))
     except KeyboardInterrupt:
         print("\n[LOCAL] Interrupted. Session state saved — re-run to resume.")
@@ -76,6 +78,7 @@ def run_remote_archiver(cfg: ConfigManager, db: "PgDatabaseManager"):
     try:
         RemoteOrchestrator(cfg, db).run()
     except RuntimeError as e:
+        get_logger().exception("remote archive run stopped")
         print(str(e))
     except KeyboardInterrupt:
         print("\n[REMOTE] Interrupted. Session state saved — re-run to resume.")
@@ -243,6 +246,8 @@ def main():
     print("=" * 60)
 
     cfg       = ConfigManager()
+    # Diagnostic trace file (backup_logs/archiver.log); console UX unchanged.
+    configure_file_logging(cfg.backup_log_dir)
     db        = create_database_manager(cfg)
     tape_mgr  = TapeManager(db, cfg.lto_drive, cfg.ibm_eject_cmd)
     retriever = LTORetriever(db, cfg.lto_drive, cfg.staging_dir, cfg.restore_dir)
@@ -279,6 +284,7 @@ def main():
                 retriever.run()
             except RuntimeError as e:
                 # e.g. tape-verify cancelled — return to the menu, don't exit.
+                get_logger().exception("restore run stopped")
                 print(str(e))
             except KeyboardInterrupt:
                 print("\n[RESTORE] Interrupted.")
