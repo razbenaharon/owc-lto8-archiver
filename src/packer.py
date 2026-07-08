@@ -2,10 +2,12 @@
 import os
 import shutil
 import zipfile
+from typing import List, Optional
 
 from .constants import (LOCAL_STAGING_RESERVE_BYTES, LOCAL_TAPE_BUDGET_BYTES,
                         ROOT_FILES_GROUP, TAPE_BUDGET_LABEL,
                         ZIP_BUNDLE_FILL_FACTOR, _auto_pack_decision)
+from .pipeline_types import FileRecord
 from .robocopy import _robocopy_file
 from .runtime import _progress_done, _progress_line
 from .skipped import SkippedFileTracker
@@ -266,7 +268,8 @@ class LTOPacker:
 
     def run_manifest(self, source_root, dest, threshold_mb, file_entries,
                      bundle_prefix="Bundle", skipped_tracker=None,
-                     source_name='local', session_id=None, chunk_index=None):
+                     source_name='local', session_id=None,
+                     chunk_index=None) -> List[FileRecord]:
         """Pack a selected list of source files into a staging directory.
 
         file_entries: iterable of {'path', 'rel', 'size'} dicts, where rel is
@@ -290,7 +293,7 @@ class LTOPacker:
                       bundle_prefix="Bundle", skipped_tracker=None,
                       source_name='local', session_id=None, chunk_index=None,
                       heading="Offline phase - tape idle",
-                      done_label="Offline phase done"):
+                      done_label="Offline phase done") -> List[FileRecord]:
         skipped_tracker = skipped_tracker or SkippedFileTracker()
         budget = StagingSpaceBudget(
             dest,
@@ -423,7 +426,7 @@ class LTOPacker:
 
     def run(self, source, dest, threshold_mb, skipped_tracker=None,
             source_name='local', session_id=None, chunk_index=None,
-            on_existing='ask'):
+            on_existing='ask') -> Optional[List[FileRecord]]:
         """
         Pack small files into ZIP bundles; copy large files loose.
 

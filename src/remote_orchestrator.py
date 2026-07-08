@@ -7,7 +7,7 @@ import threading
 import posixpath
 from datetime import datetime
 from collections import defaultdict
-from typing import Dict, Optional
+from typing import Optional
 
 from .backup import LTOBackup, _NoEjectBackup
 from .constants import (DEFAULT_TAPE_CAPACITY_GB, LOCAL_STAGING_RESERVE_BYTES,
@@ -21,6 +21,7 @@ from .paths import (_LEGACY_PATH_LIMIT, _dir_tree_size,
                     _long, _remote_fetch_base_and_rel,
                     _reserved_name_component, _volume_cluster_size,
                     _winsafe_extracted_rel)
+from .pipeline_types import StagedChunk, StreamState
 from .planning import ChunkPlanner, StreamingChunkBuilder
 from .remote_transport import _remote_tar_fetch
 from .reporting import _write_source_missing_only_log
@@ -55,7 +56,8 @@ class RemoteOrchestrator:
         self.db           = db
         self.ui           = ui or ConsoleUI()
         self.skipped_tracker = skipped_tracker or SkippedFileTracker()
-        self.notifier = TelegramNotifier.from_config(cfg)  # type: Optional[TelegramNotifier]
+        self.notifier: Optional[TelegramNotifier] = (
+            TelegramNotifier.from_config(cfg))
         self.remote_host  = cfg.remote_host
         self.remote_user  = cfg.remote_user
         self.remote_password = cfg.remote_password
@@ -363,14 +365,14 @@ class RemoteOrchestrator:
         tape_context = self._remote_tape_capacity_context(
             tape_label, session_id=session_id)
         remaining_lock = threading.Lock()
-        remaining_bytes: Dict[str, int] = {'value': tape_context['available_bytes']}
-        next_chunk_index: Dict[str, int] = {'value': (
-            self.db.get_next_remote_chunk_index(session_id)
-            if hasattr(self.db, 'get_next_remote_chunk_index')
-            else self.db.count_chunks(session_id)
-        )}
-        scan_stats: Dict[str, int] = {'chunks': 0, 'files': 0, 'bytes': 0}
-        scan_error: Dict[str, Optional[str]] = {'message': None}
+        state = StreamState(
+            remaining_bytes=tape_context['available_bytes'],
+            next_chunk_index=(
+                self.db.get_next_remote_chunk_index(session_id)
+                if hasattr(self.db, 'get_next_remote_chunk_index')
+                else self.db.count_chunks(session_id)
+            ),
+        )
 
         def _queue_put(q, item):
             while not (CANCEL.is_set() or stop_pipeline.is_set()):
@@ -409,19 +411,19 @@ class RemoteOrchestrator:
                     return True
             logical_bytes = sum(fsize for _, fsize in chunk_files)
             with remaining_lock:
-                if logical_bytes > remaining_bytes['value']:
+                if logical_bytes > state.remaining_bytes:
                     msg = (
                         f"next remote chunk needs {logical_bytes / 1024**3:.2f} GiB, "
-                        f"but only {remaining_bytes['value'] / 1024**3:.2f} GiB "
+                        f"but only {state.remaining_bytes / 1024**3:.2f} GiB "
                         "remains on the mounted tape under the DB safety budget"
                     )
-                    scan_error['message'] = msg
+                    state.scan_error = msg
                     self.db.mark_remote_scan_error(session_id, msg)
                     print(f"[TAPE] {msg}. Stopping before overfill.")
                     stop_pipeline.set()
                     return False
 
-            chunk_index = next_chunk_index['value']
+            chunk_index = state.next_chunk_index
             result = self.db.append_remote_streaming_chunk(
                 session_id, chunk_index, _chunk_rows(chunk_index, chunk_files))
             inserted_files = int(result.get('inserted_files', 0))
@@ -430,12 +432,12 @@ class RemoteOrchestrator:
                 return True
 
             with remaining_lock:
-                remaining_bytes['value'] = max(
-                    0, remaining_bytes['value'] - inserted_bytes)
-            next_chunk_index['value'] += 1
-            scan_stats['chunks'] += 1
-            scan_stats['files'] += inserted_files
-            scan_stats['bytes'] += inserted_bytes
+                state.remaining_bytes = max(
+                    0, state.remaining_bytes - inserted_bytes)
+            state.next_chunk_index += 1
+            state.chunks += 1
+            state.files += inserted_files
+            state.bytes += inserted_bytes
             _status('SCAN', f"Chunk {chunk_index + 1} planned: "
                             f"{inserted_files:,} file(s), "
                             f"{inserted_bytes / 1024**3:.2f} GiB")
@@ -473,12 +475,12 @@ class RemoteOrchestrator:
                         return
                 if not (CANCEL.is_set() or stop_pipeline.is_set()):
                     self.db.mark_remote_scan_complete(session_id)
-                    _status('SCAN', f"Complete: {scan_stats['chunks']:,} new "
-                                    f"chunk(s), {scan_stats['files']:,} file(s), "
-                                    f"{scan_stats['bytes'] / 1024**3:.2f} GiB")
+                    _status('SCAN', f"Complete: {state.chunks:,} new "
+                                    f"chunk(s), {state.files:,} file(s), "
+                                    f"{state.bytes / 1024**3:.2f} GiB")
             except Exception as e:
                 get_logger().exception("streaming scanner failed")
-                scan_error['message'] = str(e)
+                state.scan_error = str(e)
                 self.db.mark_remote_scan_error(session_id, str(e))
                 self._producer_err = str(e)
                 stop_pipeline.set()
@@ -569,8 +571,8 @@ class RemoteOrchestrator:
             print("\n[ABORTED] Stopped by user. Session saved - re-run option 6 "
                   "to resume from the interrupted chunk.")
             return
-        if failed or self._producer_err or scan_error['message']:
-            msg = self._producer_err or scan_error['message'] or (
+        if failed or self._producer_err or state.scan_error:
+            msg = self._producer_err or state.scan_error or (
                 "a chunk failed during tape write")
             print(f"\n[REMOTE] Streaming pipeline stopped: {msg}. "
                   "Re-run to resume when the condition is fixed.")
@@ -716,7 +718,7 @@ class RemoteOrchestrator:
                 if CANCEL.is_set():
                     self._discard_desc(desc)
                     break
-                ci          = desc['chunk_index']
+                ci          = desc.chunk_index
                 eject_after = (ci == last_chunk)
                 if not self._write_chunk(session_id, desc, tape_label, eject_after):
                     if not CANCEL.is_set():
@@ -849,19 +851,19 @@ class RemoteOrchestrator:
             self._cleanup_dir(pack_dir)
             _status('REMOTE', f"Chunk {chunk_index + 1}: all source files are "
                                "missing; no tape write is required.")
-            return {
-                'chunk_index': chunk_index,
-                'fetch_dir': fetch_dir,
-                'pack_dir': pack_dir,
-                'metadata': [],
-                'staged_bytes': 0,
-                'fetch_seconds': fetch_seconds,
-                'fetch_bytes': fetch_bytes,
-                'pack_seconds': 0,
-                'pack_bytes': 0,
-                'source_missing_files': source_missing_files,
-                'skip_tape': True,
-            }
+            return StagedChunk(
+                chunk_index=chunk_index,
+                fetch_dir=fetch_dir,
+                pack_dir=pack_dir,
+                metadata=[],
+                staged_bytes=0,
+                fetch_seconds=fetch_seconds,
+                fetch_bytes=fetch_bytes,
+                pack_seconds=0,
+                pack_bytes=0,
+                source_missing_files=source_missing_files,
+                skip_tape=True,
+            )
 
         # --- PACK (small files -> ZIP, large files staged loose) ---
         self.db.update_chunk_status(session_id, chunk_index, 'packing')
@@ -927,52 +929,53 @@ class RemoteOrchestrator:
             self._staged_bytes += staged_bytes
         _status('PIPELINE', f"Chunk {chunk_index + 1} staged & ready "
                             f"({staged_bytes / 1024**3:.1f} GB) — queued for tape.")
-        return {
-            'chunk_index':   chunk_index,
-            'fetch_dir':     fetch_dir,
-            'pack_dir':      pack_dir,
-            'metadata':      metadata,
-            'staged_bytes':  staged_bytes,
+        return StagedChunk(
+            chunk_index=chunk_index,
+            fetch_dir=fetch_dir,
+            pack_dir=pack_dir,
+            metadata=metadata,
+            staged_bytes=staged_bytes,
             # Per-phase producer timings, surfaced in the per-pack log. Fetch and
             # pack overlap the *previous* chunk's tape write, so they need not sum
             # to the consumer-measured Total time.
-            'fetch_seconds': fetch_seconds,
-            'fetch_bytes':   fetch_bytes,
-            'pack_seconds':  pack_seconds,
-            'pack_bytes':    staged_bytes,
-            'source_missing_files': source_missing_files,
-            'skip_tape': False,
-        }
+            fetch_seconds=fetch_seconds,
+            fetch_bytes=fetch_bytes,
+            pack_seconds=pack_seconds,
+            pack_bytes=staged_bytes,
+            source_missing_files=source_missing_files,
+            skip_tape=False,
+        )
 
     def _discard_desc(self, desc):
         """Drop a staged-but-unused chunk: clean its dirs and free its budget."""
-        self._cleanup_dir(desc['fetch_dir'])
-        self._cleanup_dir(desc['pack_dir'])
+        self._cleanup_dir(desc.fetch_dir)
+        self._cleanup_dir(desc.pack_dir)
         with self._staged_lock:
-            self._staged_bytes = max(0, self._staged_bytes - desc['staged_bytes'])
+            self._staged_bytes = max(0, self._staged_bytes - desc.staged_bytes)
 
     # ------------------------------------------------------------------
     # Consumer: write a staged chunk to tape  (runs on the main thread)
     # ------------------------------------------------------------------
 
-    def _write_chunk(self, session_id, desc, tape_label, eject_after):
-        chunk_index = desc['chunk_index']
+    def _write_chunk(self, session_id, desc: StagedChunk, tape_label,
+                     eject_after):
+        chunk_index = desc.chunk_index
         self._consumer_chunk = chunk_index
-        pack_dir = desc['pack_dir']
+        pack_dir = desc.pack_dir
 
-        if desc.get('skip_tape'):
+        if desc.skip_tape:
             log_path = _write_source_missing_only_log(
                 self.cfg.backup_log_dir,
                 session_id,
                 chunk_index,
                 tape_label,
-                desc.get('source_missing_files') or [],
+                desc.source_missing_files or [],
                 source_host=self.remote_host.split('.', 1)[0],
                 source_path=self.remote_session_path,
                 notifier=self.notifier,
             )
             self.db.update_chunk_status(session_id, chunk_index, 'done')
-            self._cleanup_dir(desc['fetch_dir'])
+            self._cleanup_dir(desc.fetch_dir)
             self._cleanup_dir(pack_dir)
             if log_path:
                 print(f"[REMOTE] Source-missing CSV summary: {log_path}")
@@ -996,7 +999,7 @@ class RemoteOrchestrator:
                 source=pack_dir,
                 tape_drive=self.cfg.lto_drive,
                 tape_label=tape_label,
-                packer_metadata=desc['metadata'],
+                packer_metadata=desc.metadata,
                 stage_stats=desc,
                 source_host=self.remote_host.split('.', 1)[0],
                 skipped_tracker=self.skipped_tracker,
@@ -1017,10 +1020,10 @@ class RemoteOrchestrator:
 
         # --- FLUSH staged files for this chunk ---
         _status('REMOTE', f"Flushing staged files for chunk {chunk_index + 1}...")
-        self._cleanup_dir(desc['fetch_dir'])   # already removed after packing
+        self._cleanup_dir(desc.fetch_dir)   # already removed after packing
         self._cleanup_dir(pack_dir)
         with self._staged_lock:
-            self._staged_bytes = max(0, self._staged_bytes - desc['staged_bytes'])
+            self._staged_bytes = max(0, self._staged_bytes - desc.staged_bytes)
         return True
 
     def _ensure_remote_chunk_fits_tape(self, tape_label, planned_bytes,
