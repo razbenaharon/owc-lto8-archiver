@@ -14,6 +14,14 @@ def _cfg(**overrides):
         "ram_soft_limit_pct": 70,
         "ram_hard_limit_pct": 85,
         "fetch_min_free_ram_gb": 16,
+        "governor_fetch_target_free_ram_gb": 4.0,
+        "governor_fetch_min_free_floor_gb": 2.5,
+        "governor_fetch_total_ram_cap_pct": 25,
+        "governor_tape_min_free_ram_gb": 3.0,
+        "governor_tape_exclusive_heavy_stages": True,
+        "governor_status_interval_seconds": 60,
+        "governor_soft_relax_after_seconds": 120,
+        "governor_soft_relax_factor": 0.75,
         "tape_write_exclusive": True,
         "allow_fetch_during_tape_write": False,
         "allow_pack_during_tape_write": False,
@@ -26,8 +34,8 @@ def _cfg(**overrides):
     return SimpleNamespace(**data)
 
 
-def _vm(percent=20, available=64 * 1024**3):
-    return SimpleNamespace(percent=percent, available=available)
+def _vm(percent=20, available=64 * 1024**3, total=64 * 1024**3):
+    return SimpleNamespace(percent=percent, available=available, total=total)
 
 
 def _disk(free=10**12):
@@ -81,6 +89,88 @@ class ResourceGovernorTests(unittest.TestCase):
             vm=_vm(percent=75))
         with patches[0], patches[1]:
             self.assertTrue(gov.can_start_pack())
+
+    def test_fetch_target_clamped_to_total_ram_pct(self):
+        gov, patches = self._governor(
+            cfg=_cfg(governor_fetch_target_free_ram_gb=16,
+                     governor_fetch_total_ram_cap_pct=25,
+                     governor_fetch_min_free_floor_gb=2.5),
+            vm=_vm(percent=40, available=3 * 1024**3, total=16 * 1024**3))
+        with patches[0], patches[1]:
+            decision = gov.decision("fetch", "start")
+        self.assertEqual(decision.effective_min_free_gb, 4.0)
+        self.assertIn("fetch_min_free_ram", decision.reasons)
+
+    def test_fetch_relaxation_never_goes_below_floor(self):
+        gov, patches = self._governor(
+            cfg=_cfg(governor_fetch_target_free_ram_gb=16,
+                     governor_fetch_total_ram_cap_pct=100,
+                     governor_fetch_min_free_floor_gb=2.5,
+                     governor_soft_relax_after_seconds=1,
+                     governor_soft_relax_factor=0.5),
+            vm=_vm(percent=40, available=3 * 1024**3, total=64 * 1024**3))
+        with patches[0], patches[1]:
+            decision = gov.decision("fetch", "start", wait_seconds=10)
+        self.assertEqual(decision.effective_min_free_gb, 2.5)
+        self.assertTrue(decision.allowed)
+
+    def test_decision_reports_distinct_blockers(self):
+        gov, patches = self._governor(
+            vm=_vm(percent=90, available=1 * 1024**3))
+        with patches[0], patches[1], gov.mark_tape_write_active():
+            decision = gov.decision(
+                "fetch", "start", needed_bytes=10**13)
+        self.assertIn("hard_ram_limit", decision.reasons)
+        self.assertIn("fetch_min_free_ram", decision.reasons)
+        self.assertIn("tape_active", decision.reasons)
+        self.assertIn("staging_reserve", decision.reasons)
+
+    def test_cold_migration_blocks_during_tape_write(self):
+        gov, patches = self._governor()
+        with patches[0], patches[1], \
+             mock.patch.object(gov, "_local_disk_io_busy", return_value=False), \
+             gov.mark_tape_write_active():
+            self.assertFalse(gov.can_start_cold_migration())
+
+    def test_cold_migration_blocks_during_fetch(self):
+        gov, patches = self._governor()
+        with patches[0], patches[1], \
+             mock.patch.object(gov, "_local_disk_io_busy", return_value=False), \
+             gov.mark_fetch_active():
+            self.assertFalse(gov.can_start_cold_migration())
+
+    def test_cold_migration_blocks_during_pack(self):
+        gov, patches = self._governor()
+        with patches[0], patches[1], \
+             mock.patch.object(gov, "_local_disk_io_busy", return_value=False), \
+             gov.mark_pack_active():
+            self.assertFalse(gov.can_start_cold_migration())
+
+    def test_cold_migration_blocks_during_db_sync(self):
+        gov, patches = self._governor()
+        with patches[0], patches[1], \
+             mock.patch.object(gov, "_local_disk_io_busy", return_value=False), \
+             gov.mark_db_sync_active():
+            self.assertFalse(gov.can_start_cold_migration())
+
+    def test_cold_migration_blocks_during_cleanup(self):
+        gov, patches = self._governor()
+        with patches[0], patches[1], \
+             mock.patch.object(gov, "_local_disk_io_busy", return_value=False), \
+             gov.mark_cleanup_active():
+            self.assertFalse(gov.can_start_cold_migration())
+
+    def test_cold_migration_blocks_unsafe_ram(self):
+        gov, patches = self._governor(vm=_vm(percent=75))
+        with patches[0], patches[1], \
+             mock.patch.object(gov, "_local_disk_io_busy", return_value=False):
+            self.assertFalse(gov.can_start_cold_migration())
+
+    def test_cold_migration_blocks_busy_local_disk_io(self):
+        gov, patches = self._governor()
+        with patches[0], patches[1], \
+             mock.patch.object(gov, "_local_disk_io_busy", return_value=True):
+            self.assertFalse(gov.can_start_cold_migration())
 
 
 class _FakeDB:

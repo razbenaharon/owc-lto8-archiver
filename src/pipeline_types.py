@@ -46,6 +46,7 @@ class StagedChunk:
     fetch_bytes: Optional[int] = None
     pack_seconds: Optional[float] = None
     pack_bytes: Optional[int] = None
+    ram_stats: dict = field(default_factory=dict)
     source_missing_files: list = field(default_factory=list)
     skip_tape: bool = False
 

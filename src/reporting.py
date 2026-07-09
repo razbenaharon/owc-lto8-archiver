@@ -57,6 +57,20 @@ SUMMARY_COLUMNS = [
     # middle of an existing CSV corrupts positional readers.
     'skipped_files_count',
     'skipped_files_report',
+    'fetch_ram_peak_pct',
+    'fetch_ram_min_available_gb',
+    'fetch_process_peak_mb',
+    'pack_ram_peak_pct',
+    'pack_ram_min_available_gb',
+    'pack_process_peak_mb',
+    'tape_ram_peak_pct',
+    'tape_ram_min_available_gb',
+    'tape_process_peak_mb',
+    'db_sync_ram_peak_pct',
+    'db_sync_ram_min_available_gb',
+    'db_sync_process_peak_mb',
+    'governor_wait_seconds',
+    'governor_wait_reasons',
 ]
 
 
@@ -276,6 +290,24 @@ def append_backup_summary_row(log_dir=None, details=None, robocopy_result=None):
         'robocopy_exit_code': (
             '' if robocopy_result is None else robocopy_result.returncode),
         'robocopy_speed_mbs': rc_sum.get('speed_mbs', ''),
+        'fetch_ram_peak_pct': details.get('fetch_ram_peak_pct', ''),
+        'fetch_ram_min_available_gb': details.get(
+            'fetch_ram_min_available_gb', ''),
+        'fetch_process_peak_mb': details.get('fetch_process_peak_mb', ''),
+        'pack_ram_peak_pct': details.get('pack_ram_peak_pct', ''),
+        'pack_ram_min_available_gb': details.get(
+            'pack_ram_min_available_gb', ''),
+        'pack_process_peak_mb': details.get('pack_process_peak_mb', ''),
+        'tape_ram_peak_pct': details.get('tape_ram_peak_pct', ''),
+        'tape_ram_min_available_gb': details.get(
+            'tape_ram_min_available_gb', ''),
+        'tape_process_peak_mb': details.get('tape_process_peak_mb', ''),
+        'db_sync_ram_peak_pct': details.get('db_sync_ram_peak_pct', ''),
+        'db_sync_ram_min_available_gb': details.get(
+            'db_sync_ram_min_available_gb', ''),
+        'db_sync_process_peak_mb': details.get('db_sync_process_peak_mb', ''),
+        'governor_wait_seconds': details.get('governor_wait_seconds', ''),
+        'governor_wait_reasons': details.get('governor_wait_reasons', ''),
     })
     return _append_row(log_dir, row)
 

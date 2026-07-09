@@ -111,6 +111,17 @@ class ConfigManager:
             'ram_hard_limit_pct':    '85',
             'fetch_target_mbs':      '100',
             'fetch_min_free_ram_gb': '16',
+            'governor_fetch_target_free_ram_gb': '4.0',
+            'governor_fetch_min_free_floor_gb': '2.5',
+            'governor_tape_min_free_ram_gb': '3.0',
+            'governor_tape_pause_other_stages': 'true',
+            'governor_tape_exclusive_heavy_stages': 'true',
+            'governor_soft_relax_after_seconds': '120',
+            'governor_soft_relax_factor': '0.75',
+            'governor_status_interval_seconds': '60',
+            'governor_memory_sample_interval_seconds': '5',
+            'governor_metadata_batch_size': '10000',
+            'governor_pack_file_batch_size': '10000',
             'tape_write_exclusive':  'true',
             'allow_fetch_during_tape_write':   'false',
             'allow_pack_during_tape_write':    'false',
@@ -132,6 +143,22 @@ class ConfigManager:
             'enabled': 'false',
             'timeout_seconds': '10',
             'heartbeat_minutes': '30',
+        }
+        self.config['COLD_MANIFEST_DB'] = {
+            'enabled': 'true',
+            'host': 'localhost',
+            'port': '55432',
+            'database': 'lto_cold_manifest',
+            'user': 'lto_cold',
+            'password_env': 'COLD_PGPASSWORD',
+            'sslmode': 'prefer',
+            'small_file_threshold_mb': '10',
+            'batch_rows': '25000',
+            'fetch_rows': '5000',
+            'sleep_between_batches_ms': '250',
+            'max_ram_pct': '60',
+            'min_free_ram_gb': '16',
+            'max_local_disk_io_mbs': '200',
         }
         with open(self.config_path, 'w', encoding='utf-8') as f:
             self.config.write(f)
@@ -345,6 +372,57 @@ class ConfigManager:
     def fetch_min_free_ram_gb(self):
         return self._get_float('PERFORMANCE', 'fetch_min_free_ram_gb', 16)
     @property
+    def governor_fetch_target_free_ram_gb(self):
+        return self._get_float(
+            'PERFORMANCE', 'governor_fetch_target_free_ram_gb',
+            min(self.fetch_min_free_ram_gb, 4.0))
+    @property
+    def governor_fetch_min_free_floor_gb(self):
+        return self._get_float(
+            'PERFORMANCE', 'governor_fetch_min_free_floor_gb', 2.5)
+    @property
+    def governor_fetch_total_ram_cap_pct(self):
+        return self._get_float(
+            'PERFORMANCE', 'governor_fetch_total_ram_cap_pct', 25)
+    @property
+    def governor_tape_min_free_ram_gb(self):
+        return self._get_float(
+            'PERFORMANCE', 'governor_tape_min_free_ram_gb', 3.0)
+    @property
+    def governor_tape_pause_other_stages(self):
+        return self._get_bool(
+            'PERFORMANCE', 'governor_tape_pause_other_stages', True)
+    @property
+    def governor_tape_exclusive_heavy_stages(self):
+        return self._get_bool(
+            'PERFORMANCE', 'governor_tape_exclusive_heavy_stages', True)
+    @property
+    def governor_soft_relax_after_seconds(self):
+        return self._get_float(
+            'PERFORMANCE', 'governor_soft_relax_after_seconds', 120)
+    @property
+    def governor_soft_relax_factor(self):
+        return self._get_float(
+            'PERFORMANCE', 'governor_soft_relax_factor', 0.75)
+    @property
+    def governor_status_interval_seconds(self):
+        return self._get_float(
+            'PERFORMANCE', 'governor_status_interval_seconds', 60)
+    @property
+    def governor_memory_sample_interval_seconds(self):
+        return self._get_float(
+            'PERFORMANCE', 'governor_memory_sample_interval_seconds', 5)
+    @property
+    def governor_metadata_batch_size(self):
+        return self._get_int(
+            'PERFORMANCE', 'governor_metadata_batch_size', 10000,
+            minimum=1)
+    @property
+    def governor_pack_file_batch_size(self):
+        return self._get_int(
+            'PERFORMANCE', 'governor_pack_file_batch_size', 10000,
+            minimum=1)
+    @property
     def tape_write_exclusive(self):
         return self._get_bool('PERFORMANCE', 'tape_write_exclusive', True)
     @property
@@ -461,3 +539,101 @@ class ConfigManager:
             os.environ.get('TELEGRAM_CHAT_ID')
             or self.env.get('TELEGRAM_CHAT_ID')
             or self.config.get('TELEGRAM', 'chat_id', fallback='', raw=True))
+
+    @property
+    def cold_manifest_enabled(self):
+        return self._get_bool('COLD_MANIFEST_DB', 'enabled', True)
+
+    @property
+    def cold_pg_host(self):
+        return self.config.get(
+            'COLD_MANIFEST_DB', 'host', fallback='localhost').strip()
+
+    @property
+    def cold_pg_port(self):
+        return self.config.get(
+            'COLD_MANIFEST_DB', 'port', fallback='55432').strip()
+
+    @property
+    def cold_pg_dbname(self):
+        return self.config.get(
+            'COLD_MANIFEST_DB', 'database',
+            fallback='lto_cold_manifest').strip()
+
+    @property
+    def cold_pg_user(self):
+        return self.config.get(
+            'COLD_MANIFEST_DB', 'user', fallback='lto_cold').strip()
+
+    @property
+    def cold_pg_password_env(self):
+        return self.config.get(
+            'COLD_MANIFEST_DB', 'password_env',
+            fallback='COLD_PGPASSWORD').strip()
+
+    @property
+    def cold_pg_password(self):
+        env_name = self.cold_pg_password_env or 'COLD_PGPASSWORD'
+        return _strip_quotes(
+            os.environ.get(env_name)
+            or self.env.get(env_name)
+            or self.config.get('COLD_MANIFEST_DB', 'password',
+                               fallback='', raw=True))
+
+    @property
+    def cold_pg_sslmode(self):
+        return self.config.get(
+            'COLD_MANIFEST_DB', 'sslmode', fallback='prefer').strip()
+
+    @property
+    def cold_db_dsn(self):
+        user = quote(self.cold_pg_user, safe='')
+        password = quote(self.cold_pg_password, safe='')
+        auth = f"{user}:{password}@" if password else f"{user}@"
+        return (
+            f"postgresql://{auth}{self.cold_pg_host}:{self.cold_pg_port}/"
+            f"{quote(self.cold_pg_dbname, safe='')}?sslmode={quote(self.cold_pg_sslmode, safe='')}"
+        )
+
+    @property
+    def cold_db_display_ref(self):
+        user = quote(self.cold_pg_user, safe='')
+        auth = f"{user}:***@" if self.cold_pg_password else f"{user}@"
+        return (
+            f"postgresql://{auth}{self.cold_pg_host}:{self.cold_pg_port}/"
+            f"{quote(self.cold_pg_dbname, safe='')}?sslmode={quote(self.cold_pg_sslmode, safe='')}"
+        )
+
+    @property
+    def cold_small_file_threshold_mb(self):
+        return self._get_float(
+            'COLD_MANIFEST_DB', 'small_file_threshold_mb', 10)
+
+    @property
+    def cold_batch_rows(self):
+        return self._get_int('COLD_MANIFEST_DB', 'batch_rows', 25000,
+                             minimum=1)
+
+    @property
+    def cold_fetch_rows(self):
+        return self._get_int('COLD_MANIFEST_DB', 'fetch_rows', 5000,
+                             minimum=1)
+
+    @property
+    def cold_sleep_between_batches_ms(self):
+        return self._get_int(
+            'COLD_MANIFEST_DB', 'sleep_between_batches_ms', 250,
+            minimum=0)
+
+    @property
+    def cold_max_ram_pct(self):
+        return self._get_float('COLD_MANIFEST_DB', 'max_ram_pct', 60)
+
+    @property
+    def cold_min_free_ram_gb(self):
+        return self._get_float('COLD_MANIFEST_DB', 'min_free_ram_gb', 16)
+
+    @property
+    def cold_max_local_disk_io_mbs(self):
+        return self._get_float(
+            'COLD_MANIFEST_DB', 'max_local_disk_io_mbs', 200)

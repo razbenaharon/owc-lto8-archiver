@@ -10,6 +10,8 @@ import shutil
 import tempfile
 import unittest
 import zipfile
+import builtins
+from unittest import mock
 
 import src.packer as packer_mod
 from src.packer import LTOPacker
@@ -70,6 +72,47 @@ class PackerOnExistingTests(unittest.TestCase):
 
         self.assertEqual(result, [])
         self.assertTrue(os.path.exists(os.path.join(self.dest, "existing.zip")))
+
+    def test_zip_packing_streams_with_bounded_reads(self):
+        src_path = os.path.join(self.source, "large-small.bin")
+        with open(src_path, "wb") as handle:
+            handle.write(b"x" * (1024 * 1024 + 7))
+
+        real_open = builtins.open
+
+        class GuardedReader:
+            def __init__(self, handle):
+                self._handle = handle
+
+            def __enter__(self):
+                self._handle.__enter__()
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return self._handle.__exit__(exc_type, exc, tb)
+
+            def read(self, size=-1):
+                if size is None or size < 0:
+                    raise AssertionError("unbounded read used during ZIP pack")
+                return self._handle.read(size)
+
+            def __getattr__(self, name):
+                return getattr(self._handle, name)
+
+        def guarded_open(path, mode="r", *args, **kwargs):
+            handle = real_open(path, mode, *args, **kwargs)
+            if os.path.abspath(path) == os.path.abspath(src_path) and "rb" in mode:
+                return GuardedReader(handle)
+            return handle
+
+        with mock.patch("src.packer.open", guarded_open):
+            metadata = LTOPacker(max_zip_size_gb=1).run(
+                source=self.source, dest=self.dest, threshold_mb=100,
+                on_existing="clean")
+
+        self.assertIsNotNone(metadata)
+        packed = [m for m in metadata if m["file_name"] == "large-small.bin"]
+        self.assertEqual(len(packed), 1)
 
 
 if __name__ == "__main__":

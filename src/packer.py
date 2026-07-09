@@ -334,7 +334,8 @@ class LTOPacker:
     def run_manifest(self, source_root, dest, threshold_mb, file_entries,
                      bundle_prefix="Bundle", skipped_tracker=None,
                      source_name='local', session_id=None,
-                     chunk_index=None) -> List[FileRecord]:
+                     chunk_index=None, governor=None,
+                     pack_file_batch_size=10000) -> List[FileRecord]:
         """Pack a selected list of source files into a staging directory.
 
         file_entries: iterable of {'path', 'rel', 'size'} dicts, where rel is
@@ -351,6 +352,8 @@ class LTOPacker:
             source_name=source_name,
             session_id=session_id,
             chunk_index=chunk_index,
+            governor=governor,
+            pack_file_batch_size=pack_file_batch_size,
             heading="Local sub-chunk staging",
             done_label="Sub-chunk done",
         )
@@ -359,6 +362,7 @@ class LTOPacker:
                       source_root=None,
                       bundle_prefix="Bundle", skipped_tracker=None,
                       source_name='local', session_id=None, chunk_index=None,
+                      governor=None, pack_file_batch_size=10000,
                       heading="Offline phase - tape idle",
                       done_label="Offline phase done") -> List[FileRecord]:
         skipped_tracker = skipped_tracker or SkippedFileTracker()
@@ -381,7 +385,11 @@ class LTOPacker:
         print(f"\n[PACKER] {heading}. "
               f"(Threshold: {threshold_mb:.0f} MB | Max ZIP: {self.max_zip_size_gb:.0f} GB)")
 
-        for entry in file_entries:
+        pack_file_batch_size = max(1, int(pack_file_batch_size or 10000))
+        for entry_index, entry in enumerate(file_entries):
+            if (governor is not None and
+                    entry_index % pack_file_batch_size == 0):
+                governor.wait_or_pause("pack", "continue")
             src = entry['path']
             rel = entry['rel']
             file = os.path.basename(src)
@@ -394,12 +402,6 @@ class LTOPacker:
                 if fsize_mb < threshold_mb:
                     budget.consume(fsize, context=file)
                     zip_rel = rel.replace('\\', '/')
-                    # Read the whole file BEFORE opening the ZIP entry: a
-                    # source I/O error mid-copy would otherwise seal a
-                    # truncated member into the bundle that ships to tape.
-                    # Peak memory is bounded by zip_threshold_mb.
-                    with open(src, 'rb') as fsrc:
-                        payload = fsrc.read()
                     if zipf is None:
                         zip_path = os.path.join(
                             dest, f"{bundle_prefix}_{zip_idx:03d}.zip")
@@ -424,9 +426,11 @@ class LTOPacker:
                         files_in_current_zip = 0
 
                     container = f"{bundle_prefix}_{zip_idx:03d}.zip"
-                    with zipf.open(zip_rel, 'w', force_zip64=True) as zdst:
-                        zdst.write(payload)
-                    del payload
+                    with open(src, 'rb') as fsrc:
+                        with zipf.open(zip_rel, 'w',
+                                       force_zip64=True) as zdst:
+                            shutil.copyfileobj(
+                                fsrc, zdst, length=16 * 1024 * 1024)
                     self._write_manifest_record(manifest_handle, {
                         "relative_path": zip_rel,
                         "file_name": file,
@@ -529,7 +533,8 @@ class LTOPacker:
 
     def run(self, source, dest, threshold_mb, skipped_tracker=None,
             source_name='local', session_id=None, chunk_index=None,
-            on_existing='ask') -> Optional[List[FileRecord]]:
+            on_existing='ask', governor=None,
+            pack_file_batch_size=10000) -> Optional[List[FileRecord]]:
         """
         Pack small files into ZIP bundles; copy large files loose.
 
@@ -593,6 +598,8 @@ class LTOPacker:
             source_name=source_name,
             session_id=session_id,
             chunk_index=chunk_index,
+            governor=governor,
+            pack_file_batch_size=pack_file_batch_size,
             heading="Offline phase - tape idle",
             done_label="Offline phase done",
         )
