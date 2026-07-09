@@ -17,11 +17,13 @@ else:
         psycopg = None
         dict_row = None
 
+from .catalog_query import escape_like_literal
 from .pg_bulk import build_conninfo, copy_rows, require_psycopg
 
 
 SOURCE_TABLE = "files_index"
 COLD_PAYLOAD_TABLE = "small_file_manifest_cold"
+COLD_PAYLOAD_UNIQUE_INDEX = "uq_cold_manifest_source"
 
 
 def _now():
@@ -207,6 +209,65 @@ def ensure_cold_schema(conn):
             error_message TEXT NULL
         )
     """)
+    _ensure_cold_payload_unique_index(conn)
+
+
+def _ensure_cold_payload_unique_index(conn):
+    """Attach the payload identity index, deduplicating legacy rows first.
+
+    The payload table historically had no constraints, so a partially failed
+    copy that was manually retried could have duplicated
+    (migration_id, source_hot_table, source_hot_row_id). The one-time dedupe
+    keeps the lowest ctid so the index can attach on an existing database.
+    """
+    exists = conn.execute(
+        """SELECT 1 FROM pg_indexes
+           WHERE schemaname='public' AND tablename=%s AND indexname=%s""",
+        (COLD_PAYLOAD_TABLE, COLD_PAYLOAD_UNIQUE_INDEX),
+    ).fetchone() is not None
+    if exists:
+        return
+    conn.execute(f"""
+        DELETE FROM {COLD_PAYLOAD_TABLE} a
+        USING {COLD_PAYLOAD_TABLE} b
+        WHERE a.ctid > b.ctid
+          AND a.migration_id IS NOT DISTINCT FROM b.migration_id
+          AND a.source_hot_table IS NOT DISTINCT FROM b.source_hot_table
+          AND a.source_hot_row_id IS NOT DISTINCT FROM b.source_hot_row_id
+    """)
+    conn.execute(f"""
+        CREATE UNIQUE INDEX IF NOT EXISTS {COLD_PAYLOAD_UNIQUE_INDEX}
+        ON {COLD_PAYLOAD_TABLE}
+        (migration_id, source_hot_table, source_hot_row_id)
+    """)
+
+
+def purge_failed_migration_payload(hot, cold):
+    """Remove cold payload rows left behind by FAILED hot migrations.
+
+    A mid-copy abort commits per-batch payload rows under a migration whose
+    hot status ends up 'failed'; those rows are incomplete copies (the hot
+    rows are never deleted for a failed migration) and previously required
+    manual cleanup. Returns the number of cold rows purged."""
+    failed_ids = [
+        row["migration_id"] for row in hot.execute(
+            """SELECT migration_id FROM small_file_cold_migrations
+               WHERE status='failed'"""
+        ).fetchall()
+    ]
+    if not failed_ids:
+        return 0
+    purged = cold.execute(
+        f"DELETE FROM {COLD_PAYLOAD_TABLE} WHERE migration_id = ANY(%s)",
+        (failed_ids,),
+    ).rowcount
+    cold.execute(
+        """UPDATE small_file_cold_loads
+           SET status='purged', finished_at=now()
+           WHERE migration_id = ANY(%s) AND status='failed'""",
+        (failed_ids,),
+    )
+    return purged
 
 
 def cold_payload_index_report(conn):
@@ -306,6 +367,16 @@ def execute_migration(hot_conninfo, cold_conninfo_value, cfg, *,
         hot.commit()
         cold.commit()
 
+        # Reclaim orphans from earlier aborted copies before starting a new
+        # one, so failed-migration payload rows never accumulate in the cold
+        # DB awaiting manual cleanup.
+        purged = purge_failed_migration_payload(hot, cold)
+        cold.commit()
+        hot.commit()  # close the read-only implicit txn the purge opened
+        if purged:
+            print(f"[COLD] Purged {purged:,} orphaned payload row(s) from "
+                  "previously failed migration(s).")
+
         source_id_column = detect_source_id_column(hot)
         if not source_id_column:
             raise RuntimeError(
@@ -315,6 +386,14 @@ def execute_migration(hot_conninfo, cold_conninfo_value, cfg, *,
         directory_catalog_available = _table_exists(
             hot, "directory_archive_bundles")
         coverage = _coverage_expr(directory_catalog_available)
+
+        # Close the implicit transaction the reads above opened. Without this,
+        # psycopg turns the snapshot block below into a SAVEPOINT inside that
+        # implicit transaction, so the "committed" snapshot was never durable:
+        # the except handler's hot.rollback() wiped the whole snapshot and the
+        # follow-up status='failed' UPDATE matched nothing — leaving cold
+        # orphans with no failed hot record for the purge to find.
+        hot.commit()
 
         with hot.transaction():
             migration_id = hot.execute(
@@ -374,6 +453,28 @@ def execute_migration(hot_conninfo, cold_conninfo_value, cfg, *,
             "relative_path", "file_name", "size_bytes", "mtime",
             "source_kind",
         )
+        col_sql = ", ".join(columns)
+
+        def _load_cold_batch(batch):
+            """COPY a batch through a temp table and upsert idempotently.
+
+            ON CONFLICT DO NOTHING against the payload identity index makes a
+            retried batch (ambiguous commit, operator re-run) converge instead
+            of duplicating rows. Returns the number of rows actually inserted.
+            """
+            with cold.transaction():
+                cold.execute(
+                    "CREATE TEMP TABLE _cold_stage ON COMMIT DROP AS "
+                    f"SELECT {col_sql} FROM {COLD_PAYLOAD_TABLE} WITH NO DATA"
+                )
+                with cold.cursor() as copy_cur:
+                    copy_rows(copy_cur, "_cold_stage", columns, batch)
+                return cold.execute(
+                    f"""INSERT INTO {COLD_PAYLOAD_TABLE} ({col_sql})
+                        SELECT {col_sql} FROM _cold_stage
+                        ON CONFLICT (migration_id, source_hot_table,
+                                     source_hot_row_id) DO NOTHING"""
+                ).rowcount
 
         try:
             with hot.cursor(name=f"cold_migration_{migration_id}") as cur:
@@ -412,20 +513,14 @@ def execute_migration(hot_conninfo, cold_conninfo_value, cfg, *,
                         copied_rows += 1
                         copied_bytes += int(row["size_bytes"] or 0)
                         if len(batch) >= batch_rows:
-                            with cold.cursor() as copy_cur:
-                                copy_rows(copy_cur, COLD_PAYLOAD_TABLE,
-                                          columns, batch)
-                            cold.commit()
+                            _load_cold_batch(batch)
                             batch = []
                             if sleep_s:
                                 time.sleep(sleep_s)
                             _resource_check(
                                 governor, "cold migration copy buffer")
                     if batch:
-                        with cold.cursor() as copy_cur:
-                            copy_rows(copy_cur, COLD_PAYLOAD_TABLE,
-                                      columns, batch)
-                        cold.commit()
+                        _load_cold_batch(batch)
                     if sleep_s:
                         time.sleep(sleep_s)
 
@@ -734,6 +829,9 @@ def remove_migrated_hot_rows(hot_conninfo, cfg, migration_id, *,
 
         deleted_rows = 0
         deleted_bytes = 0
+        # Close the implicit read transaction so the delete block below is a
+        # real outermost transaction (not a SAVEPOINT) — see execute_migration.
+        conn.commit()
         with conn.transaction():
             conn.execute(
                 """CREATE TEMP TABLE _cold_delete_ids ON COMMIT DROP AS
@@ -810,10 +908,16 @@ def remove_migrated_hot_rows(hot_conninfo, cfg, migration_id, *,
 def search_cold(cold_conninfo_value, query, *, limit=100, fetch_rows=5000,
                 governor=None):
     _resource_check(governor, "cold search")
-    needle = f"%{query}%"
+    # Escape LIKE metacharacters so a literal '_'/'%' in the query matches
+    # itself (same rule as the hot catalog search); keep the read path free
+    # of DDL so searching never requires schema privileges.
+    needle = f"%{escape_like_literal(query)}%"
     limit = max(1, int(limit or 100))
     with _connect(cold_conninfo_value) as conn:
-        ensure_cold_schema(conn)
+        if not _table_exists(conn, COLD_PAYLOAD_TABLE):
+            raise RuntimeError(
+                "[COLD] Cold manifest table does not exist yet; run a cold "
+                "migration first.")
         with conn.cursor(name="cold_search") as cur:
             cur.itersize = fetch_rows
             cur.execute(
@@ -821,7 +925,8 @@ def search_cold(cold_conninfo_value, query, *, limit=100, fetch_rows=5000,
                            tape_label, stored_bundle_path, relative_path,
                            file_name, size_bytes, source_kind, loaded_at
                     FROM {COLD_PAYLOAD_TABLE}
-                    WHERE file_name ILIKE %s OR relative_path ILIKE %s
+                    WHERE file_name ILIKE %s ESCAPE '\\'
+                       OR relative_path ILIKE %s ESCAPE '\\'
                     LIMIT %s""",
                 (needle, needle, limit),
             )
@@ -851,7 +956,9 @@ def backup_is_after_validation(backup_path, validated_at):
 
 def migration_status(hot_conninfo):
     with _connect(hot_conninfo, autocommit=True) as conn:
-        ensure_hot_schema(conn)
+        # Read-only path: no DDL. A fresh database simply has no migrations.
+        if not _table_exists(conn, "small_file_cold_migrations"):
+            return []
         rows = conn.execute(
             """SELECT migration_id, threshold_bytes, hot_db_name, cold_db_name,
                       status, eligible_rows, copied_rows, validated_rows,
@@ -866,6 +973,8 @@ def migration_status(hot_conninfo):
 
 def migration_info(hot_conninfo, migration_id):
     with _connect(hot_conninfo, autocommit=True) as conn:
-        ensure_hot_schema(conn)
+        # Read-only path: no DDL.
+        if not _table_exists(conn, "small_file_cold_migrations"):
+            return None
         row = _migration_row(conn, migration_id)
         return dict(row) if row else None
