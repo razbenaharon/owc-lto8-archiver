@@ -3,6 +3,7 @@ import io
 import json
 import os
 import shutil
+import tempfile
 import zipfile
 from typing import List, Optional
 
@@ -426,11 +427,25 @@ class LTOPacker:
                         files_in_current_zip = 0
 
                     container = f"{bundle_prefix}_{zip_idx:03d}.zip"
-                    with open(src, 'rb') as fsrc:
+                    # Spool the whole file BEFORE opening the zip entry: a
+                    # mid-read I/O error must fail before any bytes are
+                    # committed under the entry's real name. Writing straight
+                    # from the source used to leave a truncated entry sealed
+                    # into the bundle, which could later satisfy the restore
+                    # path's unique-basename fallback with corrupt data.
+                    # Small files are threshold-bounded, so the spool stays in
+                    # RAM up to 64 MiB and spills to disk above that.
+                    with open(src, 'rb') as fsrc, \
+                            tempfile.SpooledTemporaryFile(
+                                max_size=64 * 1024 * 1024,
+                                dir=dest) as spool:
+                        shutil.copyfileobj(
+                            fsrc, spool, length=16 * 1024 * 1024)
+                        spool.seek(0)
                         with zipf.open(zip_rel, 'w',
                                        force_zip64=True) as zdst:
                             shutil.copyfileobj(
-                                fsrc, zdst, length=16 * 1024 * 1024)
+                                spool, zdst, length=16 * 1024 * 1024)
                     self._write_manifest_record(manifest_handle, {
                         "relative_path": zip_rel,
                         "file_name": file,
