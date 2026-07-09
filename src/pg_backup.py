@@ -88,6 +88,10 @@ def _pg_env(cfg, dbname=None):
     return env
 
 
+def _docker_container(cfg=None):
+    return getattr(cfg, "pg_docker_container", DOCKER_DB_CONTAINER)
+
+
 def _docker_container_running(container_name=DOCKER_DB_CONTAINER):
     if not shutil.which("docker"):
         return False
@@ -100,14 +104,18 @@ def _docker_container_running(container_name=DOCKER_DB_CONTAINER):
 
 
 def _can_try_docker_backup(cfg):
-    return _is_loopback_host(getattr(cfg, "pg_host", "")) and _docker_container_running()
+    return (
+        _is_loopback_host(getattr(cfg, "pg_host", "")) and
+        _docker_container_running(_docker_container(cfg))
+    )
 
 
 def _backup_with_docker(cfg, output_path):
+    container = _docker_container(cfg)
     container_path = f"/tmp/{output_path.name}"
     try:
         _run_command([
-            "docker", "exec", DOCKER_DB_CONTAINER,
+            "docker", "exec", container,
             "pg_dump",
             "-U", cfg.pg_user,
             "-d", cfg.pg_dbname,
@@ -118,12 +126,12 @@ def _backup_with_docker(cfg, output_path):
         ])
         _run_command([
             "docker", "cp",
-            f"{DOCKER_DB_CONTAINER}:{container_path}",
+            f"{container}:{container_path}",
             str(output_path),
         ])
     finally:
         subprocess.run(
-            ["docker", "exec", DOCKER_DB_CONTAINER, "rm", "-f", container_path],
+            ["docker", "exec", container, "rm", "-f", container_path],
             text=True,
             capture_output=True,
         )
@@ -146,20 +154,27 @@ def _backup_with_local_pg_dump(cfg, output_path):
 
 
 def _restore_list_with_docker(backup_path, restore_list_path):
+    container = DOCKER_DB_CONTAINER
+    _restore_list_with_docker_container(
+        backup_path, restore_list_path, container)
+
+
+def _restore_list_with_docker_container(
+        backup_path, restore_list_path, container_name):
     container_path = f"/tmp/{backup_path.name}"
     try:
         _run_command([
             "docker", "cp", str(backup_path),
-            f"{DOCKER_DB_CONTAINER}:{container_path}",
+            f"{container_name}:{container_path}",
         ])
         result = _run_command([
-            "docker", "exec", DOCKER_DB_CONTAINER,
+            "docker", "exec", container_name,
             "pg_restore", "--list", container_path,
         ])
         restore_list_path.write_text(result.stdout, encoding="utf-8")
     finally:
         subprocess.run(
-            ["docker", "exec", DOCKER_DB_CONTAINER, "rm", "-f", container_path],
+            ["docker", "exec", container_name, "rm", "-f", container_path],
             text=True,
             capture_output=True,
         )
@@ -183,7 +198,8 @@ def verify_backup_file(cfg, backup_path):
     errors = []
     if _can_try_docker_backup(cfg):
         try:
-            _restore_list_with_docker(backup_path, restore_list_path)
+            _restore_list_with_docker_container(
+                backup_path, restore_list_path, _docker_container(cfg))
         except RuntimeError as exc:
             errors.append(f"Docker pg_restore --list failed: {exc}")
     if not restore_list_path.exists():
