@@ -1,5 +1,6 @@
 """Resource Governor for heavy local archive pipeline work."""
 import contextlib
+from dataclasses import dataclass, field
 import os
 import shutil
 import threading
@@ -13,11 +14,32 @@ except ImportError:  # pragma: no cover - requirements includes psutil
 from .constants import LOCAL_STAGING_RESERVE_BYTES
 
 
+GB = 1024**3
+
+
 def _bool_config(cfg, name, default=False):
     value = getattr(cfg, name, default)
     if isinstance(value, str):
         return value.strip().lower() in ("1", "true", "yes", "on")
     return bool(value)
+
+
+@dataclass
+class GovernorDecision:
+    allowed: bool
+    action: str
+    stage: str
+    reasons: list = field(default_factory=list)
+    memory_pct: float = 0.0
+    available_gb: float = 0.0
+    process_tree_rss_mb: float = 0.0
+    effective_min_free_gb: float = 0.0
+    hard_limit_pct: float = 0.0
+    tape_active: bool = False
+    wait_seconds: float = 0.0
+
+    def reason_text(self):
+        return ",".join(self.reasons)
 
 
 class ResourceGovernor:
@@ -33,6 +55,11 @@ class ResourceGovernor:
         self.fetch_active = False
         self.pack_active = False
         self.db_sync_active = False
+        self._wait_started = {}
+        self._last_status = {}
+        self.total_wait_seconds = 0.0
+        self.wait_reasons = set()
+        self.cleanup_active = False
 
     @property
     def ram_soft_limit_pct(self):
@@ -44,8 +71,45 @@ class ResourceGovernor:
 
     @property
     def fetch_min_free_ram_bytes(self):
-        gb = float(getattr(self.cfg, "fetch_min_free_ram_gb", 16))
+        gb = float(getattr(
+            self.cfg, "governor_fetch_target_free_ram_gb",
+            getattr(self.cfg, "fetch_min_free_ram_gb", 16)))
+        return int(gb * GB)
+
+    @property
+    def fetch_floor_bytes(self):
+        gb = float(getattr(self.cfg, "governor_fetch_min_free_floor_gb", 2.5))
+        return int(max(0.5, gb) * GB)
+
+    @property
+    def tape_min_free_ram_bytes(self):
+        gb = float(getattr(self.cfg, "governor_tape_min_free_ram_gb", 3.0))
+        return int(max(0.5, gb) * GB)
+
+    @property
+    def status_interval_seconds(self):
+        return float(getattr(self.cfg, "governor_status_interval_seconds", 60))
+
+    @property
+    def soft_relax_after_seconds(self):
+        return float(getattr(self.cfg, "governor_soft_relax_after_seconds", 120))
+
+    @property
+    def soft_relax_factor(self):
+        return float(getattr(self.cfg, "governor_soft_relax_factor", 0.75))
+
+    @property
+    def cold_min_free_ram_bytes(self):
+        gb = float(getattr(self.cfg, "cold_min_free_ram_gb", 16))
         return int(gb * 1024**3)
+
+    @property
+    def cold_max_ram_pct(self):
+        return float(getattr(self.cfg, "cold_max_ram_pct", 60))
+
+    @property
+    def cold_max_local_disk_io_mbs(self):
+        return float(getattr(self.cfg, "cold_max_local_disk_io_mbs", 200))
 
     @property
     def tape_write_exclusive(self):
@@ -68,6 +132,55 @@ class ResourceGovernor:
         vm = self._virtual_memory()
         return None if vm is None else int(vm.available)
 
+    def _memory_total(self):
+        vm = self._virtual_memory()
+        return None if vm is None else int(vm.total)
+
+    def _process_tree_rss_mb(self):
+        if psutil is None:
+            return 0.0
+        try:
+            proc = psutil.Process()
+            procs = [proc] + proc.children(recursive=True)
+            total = 0
+            for item in procs:
+                try:
+                    total += item.memory_info().rss
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            return total / 1024**2
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return 0.0
+
+    def _cold_memory_ok(self):
+        available = self._memory_available()
+        if self._memory_pct() >= self.cold_max_ram_pct:
+            return False
+        if (available is not None and
+                available < self.cold_min_free_ram_bytes):
+            return False
+        return True
+
+    def _local_disk_io_busy(self):
+        if psutil is None:
+            return False
+        try:
+            first = psutil.disk_io_counters()
+            if first is None:
+                return False
+            time.sleep(0.05)
+            second = psutil.disk_io_counters()
+        except Exception:
+            return False
+        if second is None:
+            return False
+        delta = (
+            (second.read_bytes - first.read_bytes) +
+            (second.write_bytes - first.write_bytes)
+        )
+        mbs = delta / 0.05 / 1024**2
+        return mbs > self.cold_max_local_disk_io_mbs
+
     def _hard_memory_ok(self):
         return self._memory_pct() < self.ram_hard_limit_pct
 
@@ -85,61 +198,143 @@ class ResourceGovernor:
         needed = max(0, int(needed_bytes or 0)) + max(0, int(queued_bytes or 0))
         return (self._disk_free() - needed) >= LOCAL_STAGING_RESERVE_BYTES
 
-    def can_start_fetch(self, needed_bytes=0, queued_bytes=0):
+    def _effective_fetch_min_free_bytes(self, wait_seconds=0):
+        target = self.fetch_min_free_ram_bytes
+        total = self._memory_total()
+        if total:
+            cap_pct = float(getattr(
+                self.cfg, "governor_fetch_total_ram_cap_pct", 25))
+            target = min(target, int(total * max(1.0, cap_pct) / 100.0))
+        floor = self.fetch_floor_bytes
+        if wait_seconds > 0 and self.soft_relax_after_seconds > 0:
+            steps = int(wait_seconds // self.soft_relax_after_seconds)
+            if steps > 0:
+                factor = min(0.99, max(0.10, self.soft_relax_factor))
+                target = int(target * (factor ** steps))
+        return max(floor, target)
+
+    def _base_decision(self, stage, action, wait_seconds=0):
+        available = self._memory_available()
+        available_gb = 0.0 if available is None else available / GB
+        return GovernorDecision(
+            allowed=True,
+            action=action,
+            stage=stage,
+            memory_pct=self._memory_pct(),
+            available_gb=available_gb,
+            process_tree_rss_mb=self._process_tree_rss_mb(),
+            hard_limit_pct=self.ram_hard_limit_pct,
+            tape_active=self.tape_write_active or self.tape_write_pending,
+            wait_seconds=wait_seconds,
+        )
+
+    def decision(self, stage, action="start", needed_bytes=0, queued_bytes=0,
+                 wait_seconds=0):
         with self._lock:
-            if not self._tape_allows("allow_fetch_during_tape_write"):
-                return False
-            if self.db_sync_active:
-                return False
-            if not self._hard_memory_ok():
-                return False
+            stage = str(stage)
+            action = str(action)
+            dec = self._base_decision(stage, action, wait_seconds)
             available = self._memory_available()
-            if (available is not None and
-                    available < self.fetch_min_free_ram_bytes):
-                return False
-            return self._staging_ok(needed_bytes, queued_bytes)
+            if not self._hard_memory_ok():
+                dec.reasons.append("hard_ram_limit")
+
+            if stage == "fetch":
+                min_free = self._effective_fetch_min_free_bytes(wait_seconds)
+                dec.effective_min_free_gb = min_free / GB
+                if available is not None and available < min_free:
+                    dec.reasons.append("fetch_min_free_ram")
+                if not self._tape_allows("allow_fetch_during_tape_write"):
+                    dec.reasons.append("tape_active")
+                if self.db_sync_active:
+                    dec.reasons.append("db_sync_active")
+                if self.pack_active and not self._soft_memory_ok():
+                    dec.reasons.append("pack_memory_pressure")
+            elif stage == "pack":
+                if not self._tape_allows("allow_pack_during_tape_write"):
+                    dec.reasons.append("tape_active")
+                if self.db_sync_active:
+                    dec.reasons.append("db_sync_active")
+                if (self.fetch_active and
+                        str(getattr(self.cfg, "allow_pack_during_fetch",
+                                    "conditional")).strip().lower() == "false"):
+                    dec.reasons.append("fetch_active")
+                if (not self._soft_memory_ok() and
+                        not _bool_config(self.cfg, "allow_pack_above_ram_soft",
+                                         False)):
+                    dec.reasons.append("ram_soft_limit")
+            elif stage == "tape":
+                dec.effective_min_free_gb = self.tape_min_free_ram_bytes / GB
+                if available is not None and available < self.tape_min_free_ram_bytes:
+                    dec.reasons.append("tape_min_free_ram")
+                if self.tape_write_active or self.fetch_active or self.pack_active or self.db_sync_active:
+                    dec.reasons.append("heavy_stage_active")
+            elif stage == "db_sync":
+                if not self._tape_allows("allow_db_sync_during_tape_write"):
+                    dec.reasons.append("tape_active")
+                if not _bool_config(self.cfg, "allow_db_sync_during_fetch", False):
+                    if self.fetch_active:
+                        dec.reasons.append("fetch_active")
+                if self.pack_active:
+                    dec.reasons.append("pack_active")
+            elif stage == "cleanup":
+                if self.tape_write_active or self.tape_write_pending:
+                    dec.reasons.append("tape_active")
+                if self.fetch_active or self.pack_active:
+                    dec.reasons.append("producer_active")
+
+            if (stage in ("fetch", "pack", "db_sync") and
+                    _bool_config(self.cfg, "governor_tape_exclusive_heavy_stages",
+                                 False) and
+                    (self.tape_write_active or self.tape_write_pending)):
+                if "tape_active" not in dec.reasons:
+                    dec.reasons.append("tape_active")
+            if (stage in ("fetch", "pack", "db_sync") and
+                    _bool_config(self.cfg, "governor_tape_pause_other_stages",
+                                 True) and
+                    (self.tape_write_active or self.tape_write_pending) and
+                    available is not None and
+                    available < self.tape_min_free_ram_bytes):
+                dec.effective_min_free_gb = max(
+                    dec.effective_min_free_gb,
+                    self.tape_min_free_ram_bytes / GB)
+                dec.reasons.append("tape_ram_reserve")
+
+            if not self._staging_ok(needed_bytes, queued_bytes):
+                dec.reasons.append("staging_reserve")
+
+            dec.allowed = not dec.reasons
+            return dec
+
+    def can_start_fetch(self, needed_bytes=0, queued_bytes=0):
+        return self.decision(
+            "fetch", "start", needed_bytes, queued_bytes).allowed
 
     def can_start_pack(self, needed_bytes=0, queued_bytes=0):
-        with self._lock:
-            if not self._tape_allows("allow_pack_during_tape_write"):
-                return False
-            if self.db_sync_active:
-                return False
-            if (self.fetch_active and
-                    str(getattr(self.cfg, "allow_pack_during_fetch",
-                                "conditional")).strip().lower() == "false"):
-                return False
-            if not self._hard_memory_ok():
-                return False
-            if (not self._soft_memory_ok() and
-                    not _bool_config(self.cfg, "allow_pack_above_ram_soft",
-                                     False)):
-                return False
-            return self._staging_ok(needed_bytes, queued_bytes)
+        return self.decision(
+            "pack", "start", needed_bytes, queued_bytes).allowed
 
     def can_start_tape_write(self):
-        with self._lock:
-            if not self._hard_memory_ok():
-                return False
-            return not (
-                self.tape_write_active or self.fetch_active or
-                self.pack_active or self.db_sync_active
-            )
+        return self.decision("tape", "start").allowed
 
     def can_start_db_sync(self):
-        with self._lock:
-            if not self._tape_allows("allow_db_sync_during_tape_write"):
-                return False
-            if not _bool_config(self.cfg, "allow_db_sync_during_fetch", False):
-                if self.fetch_active:
-                    return False
-            return self._hard_memory_ok() and not self.pack_active
+        return self.decision("db_sync", "start").allowed
 
     def can_cleanup(self):
+        return self.decision("cleanup", "start").allowed
+
+    def can_start_cold_migration(self):
         with self._lock:
-            if self.tape_write_active or self.tape_write_pending:
+            if (self.tape_write_active or self.tape_write_pending or
+                    self.fetch_active or self.pack_active or
+                    self.db_sync_active or self.cleanup_active):
                 return False
-            return not (self.fetch_active or self.pack_active)
+            if not self._cold_memory_ok():
+                return False
+            if not self._staging_ok():
+                return False
+            if self._local_disk_io_busy():
+                return False
+            return True
 
     def wait_for_memory(self, stop_evt=None):
         while not (stop_evt is not None and stop_evt.is_set()):
@@ -158,6 +353,45 @@ class ResourceGovernor:
                 warned = True
             time.sleep(self.sleep_seconds)
         return False
+
+    def wait_or_pause(self, stage, action="start", needed_bytes=0,
+                      queued_bytes=0, stop_evt=None):
+        key = (stage, action)
+        while not (stop_evt is not None and stop_evt.is_set()):
+            now = time.time()
+            started = self._wait_started.setdefault(key, now)
+            wait_seconds = now - started
+            dec = self.decision(
+                stage, action, needed_bytes=needed_bytes,
+                queued_bytes=queued_bytes, wait_seconds=wait_seconds)
+            if dec.allowed:
+                with self._lock:
+                    self._wait_started.pop(key, None)
+                return True
+
+            self.wait_reasons.update(dec.reasons)
+            last = self._last_status.get(key, 0)
+            if now - last >= self.status_interval_seconds:
+                print(
+                    f"[GOVERNOR] {stage} {action}: "
+                    f"available={dec.available_gb:.2f} GB, "
+                    f"min={dec.effective_min_free_gb:.2f} GB, "
+                    f"memory={dec.memory_pct:.1f}%, "
+                    f"process_rss={dec.process_tree_rss_mb:.0f} MB, "
+                    f"tape_active={str(dec.tape_active).lower()}, "
+                    f"reason={dec.reason_text() or 'unknown'}"
+                )
+                self._last_status[key] = now
+            sleep_for = min(self.sleep_seconds, 2.0)
+            self.total_wait_seconds += sleep_for
+            time.sleep(sleep_for)
+        return False
+
+    def telemetry_details(self):
+        return {
+            "governor_wait_seconds": f"{self.total_wait_seconds:.3f}",
+            "governor_wait_reasons": ";".join(sorted(self.wait_reasons)),
+        }
 
     @contextlib.contextmanager
     def mark_fetch_active(self):
@@ -179,6 +413,11 @@ class ResourceGovernor:
     @contextlib.contextmanager
     def mark_db_sync_active(self):
         with self._mark("db_sync_active"):
+            yield
+
+    @contextlib.contextmanager
+    def mark_cleanup_active(self):
+        with self._mark("cleanup_active"):
             yield
 
     @contextlib.contextmanager

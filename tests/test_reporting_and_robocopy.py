@@ -70,8 +70,10 @@ class ReportingAndRobocopyTests(unittest.TestCase):
             with open(path, newline="", encoding="utf-8") as handle:
                 header = next(csv.reader(handle))
 
+            self.assertIn("skipped_files_count", header)
+            self.assertIn("skipped_files_report", header)
             self.assertEqual(header[-2:], [
-                "skipped_files_count", "skipped_files_report"])
+                "governor_wait_seconds", "governor_wait_reasons"])
             self.assertEqual(rows[-1]["tape_used_after_bytes"], "3633327538007")
             self.assertEqual(rows[-1]["robocopy_exit_code"], "0")
             self.assertEqual(rows[-1]["robocopy_speed_mbs"], "342.1")
@@ -126,6 +128,28 @@ class ReportingAndRobocopyTests(unittest.TestCase):
             self.assertEqual(repaired["tape_used_after_bytes"], "3633327538007")
             self.assertEqual(repaired["robocopy_exit_code"], "1")
             self.assertEqual(repaired["robocopy_speed_mbs"], "342.051774")
+
+    def test_ram_telemetry_columns_append_and_blank_when_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = append_backup_summary_row(tmp, {
+                "status": "completed",
+                "fetch_ram_peak_pct": "72.5",
+                "pack_process_peak_mb": "3100.0",
+                "governor_wait_reasons": "tape_active",
+                "record_counts": {},
+                "rc_sum": {},
+            })
+            with open(path, newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            with open(path, newline="", encoding="utf-8") as handle:
+                header = next(csv.reader(handle))
+
+            self.assertEqual(rows[0]["fetch_ram_peak_pct"], "72.5")
+            self.assertEqual(rows[0]["pack_process_peak_mb"], "3100.0")
+            self.assertEqual(rows[0]["governor_wait_reasons"], "tape_active")
+            self.assertEqual(rows[0]["db_sync_ram_peak_pct"], "")
+            self.assertEqual(header[-2:], [
+                "governor_wait_seconds", "governor_wait_reasons"])
 
     def test_robocopy_bytes_parser_accepts_integer_byte_summary(self):
         output = """

@@ -259,10 +259,8 @@ class LocalOrchestrator:
                     batch_bytes,
                     context=f"local batch {batch_index + 1}/{len(batches)}",
                 )
-                self.governor.wait_until(
-                    lambda: self.governor.can_start_pack(
-                        needed_bytes=batch_bytes),
-                    "local pack")
+                self.governor.wait_or_pause(
+                    "pack", "start", needed_bytes=batch_bytes)
                 with self.governor.mark_pack_active():
                     metadata = LTOPacker(
                         self.cfg.max_zip_size_gb,
@@ -283,6 +281,9 @@ class LocalOrchestrator:
                         source_name='local',
                         session_id=session['session_id'],
                         chunk_index=chunk_index,
+                        governor=self.governor,
+                        pack_file_batch_size=(
+                            self.cfg.governor_pack_file_batch_size),
                     )
                 exclude_files, exclude_dirs = self._build_resume_excludes(
                     session['session_id'], chunk_index, tape_label,
@@ -567,7 +568,8 @@ class LocalOrchestrator:
         if os.path.exists(path):
             self.governor.wait_until(self.governor.can_cleanup, "cleanup")
             try:
-                shutil.rmtree(path)
+                with self.governor.mark_cleanup_active():
+                    shutil.rmtree(path)
                 print(f"[LOCAL] Cleaned staging: {path}")
             except OSError as e:
                 print(f"[LOCAL] Warning - could not clean {path}: {e}")

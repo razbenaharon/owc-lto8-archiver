@@ -23,6 +23,7 @@ from .paths import (_LEGACY_PATH_LIMIT, _dir_tree_size,
                     _winsafe_extracted_rel)
 from .pipeline_types import StagedChunk, StreamState
 from .planning import ChunkPlanner, StreamingChunkBuilder
+from .ram_telemetry import RamStageSampler
 from .remote_transport import _remote_tar_fetch
 from .resource_governor import ResourceGovernor
 from .reporting import _write_source_missing_only_log
@@ -76,6 +77,9 @@ class RemoteOrchestrator:
         self.staging_padding   = cfg.staging_padding_factor
         self.fetch_abort_factor = cfg.fetch_overrun_abort_factor
         self.chunk_max_files  = cfg.chunk_max_files
+        self.metadata_batch_size = cfg.governor_metadata_batch_size
+        self.pack_file_batch_size = cfg.governor_pack_file_batch_size
+        self.ram_sample_interval = cfg.governor_memory_sample_interval_seconds
         self.heartbeat_secs    = cfg.telegram_heartbeat_minutes * 60
         self.ssh_cipher        = cfg.ssh_cipher
         self.ssh_timeout       = cfg.ssh_command_timeout_seconds
@@ -837,15 +841,16 @@ class RemoteOrchestrator:
             except OSError:
                 free = need + floor
             governor = getattr(self, 'governor', None)
-            if governor and not governor.can_start_fetch(
-                    needed_bytes=need, queued_bytes=resident):
+            if governor:
                 if not warned:
                     _status('PIPELINE',
                             "Backpressure - waiting for RAM/staging/tape "
                             "governor before fetching the next chunk.")
                     warned = True
-                time.sleep(2)
-                continue
+                if not governor.wait_or_pause(
+                        "fetch", "start", needed_bytes=need,
+                        queued_bytes=resident, stop_evt=stop_evt):
+                    return
             room_cap  = (resident + need) <= self.staging_max_bytes
             room_disk = (free - need) >= floor
             if not room_disk:
@@ -881,25 +886,28 @@ class RemoteOrchestrator:
         # --- FETCH (remote -> PC) ---
         self.db.update_chunk_status(session_id, chunk_index, 'fetching')
         fetch_start = time.perf_counter()
+        ram_stats = {}
         governor = getattr(self, 'governor', None)
         if governor:
             planned_bytes = sum(int(row['file_size_bytes'])
                                 for row in chunk_files)
-            governor.wait_until(
-                lambda: governor.can_start_fetch(needed_bytes=planned_bytes),
-                "fetch")
+            governor.wait_or_pause(
+                "fetch", "start", needed_bytes=planned_bytes)
             fetch_guard = governor.mark_fetch_active()
         else:
             fetch_guard = None
-        if fetch_guard:
-            with fetch_guard:
+        with RamStageSampler(
+                "fetch", self.ram_sample_interval) as fetch_sampler:
+            if fetch_guard:
+                with fetch_guard:
+                    fetch_ok, source_missing_files, fetched_file_count = (
+                        self._fetch_chunk(
+                            session_id, chunk_index, chunk_files, fetch_dir))
+            else:
                 fetch_ok, source_missing_files, fetched_file_count = (
                     self._fetch_chunk(
                         session_id, chunk_index, chunk_files, fetch_dir))
-        else:
-            fetch_ok, source_missing_files, fetched_file_count = self._fetch_chunk(
-                session_id, chunk_index, chunk_files, fetch_dir
-            )
+        ram_stats.update(fetch_sampler.as_details("fetch"))
         if not fetch_ok:
             if not CANCEL.is_set():
                 self.db.update_chunk_status(session_id, chunk_index, 'fetch_failed')
@@ -926,6 +934,7 @@ class RemoteOrchestrator:
                 fetch_bytes=fetch_bytes,
                 pack_seconds=0,
                 pack_bytes=0,
+                ram_stats=ram_stats,
                 source_missing_files=source_missing_files,
                 skip_tape=True,
             )
@@ -938,11 +947,9 @@ class RemoteOrchestrator:
         pack_start = time.perf_counter()
         try:
             if governor:
-                governor.wait_until(
-                    lambda: governor.can_start_pack(
-                        needed_bytes=fetch_bytes,
-                        queued_bytes=getattr(self, '_staged_bytes', 0)),
-                    "pack")
+                governor.wait_or_pause(
+                    "pack", "start", needed_bytes=fetch_bytes,
+                    queued_bytes=getattr(self, '_staged_bytes', 0))
                 pack_guard = governor.mark_pack_active()
             else:
                 pack_guard = None
@@ -950,18 +957,33 @@ class RemoteOrchestrator:
             # never block on the packer's interactive stdin prompt. If the dest
             # cannot be cleaned, the packer raises and the chunk stays
             # resumable instead of the pipeline deadlocking.
-            if pack_guard:
-                with pack_guard:
-                    metadata = LTOPacker(
-                        self.cfg.max_zip_size_gb,
-                        index_min_file_mb=self.cfg.index_min_file_mb,
-                        index_packed_small_files=(
-                            self.cfg.index_packed_small_files),
-                        manifest_enabled=self.cfg.small_file_manifest_enabled,
-                        manifest_format=self.cfg.small_file_manifest_format,
-                        manifest_compression=(
-                            self.cfg.small_file_manifest_compression),
-                    ).run(
+            packer = LTOPacker(
+                self.cfg.max_zip_size_gb,
+                index_min_file_mb=self.cfg.index_min_file_mb,
+                index_packed_small_files=self.cfg.index_packed_small_files,
+                manifest_enabled=self.cfg.small_file_manifest_enabled,
+                manifest_format=self.cfg.small_file_manifest_format,
+                manifest_compression=(
+                    self.cfg.small_file_manifest_compression),
+            )
+            with RamStageSampler(
+                    "pack", self.ram_sample_interval) as pack_sampler:
+                if pack_guard:
+                    with pack_guard:
+                        metadata = packer.run(
+                            source=fetch_dir,
+                            dest=pack_dir,
+                            threshold_mb=self.cfg.zip_threshold_mb,
+                            skipped_tracker=self.skipped_tracker,
+                            source_name='remote',
+                            session_id=session_id,
+                            chunk_index=chunk_index,
+                            on_existing='clean',
+                            governor=governor,
+                            pack_file_batch_size=self.pack_file_batch_size,
+                        )
+                else:
+                    metadata = packer.run(
                         source=fetch_dir,
                         dest=pack_dir,
                         threshold_mb=self.cfg.zip_threshold_mb,
@@ -970,26 +992,10 @@ class RemoteOrchestrator:
                         session_id=session_id,
                         chunk_index=chunk_index,
                         on_existing='clean',
+                        governor=governor,
+                        pack_file_batch_size=self.pack_file_batch_size,
                     )
-            else:
-                metadata = LTOPacker(
-                    self.cfg.max_zip_size_gb,
-                    index_min_file_mb=self.cfg.index_min_file_mb,
-                    index_packed_small_files=self.cfg.index_packed_small_files,
-                    manifest_enabled=self.cfg.small_file_manifest_enabled,
-                    manifest_format=self.cfg.small_file_manifest_format,
-                    manifest_compression=(
-                        self.cfg.small_file_manifest_compression),
-                ).run(
-                    source=fetch_dir,
-                    dest=pack_dir,
-                    threshold_mb=self.cfg.zip_threshold_mb,
-                    skipped_tracker=self.skipped_tracker,
-                    source_name='remote',
-                    session_id=session_id,
-                    chunk_index=chunk_index,
-                    on_existing='clean',
-                )
+            ram_stats.update(pack_sampler.as_details("pack"))
         except Exception as e:
             print(f"[REMOTE] Packer error: {e}")
             if not CANCEL.is_set():
@@ -1046,6 +1052,7 @@ class RemoteOrchestrator:
             fetch_bytes=fetch_bytes,
             pack_seconds=pack_seconds,
             pack_bytes=staged_bytes,
+            ram_stats=ram_stats,
             source_missing_files=source_missing_files,
             skip_tape=False,
         )
@@ -1298,7 +1305,12 @@ class RemoteOrchestrator:
             (collisions if collided else pending).append(
                 (row, remote_base, rel, local_rel, local_path))
 
-        self.db.update_manifest_rows_fetching(fetching_ids, session_id=session_id)
+        for start in range(0, len(fetching_ids), self.metadata_batch_size):
+            if governor := getattr(self, 'governor', None):
+                governor.wait_or_pause("fetch", "continue")
+            batch_ids = fetching_ids[start:start + self.metadata_batch_size]
+            self.db.update_manifest_rows_fetching(
+                batch_ids, session_id=session_id)
 
         if pending or collisions:
             todo_bytes = sum(row['file_size_bytes']
@@ -1324,29 +1336,35 @@ class RemoteOrchestrator:
                 for remote_base, base_pending in pending_by_base.items():
                     if CANCEL.is_set():
                         return False, source_missing_files, fetched_file_count
-                    ok, err = _remote_tar_fetch(
-                        self.remote_user,
-                        self.remote_host,
-                        remote_base,
-                        [rel for _, rel, _ in base_pending],
-                        fetch_dir,
-                        password=self.remote_password,
-                        cipher=self.ssh_cipher,
-                        use_mbuffer=self.use_mbuffer,
-                        mbuffer_size=self.mbuffer_size,
-                        fetch_cores=self.fetch_cores,
-                        abort_evt=fetch_abort,
-                    )
-                    if not ok:
-                        if CANCEL.is_set():
-                            return False, source_missing_files, fetched_file_count
-                        print(f"\n[REMOTE] Tar fetch failed:\n{err}")
-                        self.db.update_manifest_rows_fetch_failed(
-                            (row['manifest_id'] for row, _, _ in base_pending),
-                            err,
-                            session_id=session_id,
+                    for start in range(
+                            0, len(base_pending), self.metadata_batch_size):
+                        if governor := getattr(self, 'governor', None):
+                            governor.wait_or_pause("fetch", "continue")
+                        base_batch = base_pending[
+                            start:start + self.metadata_batch_size]
+                        ok, err = _remote_tar_fetch(
+                            self.remote_user,
+                            self.remote_host,
+                            remote_base,
+                            [rel for _, rel, _ in base_batch],
+                            fetch_dir,
+                            password=self.remote_password,
+                            cipher=self.ssh_cipher,
+                            use_mbuffer=self.use_mbuffer,
+                            mbuffer_size=self.mbuffer_size,
+                            fetch_cores=self.fetch_cores,
+                            abort_evt=fetch_abort,
                         )
-                        return False, source_missing_files, fetched_file_count
+                        if not ok:
+                            if CANCEL.is_set():
+                                return False, source_missing_files, fetched_file_count
+                            print(f"\n[REMOTE] Tar fetch failed:\n{err}")
+                            self.db.update_manifest_rows_fetch_failed(
+                                (row['manifest_id'] for row, _, _ in base_batch),
+                                err,
+                                session_id=session_id,
+                            )
+                            return False, source_missing_files, fetched_file_count
 
                 # Renamed files can't ride the shared stream (bsdtar would
                 # extract them onto the primary's path), so fetch each alone
@@ -1440,8 +1458,12 @@ class RemoteOrchestrator:
                 return False, source_missing_files, fetched_file_count
 
             fetched_updates.append((local_rel, manifest_id))
-        self.db.update_manifest_rows_fetched(
-            fetched_updates, session_id=session_id)
+        for start in range(0, len(fetched_updates), self.metadata_batch_size):
+            if governor := getattr(self, 'governor', None):
+                governor.wait_or_pause("fetch", "continue")
+            self.db.update_manifest_rows_fetched(
+                fetched_updates[start:start + self.metadata_batch_size],
+                session_id=session_id)
         fetched_file_count = len(fetched_updates)
         return True, source_missing_files, fetched_file_count
 
@@ -1458,6 +1480,8 @@ class RemoteOrchestrator:
             for row, remote_base, rel, _local_rel, local_path in collisions:
                 if CANCEL.is_set():
                     return False
+                if governor := getattr(self, 'governor', None):
+                    governor.wait_or_pause("fetch", "continue")
                 tmp = os.path.join(collide_root, str(row['manifest_id']))
                 shutil.rmtree(_long(tmp), ignore_errors=True)
                 os.makedirs(_long(tmp), exist_ok=True)
@@ -1645,7 +1669,11 @@ class RemoteOrchestrator:
             if governor:
                 governor.wait_until(governor.can_cleanup, "cleanup")
             try:
-                shutil.rmtree(_long(path))
+                if governor:
+                    with governor.mark_cleanup_active():
+                        shutil.rmtree(_long(path))
+                else:
+                    shutil.rmtree(_long(path))
                 print(f"[REMOTE] Cleaned: {path}")
             except OSError as e:
                 print(f"[REMOTE] Warning — could not clean {path}: {e}")

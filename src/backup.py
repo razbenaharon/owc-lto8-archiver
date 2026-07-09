@@ -10,12 +10,13 @@ from typing import TYPE_CHECKING
 
 try:
     import psutil
-except ImportError:  # optional dependency — priority/affinity degrade gracefully
+except ImportError:  # optional dependency; priority/affinity degrade gracefully
     psutil = None
 
 from .constants import BACKUP_LOG_DIR, LTFS_WRITE_WARNING
 from .logsetup import get_logger
 from .ltfs import _ensure_lto_drive_ready, eject_tape_drive
+from .ram_telemetry import RamStageSampler
 from .reporting import append_backup_summary_row
 from .robocopy import _parse_robocopy_summary, _run_robocopy_tuned
 from .runtime import CANCEL, _acquire_tape_io_lock, _fmt_eta, _phase, _progress_done, _progress_line, _release_tape_io_lock
@@ -113,15 +114,25 @@ class LTOBackup:
         Copy files from source to tape and commit to the database.
 
         packer_metadata:
-            list of dicts  — staged backup with full metadata (from LTOPacker).
-            []             — staged backup, existing staging, no per-file metadata.
-            None           — direct backup from source directory.
+            list of dicts  - staged backup with full metadata (from LTOPacker).
+            []             - staged backup, existing staging, no per-file metadata.
+            None           - direct backup from source directory.
         stage_stats:
             src.pipeline_types.StagedChunk from the remote pipeline (producer
             timings + source-missing list), or None for local/direct runs.
         """
         def _stat(name, default=None):
             return getattr(stage_stats, name, default) if stage_stats else default
+        def _ram_interval():
+            cfg = getattr(self.governor, "cfg", None)
+            return getattr(cfg, "governor_memory_sample_interval_seconds", 5)
+        def _stage_ram_details():
+            details = {}
+            if stage_stats and getattr(stage_stats, "ram_stats", None):
+                details.update(stage_stats.ram_stats)
+            if self.governor:
+                details.update(self.governor.telemetry_details())
+            return details
         print(f"\n[BACKUP] Starting... Tape: {tape_label} | Drive: {tape_drive}")
         if not _ensure_lto_drive_ready(tape_drive, prefix="[BACKUP]"):
             raise RuntimeError("LTO drive is not ready for backup.")
@@ -166,7 +177,7 @@ class LTOBackup:
         record_counts = defaultdict(int)
 
         # ---------------------------------------------------------------
-        # Phase 1 — Build loose-file map before any tape I/O.
+        # Phase 1 - Build loose-file map before any tape I/O.
         #   AUTO-PILOT : consume metadata from packer_metadata.
         #   DIRECT     : walk source_dir and stage every new/changed file.
         # ---------------------------------------------------------------
@@ -199,7 +210,7 @@ class LTOBackup:
                     'dst':   dst,
                 }
         else:
-            # DIRECT path — files are written loose to tape; skipping an extra
+            # DIRECT path - files are written loose to tape; skipping an extra
             # full-file read keeps the tape from waiting.
             print("[BACKUP] Walking source files...")
             # One indexed-paths query replaces a per-file record lookup on
@@ -270,7 +281,7 @@ class LTOBackup:
               f"({total_bytes / 1024**3:.2f} GB to copy) | {skipped} already on tape.")
 
         # ---------------------------------------------------------------
-        # Phase 2 — Single robocopy call: source directory → tape
+        # Phase 2 - Single robocopy call: source directory to tape
         # ---------------------------------------------------------------
         prio_label = (
             (self.tape_priority is not None) and
@@ -281,7 +292,7 @@ class LTOBackup:
         ) or 'default'
         cores_label = (f"cores {self.tape_affinity}"
                        if self.tape_affinity else "all cores")
-        _phase('TAPE', f"PC → Tape (LTFS) | {tape_label} | "
+        _phase('TAPE', f"PC -> Tape (LTFS) | {tape_label} | "
                        f"priority={prio_label}, {cores_label}")
         print("[BACKUP] Copying to tape via robocopy...")
 
@@ -302,7 +313,7 @@ class LTOBackup:
         robocopy_cmd = [
             'robocopy', source, tape_root,
              '/E',     # recurse subdirectories including empty ones
-             '/J',     # unbuffered I/O — optimised for large files / tape
+             '/J',     # unbuffered I/O; optimised for large files / tape
              '/R:3', '/W:10',
              '/NP',    # no per-file progress %
              '/NDL',   # no directory listing lines
@@ -315,17 +326,17 @@ class LTOBackup:
             robocopy_cmd.extend(['/XD'] + exclude_dir_paths)
 
         if self.governor:
-            self.governor.wait_until(
-                self.governor.can_start_tape_write, "tape write")
+            self.governor.wait_or_pause("tape", "start")
             tape_guard = self.governor.mark_tape_write_active()
         else:
             tape_guard = contextlib.nullcontext()
         try:
-            with tape_guard:
-                rc = _run_robocopy_tuned(
-                    robocopy_cmd,
-                    priority=self.tape_priority,
-                    affinity=self.tape_affinity)
+            with RamStageSampler("tape", _ram_interval()) as tape_sampler:
+                with tape_guard:
+                    rc = _run_robocopy_tuned(
+                        robocopy_cmd,
+                        priority=self.tape_priority,
+                        affinity=self.tape_affinity)
         finally:
             stop_evt.set()
             mon.join(timeout=2)
@@ -343,7 +354,7 @@ class LTOBackup:
         # robocopy prints an ERROR line for EVERY failed attempt, including
         # transient errors it then retried successfully (/R:3 /W:10). The final
         # summary counters are the authoritative verdict, so the raw ERROR-line
-        # scan only applies when robocopy died before printing its summary —
+        # scan only applies when robocopy died before printing its summary;
         # otherwise a single recovered transient would abort a healthy chunk.
         critical_robocopy_failure = (
             rc.returncode >= 8 or
@@ -381,6 +392,8 @@ class LTOBackup:
                     'skipped_files_report':
                         skipped_tracker.write_csv(self.log_dir or BACKUP_LOG_DIR)
                         if skipped_tracker and skipped_tracker.has_items() else '',
+                    **_stage_ram_details(),
+                    **tape_sampler.as_details("tape"),
                 },
                 packer_metadata,
                 loose_map,
@@ -400,11 +413,10 @@ class LTOBackup:
             raise RuntimeError(msg)
 
         # ---------------------------------------------------------------
-        # Phase 3 — DB inserts (new/recovered files from this run)
+        # Phase 3 - DB inserts (new/recovered files from this run)
         # ---------------------------------------------------------------
         if self.governor:
-            self.governor.wait_until(
-                self.governor.can_start_db_sync, "database sync")
+            self.governor.wait_or_pause("db_sync", "start")
             db_guard = self.governor.mark_db_sync_active()
         else:
             db_guard = contextlib.nullcontext()
@@ -429,117 +441,129 @@ class LTOBackup:
                 'remote_chunk_index': remote_chunk_index,
             }
 
+        def _db_checkpoint():
+            if self.governor:
+                self.governor.wait_or_pause("db_sync", "continue")
+
         # The db_sync guard is held across every catalog write below, including
         # recalculate_tape_used_space, and is released by ``with`` even if a
-        # bulk upsert raises — otherwise a failed sync would leave
+        # bulk upsert raises; otherwise a failed sync would leave
         # db_sync_active=True and block later fetch/pack/tape work.
-        with db_guard:
-            if packer_metadata is None:
-                recovered_stats = self.db.bulk_upsert_files(
-                    (catalog_record(
-                        info['file_name'], info['original_path'],
-                        info['file_size_bytes'], False, None,
-                        info['stored_path'])
-                     for info in recovered_direct_existing),
-                )
-                recovered_count = recovered_stats['inserted']
-                record_counts['direct_recovered_inserted'] += recovered_stats['inserted']
-                record_counts['direct_recovered_updated'] += recovered_stats['updated']
-                if recovered_count:
-                    print(f"[DB] Recovered {recovered_count} existing tape file record(s).")
-                loose_stats = self.db.bulk_upsert_files(
-                    (catalog_record(
-                        os.path.basename(info['src']), info['src'], info['fsize'],
-                        False, None, info['dst'])
-                     for info in loose_map.values()),
-                )
-                record_counts['loose_records_inserted'] += loose_stats['inserted']
-                record_counts['loose_records_updated'] += loose_stats['updated']
-
-            else:
-                # Preserve resume semantics while batching all indexed lookups and
-                # writes into bounded transactions.
-                directory_stats = (
-                    self.db.bulk_upsert_directory_catalog(
-                        packer_metadata,
-                        tape_label,
-                        source_host,
-                        local_session_id=local_session_id,
-                        local_chunk_index=local_chunk_index,
-                        remote_session_id=remote_session_id,
-                        tape_root=tape_root,
-                        backup_date=started_at,
-                        index_min_file_mb=self.index_min_file_mb,
+        with RamStageSampler("db_sync", _ram_interval()) as db_sampler:
+            with db_guard:
+                if packer_metadata is None:
+                    _db_checkpoint()
+                    recovered_stats = self.db.bulk_upsert_files(
+                        (catalog_record(
+                            info['file_name'], info['original_path'],
+                            info['file_size_bytes'], False, None,
+                            info['stored_path'])
+                         for info in recovered_direct_existing),
                     )
-                    if hasattr(self.db, 'bulk_upsert_directory_catalog')
-                    else {"bundles": 0, "stats": 0, "tree_rows": 0}
-                )
-                record_counts['directory_bundles_upserted'] += (
-                    directory_stats['bundles'])
-                record_counts['directory_stats_upserted'] += directory_stats['stats']
-                record_counts['directory_tree_rows_upserted'] += (
-                    directory_stats['tree_rows'])
+                    recovered_count = recovered_stats['inserted']
+                    record_counts['direct_recovered_inserted'] += recovered_stats['inserted']
+                    record_counts['direct_recovered_updated'] += recovered_stats['updated']
+                    if recovered_count:
+                        print(f"[DB] Recovered {recovered_count} existing tape file record(s).")
+                    _db_checkpoint()
+                    loose_stats = self.db.bulk_upsert_files(
+                        (catalog_record(
+                            os.path.basename(info['src']), info['src'], info['fsize'],
+                            False, None, info['dst'])
+                         for info in loose_map.values()),
+                    )
+                    record_counts['loose_records_inserted'] += loose_stats['inserted']
+                    record_counts['loose_records_updated'] += loose_stats['updated']
 
-                recovered_stats = self.db.bulk_upsert_files(
-                    (catalog_record(
-                        m['file_name'], m['original_path'], m['file_size_bytes'],
-                        False, None, dst,
-                        m.get('canonical_source_path'))
-                     for _, m, dst in skipped_existing),
-                    update_existing=False,
-                )
-                recovered_count = recovered_stats['inserted']
-                record_counts['loose_recovered_inserted'] += recovered_stats['inserted']
-                record_counts['loose_records_skipped_existing'] += recovered_stats['skipped']
+                else:
+                    # Preserve resume semantics while batching all indexed lookups and
+                    # writes into bounded transactions.
+                    _db_checkpoint()
+                    directory_stats = (
+                        self.db.bulk_upsert_directory_catalog(
+                            packer_metadata,
+                            tape_label,
+                            source_host,
+                            local_session_id=local_session_id,
+                            local_chunk_index=local_chunk_index,
+                            remote_session_id=remote_session_id,
+                            tape_root=tape_root,
+                            backup_date=started_at,
+                            index_min_file_mb=self.index_min_file_mb,
+                        )
+                        if hasattr(self.db, 'bulk_upsert_directory_catalog')
+                        else {"bundles": 0, "stats": 0, "tree_rows": 0}
+                    )
+                    record_counts['directory_bundles_upserted'] += (
+                        directory_stats['bundles'])
+                    record_counts['directory_stats_upserted'] += directory_stats['stats']
+                    record_counts['directory_tree_rows_upserted'] += (
+                        directory_stats['tree_rows'])
 
-                def loose_staged_records():
-                    # loose_map is built only from is_packed=False packer metadata,
-                    # so generated bundle ZIPs can never appear here — no name
-                    # filter is needed (one used to silently drop legitimate user
-                    # files that happened to be named "Bundle_*.zip").
-                    for rel_path, info in loose_map.items():
-                        file = os.path.basename(info['src'])
-                        m = meta_by_rel.get(rel_path)
-                        if m:
-                            yield catalog_record(
-                                file, m['original_path'], info['fsize'], False,
-                                None, info['dst'],
-                                m.get('canonical_source_path'))
+                    _db_checkpoint()
+                    recovered_stats = self.db.bulk_upsert_files(
+                        (catalog_record(
+                            m['file_name'], m['original_path'], m['file_size_bytes'],
+                            False, None, dst,
+                            m.get('canonical_source_path'))
+                         for _, m, dst in skipped_existing),
+                        update_existing=False,
+                    )
+                    recovered_count = recovered_stats['inserted']
+                    record_counts['loose_recovered_inserted'] += recovered_stats['inserted']
+                    record_counts['loose_records_skipped_existing'] += recovered_stats['skipped']
 
-                loose_stats = self.db.bulk_upsert_files(
-                    loose_staged_records(), update_existing=False)
-                record_counts['loose_records_inserted'] += loose_stats['inserted']
-                record_counts['loose_records_skipped_existing'] += loose_stats['skipped']
+                    def loose_staged_records():
+                        # loose_map is built only from is_packed=False packer metadata,
+                        # so generated bundle ZIPs can never appear here; no name
+                        # filter is needed (one used to silently drop legitimate user
+                        # files that happened to be named "Bundle_*.zip").
+                        for rel_path, info in loose_map.items():
+                            file = os.path.basename(info['src'])
+                            m = meta_by_rel.get(rel_path)
+                            if m:
+                                yield catalog_record(
+                                    file, m['original_path'], info['fsize'], False,
+                                    None, info['dst'],
+                                    m.get('canonical_source_path'))
 
-                print("[DB] Recording packed file entries in transaction batches...")
-                packed_stats = self.db.bulk_upsert_files(
-                    (catalog_record(
-                        m['file_name'], m['original_path'], m['file_size_bytes'],
-                        True, os.path.join(tape_root, m['container_name']),
-                        m['stored_path'], m.get('canonical_source_path'))
-                     for m in packer_metadata
-                     if m['is_packed']
-                     and m.get('catalog_policy') != 'manifest_only'),
-                    update_existing=False,
-                )
-                packed_count = packed_stats['inserted']
-                record_counts['packed_records_inserted'] += packed_stats['inserted']
-                record_counts['packed_records_skipped_existing'] += packed_stats['skipped']
-                if recovered_count:
-                    print(f"[DB] Recovered {recovered_count} existing loose file record(s).")
-                print(f"[DB] {packed_count} packed file record(s) inserted; "
-                      f"{packed_stats['skipped']} already indexed.")
+                    _db_checkpoint()
+                    loose_stats = self.db.bulk_upsert_files(
+                        loose_staged_records(), update_existing=False)
+                    record_counts['loose_records_inserted'] += loose_stats['inserted']
+                    record_counts['loose_records_skipped_existing'] += loose_stats['skipped']
 
-            db_sync_seconds = time.perf_counter() - db_sync_start
+                    print("[DB] Recording packed file entries in transaction batches...")
+                    _db_checkpoint()
+                    packed_stats = self.db.bulk_upsert_files(
+                        (catalog_record(
+                            m['file_name'], m['original_path'], m['file_size_bytes'],
+                            True, os.path.join(tape_root, m['container_name']),
+                            m['stored_path'], m.get('canonical_source_path'))
+                         for m in packer_metadata
+                         if m['is_packed']
+                         and m.get('catalog_policy') != 'manifest_only'),
+                        update_existing=False,
+                    )
+                    packed_count = packed_stats['inserted']
+                    record_counts['packed_records_inserted'] += packed_stats['inserted']
+                    record_counts['packed_records_skipped_existing'] += packed_stats['skipped']
+                    if recovered_count:
+                        print(f"[DB] Recovered {recovered_count} existing loose file record(s).")
+                    print(f"[DB] {packed_count} packed file record(s) inserted; "
+                          f"{packed_stats['skipped']} already indexed.")
 
-            # /BYTES keeps robocopy byte counts parseable without reading LTFS
-            # immediately after a write.
-            copied_bytes = rc_sum['bytes_copied']
-            new_used = int(self.db.recalculate_tape_used_space(tape_label) or 0)
-            print(f"[DB] Tape used space reconciled to {new_used / 1024**3:.3f} GB.")
+                db_sync_seconds = time.perf_counter() - db_sync_start
+
+                # /BYTES keeps robocopy byte counts parseable without reading LTFS
+                # immediately after a write.
+                copied_bytes = rc_sum['bytes_copied']
+                _db_checkpoint()
+                new_used = int(self.db.recalculate_tape_used_space(tape_label) or 0)
+                print(f"[DB] Tape used space reconciled to {new_used / 1024**3:.3f} GB.")
 
         # ---------------------------------------------------------------
-        # Phase 4 — Print Robocopy job summary
+        # Phase 4 - Print Robocopy job summary
         # ---------------------------------------------------------------
         total_time = time.time() - total_start
         finished_at = datetime.now()
@@ -577,6 +601,9 @@ class LTOBackup:
                     _stat('source_missing_files', []),
                 'skipped_files_count': skipped_count,
                 'skipped_files_report': skipped_report,
+                **_stage_ram_details(),
+                **tape_sampler.as_details("tape"),
+                **db_sampler.as_details("db_sync"),
             },
             packer_metadata,
             loose_map,
