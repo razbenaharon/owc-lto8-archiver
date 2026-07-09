@@ -87,15 +87,29 @@ class ConfigManager:
             'staging_fill_pct': '0.80',
         }
         self.config['PERFORMANCE'] = {
-            'chunk_cap_gb':          '100',
-            'prefetch_chunks_ahead': '2',
+            'pipeline_profile':      'tape_first_controlled',
+            'chunk_cap_gb':          '50',
+            'chunk_max_files':       '100000',
+            'prefetch_chunks_ahead': '1',
             'staging_max_gb':        '350',
+            'ram_soft_limit_pct':    '70',
+            'ram_hard_limit_pct':    '85',
+            'fetch_target_mbs':      '100',
+            'fetch_min_free_ram_gb': '16',
+            'tape_write_exclusive':  'true',
+            'allow_fetch_during_tape_write':   'false',
+            'allow_pack_during_tape_write':    'false',
+            'allow_db_sync_during_tape_write': 'false',
+            'allow_db_sync_during_fetch':      'false',
+            'allow_pack_during_fetch':         'conditional',
+            'allow_pack_above_ram_soft':       'false',
+            'allow_resume_oversized_chunks':   'false',
             'robocopy_priority':     'high',
             'cpu_affinity':          'auto',
             'ssh_cipher':            'aes128-gcm@openssh.com',
             'ssh_command_timeout_seconds': '3600',
-            'use_mbuffer':           'true',
-            'mbuffer_size':          '2G',
+            'use_mbuffer':           'false',
+            'mbuffer_size':          '512M',
             'staging_padding_factor':      '1.15',
             'fetch_overrun_abort_factor':  '2.0',
         }
@@ -117,6 +131,24 @@ class ConfigManager:
             print(f"[CONFIG] Invalid [{section}] {key} = {raw!r}; "
                   f"using default {fallback}.")
             return float(fallback)
+
+    def _get_bool(self, section, key, fallback):
+        raw = self.config.get(section, key, fallback=str(fallback))
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() in ('1', 'true', 'yes', 'on')
+
+    def _get_int(self, section, key, fallback, minimum=None):
+        raw = self.config.get(section, key, fallback=str(fallback)).strip()
+        try:
+            value = int(float(raw))
+        except ValueError:
+            print(f"[CONFIG] Invalid [{section}] {key} = {raw!r}; "
+                  f"using default {fallback}.")
+            value = int(fallback)
+        if minimum is not None:
+            value = max(minimum, value)
+        return value
 
     @property
     def source_dir(self):
@@ -220,15 +252,68 @@ class ConfigManager:
 
     # --- [PERFORMANCE] : continuous-streaming pipeline tuning -----------------
     @property
+    def pipeline_profile(self):
+        return self.config.get(
+            'PERFORMANCE', 'pipeline_profile',
+            fallback='tape_first_controlled').strip()
+    @property
     def chunk_cap_gb(self):
-        return self._get_float('PERFORMANCE', 'chunk_cap_gb', 100)
+        return self._get_float('PERFORMANCE', 'chunk_cap_gb', 50)
+    @property
+    def chunk_max_files(self):
+        return self._get_int('PERFORMANCE', 'chunk_max_files', 100000,
+                             minimum=1)
     @property
     def prefetch_chunks_ahead(self):
         return max(1, int(self._get_float(
-            'PERFORMANCE', 'prefetch_chunks_ahead', 2)))
+            'PERFORMANCE', 'prefetch_chunks_ahead', 1)))
     @property
     def staging_max_gb(self):
         return self._get_float('PERFORMANCE', 'staging_max_gb', 350)
+    @property
+    def ram_soft_limit_pct(self):
+        return self._get_float('PERFORMANCE', 'ram_soft_limit_pct', 70)
+    @property
+    def ram_hard_limit_pct(self):
+        return self._get_float('PERFORMANCE', 'ram_hard_limit_pct', 85)
+    @property
+    def fetch_target_mbs(self):
+        return self._get_float('PERFORMANCE', 'fetch_target_mbs', 100)
+    @property
+    def fetch_min_free_ram_gb(self):
+        return self._get_float('PERFORMANCE', 'fetch_min_free_ram_gb', 16)
+    @property
+    def tape_write_exclusive(self):
+        return self._get_bool('PERFORMANCE', 'tape_write_exclusive', True)
+    @property
+    def allow_fetch_during_tape_write(self):
+        return self._get_bool(
+            'PERFORMANCE', 'allow_fetch_during_tape_write', False)
+    @property
+    def allow_pack_during_tape_write(self):
+        return self._get_bool(
+            'PERFORMANCE', 'allow_pack_during_tape_write', False)
+    @property
+    def allow_db_sync_during_tape_write(self):
+        return self._get_bool(
+            'PERFORMANCE', 'allow_db_sync_during_tape_write', False)
+    @property
+    def allow_db_sync_during_fetch(self):
+        return self._get_bool(
+            'PERFORMANCE', 'allow_db_sync_during_fetch', False)
+    @property
+    def allow_pack_during_fetch(self):
+        return self.config.get(
+            'PERFORMANCE', 'allow_pack_during_fetch',
+            fallback='conditional').strip().lower()
+    @property
+    def allow_pack_above_ram_soft(self):
+        return self._get_bool(
+            'PERFORMANCE', 'allow_pack_above_ram_soft', False)
+    @property
+    def allow_resume_oversized_chunks(self):
+        return self._get_bool(
+            'PERFORMANCE', 'allow_resume_oversized_chunks', False)
     @property
     def robocopy_priority(self):
         return self.config.get('PERFORMANCE', 'robocopy_priority', fallback='high').strip().lower()
@@ -249,10 +334,10 @@ class ConfigManager:
         return max(1, value)
     @property
     def use_mbuffer(self):
-        return self.config.get('PERFORMANCE', 'use_mbuffer', fallback='true').strip().lower() in ('1', 'true', 'yes', 'on')
+        return self.config.get('PERFORMANCE', 'use_mbuffer', fallback='false').strip().lower() in ('1', 'true', 'yes', 'on')
     @property
     def mbuffer_size(self):
-        return self.config.get('PERFORMANCE', 'mbuffer_size', fallback='2G').strip()
+        return self.config.get('PERFORMANCE', 'mbuffer_size', fallback='512M').strip()
     @property
     def staging_padding_factor(self):
         raw = self.config.get('PERFORMANCE', 'staging_padding_factor',

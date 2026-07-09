@@ -24,6 +24,7 @@ from .paths import (_LEGACY_PATH_LIMIT, _dir_tree_size,
 from .pipeline_types import StagedChunk, StreamState
 from .planning import ChunkPlanner, StreamingChunkBuilder
 from .remote_transport import _remote_tar_fetch
+from .resource_governor import ResourceGovernor
 from .reporting import _write_source_missing_only_log
 from .runtime import (CANCEL, _fmt_eta, _phase, _priority_class,
                       _progress_done, _progress_line, _status,
@@ -74,6 +75,7 @@ class RemoteOrchestrator:
         self.prefetch_ahead    = cfg.prefetch_chunks_ahead
         self.staging_padding   = cfg.staging_padding_factor
         self.fetch_abort_factor = cfg.fetch_overrun_abort_factor
+        self.chunk_max_files  = cfg.chunk_max_files
         self.heartbeat_secs    = cfg.telegram_heartbeat_minutes * 60
         self.ssh_cipher        = cfg.ssh_cipher
         self.ssh_timeout       = cfg.ssh_command_timeout_seconds
@@ -86,6 +88,7 @@ class RemoteOrchestrator:
         self._staged_bytes = 0                 # bytes currently resident in staging
         self._staged_lock  = threading.Lock()
         self._producer_err = None              # first fatal producer error, if any
+        self.governor = ResourceGovernor(cfg, self.staging_dir)
 
     def _backup_writer(self, cls=LTOBackup):
         return cls(
@@ -95,6 +98,7 @@ class RemoteOrchestrator:
             tape_affinity=self.tape_cores,
             log_dir=self.cfg.backup_log_dir,
             notifier=self.notifier,
+            governor=self.governor,
         )
 
     # ------------------------------------------------------------------
@@ -324,6 +328,7 @@ class RemoteOrchestrator:
             budget,
             alloc_unit=_volume_cluster_size(self.staging_dir),
             padding_factor=self.staging_padding,
+            max_files=self.chunk_max_files,
         )
         for remote_path, fsize in sorted(manifest, key=lambda x: x[1], reverse=True):
             if planner.footprint(fsize) > budget:
@@ -454,6 +459,7 @@ class RemoteOrchestrator:
                     budget,
                     alloc_unit=_volume_cluster_size(self.staging_dir),
                     padding_factor=self.staging_padding,
+                    max_files=self.chunk_max_files,
                 )
                 scanner = StreamingRemoteScanner(
                     self.remote_user,
@@ -504,6 +510,8 @@ class RemoteOrchestrator:
                     summary = self.db.get_chunk_size_summary(
                         session_id, ci).get(ci, (0, 0, 0))
                     planned_bytes, _, planned_files = summary
+                    self._validate_chunk_file_limit(
+                        session_id, ci, planned_files)
                     self._await_staging_capacity(
                         planned_bytes, planned_files, stop_pipeline)
                     if CANCEL.is_set() or stop_pipeline.is_set():
@@ -662,6 +670,8 @@ class RemoteOrchestrator:
         # chunk's rows from the catalog just before staging it.
         size_summary = self.db.get_chunk_size_summary(session_id)
         planned = {ci: size_summary.get(ci, (0, 0, 0)) for ci in pending_chunks}
+        self._validate_pending_chunk_limits(
+            session_id, pending_chunks, planned)
 
         ready_q       = queue.Queue(maxsize=self.prefetch_ahead)
         stop_pipeline = threading.Event()
@@ -780,6 +790,34 @@ class RemoteOrchestrator:
         cluster = _volume_cluster_size(self.staging_dir)
         return int((logical_bytes + file_count * cluster) * self.staging_padding)
 
+    def _validate_chunk_file_limit(self, session_id, chunk_index, file_count):
+        limit = int(getattr(self, 'chunk_max_files', 100000))
+        if int(file_count) <= limit:
+            return
+        if getattr(self.cfg, 'allow_resume_oversized_chunks', False):
+            print(f"[REMOTE] Warning: session {session_id} chunk "
+                  f"{chunk_index + 1} has {int(file_count):,} files, above "
+                  f"chunk_max_files={limit:,}; override is enabled.")
+            return
+        session = self.db.get_remote_session(session_id)
+        label = (session or {}).get('session_label', f'id {session_id}')
+        raise RuntimeError(
+            "[REMOTE] Refusing to resume an oversized legacy chunk. "
+            f"Session: {label} (id {session_id}); chunk: {chunk_index + 1}; "
+            f"file count: {int(file_count):,}; configured limit: {limit:,}. "
+            "Abandon and replan the session so chunks are split safely, or set "
+            "allow_resume_oversized_chunks=true only for an explicit one-time "
+            "override."
+        )
+
+    def _validate_pending_chunk_limits(self, session_id, pending_chunks,
+                                       size_summary):
+        for chunk_index in pending_chunks:
+            _planned_bytes, _present_bytes, file_count = size_summary.get(
+                chunk_index, (0, 0, 0))
+            self._validate_chunk_file_limit(
+                session_id, chunk_index, file_count)
+
     def _await_staging_capacity(self, planned_bytes, planned_files, stop_evt):
         """Block until there is room to stage another chunk without breaching the
         staging cap or starving the disk. Accounts for the ~2x transient
@@ -797,6 +835,16 @@ class RemoteOrchestrator:
                 free = shutil.disk_usage(self.staging_dir).free
             except OSError:
                 free = need + floor
+            governor = getattr(self, 'governor', None)
+            if governor and not governor.can_start_fetch(
+                    needed_bytes=need, queued_bytes=resident):
+                if not warned:
+                    _status('PIPELINE',
+                            "Backpressure - waiting for RAM/staging/tape "
+                            "governor before fetching the next chunk.")
+                    warned = True
+                time.sleep(2)
+                continue
             room_cap  = (resident + need) <= self.staging_max_bytes
             room_disk = (free - need) >= floor
             if not room_disk:
@@ -832,9 +880,25 @@ class RemoteOrchestrator:
         # --- FETCH (remote -> PC) ---
         self.db.update_chunk_status(session_id, chunk_index, 'fetching')
         fetch_start = time.perf_counter()
-        fetch_ok, source_missing_files, fetched_file_count = self._fetch_chunk(
-            session_id, chunk_index, chunk_files, fetch_dir
-        )
+        governor = getattr(self, 'governor', None)
+        if governor:
+            planned_bytes = sum(int(row['file_size_bytes'])
+                                for row in chunk_files)
+            governor.wait_until(
+                lambda: governor.can_start_fetch(needed_bytes=planned_bytes),
+                "fetch")
+            fetch_guard = governor.mark_fetch_active()
+        else:
+            fetch_guard = None
+        if fetch_guard:
+            with fetch_guard:
+                fetch_ok, source_missing_files, fetched_file_count = (
+                    self._fetch_chunk(
+                        session_id, chunk_index, chunk_files, fetch_dir))
+        else:
+            fetch_ok, source_missing_files, fetched_file_count = self._fetch_chunk(
+                session_id, chunk_index, chunk_files, fetch_dir
+            )
         if not fetch_ok:
             if not CANCEL.is_set():
                 self.db.update_chunk_status(session_id, chunk_index, 'fetch_failed')
@@ -872,20 +936,42 @@ class RemoteOrchestrator:
                        f"small files -> ZIP, large files staged loose")
         pack_start = time.perf_counter()
         try:
+            if governor:
+                governor.wait_until(
+                    lambda: governor.can_start_pack(
+                        needed_bytes=fetch_bytes,
+                        queued_bytes=getattr(self, '_staged_bytes', 0)),
+                    "pack")
+                pack_guard = governor.mark_pack_active()
+            else:
+                pack_guard = None
             # on_existing='clean': this runs on the producer thread, which must
             # never block on the packer's interactive stdin prompt. If the dest
             # cannot be cleaned, the packer raises and the chunk stays
             # resumable instead of the pipeline deadlocking.
-            metadata = LTOPacker(self.cfg.max_zip_size_gb).run(
-                source=fetch_dir,
-                dest=pack_dir,
-                threshold_mb=self.cfg.zip_threshold_mb,
-                skipped_tracker=self.skipped_tracker,
-                source_name='remote',
-                session_id=session_id,
-                chunk_index=chunk_index,
-                on_existing='clean',
-            )
+            if pack_guard:
+                with pack_guard:
+                    metadata = LTOPacker(self.cfg.max_zip_size_gb).run(
+                        source=fetch_dir,
+                        dest=pack_dir,
+                        threshold_mb=self.cfg.zip_threshold_mb,
+                        skipped_tracker=self.skipped_tracker,
+                        source_name='remote',
+                        session_id=session_id,
+                        chunk_index=chunk_index,
+                        on_existing='clean',
+                    )
+            else:
+                metadata = LTOPacker(self.cfg.max_zip_size_gb).run(
+                    source=fetch_dir,
+                    dest=pack_dir,
+                    threshold_mb=self.cfg.zip_threshold_mb,
+                    skipped_tracker=self.skipped_tracker,
+                    source_name='remote',
+                    session_id=session_id,
+                    chunk_index=chunk_index,
+                    on_existing='clean',
+                )
         except Exception as e:
             print(f"[REMOTE] Packer error: {e}")
             if not CANCEL.is_set():
@@ -994,16 +1080,33 @@ class RemoteOrchestrator:
         self.db.update_chunk_status(session_id, chunk_index, 'backing')
         # _NoEjectBackup keeps the tape mounted; eject only after the final chunk.
         backup_cls = LTOBackup if eject_after else _NoEjectBackup
+        governor = getattr(self, 'governor', None)
+        tape_pending = (
+            governor.mark_tape_write_pending()
+            if governor else None
+        )
         try:
-            self._backup_writer(backup_cls).run(
-                source=pack_dir,
-                tape_drive=self.cfg.lto_drive,
-                tape_label=tape_label,
-                packer_metadata=desc.metadata,
-                stage_stats=desc,
-                source_host=self.remote_host.split('.', 1)[0],
-                skipped_tracker=self.skipped_tracker,
-            )
+            if tape_pending:
+                with tape_pending:
+                    self._backup_writer(backup_cls).run(
+                        source=pack_dir,
+                        tape_drive=self.cfg.lto_drive,
+                        tape_label=tape_label,
+                        packer_metadata=desc.metadata,
+                        stage_stats=desc,
+                        source_host=self.remote_host.split('.', 1)[0],
+                        skipped_tracker=self.skipped_tracker,
+                    )
+            else:
+                self._backup_writer(backup_cls).run(
+                    source=pack_dir,
+                    tape_drive=self.cfg.lto_drive,
+                    tape_label=tape_label,
+                    packer_metadata=desc.metadata,
+                    stage_stats=desc,
+                    source_host=self.remote_host.split('.', 1)[0],
+                    skipped_tracker=self.skipped_tracker,
+                )
         except Exception as e:
             if CANCEL.is_set():
                 # Robocopy was terminated by the stop request; leave the chunk
@@ -1516,6 +1619,9 @@ class RemoteOrchestrator:
 
     def _cleanup_dir(self, path):
         if os.path.exists(_long(path)):
+            governor = getattr(self, 'governor', None)
+            if governor:
+                governor.wait_until(governor.can_cleanup, "cleanup")
             try:
                 shutil.rmtree(_long(path))
                 print(f"[REMOTE] Cleaned: {path}")

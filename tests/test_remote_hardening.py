@@ -122,6 +122,12 @@ class ChunkPlannerFootprintTests(unittest.TestCase):
         chunks = planner.plan([("/f/a", 5)])
         self.assertEqual(chunks, [[("/f/a", 5)]])
 
+    def test_plan_splits_by_max_files(self):
+        planner = ChunkPlanner(
+            10**9, alloc_unit=1, padding_factor=1.0, max_files=3)
+        chunks = planner.plan([(f"/f/{i}", 1) for i in range(7)])
+        self.assertEqual([len(c) for c in chunks], [3, 3, 1])
+
 
 class StreamingChunkBuilderTests(unittest.TestCase):
     def test_emits_chunk_at_threshold(self):
@@ -146,6 +152,42 @@ class StreamingChunkBuilderTests(unittest.TestCase):
             self.assertEqual(builder.add(f"/f/{idx}", 1), [])
         self.assertEqual(builder.add("/f/10", 1),
                          [[(f"/f/{idx}", 1) for idx in range(10)]])
+
+    def test_emits_chunk_at_max_files(self):
+        builder = StreamingChunkBuilder(
+            10**9, alloc_unit=1, padding_factor=1.0, max_files=2)
+        self.assertEqual(builder.add("/f/a", 1), [])
+        self.assertEqual(builder.add("/f/b", 1), [])
+        self.assertEqual(builder.add("/f/c", 1),
+                         [[("/f/a", 1), ("/f/b", 1)]])
+        self.assertEqual(builder.flush(), [[("/f/c", 1)]])
+
+
+class RemoteResumeChunkLimitTests(unittest.TestCase):
+    def _orchestrator(self, allow_override=False):
+        class FakeDB:
+            def get_remote_session(self, session_id):
+                return {"session_label": "REMOTE_legacy"}
+
+        orch = RemoteOrchestrator.__new__(RemoteOrchestrator)
+        orch.db = FakeDB()
+        orch.cfg = SimpleNamespace(
+            allow_resume_oversized_chunks=allow_override)
+        orch.chunk_max_files = 100000
+        return orch
+
+    def test_legacy_oversized_chunk_fails_clearly(self):
+        orch = self._orchestrator()
+        with self.assertRaisesRegex(
+                RuntimeError,
+                "REMOTE_legacy.*chunk: 3.*150,000.*100,000.*Abandon"):
+            orch._validate_pending_chunk_limits(
+                42, [2], {2: (0, 0, 150000)})
+
+    def test_legacy_oversized_chunk_override_allows_resume(self):
+        orch = self._orchestrator(allow_override=True)
+        orch._validate_pending_chunk_limits(
+            42, [2], {2: (0, 0, 150000)})
 
 
 class FetchWatchdogTests(unittest.TestCase):

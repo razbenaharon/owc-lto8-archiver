@@ -1,4 +1,5 @@
 """LTOBackup and _NoEjectBackup tape writers."""
+import contextlib
 import os
 import re
 import time
@@ -46,13 +47,14 @@ def _tape_destination_root(source, tape_drive, tape_parent_dir=None):
 class LTOBackup:
     def __init__(self, db: "PgDatabaseManager", ibm_eject_cmd: str,
                  tape_priority=None, tape_affinity=None, log_dir=None,
-                 notifier=None):
+                 notifier=None, governor=None):
         self.db            = db
         self.ibm_eject_cmd = ibm_eject_cmd
         self.tape_priority = tape_priority   # psutil priority class for robocopy
         self.tape_affinity = tape_affinity   # consumer (tape-writer) core set
         self.log_dir       = log_dir or BACKUP_LOG_DIR
         self.notifier      = notifier
+        self.governor      = governor
 
     def _write_backup_log(self, details, packer_metadata, loose_map,
                           recovered_direct_existing, skipped_existing,
@@ -294,13 +296,22 @@ class LTOBackup:
         if exclude_dir_paths:
             robocopy_cmd.extend(['/XD'] + exclude_dir_paths)
 
-        rc = _run_robocopy_tuned(robocopy_cmd,
-                                 priority=self.tape_priority,
-                                 affinity=self.tape_affinity)
-
-        stop_evt.set()
-        mon.join(timeout=2)
-        _progress_done()
+        if self.governor:
+            self.governor.wait_until(
+                self.governor.can_start_tape_write, "tape write")
+            tape_guard = self.governor.mark_tape_write_active()
+        else:
+            tape_guard = contextlib.nullcontext()
+        try:
+            with tape_guard:
+                rc = _run_robocopy_tuned(
+                    robocopy_cmd,
+                    priority=self.tape_priority,
+                    affinity=self.tape_affinity)
+        finally:
+            stop_evt.set()
+            mon.join(timeout=2)
+            _progress_done()
 
         # If the user pressed Ctrl+C, robocopy was terminated mid-write. Skip the
         # DB commit and the eject so the chunk stays resumable and the tape is
@@ -373,6 +384,13 @@ class LTOBackup:
         # ---------------------------------------------------------------
         # Phase 3 — DB inserts (new/recovered files from this run)
         # ---------------------------------------------------------------
+        if self.governor:
+            self.governor.wait_until(
+                self.governor.can_start_db_sync, "database sync")
+            db_guard = self.governor.mark_db_sync_active()
+            db_guard.__enter__()
+        else:
+            db_guard = None
         db_sync_start = time.perf_counter()
 
         def catalog_record(file_name, original_path, file_size_bytes,
@@ -472,6 +490,8 @@ class LTOBackup:
         copied_bytes = rc_sum['bytes_copied']
         new_used = int(self.db.recalculate_tape_used_space(tape_label) or 0)
         print(f"[DB] Tape used space reconciled to {new_used / 1024**3:.3f} GB.")
+        if db_guard:
+            db_guard.__exit__(None, None, None)
 
         # ---------------------------------------------------------------
         # Phase 4 — Print Robocopy job summary
