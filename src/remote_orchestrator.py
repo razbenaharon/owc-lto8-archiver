@@ -575,6 +575,14 @@ class RemoteOrchestrator:
                         self._discard_desc(leftover)
             except queue.Empty:
                 pass
+            # Drain chunk_q too: the scanner's _force_put(SENTINEL) can spin
+            # forever on a full queue once the stager has exited, leaking the
+            # scanner thread past its join timeout.
+            try:
+                while True:
+                    chunk_q.get_nowait()
+            except queue.Empty:
+                pass
             scanner_thread.join(timeout=15)
             stager_thread.join(timeout=15)
             if self.fetch_cores:

@@ -218,7 +218,8 @@ def _db_management_menu(db):
             tape_row = next((t for t in tapes if t['volume_label'] == label), None)
             old_used = (tape_row['used_space'] or 0) if tape_row else 0
             new_used = db.recalculate_tape_used_space(label)
-            print(f"[DB] Used space updated: {old_used/1024**3:.2f} GB → {new_used/1024**3:.2f} GB")
+            # Decimal GB, matching _print_tapes_table (capacity is decimal GB).
+            print(f"[DB] Used space updated: {old_used/1000**3:.2f} GB → {new_used/1000**3:.2f} GB")
 
         elif sub == '6':
             tapes = _print_tapes_table(db)

@@ -381,10 +381,10 @@ def create_migrated_database_from_backup(cfg, backup_path, dbname=None):
     try:
         restore_backup_to_database(cfg, backup_path, target_db)
         apply_directory_catalog_schema_to_database(cfg, target_db)
-    except Exception:
+    except Exception as exc:
         raise RuntimeError(
             "[DB MIGRATION] Migrated database creation failed. The partially "
             f"created database '{target_db}' was left in place for manual "
             "inspection; drop it manually only after confirming it is not needed."
-        )
+        ) from exc
     return target_db
