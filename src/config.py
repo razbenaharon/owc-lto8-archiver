@@ -77,6 +77,16 @@ class ConfigManager:
             'zip_threshold_mb': '100',
             'max_zip_size_gb':  '100',
         }
+        self.config['CATALOG'] = {
+            'index_min_file_mb': '10',
+            'index_packed_small_files': 'false',
+            'index_directory_stats': 'true',
+            'index_full_directory_tree': 'true',
+            'prefer_directory_containers': 'true',
+            'small_file_manifest_enabled': 'true',
+            'small_file_manifest_format': 'jsonl',
+            'small_file_manifest_compression': 'zstd',
+        }
         self.config['REMOTE'] = {
             'remote_host':      'your.remote.host',
             'remote_user':      '',
@@ -85,6 +95,11 @@ class ConfigManager:
             'remote_selected_paths': '',
             'confirm_before_backup': 'true',
             'staging_fill_pct': '0.80',
+            'scan_mode': 'directories',
+            'remote_scan_depth': '2',
+            'large_file_min_mb': '10',
+            'directory_chunk_max_gb': '50',
+            'directory_chunk_max_files': '100000',
         }
         self.config['PERFORMANCE'] = {
             'pipeline_profile':      'tape_first_controlled',
@@ -223,6 +238,34 @@ class ConfigManager:
     def max_zip_size_gb(self):
         return self._get_float('SETTINGS', 'max_zip_size_gb', 100)
     @property
+    def index_min_file_mb(self):
+        return self._get_float('CATALOG', 'index_min_file_mb', 10)
+    @property
+    def index_packed_small_files(self):
+        return self._get_bool('CATALOG', 'index_packed_small_files', False)
+    @property
+    def index_directory_stats(self):
+        return self._get_bool('CATALOG', 'index_directory_stats', True)
+    @property
+    def index_full_directory_tree(self):
+        return self._get_bool('CATALOG', 'index_full_directory_tree', True)
+    @property
+    def prefer_directory_containers(self):
+        return self._get_bool('CATALOG', 'prefer_directory_containers', True)
+    @property
+    def small_file_manifest_enabled(self):
+        return self._get_bool('CATALOG', 'small_file_manifest_enabled', True)
+    @property
+    def small_file_manifest_format(self):
+        return self.config.get(
+            'CATALOG', 'small_file_manifest_format',
+            fallback='jsonl').strip().lower()
+    @property
+    def small_file_manifest_compression(self):
+        return self.config.get(
+            'CATALOG', 'small_file_manifest_compression',
+            fallback='zstd').strip().lower()
+    @property
     def remote_host(self):      return self.config.get('REMOTE', 'remote_host', fallback='')
     @property
     def remote_user(self):      return self.config.get('REMOTE', 'remote_user', fallback='')
@@ -249,6 +292,25 @@ class ConfigManager:
     @property
     def staging_fill_pct(self):
         return self._get_float('REMOTE', 'staging_fill_pct', 0.80)
+    @property
+    def remote_scan_mode(self):
+        return self.config.get(
+            'REMOTE', 'scan_mode', fallback='directories').strip().lower()
+    @property
+    def remote_scan_depth(self):
+        return self._get_int('REMOTE', 'remote_scan_depth', 2, minimum=0)
+    @property
+    def large_file_min_mb(self):
+        return self._get_float('REMOTE', 'large_file_min_mb',
+                               self.index_min_file_mb)
+    @property
+    def directory_chunk_max_gb(self):
+        return self._get_float('REMOTE', 'directory_chunk_max_gb',
+                               self.chunk_cap_gb)
+    @property
+    def directory_chunk_max_files(self):
+        return self._get_int('REMOTE', 'directory_chunk_max_files',
+                             self.chunk_max_files, minimum=1)
 
     # --- [PERFORMANCE] : continuous-streaming pipeline tuning -----------------
     @property

@@ -123,6 +123,27 @@ class PgTapeMixin:
         stats["bundles"] = conn.execute(
             "DELETE FROM archive_bundles WHERE tape_label=%s", (volume_label,)
         ).rowcount
+        if self._table_exists_conn(conn, "directory_archive_bundles"):
+            stats["directory_bundles"] = conn.execute(
+                "DELETE FROM directory_archive_bundles WHERE tape_label=%s",
+                (volume_label,),
+            ).rowcount
+        else:
+            stats["directory_bundles"] = 0
+        if self._table_exists_conn(conn, "directory_archive_stats"):
+            stats["directory_stats"] = conn.execute(
+                "DELETE FROM directory_archive_stats WHERE tape_label=%s",
+                (volume_label,),
+            ).rowcount
+        else:
+            stats["directory_stats"] = 0
+        if self._table_exists_conn(conn, "directory_tree_index"):
+            stats["directory_tree"] = conn.execute(
+                "DELETE FROM directory_tree_index WHERE tape_label=%s",
+                (volume_label,),
+            ).rowcount
+        else:
+            stats["directory_tree"] = 0
         stats["runs"] = conn.execute(
             "DELETE FROM archive_runs WHERE tape_label=%s", (volume_label,)
         ).rowcount
@@ -130,6 +151,48 @@ class PgTapeMixin:
             "DELETE FROM catalog_directories WHERE tape_label=%s", (volume_label,)
         ).rowcount
         return stats
+
+    def _calculate_tape_used_space_conn(self, conn, volume_label):
+        if not self._table_exists_conn(conn, "directory_archive_bundles"):
+            row = conn.execute(
+                """SELECT COALESCE(SUM(file_size_bytes), 0) AS used
+                   FROM files_index
+                   WHERE tape_label=%s""",
+                (volume_label,),
+            ).fetchone()
+            return row["used"]
+        row = conn.execute(
+            """WITH bundle_paths AS (
+                   SELECT stored_bundle_path
+                   FROM directory_archive_bundles
+                   WHERE tape_label=%s
+               ),
+               legacy_file_bytes AS (
+                   SELECT COALESCE(SUM(f.file_size_bytes), 0) AS n
+                   FROM files_index f
+                   LEFT JOIN archive_bundles b
+                     ON b.bundle_id=f.bundle_id
+                   WHERE f.tape_label=%s
+                     AND NOT EXISTS (
+                         SELECT 1 FROM bundle_paths bp
+                         WHERE bp.stored_bundle_path = b.tape_path
+                     )
+               ),
+               directory_bundle_bytes AS (
+                   SELECT COALESCE(SUM(byte_count), 0) AS n
+                   FROM directory_archive_bundles
+                   WHERE tape_label=%s
+               )
+               SELECT
+                   (SELECT n FROM legacy_file_bytes)
+                   + (SELECT n FROM directory_bundle_bytes) AS used""",
+            (volume_label, volume_label, volume_label),
+        ).fetchone()
+        return row["used"]
+
+    def estimate_tape_used_space(self, volume_label):
+        with self._pool.connection() as conn:
+            return self._calculate_tape_used_space_conn(conn, volume_label)
 
     def delete_tape(self, volume_label):
         def operation(conn):
@@ -154,12 +217,7 @@ class PgTapeMixin:
 
     def recalculate_tape_used_space(self, volume_label):
         def operation(conn):
-            row = conn.execute(
-                """SELECT COALESCE(SUM(file_size_bytes), 0) AS used
-                   FROM files_index WHERE tape_label=%s""",
-                (volume_label,),
-            ).fetchone()
-            new_used = row["used"]
+            new_used = self._calculate_tape_used_space_conn(conn, volume_label)
             cur = conn.execute(
                 "UPDATE tapes SET used_space=%s WHERE volume_label=%s",
                 (new_used, volume_label),
@@ -210,6 +268,24 @@ class PgTapeMixin:
                 "UPDATE archive_bundles SET tape_label=%s WHERE tape_label=%s",
                 (new_label, old_label),
             )
+            if self._table_exists_conn(conn, "directory_archive_bundles"):
+                conn.execute(
+                    """UPDATE directory_archive_bundles
+                       SET tape_label=%s WHERE tape_label=%s""",
+                    (new_label, old_label),
+                )
+            if self._table_exists_conn(conn, "directory_archive_stats"):
+                conn.execute(
+                    """UPDATE directory_archive_stats
+                       SET tape_label=%s WHERE tape_label=%s""",
+                    (new_label, old_label),
+                )
+            if self._table_exists_conn(conn, "directory_tree_index"):
+                conn.execute(
+                    """UPDATE directory_tree_index
+                       SET tape_label=%s WHERE tape_label=%s""",
+                    (new_label, old_label),
+                )
             conn.execute(
                 "UPDATE archive_runs SET tape_label=%s WHERE tape_label=%s",
                 (new_label, old_label),

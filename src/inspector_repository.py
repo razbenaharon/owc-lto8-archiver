@@ -1,4 +1,7 @@
 """Read-only, bounded PostgreSQL query layer for the database inspector."""
+import gzip
+import json
+import os
 from typing import Any, TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
@@ -11,6 +14,11 @@ else:
     except ImportError:  # pragma: no cover - optional until PG backend is selected
         psycopg = None
         dict_row = None
+
+try:
+    import zstandard as zstd
+except ImportError:  # pragma: no cover - requirements includes zstandard
+    zstd = None
 
 from .catalog_query import prefix_pattern, substring_pattern
 from .db import _derived_file_name
@@ -173,6 +181,153 @@ class InspectorRepository:
                            0 AS file_records
                     FROM remote_sessions s ORDER BY s.session_id"""))
         return sorted(rows, key=lambda r: (r["kind"], int(r["session_id"])))
+
+    def list_directory_bundles(self, tape_label=None, cursor=None, limit=None):
+        page_size = self._limit(limit)
+        where = []
+        params = []
+        if tape_label and tape_label != "All":
+            where.append("tape_label=%s")
+            params.append(tape_label)
+        if cursor:
+            where.append("bundle_id > %s")
+            params.append(cursor["bundle_id"])
+        sql = """SELECT * FROM directory_archive_bundles"""
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY bundle_id LIMIT %s"
+        rows = self._execute(sql, params + [page_size + 1]).fetchall()
+        return self._page(rows, page_size, ("bundle_id",))
+
+    def list_directory_stats(self, tape_label=None, cursor=None, limit=None):
+        page_size = self._limit(limit)
+        where = []
+        params = []
+        if tape_label and tape_label != "All":
+            where.append("tape_label=%s")
+            params.append(tape_label)
+        if cursor:
+            where.append("stat_id > %s")
+            params.append(cursor["stat_id"])
+        sql = """SELECT * FROM directory_archive_stats"""
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY stat_id LIMIT %s"
+        rows = self._execute(sql, params + [page_size + 1]).fetchall()
+        return self._page(rows, page_size, ("stat_id",))
+
+    def find_directory_tree(self, query, tape_label=None, limit=None):
+        page_size = self._limit(limit)
+        params = [substring_pattern(query)]
+        where = ["original_dir_path ILIKE %s ESCAPE '\\'"]
+        if tape_label and tape_label != "All":
+            where.append("tape_label=%s")
+            params.append(tape_label)
+        rows = self._execute(
+            """SELECT * FROM directory_tree_index
+               WHERE """ + " AND ".join(where) +
+            """ ORDER BY original_dir_path, dir_id LIMIT %s""",
+            params + [page_size],
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def _open_manifest(path, compression):
+        compression = (compression or "").lower()
+        if compression in ("zstd", "zst") or str(path).endswith(".zst"):
+            if zstd is None:
+                raise RuntimeError("zstandard is required to read .jsonl.zst manifests")
+            raw = open(path, "rb")
+            reader = zstd.ZstdDecompressor().stream_reader(raw)
+            import io
+            return raw, reader, io.TextIOWrapper(reader, encoding="utf-8")
+        if compression == "gzip" or str(path).endswith(".gz"):
+            return (gzip.open(path, "rt", encoding="utf-8"),)
+        return (open(path, "r", encoding="utf-8"),)
+
+    @staticmethod
+    def _close_manifest(handle):
+        for item in reversed(handle):
+            try:
+                item.close()
+            except Exception:
+                pass
+
+    def search_small_file_manifests(self, query, tape_label=None, limit=None):
+        page_size = self._limit(limit)
+        where = ["manifest_path IS NOT NULL"]
+        params = []
+        if tape_label and tape_label != "All":
+            where.append("tape_label=%s")
+            params.append(tape_label)
+        bundles = self._execute(
+            """SELECT bundle_id, tape_label, stored_bundle_path,
+                      manifest_path, manifest_compression
+               FROM directory_archive_bundles
+               WHERE """ + " AND ".join(where) +
+            " ORDER BY backup_date DESC",
+            params,
+        ).fetchall()
+        needle = (query or "").lower()
+        hits = []
+        for bundle in bundles:
+            if len(hits) >= page_size:
+                break
+            path = bundle["manifest_path"]
+            if not path or not os.path.exists(path):
+                continue
+            handle = self._open_manifest(path, bundle["manifest_compression"])
+            try:
+                for line in handle[-1]:
+                    if len(hits) >= page_size:
+                        break
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    text = (
+                        str(item.get("file_name") or "") + "\n"
+                        + str(item.get("relative_path") or "")
+                    ).lower()
+                    if needle in text:
+                        row = dict(item)
+                        row.update({
+                            "bundle_id": bundle["bundle_id"],
+                            "tape_label": bundle["tape_label"],
+                            "stored_bundle_path": bundle["stored_bundle_path"],
+                            "manifest_path": path,
+                        })
+                        hits.append(row)
+            finally:
+                self._close_manifest(handle)
+        return hits
+
+    def validate_directory_catalog(self, tape_label=None):
+        params = []
+        tape_filter = ""
+        if tape_label and tape_label != "All":
+            tape_filter = "WHERE b.tape_label=%s"
+            params.append(tape_label)
+        rows = self._execute(
+            f"""SELECT b.bundle_id, b.tape_label, b.stored_bundle_path,
+                      b.file_count, b.byte_count,
+                      COALESCE(SUM(t.direct_file_count), 0) AS direct_files,
+                      COALESCE(SUM(t.direct_bytes), 0) AS direct_bytes
+               FROM directory_archive_bundles b
+               LEFT JOIN directory_tree_index t ON t.bundle_id=b.bundle_id
+               {tape_filter}
+               GROUP BY b.bundle_id, b.tape_label, b.stored_bundle_path,
+                        b.file_count, b.byte_count
+               ORDER BY b.bundle_id""",
+            params,
+        ).fetchall()
+        warnings = []
+        for row in rows:
+            if row["file_count"] != row["direct_files"]:
+                warnings.append(dict(row) | {"warning": "file_count mismatch"})
+            if row["byte_count"] != row["direct_bytes"]:
+                warnings.append(dict(row) | {"warning": "byte_count mismatch"})
+        return {"bundles_checked": len(rows), "warnings": warnings}
 
     def unreferenced_remote_data_summary(self):
         required = {

@@ -8,6 +8,8 @@ from unittest import mock
 from src.constants import LOCAL_STAGING_RESERVE_BYTES
 from src.orchestrators import (
     ChunkPlanner,
+    DirectoryPlanUnit,
+    DirectoryUnitPlanner,
     RemoteOrchestrator,
     RemoteScanner,
     StreamingChunkBuilder,
@@ -161,6 +163,23 @@ class StreamingChunkBuilderTests(unittest.TestCase):
         self.assertEqual(builder.add("/f/c", 1),
                          [[("/f/a", 1), ("/f/b", 1)]])
         self.assertEqual(builder.flush(), [[("/f/c", 1)]])
+
+
+class DirectoryUnitPlannerTests(unittest.TestCase):
+    def test_keeps_whole_directory_when_under_thresholds(self):
+        unit = DirectoryPlanUnit("/root/project", 10, 100)
+        planner = DirectoryUnitPlanner(max_bytes=200, max_files=20)
+        self.assertEqual(planner.plan([unit]), [unit])
+
+    def test_descends_when_directory_exceeds_thresholds(self):
+        child_a = DirectoryPlanUnit("/root/project/a", 5, 50)
+        child_b = DirectoryPlanUnit("/root/project/b", 6, 60)
+        root = DirectoryPlanUnit(
+            "/root/project", 11, 110, children=[child_b, child_a])
+        planner = DirectoryUnitPlanner(max_bytes=75, max_files=10)
+        self.assertEqual(
+            [unit.original_dir_path for unit in planner.plan([root])],
+            ["/root/project/a", "/root/project/b"])
 
 
 class RemoteResumeChunkLimitTests(unittest.TestCase):

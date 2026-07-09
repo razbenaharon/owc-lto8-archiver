@@ -99,6 +99,7 @@ class RemoteOrchestrator:
             log_dir=self.cfg.backup_log_dir,
             notifier=self.notifier,
             governor=self.governor,
+            index_min_file_mb=self.cfg.index_min_file_mb,
         )
 
     # ------------------------------------------------------------------
@@ -951,7 +952,16 @@ class RemoteOrchestrator:
             # resumable instead of the pipeline deadlocking.
             if pack_guard:
                 with pack_guard:
-                    metadata = LTOPacker(self.cfg.max_zip_size_gb).run(
+                    metadata = LTOPacker(
+                        self.cfg.max_zip_size_gb,
+                        index_min_file_mb=self.cfg.index_min_file_mb,
+                        index_packed_small_files=(
+                            self.cfg.index_packed_small_files),
+                        manifest_enabled=self.cfg.small_file_manifest_enabled,
+                        manifest_format=self.cfg.small_file_manifest_format,
+                        manifest_compression=(
+                            self.cfg.small_file_manifest_compression),
+                    ).run(
                         source=fetch_dir,
                         dest=pack_dir,
                         threshold_mb=self.cfg.zip_threshold_mb,
@@ -962,7 +972,15 @@ class RemoteOrchestrator:
                         on_existing='clean',
                     )
             else:
-                metadata = LTOPacker(self.cfg.max_zip_size_gb).run(
+                metadata = LTOPacker(
+                    self.cfg.max_zip_size_gb,
+                    index_min_file_mb=self.cfg.index_min_file_mb,
+                    index_packed_small_files=self.cfg.index_packed_small_files,
+                    manifest_enabled=self.cfg.small_file_manifest_enabled,
+                    manifest_format=self.cfg.small_file_manifest_format,
+                    manifest_compression=(
+                        self.cfg.small_file_manifest_compression),
+                ).run(
                     source=fetch_dir,
                     dest=pack_dir,
                     threshold_mb=self.cfg.zip_threshold_mb,

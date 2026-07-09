@@ -111,6 +111,48 @@ class PgConnectionCore:
                     cur.execute((sql_dir / migration).read_text(encoding="utf-8"))
             conn.commit()
 
+    def apply_directory_catalog_schema(self):
+        """Explicitly install the directory-catalog schema migration.
+
+        This migration is intentionally not part of startup schema init because
+        production migration must happen only after a verified backup and on the
+        chosen target database.
+        """
+        sql_path = (Path(PROJECT_ROOT) / "scripts" / "sql"
+                    / "007_postgres_directory_catalog.sql")
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql_path.read_text(encoding="utf-8"))
+            conn.commit()
+
+    @staticmethod
+    def _table_exists_conn(conn, table_name):
+        return conn.execute(
+            """SELECT 1
+               FROM information_schema.tables
+               WHERE table_schema='public' AND table_name=%s""",
+            (table_name,),
+        ).fetchone() is not None
+
+    def directory_catalog_schema_installed(self):
+        required = (
+            "directory_archive_stats",
+            "directory_archive_bundles",
+            "directory_tree_index",
+        )
+        with self._pool.connection() as conn:
+            return all(self._table_exists_conn(conn, name) for name in required)
+
+    def _require_directory_catalog_schema(self):
+        if not self.directory_catalog_schema_installed():
+            raise RuntimeError(
+                "[DB] Directory catalog schema is not installed on this "
+                "database. Apply scripts/sql/007_postgres_directory_catalog.sql "
+                "explicitly to the migrated PostgreSQL database after creating "
+                "and verifying a production backup. See "
+                "docs/directory_catalog_migration_runbook.md."
+            )
+
     def _ensure_runtime_constraints(self):
         with self._pool.connection() as conn:
             with conn.cursor() as cur:

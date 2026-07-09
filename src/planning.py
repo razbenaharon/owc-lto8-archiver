@@ -1,4 +1,49 @@
 """Chunk planners: bin-pack scanned manifests into staging-sized chunks."""
+from dataclasses import dataclass, field
+
+
+@dataclass
+class DirectoryPlanUnit:
+    original_dir_path: str
+    recursive_file_count: int
+    recursive_bytes: int
+    direct_file_count: int = 0
+    direct_bytes: int = 0
+    small_file_count: int = 0
+    small_file_bytes: int = 0
+    large_file_count: int = 0
+    large_file_bytes: int = 0
+    depth: int = 0
+    children: list = field(default_factory=list)
+
+
+class DirectoryUnitPlanner:
+    """Choose whole directory containers, descending when thresholds overflow."""
+
+    def __init__(self, max_bytes, max_files):
+        self.max_bytes = int(max_bytes)
+        self.max_files = int(max_files)
+
+    def fits(self, unit):
+        return (
+            int(unit.recursive_bytes) <= self.max_bytes and
+            int(unit.recursive_file_count) <= self.max_files
+        )
+
+    def plan(self, roots):
+        planned = []
+        for unit in roots:
+            self._append(unit, planned)
+        return planned
+
+    def _append(self, unit, planned):
+        if self.fits(unit) or not unit.children:
+            planned.append(unit)
+            return
+        for child in sorted(
+                unit.children,
+                key=lambda item: item.original_dir_path.lower()):
+            self._append(child, planned)
 
 
 class ChunkPlanner:

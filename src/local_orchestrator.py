@@ -39,6 +39,7 @@ class LocalOrchestrator:
             log_dir=self.cfg.backup_log_dir,
             notifier=self.notifier,
             governor=self.governor,
+            index_min_file_mb=self.cfg.index_min_file_mb,
         )
 
     def run(self):
@@ -263,7 +264,16 @@ class LocalOrchestrator:
                         needed_bytes=batch_bytes),
                     "local pack")
                 with self.governor.mark_pack_active():
-                    metadata = LTOPacker(self.cfg.max_zip_size_gb).run_manifest(
+                    metadata = LTOPacker(
+                        self.cfg.max_zip_size_gb,
+                        index_min_file_mb=self.cfg.index_min_file_mb,
+                        index_packed_small_files=(
+                            self.cfg.index_packed_small_files),
+                        manifest_enabled=self.cfg.small_file_manifest_enabled,
+                        manifest_format=self.cfg.small_file_manifest_format,
+                        manifest_compression=(
+                            self.cfg.small_file_manifest_compression),
+                    ).run_manifest(
                         source_root=session['source_dir'],
                         dest=pack_dir,
                         threshold_mb=self.cfg.zip_threshold_mb,
