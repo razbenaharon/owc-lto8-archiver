@@ -15,6 +15,7 @@ from unittest import mock
 
 import src.packer as packer_mod
 from src.packer import LTOPacker
+from src.skipped import SkippedFileTracker
 
 
 class _NoopBudget:
@@ -113,6 +114,54 @@ class PackerOnExistingTests(unittest.TestCase):
         self.assertIsNotNone(metadata)
         packed = [m for m in metadata if m["file_name"] == "large-small.bin"]
         self.assertEqual(len(packed), 1)
+
+    def test_mid_read_io_error_leaves_no_entry_in_bundle(self):
+        """Regression: a mid-read IOError must not leave a truncated entry.
+
+        _pack_entries now spools the whole source file through a
+        SpooledTemporaryFile BEFORE opening the zip entry (see src/packer.py
+        comment above the copyfileobj calls), so a failure while reading the
+        source aborts before any bytes are written under the entry's real
+        name inside the zip. This poisons only the first copyfileobj call
+        for the bad file (the source -> spool step); the good file's copy
+        (both spool and spool -> zip steps) goes through the real
+        shutil.copyfileobj unmodified.
+        """
+        good_path = os.path.join(self.source, "good.bin")
+        bad_path = os.path.join(self.source, "bad.bin")
+        with open(good_path, "wb") as handle:
+            handle.write(b"good-data")
+        with open(bad_path, "wb") as handle:
+            handle.write(b"bad-data")
+
+        real_copyfileobj = packer_mod.shutil.copyfileobj
+
+        def poisoning_copyfileobj(fsrc, fdst, *args, **kwargs):
+            if getattr(fsrc, "name", None) == bad_path:
+                raise OSError("simulated mid-read I/O error")
+            return real_copyfileobj(fsrc, fdst, *args, **kwargs)
+
+        tracker = SkippedFileTracker()
+        with mock.patch("src.packer.shutil.copyfileobj",
+                         side_effect=poisoning_copyfileobj):
+            metadata = LTOPacker(max_zip_size_gb=1, manifest_enabled=False).run(
+                source=self.source, dest=self.dest, threshold_mb=100,
+                on_existing="clean", skipped_tracker=tracker)
+
+        self.assertIsNotNone(metadata)
+        names = [m["file_name"] for m in metadata]
+        self.assertIn("good.bin", names)
+        self.assertNotIn("bad.bin", names)
+
+        bundle = os.path.join(self.dest, "Bundle_001.zip")
+        self.assertTrue(os.path.exists(bundle))
+        with zipfile.ZipFile(bundle) as zf:
+            names_in_zip = zf.namelist()
+            self.assertIn("good.bin", names_in_zip)
+            self.assertNotIn("bad.bin", names_in_zip)
+
+        skipped_paths = [item.path for item in tracker.items()]
+        self.assertIn(bad_path, skipped_paths)
 
 
 if __name__ == "__main__":
