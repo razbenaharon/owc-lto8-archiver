@@ -5,6 +5,7 @@ from src.catalog_v3 import catalog_directory_chain, catalog_file_name
 from src.db import DatabaseManager, _apply_canonical_remote_paths, _file_record_key
 from src.inspector_repository import InspectorRepository
 from src.pg_db import _canonical_remote_path, _coerce_timestamptz, _now_utc
+from inspect_db import _DbOverrideConfig
 
 
 class PostgresOnlyHelperTests(unittest.TestCase):
@@ -73,6 +74,20 @@ class PostgresOnlyHelperTests(unittest.TestCase):
         assert cursor_sql is not None
         self.assertIn("%s", cursor_sql[0])
         self.assertNotIn("?", cursor_sql[0])
+
+    def test_inspect_db_override_changes_only_database_name(self):
+        class Base:
+            pg_host = "localhost"
+            pg_port = "5432"
+            pg_user = "lto"
+            pg_password = "secret"
+            pg_sslmode = "prefer"
+            pg_dbname = "lto_archive"
+
+        cfg = _DbOverrideConfig(Base(), "lto_archive_migrated")
+        self.assertEqual(cfg.pg_dbname, "lto_archive_migrated")
+        self.assertIn("/lto_archive_migrated?", cfg.db_dsn)
+        self.assertIn("lto:***@", cfg.db_display_ref)
 
 
 if __name__ == "__main__":

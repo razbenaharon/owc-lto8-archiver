@@ -11,6 +11,7 @@ server with the standard PG* environment variables (PGHOST/PGPORT/PGUSER/
 PGPASSWORD); the local ``docker compose up -d db`` default works out of the box
 with ``PGPASSWORD=change_me_local``.
 """
+import os
 import unittest
 import uuid
 from pathlib import Path
@@ -59,6 +60,8 @@ class PgIntegrationTests(unittest.TestCase):
             conn.execute(f'CREATE DATABASE "{cls.dbname}"')
         cls.conninfo = build_conninfo(dbname=cls.dbname)
         cls.db = PgDatabaseManager(cls.conninfo)
+        cls.directory_schema_was_auto_installed = cls.db.directory_catalog_schema_installed()
+        cls.db.apply_directory_catalog_schema()
 
     @classmethod
     def tearDownClass(cls):
@@ -96,6 +99,9 @@ class PgIntegrationTests(unittest.TestCase):
             "container_name": None,
             "stored_path": original_path,
         }
+
+    def test_directory_catalog_schema_is_not_auto_applied_on_startup(self):
+        self.assertFalse(self.directory_schema_was_auto_installed)
 
     # -- §1.1 ILIKE escaping -------------------------------------------------
 
@@ -431,6 +437,118 @@ class PgIntegrationTests(unittest.TestCase):
             after = ids[-1]
         self.assertEqual(len(seen), 5)
         self.assertEqual(len(set(seen)), 5)
+
+    def test_directory_catalog_counts_bundle_without_double_counting(self):
+        self.db.register_tape("TDC")
+        bundle_path = os.path.join("TROOT", "Bundle_001.zip")
+        large_size = 12 * 1024 * 1024
+        records = [
+            {
+                "file_name": "small.txt",
+                "original_path": "/src/project/sub/small.txt",
+                "file_size_bytes": 5,
+                "tape_label": "TDC",
+                "source_host": "so02",
+                "is_packed": True,
+                "container_name": "Bundle_001.zip",
+                "stored_path": "sub/small.txt",
+                "catalog_policy": "manifest_only",
+                "manifest_name": "Bundle_001.manifest.jsonl.zst",
+                "manifest_format": "jsonl",
+                "manifest_compression": "zstd",
+            },
+            {
+                "file_name": "large.bin",
+                "original_path": "/src/project/sub/large.bin",
+                "file_size_bytes": large_size,
+                "tape_label": "TDC",
+                "source_host": "so02",
+                "is_packed": True,
+                "container_name": "Bundle_001.zip",
+                "stored_path": "sub/large.bin",
+                "catalog_policy": "index",
+                "manifest_name": "Bundle_001.manifest.jsonl.zst",
+                "manifest_format": "jsonl",
+                "manifest_compression": "zstd",
+            },
+        ]
+        stats = self.db.bulk_upsert_directory_catalog(
+            records, "TDC", "so02", tape_root="TROOT",
+            index_min_file_mb=10)
+        self.assertEqual(stats["bundles"], 1)
+        self.db.bulk_upsert_files([
+            dict(records[1], container_name=bundle_path)
+        ])
+        self.assertEqual(
+            self._query(
+                "SELECT COUNT(*) AS n FROM files_index WHERE tape_label=%s",
+                ("TDC",))[0]["n"],
+            1)
+        used = self.db.recalculate_tape_used_space("TDC")
+        self.assertEqual(used, large_size + 5)
+        tree = self._query(
+            """SELECT original_dir_path, recursive_file_count, recursive_bytes
+               FROM directory_tree_index WHERE tape_label=%s""",
+            ("TDC",))
+        by_path = {row["original_dir_path"]: row for row in tree}
+        self.assertEqual(by_path["/src/project/sub"]["recursive_file_count"], 2)
+        self.assertEqual(
+            by_path["/src/project/sub"]["recursive_bytes"], large_size + 5)
+
+    def test_directory_backfill_dry_run_and_execute_are_idempotent(self):
+        self.db.register_tape("TBF")
+        records = [
+            {
+                "original_path": "/legacy/project/a.txt",
+                "file_size_bytes": 7,
+                "tape_label": "TBF",
+                "source_host": "so02",
+                "is_packed": True,
+                "container_name": "LegacyBundle.zip",
+                "stored_path": "project/a.txt",
+            },
+            {
+                "original_path": "/legacy/project/sub/b.txt",
+                "file_size_bytes": 11,
+                "tape_label": "TBF",
+                "source_host": "so02",
+                "is_packed": True,
+                "container_name": "LegacyBundle.zip",
+                "stored_path": "project/sub/b.txt",
+            },
+        ]
+        self.db.bulk_upsert_files(records)
+        dry = self.db.backfill_directory_catalog_from_files_index(
+            tape_label="TBF", dry_run=True)
+        self.assertEqual(dry["bundles_pending"], 1)
+        self.assertEqual(
+            self._query(
+                "SELECT COUNT(*) AS n FROM directory_archive_bundles "
+                "WHERE tape_label=%s", ("TBF",))[0]["n"],
+            0)
+        first = self.db.backfill_directory_catalog_from_files_index(
+            tape_label="TBF", dry_run=False)
+        self.assertEqual(first["bundles_backfilled"], 1)
+        counts_after_first = {
+            table: self._query(
+                f"SELECT COUNT(*) AS n FROM {table} WHERE tape_label=%s",
+                ("TBF",))[0]["n"]
+            for table in (
+                "directory_archive_bundles",
+                "directory_archive_stats",
+                "directory_tree_index",
+            )
+        }
+        second = self.db.backfill_directory_catalog_from_files_index(
+            tape_label="TBF", dry_run=False)
+        self.assertEqual(second["bundles_backfilled"], 0)
+        counts_after_second = {
+            table: self._query(
+                f"SELECT COUNT(*) AS n FROM {table} WHERE tape_label=%s",
+                ("TBF",))[0]["n"]
+            for table in counts_after_first
+        }
+        self.assertEqual(counts_after_first, counts_after_second)
 
     # -- §1.2 backslash-safe remote manifest --------------------------------
 

@@ -47,7 +47,7 @@ def _tape_destination_root(source, tape_drive, tape_parent_dir=None):
 class LTOBackup:
     def __init__(self, db: "PgDatabaseManager", ibm_eject_cmd: str,
                  tape_priority=None, tape_affinity=None, log_dir=None,
-                 notifier=None, governor=None):
+                 notifier=None, governor=None, index_min_file_mb=10):
         self.db            = db
         self.ibm_eject_cmd = ibm_eject_cmd
         self.tape_priority = tape_priority   # psutil priority class for robocopy
@@ -55,6 +55,7 @@ class LTOBackup:
         self.log_dir       = log_dir or BACKUP_LOG_DIR
         self.notifier      = notifier
         self.governor      = governor
+        self.index_min_file_mb = index_min_file_mb
 
     def _write_backup_log(self, details, packer_metadata, loose_map,
                           recovered_direct_existing, skipped_existing,
@@ -128,6 +129,19 @@ class LTOBackup:
             raise RuntimeError(
                 "[DB] Cannot sync staged backup without packer metadata. "
                 "Repack the staging data before backing up."
+            )
+        if (packer_metadata and
+                any(item.get("is_packed") for item in packer_metadata) and
+                hasattr(self.db, "directory_catalog_schema_installed") and
+                not self.db.directory_catalog_schema_installed()):
+            raise RuntimeError(
+                "[DB] Directory catalog indexing is enabled for packed archive "
+                "runs, but the explicit directory catalog schema migration is "
+                "not installed on this database. Refusing to start the tape "
+                "write. Create and verify a PostgreSQL backup, restore it to a "
+                "separate migrated database, then apply "
+                "scripts/sql/007_postgres_directory_catalog.sql. See "
+                "docs/directory_catalog_migration_runbook.md."
             )
 
         exclude_file_paths = exclude_file_paths or []
@@ -435,6 +449,26 @@ class LTOBackup:
         else:
             # Preserve resume semantics while batching all indexed lookups and
             # writes into bounded transactions.
+            directory_stats = (
+                self.db.bulk_upsert_directory_catalog(
+                    packer_metadata,
+                    tape_label,
+                    source_host,
+                    local_session_id=local_session_id,
+                    local_chunk_index=local_chunk_index,
+                    tape_root=tape_root,
+                    backup_date=started_at,
+                    index_min_file_mb=self.index_min_file_mb,
+                )
+                if hasattr(self.db, 'bulk_upsert_directory_catalog')
+                else {"bundles": 0, "stats": 0, "tree_rows": 0}
+            )
+            record_counts['directory_bundles_upserted'] += (
+                directory_stats['bundles'])
+            record_counts['directory_stats_upserted'] += directory_stats['stats']
+            record_counts['directory_tree_rows_upserted'] += (
+                directory_stats['tree_rows'])
+
             recovered_stats = self.db.bulk_upsert_files(
                 (catalog_record(
                     m['file_name'], m['original_path'], m['file_size_bytes'],
@@ -472,7 +506,9 @@ class LTOBackup:
                     m['file_name'], m['original_path'], m['file_size_bytes'],
                     True, os.path.join(tape_root, m['container_name']),
                     m['stored_path'], m.get('canonical_source_path'))
-                 for m in packer_metadata if m['is_packed']),
+                 for m in packer_metadata
+                 if m['is_packed']
+                 and m.get('catalog_policy') != 'manifest_only'),
                 update_existing=False,
             )
             packed_count = packed_stats['inserted']

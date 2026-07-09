@@ -325,6 +325,40 @@ class FileTableModel(QAbstractTableModel):
         return sorted(set(result))
 
 
+class SimpleRowsTableModel(QAbstractTableModel):
+    def __init__(self, columns, parent=None):
+        super().__init__(parent)
+        self.columns = list(columns)
+        self.rows = []
+
+    def set_rows(self, rows):
+        self.beginResetModel()
+        self.rows = list(rows or [])
+        self.endResetModel()
+
+    def rowCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.rows)
+
+    def columnCount(self, parent=QModelIndex()):
+        return 0 if parent.isValid() else len(self.columns)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid() or role != Qt.ItemDataRole.DisplayRole:
+            return None
+        key = self.columns[index.column()]
+        value = self.rows[index.row()].get(key)
+        if key.endswith("bytes") or key in (
+                "byte_count", "direct_bytes", "recursive_bytes",
+                "small_file_bytes", "large_file_bytes"):
+            return _fmt_bytes(value)
+        return "" if value is None else str(value)
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
+            return self.columns[section]
+        return None
+
+
 class FileDetailDialog(QDialog):
     def __init__(self, record, parent=None):
         super().__init__(parent)
@@ -690,6 +724,171 @@ class SearchWidget(QWidget):
         QMessageBox.critical(self, "Search Error", message)
 
 
+class DirectoryCatalogWidget(QWidget):
+    def __init__(self, db, db_path, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.db_path = db_path
+        self.pool = QThreadPool.globalInstance()
+        self.generation = 0
+
+        layout = QVBoxLayout(self)
+        controls = QHBoxLayout()
+        self.tape_combo = QComboBox()
+        self.query = QLineEdit()
+        self.query.setPlaceholderText("Directory or small-file search")
+        self.bundles_btn = QPushButton("Bundles")
+        self.stats_btn = QPushButton("Directory Stats")
+        self.dir_btn = QPushButton("Find Directory")
+        self.manifest_btn = QPushButton("Manifest Search")
+        self.validate_btn = QPushButton("Validate")
+        for widget in (
+                QLabel("Tape:"), self.tape_combo, self.query,
+                self.bundles_btn, self.stats_btn, self.dir_btn,
+                self.manifest_btn, self.validate_btn):
+            controls.addWidget(widget)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+        self.status = QLabel("")
+        layout.addWidget(self.status)
+        self.table = QTableView()
+        self.model = SimpleRowsTableModel([], self)
+        self.table.setModel(self.model)
+        layout.addWidget(self.table, 1)
+
+        self.bundles_btn.clicked.connect(self.load_bundles)
+        self.stats_btn.clicked.connect(self.load_stats)
+        self.dir_btn.clicked.connect(self.find_directory)
+        self.manifest_btn.clicked.connect(self.search_manifest)
+        self.validate_btn.clicked.connect(self.validate)
+        self.refresh_tapes()
+
+    def refresh_tapes(self):
+        current = self.tape_combo.currentText()
+        self.tape_combo.clear()
+        self.tape_combo.addItem("All")
+        for tape in self.db.list_tapes():
+            self.tape_combo.addItem(tape["volume_label"])
+        if current:
+            idx = self.tape_combo.findText(current)
+            if idx >= 0:
+                self.tape_combo.setCurrentIndex(idx)
+
+    def _tape(self):
+        value = self.tape_combo.currentText()
+        return None if value == "All" else value
+
+    def _run(self, columns, fn, label):
+        self.generation += 1
+        generation = self.generation
+        self.status.setText(f"{label}...")
+        worker = RepositoryWorker(self.db_path, generation, fn)
+        worker.signals.finished.connect(
+            lambda token, result: self._loaded(token, result, columns))
+        worker.signals.failed.connect(lambda _token, msg: self._show_error(msg))
+        self.pool.start(worker)
+
+    @Slot(object, object)
+    def _loaded(self, generation, result, columns):
+        if generation != self.generation:
+            return
+        if isinstance(result, dict) and "rows" in result:
+            rows = result["rows"]
+        elif isinstance(result, dict) and "warnings" in result:
+            rows = result["warnings"]
+            if not rows:
+                rows = [{"status": "ok", "bundles_checked": result["bundles_checked"]}]
+                columns = ["status", "bundles_checked"]
+        else:
+            rows = result
+        self.model = SimpleRowsTableModel(columns, self)
+        self.model.set_rows(rows)
+        self.table.setModel(self.model)
+        self.table.resizeColumnsToContents()
+        self.status.setText(f"{len(rows):,} row(s)")
+
+    def load_bundles(self):
+        tape = self._tape()
+        columns = [
+            "bundle_id", "tape_label", "source_host", "original_dir_path",
+            "stored_bundle_path", "manifest_path", "file_count", "byte_count",
+            "small_file_count", "large_file_count",
+        ]
+        self._run(
+            columns,
+            lambda repo: repo.list_directory_bundles(
+                tape_label=tape, limit=PAGE_SIZE),
+            "Loading bundles",
+        )
+
+    def load_stats(self):
+        tape = self._tape()
+        columns = [
+            "stat_id", "tape_label", "source_host", "original_dir_path",
+            "recursive_file_count", "recursive_bytes", "small_file_count",
+            "small_file_bytes", "large_file_count", "large_file_bytes",
+            "stored_root_path",
+        ]
+        self._run(
+            columns,
+            lambda repo: repo.list_directory_stats(
+                tape_label=tape, limit=PAGE_SIZE),
+            "Loading directory stats",
+        )
+
+    def find_directory(self):
+        query = self.query.text().strip()
+        tape = self._tape()
+        if not query:
+            self.status.setText("Enter a directory path.")
+            return
+        columns = [
+            "dir_id", "tape_label", "source_host", "original_dir_path",
+            "parent_original_dir_path", "depth", "recursive_file_count",
+            "recursive_bytes", "recursive_small_file_count",
+            "recursive_large_file_count", "stored_bundle_path",
+            "manifest_path",
+        ]
+        self._run(
+            columns,
+            lambda repo: repo.find_directory_tree(
+                query, tape_label=tape, limit=PAGE_SIZE),
+            "Searching directories",
+        )
+
+    def search_manifest(self):
+        query = self.query.text().strip()
+        tape = self._tape()
+        if not query:
+            self.status.setText("Enter a small-file search term.")
+            return
+        columns = [
+            "tape_label", "stored_bundle_path", "relative_path", "file_name",
+            "size_bytes", "manifest_path",
+        ]
+        self._run(
+            columns,
+            lambda repo: repo.search_small_file_manifests(
+                query, tape_label=tape, limit=PAGE_SIZE),
+            "Streaming manifests",
+        )
+
+    def validate(self):
+        tape = self._tape()
+        columns = [
+            "warning", "bundle_id", "tape_label", "stored_bundle_path",
+            "file_count", "direct_files", "byte_count", "direct_bytes",
+        ]
+        self._run(
+            columns,
+            lambda repo: repo.validate_directory_catalog(tape_label=tape),
+            "Validating directory catalog",
+        )
+
+    def _show_error(self, message):
+        QMessageBox.critical(self, "Directory Catalog Error", message)
+
+
 class ManageWidget(QWidget):
     def __init__(self, db, db_path, parent=None):
         super().__init__(parent)
@@ -970,9 +1169,11 @@ class DBInspectorQtApp(QMainWindow):
         self.tabs = tabs
         self.browse = BrowseWidget(db, db_path, self)
         self.search = SearchWidget(db, db_path, self)
+        self.directory_catalog = DirectoryCatalogWidget(db, db_path, self)
         self.manage = ManageWidget(db, db_path, self)
         tabs.addTab(self.browse, "Files")
         tabs.addTab(self.search, "Search")
+        tabs.addTab(self.directory_catalog, "Directory Catalog")
         tabs.addTab(self.manage, "Manage")
         tabs.currentChanged.connect(self._tab_changed)
         self.setCentralWidget(tabs)
@@ -984,6 +1185,7 @@ class DBInspectorQtApp(QMainWindow):
 
     def refresh_all(self):
         self.search.refresh_tapes()
+        self.directory_catalog.refresh_tapes()
         if self.manage._loaded:
             self.manage.refresh()
 

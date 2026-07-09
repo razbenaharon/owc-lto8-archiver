@@ -14,13 +14,15 @@ in (e.g. ``src.scanning._ssh_run``, ``src.remote_orchestrator._dir_tree_size``),
 not this facade.
 """
 from .local_orchestrator import LocalOrchestrator
-from .planning import ChunkPlanner, StreamingChunkBuilder
+from .planning import ChunkPlanner, DirectoryPlanUnit, DirectoryUnitPlanner, StreamingChunkBuilder
 from .remote_orchestrator import RemoteOrchestrator
 from .resource_governor import ResourceGovernor
-from .scanning import RemoteScanner, StreamingRemoteScanner
+from .scanning import DirectoryFirstRemoteScanner, RemoteScanner, StreamingRemoteScanner
 
 __all__ = [
-    "ChunkPlanner", "LocalOrchestrator", "RemoteOrchestrator",
+    "ChunkPlanner", "DirectoryPlanUnit", "DirectoryUnitPlanner",
+    "LocalOrchestrator", "RemoteOrchestrator",
     "ResourceGovernor",
-    "RemoteScanner", "StreamingChunkBuilder", "StreamingRemoteScanner",
+    "DirectoryFirstRemoteScanner", "RemoteScanner", "StreamingChunkBuilder",
+    "StreamingRemoteScanner",
 ]

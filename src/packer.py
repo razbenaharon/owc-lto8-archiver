@@ -1,8 +1,15 @@
 """LTOAnalyzer and LTOPacker."""
+import io
+import json
 import os
 import shutil
 import zipfile
 from typing import List, Optional
+
+try:
+    import zstandard as zstd
+except ImportError:  # pragma: no cover - requirements includes zstandard
+    zstd = None
 
 from .constants import (LOCAL_STAGING_RESERVE_BYTES, LOCAL_TAPE_BUDGET_BYTES,
                         ROOT_FILES_GROUP, TAPE_BUDGET_LABEL,
@@ -263,8 +270,66 @@ class LTOAnalyzer:
 
 
 class LTOPacker:
-    def __init__(self, max_zip_size_gb):
+    def __init__(self, max_zip_size_gb, *, index_min_file_mb=10,
+                 index_packed_small_files=False, manifest_enabled=True,
+                 manifest_format="jsonl", manifest_compression="zstd"):
         self.max_zip_size_gb = max_zip_size_gb
+        self.index_min_file_mb = float(index_min_file_mb or 10)
+        self.index_packed_small_files = bool(index_packed_small_files)
+        self.manifest_enabled = bool(manifest_enabled)
+        self.manifest_format = (manifest_format or "jsonl").lower()
+        self.manifest_compression = (manifest_compression or "zstd").lower()
+
+    def _manifest_name(self, bundle_prefix, zip_idx):
+        ext = ".jsonl"
+        if self.manifest_compression in ("zstd", "zst"):
+            ext += ".zst"
+        elif self.manifest_compression == "gzip":
+            ext += ".gz"
+        return f"{bundle_prefix}_{zip_idx:03d}.manifest{ext}"
+
+    def _open_manifest(self, dest, bundle_prefix, zip_idx):
+        if not self.manifest_enabled:
+            return None, None, None
+        if self.manifest_format != "jsonl":
+            raise RuntimeError(
+                f"[PACKER] Unsupported manifest format: {self.manifest_format}")
+        name = self._manifest_name(bundle_prefix, zip_idx)
+        path = os.path.join(dest, name)
+        if self.manifest_compression in ("zstd", "zst"):
+            if zstd is None:
+                raise RuntimeError(
+                    "[PACKER] zstandard is required for .jsonl.zst manifests. "
+                    "Run `python -m pip install -r requirements.txt`.")
+            raw = open(path, "wb")
+            writer = zstd.ZstdCompressor().stream_writer(raw)
+            text = io.TextIOWrapper(writer, encoding="utf-8")
+            return name, path, (text, writer, raw)
+        if self.manifest_compression == "gzip":
+            import gzip
+            return name, path, gzip.open(path, "wt", encoding="utf-8")
+        return name, path, open(path, "w", encoding="utf-8")
+
+    @staticmethod
+    def _close_manifest(handle):
+        if handle is None:
+            return
+        if isinstance(handle, tuple):
+            text, writer, raw = handle
+            text.flush()
+            text.detach()
+            writer.close()
+            raw.close()
+            return
+        handle.close()
+
+    @staticmethod
+    def _write_manifest_record(handle, payload):
+        if handle is None:
+            return
+        target = handle[0] if isinstance(handle, tuple) else handle
+        json.dump(payload, target, ensure_ascii=False, separators=(",", ":"))
+        target.write("\n")
 
     def run_manifest(self, source_root, dest, threshold_mb, file_entries,
                      bundle_prefix="Bundle", skipped_tracker=None,
@@ -280,6 +345,7 @@ class LTOPacker:
         os.makedirs(dest, exist_ok=True)
         return self._pack_entries(
             dest, threshold_mb, list(file_entries),
+            source_root=source_root,
             bundle_prefix=bundle_prefix,
             skipped_tracker=skipped_tracker,
             source_name=source_name,
@@ -290,6 +356,7 @@ class LTOPacker:
         )
 
     def _pack_entries(self, dest, threshold_mb, file_entries,
+                      source_root=None,
                       bundle_prefix="Bundle", skipped_tracker=None,
                       source_name='local', session_id=None, chunk_index=None,
                       heading="Offline phase - tape idle",
@@ -303,6 +370,9 @@ class LTOPacker:
         metadata             = []
         zip_idx              = 1
         zipf                 = None
+        manifest_handle      = None
+        manifest_name        = None
+        manifest_path        = None
         current_zip_size     = 0
         files_in_current_zip = 0
         total_packed         = 0
@@ -335,16 +405,21 @@ class LTOPacker:
                             dest, f"{bundle_prefix}_{zip_idx:03d}.zip")
                         zipf = zipfile.ZipFile(
                             zip_path, 'w', zipfile.ZIP_STORED, allowZip64=True)
+                        manifest_name, manifest_path, manifest_handle = (
+                            self._open_manifest(dest, bundle_prefix, zip_idx))
                     if (files_in_current_zip > 0 and
                             current_zip_size + fsize >
                             self.max_zip_size_gb * 1024**3 *
                             ZIP_BUNDLE_FILL_FACTOR):
                         zipf.close()
+                        self._close_manifest(manifest_handle)
                         _progress_done()
                         print(f"\n -> Sealed {bundle_prefix}_{zip_idx:03d}.zip ({files_in_current_zip} files)")
                         zip_idx += 1
                         zip_path = os.path.join(dest, f"{bundle_prefix}_{zip_idx:03d}.zip")
                         zipf = zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED, allowZip64=True)
+                        manifest_name, manifest_path, manifest_handle = (
+                            self._open_manifest(dest, bundle_prefix, zip_idx))
                         current_zip_size     = 0
                         files_in_current_zip = 0
 
@@ -352,9 +427,23 @@ class LTOPacker:
                     with zipf.open(zip_rel, 'w', force_zip64=True) as zdst:
                         zdst.write(payload)
                     del payload
+                    self._write_manifest_record(manifest_handle, {
+                        "relative_path": zip_rel,
+                        "file_name": file,
+                        "size_bytes": int(fsize),
+                        "mtime": None,
+                        "source_host": source_name,
+                        "original_root_dir": source_root or "",
+                        "bundle_id": container,
+                        "stored_bundle_path": container,
+                        "tape_label": None,
+                    })
                     current_zip_size     += fsize
                     files_in_current_zip += 1
                     total_packed         += 1
+                    manifest_only = (
+                        not self.index_packed_small_files and
+                        fsize_mb < self.index_min_file_mb)
 
                     metadata.append({
                         'file_name':       file,
@@ -363,6 +452,13 @@ class LTOPacker:
                         'is_packed':       True,
                         'container_name':  container,
                         'stored_path':     zip_rel,
+                        'catalog_policy': (
+                            'manifest_only' if manifest_only else 'index'),
+                        'manifest_name': manifest_name,
+                        'manifest_path': manifest_path,
+                        'manifest_format': self.manifest_format,
+                        'manifest_compression': self.manifest_compression,
+                        'original_root_dir': source_root or '',
                     })
 
                     if total_packed % 500 == 0:
@@ -396,6 +492,7 @@ class LTOPacker:
                 try:
                     if zipf is not None:
                         zipf.close()
+                    self._close_manifest(manifest_handle)
                 except Exception:
                     pass
                 raise
@@ -408,6 +505,7 @@ class LTOPacker:
 
         if zipf is not None:
             zipf.close()
+            self._close_manifest(manifest_handle)
             if files_in_current_zip > 0:
                 _progress_done()
                 print(f"\n -> Sealed {bundle_prefix}_{zip_idx:03d}.zip ({files_in_current_zip} files)")
@@ -417,6 +515,11 @@ class LTOPacker:
                 # nor copied to tape as a stray artifact.
                 try:
                     os.remove(zip_path)
+                except OSError:
+                    pass
+                try:
+                    if manifest_path:
+                        os.remove(manifest_path)
                 except OSError:
                     pass
 
@@ -484,6 +587,7 @@ class LTOPacker:
 
         return self._pack_entries(
             dest, threshold_mb, entries,
+            source_root=source,
             bundle_prefix="Bundle",
             skipped_tracker=skipped_tracker,
             source_name=source_name,

@@ -7,6 +7,7 @@ import subprocess
 import threading
 
 from .remote_transport import _ssh_run, _ssh_stream_command
+from .planning import DirectoryPlanUnit
 from .skipped import SkippedFileTracker
 from .ui import ConsoleUI
 
@@ -286,3 +287,130 @@ class StreamingRemoteScanner(RemoteScanner):
             raise RuntimeError(
                 f"[REMOTE] SSH scan failed (exit {proc.returncode}):\n{stderr}"
             )
+
+
+class DirectoryFirstRemoteScanner(RemoteScanner):
+    """Directory-level remote scanner for directory-first planning.
+
+    This scanner keeps the high-cardinality tiny-file names on the remote host
+    during planning. It emits directory statistics and exposes a separate
+    large-file iterator for files that must remain searchable in files_index.
+    """
+
+    def __init__(self, remote_user, remote_host, remote_password='',
+                 timeout=None, skipped_tracker=None, ui=None, depth=2,
+                 large_file_min_mb=10):
+        super().__init__(
+            remote_user, remote_host, remote_password=remote_password,
+            timeout=timeout, skipped_tracker=skipped_tracker, ui=ui)
+        self.depth = max(0, int(depth))
+        self.large_file_min_mb = float(large_file_min_mb or 10)
+
+    def discover_candidate_dirs(self, scan_path):
+        cmd = (
+            f"LC_ALL=C find {shlex.quote(scan_path)} -mindepth 0 "
+            f"-maxdepth {self.depth} -type d -print0"
+        )
+        result = _ssh_run(
+            self.remote_user, self.remote_host, cmd, capture=True,
+            password=self.remote_password, timeout=self.timeout)
+        stderr = (result.stderr or '').strip()
+        if result.returncode != 0 and stderr:
+            self._record_find_warnings(stderr)
+        if result.returncode == 255:
+            raise RuntimeError(
+                f"[REMOTE] SSH directory scan failed:\n{stderr}")
+        root = posixpath.normpath(scan_path.replace('\\', '/').strip())
+        dirs = []
+        for path in (result.stdout or '').split('\0'):
+            if not path:
+                continue
+            norm = posixpath.normpath(path)
+            if norm == root or norm.startswith(root + '/'):
+                dirs.append(norm)
+        return dirs
+
+    def stat_directory(self, dir_path):
+        threshold = int(self.large_file_min_mb * 1024 * 1024)
+        script = r"""
+root=$1
+threshold=$2
+find "$root" -type f -printf '%s %h\0' |
+awk -v RS='\0' -v root="$root" -v threshold="$threshold" '
+BEGIN { direct_count=0; direct_bytes=0; rec_count=0; rec_bytes=0;
+        small_count=0; small_bytes=0; large_count=0; large_bytes=0; }
+NF {
+  size=$1; dir=$0; sub(/^[0-9]+ /, "", dir);
+  rec_count++; rec_bytes += size;
+  if (dir == root) { direct_count++; direct_bytes += size; }
+  if (size < threshold) { small_count++; small_bytes += size; }
+  else { large_count++; large_bytes += size; }
+}
+END { printf "%d %d %d %d %d %d %d %d\n",
+      direct_count, direct_bytes, rec_count, rec_bytes,
+      small_count, small_bytes, large_count, large_bytes; }'
+"""
+        cmd = (
+            "bash -lc " + shlex.quote(script)
+            + " _ " + shlex.quote(dir_path) + " " + str(threshold)
+        )
+        result = _ssh_run(
+            self.remote_user, self.remote_host, cmd, capture=True,
+            password=self.remote_password, timeout=self.timeout)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"[REMOTE] Directory stat failed for {dir_path}:\n"
+                f"{(result.stderr or '').strip()}")
+        parts = (result.stdout or '').strip().split()
+        if len(parts) != 8:
+            raise RuntimeError(
+                f"[REMOTE] Could not parse directory stats for {dir_path}: "
+                f"{result.stdout!r}")
+        values = [int(part) for part in parts]
+        return DirectoryPlanUnit(
+            original_dir_path=posixpath.normpath(dir_path),
+            direct_file_count=values[0],
+            direct_bytes=values[1],
+            recursive_file_count=values[2],
+            recursive_bytes=values[3],
+            small_file_count=values[4],
+            small_file_bytes=values[5],
+            large_file_count=values[6],
+            large_file_bytes=values[7],
+            depth=len([p for p in dir_path.strip('/').split('/') if p]),
+        )
+
+    def iter_large_files(self, dir_path):
+        threshold = int(self.large_file_min_mb)
+        cmd = (
+            f"LC_ALL=C find {shlex.quote(dir_path)} -type f "
+            f"-size +{threshold - 1}M -printf '%s %p\\0'"
+        )
+        result = _ssh_run(
+            self.remote_user, self.remote_host, cmd, capture=True,
+            password=self.remote_password, timeout=self.timeout)
+        if result.returncode != 0 and (result.stderr or '').strip():
+            self._record_find_warnings(result.stderr)
+        root = posixpath.normpath(dir_path.replace('\\', '/').strip())
+        for record in (result.stdout or '').split('\0'):
+            parsed = self._parse_large_record(record, root)
+            if parsed is not None:
+                yield parsed
+
+    def _parse_large_record(self, record, root):
+        if not record:
+            return None
+        parts = record.split(' ', 1)
+        if len(parts) != 2:
+            return None
+        size_s, path = parts
+        try:
+            size = int(size_s)
+        except ValueError:
+            return None
+        norm = posixpath.normpath(path)
+        if norm == root or norm.startswith(root + '/'):
+            return norm, size
+        self.skipped_tracker.add(
+            'remote', path, "large-file record outside directory root", 'scan')
+        return None

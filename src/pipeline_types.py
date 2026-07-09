@@ -20,6 +20,12 @@ class FileRecord(TypedDict, total=False):
     container_name: Optional[str]
     stored_path: str
     canonical_source_path: Optional[str]
+    catalog_policy: str
+    manifest_name: Optional[str]
+    manifest_path: Optional[str]
+    manifest_format: Optional[str]
+    manifest_compression: Optional[str]
+    original_root_dir: Optional[str]
 
 
 @dataclass
