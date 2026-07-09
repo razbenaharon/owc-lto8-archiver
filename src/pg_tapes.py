@@ -1,6 +1,6 @@
 """Tape-registry method group: tapes table and label-wide maintenance."""
 from .db import _file_record_key
-from .pg_core import _now_utc, _row, _rows, errors
+from .pg_core import _now_utc, _row, _rows
 
 
 class PgTapeMixin:
@@ -43,21 +43,25 @@ class PgTapeMixin:
         return [row["tape_path"] for row in rows if row["tape_path"]]
 
     def register_tape(self, volume_label, capacity_gb=None):
-        try:
-            self._transaction(
-                lambda conn: conn.execute(
-                    """INSERT INTO tapes
-                       (volume_label, date_formatted, total_capacity)
-                       VALUES (%s, %s, %s)""",
-                    (volume_label, _now_utc(), capacity_gb),
-                ),
-                f"register tape {volume_label}",
-            )
+        # ON CONFLICT DO NOTHING (not try/except UniqueViolation) keeps this
+        # idempotent under the ambiguous-commit retry loop in _transaction: a
+        # retry whose first COMMIT actually landed reports rowcount 0 instead
+        # of raising and being misreported as "already in the database".
+        inserted = self._transaction(
+            lambda conn: conn.execute(
+                """INSERT INTO tapes
+                   (volume_label, date_formatted, total_capacity)
+                   VALUES (%s, %s, %s)
+                   ON CONFLICT (volume_label) DO NOTHING""",
+                (volume_label, _now_utc(), capacity_gb),
+            ).rowcount,
+            f"register tape {volume_label}",
+        )
+        if inserted:
             print(f"[DB] Tape '{volume_label}' registered successfully.")
             return True
-        except errors.UniqueViolation:
-            print(f"[DB] Tape '{volume_label}' is already in the database.")
-            return False
+        print(f"[DB] Tape '{volume_label}' is already in the database.")
+        return False
 
     def tape_exists(self, volume_label):
         with self._pool.connection() as conn:
@@ -252,6 +256,15 @@ class PgTapeMixin:
                 (old_label,),
             ).fetchone()
             if not old:
+                # Ambiguous-commit retry: if the first COMMIT landed, the old
+                # label is gone and the new one exists — converge on success
+                # instead of raising a false "Tape not found" after the rename
+                # actually happened.
+                if conn.execute(
+                    "SELECT 1 FROM tapes WHERE volume_label=%s",
+                    (new_label,),
+                ).fetchone():
+                    return
                 raise RuntimeError(f"[DB] Tape not found: {old_label}")
             conn.execute(
                 """INSERT INTO tapes
@@ -296,19 +309,26 @@ class PgTapeMixin:
             )
             rows = conn.execute(
                 """SELECT file_id, original_path, source_host,
-                          local_session_id, local_chunk_index
+                          local_session_id, local_chunk_index,
+                          remote_session_id, remote_chunk_index
                    FROM files_index WHERE tape_label=%s""",
                 (new_label,),
             ).fetchall()
             # executemany pipelines the statements — one round-trip flight
             # instead of one per file record (hours at catalog scale).
+            # Remote provenance MUST be threaded through: rebuilding with the
+            # legacy 5-field key would collide provenance-distinct rows and
+            # silently re-key remote records so later resume/upsert lookups
+            # miss them and insert duplicates.
             with conn.cursor() as cur:
                 cur.executemany(
                     "UPDATE files_index SET record_key=%s WHERE file_id=%s",
                     ((_file_record_key(
                         row["original_path"], new_label,
                         row["local_session_id"], row["local_chunk_index"],
-                        row["source_host"]),
+                        row["source_host"],
+                        remote_session_id=row["remote_session_id"],
+                        remote_chunk_index=row["remote_chunk_index"]),
                       row["file_id"]) for row in rows),
                 )
             conn.execute(
