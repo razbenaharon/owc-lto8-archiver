@@ -11,10 +11,12 @@ class ChunkPlanner:
     rounding on small files, filesystem metadata, files that grow after the
     scan). The manifest's logical sizes are preserved in the plan."""
 
-    def __init__(self, budget_bytes, alloc_unit=1, padding_factor=1.0):
+    def __init__(self, budget_bytes, alloc_unit=1, padding_factor=1.0,
+                 max_files=None):
         self.budget_bytes = budget_bytes
         self.alloc_unit = max(1, int(alloc_unit))
         self.padding_factor = max(1.0, padding_factor)
+        self.max_files = int(max_files) if max_files else None
 
     def footprint(self, fsize):
         """Estimated bytes a file of logical size fsize allocates on disk."""
@@ -30,7 +32,9 @@ class ChunkPlanner:
             if fp > self.budget_bytes:
                 chunks.append([(remote_path, fsize)])
                 continue
-            if cur_fp + fp > self.budget_bytes and current:
+            if (current and
+                    (cur_fp + fp > self.budget_bytes or
+                     (self.max_files and len(current) >= self.max_files))):
                 chunks.append(current)
                 current = []
                 cur_fp = 0
@@ -43,9 +47,11 @@ class ChunkPlanner:
 class StreamingChunkBuilder:
     """Build threshold-sized chunks in discovery order."""
 
-    def __init__(self, budget_bytes, alloc_unit=1, padding_factor=1.0):
+    def __init__(self, budget_bytes, alloc_unit=1, padding_factor=1.0,
+                 max_files=None):
         self.planner = ChunkPlanner(
-            budget_bytes, alloc_unit=alloc_unit, padding_factor=padding_factor)
+            budget_bytes, alloc_unit=alloc_unit,
+            padding_factor=padding_factor, max_files=max_files)
         self.current = []
         self.current_fp = 0
 
@@ -59,7 +65,10 @@ class StreamingChunkBuilder:
                 self.current_fp = 0
             chunks.append([(remote_path, fsize)])
             return chunks
-        if self.current and self.current_fp + fp > self.planner.budget_bytes:
+        if (self.current and
+                (self.current_fp + fp > self.planner.budget_bytes or
+                 (self.planner.max_files and
+                  len(self.current) >= self.planner.max_files))):
             ready = self.current
             self.current = [(remote_path, fsize)]
             self.current_fp = fp

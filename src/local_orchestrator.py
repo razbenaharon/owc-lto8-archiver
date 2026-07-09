@@ -11,6 +11,7 @@ from .constants import (DEFAULT_TAPE_CAPACITY_GB, LOCAL_STAGING_RESERVE_BYTES,
                         tape_budget_bytes)
 from .ltfs import _ensure_lto_drive_ready, get_volume_label
 from .packer import LTOAnalyzer, LTOPacker, ensure_staging_space
+from .resource_governor import ResourceGovernor
 from .runtime import _acquire_tape_io_lock, _release_tape_io_lock
 from .skipped import SkippedFileTracker
 from .telegram_notify import TelegramNotifier
@@ -29,6 +30,7 @@ class LocalOrchestrator:
         self.source_dir = cfg.source_dir
         self.staging_dir = cfg.staging_dir
         self.fill_pct = cfg.staging_fill_pct
+        self.governor = ResourceGovernor(cfg, self.staging_dir)
 
     def _backup_writer(self, cls: Type[LTOBackup] = _NoEjectBackup) -> LTOBackup:
         return cls(
@@ -36,6 +38,7 @@ class LocalOrchestrator:
             self.cfg.ibm_eject_cmd,
             log_dir=self.cfg.backup_log_dir,
             notifier=self.notifier,
+            governor=self.governor,
         )
 
     def run(self):
@@ -255,17 +258,22 @@ class LocalOrchestrator:
                     batch_bytes,
                     context=f"local batch {batch_index + 1}/{len(batches)}",
                 )
-                metadata = LTOPacker(self.cfg.max_zip_size_gb).run_manifest(
-                    source_root=session['source_dir'],
-                    dest=pack_dir,
-                    threshold_mb=self.cfg.zip_threshold_mb,
-                    file_entries=pending,
-                    bundle_prefix=bundle_prefix,
-                    skipped_tracker=self.skipped_tracker,
-                    source_name='local',
-                    session_id=session['session_id'],
-                    chunk_index=chunk_index,
-                )
+                self.governor.wait_until(
+                    lambda: self.governor.can_start_pack(
+                        needed_bytes=batch_bytes),
+                    "local pack")
+                with self.governor.mark_pack_active():
+                    metadata = LTOPacker(self.cfg.max_zip_size_gb).run_manifest(
+                        source_root=session['source_dir'],
+                        dest=pack_dir,
+                        threshold_mb=self.cfg.zip_threshold_mb,
+                        file_entries=pending,
+                        bundle_prefix=bundle_prefix,
+                        skipped_tracker=self.skipped_tracker,
+                        source_name='local',
+                        session_id=session['session_id'],
+                        chunk_index=chunk_index,
+                    )
                 exclude_files, exclude_dirs = self._build_resume_excludes(
                     session['session_id'], chunk_index, tape_label,
                     batch_name, pack_dir
@@ -547,6 +555,7 @@ class LocalOrchestrator:
 
     def _cleanup_dir(self, path):
         if os.path.exists(path):
+            self.governor.wait_until(self.governor.can_cleanup, "cleanup")
             try:
                 shutil.rmtree(path)
                 print(f"[LOCAL] Cleaned staging: {path}")

@@ -49,8 +49,7 @@ python inspect_db.py                                # run the database inspector
 
 ## Coding Style & Naming Conventions
 
-Python 3, four-space indentation, descriptive `snake_case` for functions, variables,
-and methods. Keep the existing module shape: procedural helpers near the top, larger
+Keep the existing module shape: procedural helpers near the top, larger
 workflow classes (`LTOPacker`, `LTOBackup`, `LTORetriever`, `DatabaseManager`) below.
 Prefer small helpers for hardware, LTFS, robocopy, database, and path-safety
 behavior. Avoid broad refactors during operational fixes.

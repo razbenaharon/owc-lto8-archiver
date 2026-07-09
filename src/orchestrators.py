@@ -16,9 +16,11 @@ not this facade.
 from .local_orchestrator import LocalOrchestrator
 from .planning import ChunkPlanner, StreamingChunkBuilder
 from .remote_orchestrator import RemoteOrchestrator
+from .resource_governor import ResourceGovernor
 from .scanning import RemoteScanner, StreamingRemoteScanner
 
 __all__ = [
     "ChunkPlanner", "LocalOrchestrator", "RemoteOrchestrator",
+    "ResourceGovernor",
     "RemoteScanner", "StreamingChunkBuilder", "StreamingRemoteScanner",
 ]
