@@ -43,13 +43,30 @@ def _short_source_host(value):
 
 
 def _file_record_key(original_path, tape_label, local_session_id=None,
-                     local_chunk_index=None, source_host="so02"):
-    """Stable compact key for NULL-safe file-record upserts."""
+                     local_chunk_index=None, source_host="so02",
+                     remote_session_id=None, remote_chunk_index=None):
+    """Stable compact key for NULL-safe file-record upserts.
+
+    Remote provenance (``remote_session_id``/``remote_chunk_index``) is folded
+    into the digest **only** when supplied. Keys for local archives — and every
+    row written before remote provenance existed — are therefore byte-identical
+    to the legacy 5-field key, so this change does not re-key the existing
+    catalog. Remote archives that thread a ``remote_session_id`` get a distinct
+    identity, so re-archiving the same ``source_host + original_path +
+    tape_label`` no longer collides on the ``-1/-1`` local placeholders.
+    """
     digest = hashlib.sha256()
-    for value in (_short_source_host(source_host), original_path or "",
-                  tape_label or "",
-                  -1 if local_session_id is None else local_session_id,
-                  -1 if local_chunk_index is None else local_chunk_index):
+    values = [_short_source_host(source_host), original_path or "",
+              tape_label or "",
+              -1 if local_session_id is None else local_session_id,
+              -1 if local_chunk_index is None else local_chunk_index]
+    if remote_session_id is not None or remote_chunk_index is not None:
+        values.extend([
+            "remote",
+            -1 if remote_session_id is None else remote_session_id,
+            -1 if remote_chunk_index is None else remote_chunk_index,
+        ])
+    for value in values:
         raw = str(value).encode("utf-8", errors="surrogatepass")
         digest.update(len(raw).to_bytes(8, "big"))
         digest.update(raw)

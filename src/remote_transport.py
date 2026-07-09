@@ -227,7 +227,11 @@ def _scp_fetch_file(remote_user, remote_host, remote_file_path, local_dest_path,
             env = os.environ.copy()
             env['SSHPASS'] = password
             proc = subprocess.Popen(
-                ['sshpass', '-e', 'scp', '-p', remote_spec, local_dest_path],
+                [
+                    'sshpass', '-e', 'scp',
+                    '-o', f'StrictHostKeyChecking={SSH_HOSTKEY_POLICY}',
+                    '-p', remote_spec, local_dest_path,
+                ],
                 env=env
             )
             return proc.wait()
@@ -239,6 +243,7 @@ def _scp_fetch_file(remote_user, remote_host, remote_file_path, local_dest_path,
                     '-o', 'BatchMode=no',
                     '-o', 'PubkeyAuthentication=no',
                     '-o', 'NumberOfPasswordPrompts=1',
+                    '-o', f'StrictHostKeyChecking={SSH_HOSTKEY_POLICY}',
                     '-p',
                     remote_spec,
                     local_dest_path,
@@ -250,7 +255,13 @@ def _scp_fetch_file(remote_user, remote_host, remote_file_path, local_dest_path,
         print("[REMOTE] remote_password is set, but scp/OpenSSH or sshpass was not found.")
         return 255
 
-    proc = subprocess.Popen(['scp', '-p', remote_spec, local_dest_path])
+    proc = subprocess.Popen(
+        [
+            'scp',
+            '-o', f'StrictHostKeyChecking={SSH_HOSTKEY_POLICY}',
+            '-p', remote_spec, local_dest_path,
+        ]
+    )
     return proc.wait()
 
 

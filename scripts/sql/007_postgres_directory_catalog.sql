@@ -113,4 +113,53 @@ CREATE INDEX IF NOT EXISTS idx_directory_tree_bundle
     ON directory_tree_index(bundle_id)
     WHERE bundle_id IS NOT NULL;
 
+-- find_directory_tree() matches original_dir_path with ILIKE '%term%'. The
+-- btree indexes above only accelerate anchored prefixes, so add a trigram GIN
+-- for arbitrary substring search. Keep the build below Docker's /dev/shm
+-- ceiling so PostgreSQL spills to temp files instead of hitting a hard limit.
+SET LOCAL maintenance_work_mem = '512MB';
+
+CREATE INDEX IF NOT EXISTS idx_directory_tree_path_trgm
+    ON directory_tree_index USING gin (original_dir_path gin_trgm_ops);
+
+RESET maintenance_work_mem;
+
+-- Bundle/tape consistency for the directory catalog: a directory row must
+-- reference a bundle on the same tape. bundle_id is the PK of
+-- directory_archive_bundles, so the composite UNIQUE cannot fail on existing
+-- data. The FK is NOT VALID (enforced for new/updated rows; legacy rows are
+-- not scanned) and MATCH SIMPLE skips NULL bundle_id rows.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'uq_dir_bundles_id_tape'
+          AND conrelid = 'directory_archive_bundles'::regclass
+    ) THEN
+        ALTER TABLE directory_archive_bundles
+            ADD CONSTRAINT uq_dir_bundles_id_tape UNIQUE (bundle_id, tape_label);
+    END IF;
+END $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'fk_dir_tree_bundle_tape'
+          AND conrelid = 'directory_tree_index'::regclass
+    ) THEN
+        -- Default ON DELETE NO ACTION (deferred check at statement end). The
+        -- sibling single-column FK on bundle_id already runs ON DELETE SET
+        -- NULL, so by the time this composite constraint is checked bundle_id
+        -- is NULL and MATCH SIMPLE skips it -- deletes are not blocked. It
+        -- cannot use SET NULL itself because tape_label is NOT NULL.
+        ALTER TABLE directory_tree_index
+            ADD CONSTRAINT fk_dir_tree_bundle_tape
+            FOREIGN KEY (bundle_id, tape_label)
+            REFERENCES directory_archive_bundles (bundle_id, tape_label)
+            ON UPDATE CASCADE
+            NOT VALID;
+    END IF;
+END $$;
+
 COMMIT;
