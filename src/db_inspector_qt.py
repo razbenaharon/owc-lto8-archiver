@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
@@ -117,13 +118,16 @@ class DbWriteTask(QRunnable):
 
 class TreeNode:
     def __init__(self, name, kind, parent=None, tape_label=None,
-                 directory_id=None, normalized_path=None):
+                 directory_id=None, normalized_path=None,
+                 recursive_bytes=None, recursive_file_count=None):
         self.name = name
         self.kind = kind
         self.parent = parent
         self.tape_label = tape_label
         self.directory_id = directory_id
         self.normalized_path = normalized_path
+        self.recursive_bytes = recursive_bytes
+        self.recursive_file_count = recursive_file_count
         self.children = []
         self.cursor = None
         self.has_more = kind in ("tape", "dir")
@@ -151,12 +155,13 @@ class ArchiveTreeModel(QAbstractItemModel):
             tapes = repo.list_tapes()
         self.root.children = [
             TreeNode(t["volume_label"], "tape", self.root,
-                     tape_label=t["volume_label"])
+                     tape_label=t["volume_label"],
+                     recursive_bytes=t["used_space"] or 0)
             for t in tapes
         ]
 
     def index(self, row, column, parent=QModelIndex()):
-        if column != 0 or row < 0:
+        if column not in (0, 1) or row < 0:
             return QModelIndex()
         parent_node = self.node_from_index(parent)
         if row >= len(parent_node.children):
@@ -176,24 +181,35 @@ class ArchiveTreeModel(QAbstractItemModel):
         return len(self.node_from_index(parent).children)
 
     def columnCount(self, parent=QModelIndex()):
-        return 1
+        return 2
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid():
             return None
         node = index.internalPointer()
+        column = index.column()
         if role == Qt.ItemDataRole.DisplayRole:
-            return node.name
+            if column == 0:
+                return node.name
+            if column == 1 and node.kind in ("tape", "dir"):
+                return _fmt_bytes(node.recursive_bytes)
+            return None
+        if role == Qt.ItemDataRole.TextAlignmentRole and column == 1:
+            return Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         if role == Qt.ItemDataRole.ToolTipRole:
             if node.kind == "tape":
                 return f"Tape: {node.tape_label}"
             if node.kind == "dir":
-                return node.normalized_path
+                path = node.normalized_path or ""
+                if node.recursive_file_count is not None:
+                    return (f"{path}\n{node.recursive_file_count:,} file(s), "
+                            f"{_fmt_bytes(node.recursive_bytes)}")
+                return path
         return None
 
     def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
         if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
-            return "Archive"
+            return "Size" if section == 1 else "Archive"
         return None
 
     def flags(self, index):
@@ -219,12 +235,20 @@ class ArchiveTreeModel(QAbstractItemModel):
 
         def load(repo):
             if node.kind == "tape":
-                return repo.list_child_directories(
+                page = repo.list_child_directories(
                     tape_label=node.tape_label, cursor=node.cursor,
                     limit=PAGE_SIZE)
-            return repo.list_child_directories(
-                parent_id=node.directory_id, cursor=node.cursor,
-                limit=PAGE_SIZE)
+            else:
+                page = repo.list_child_directories(
+                    parent_id=node.directory_id, cursor=node.cursor,
+                    limit=PAGE_SIZE)
+            sizes = repo.subtree_sizes(
+                [row["directory_id"] for row in page["rows"]])
+            for row in page["rows"]:
+                totals = sizes.get(row["directory_id"], {})
+                row["recursive_bytes"] = totals.get("recursive_bytes", 0)
+                row["recursive_file_count"] = totals.get("recursive_file_count", 0)
+            return page
 
         worker = RepositoryWorker(self.db_path, token, load)
         worker.signals.finished.connect(self._on_loaded)
@@ -253,7 +277,9 @@ class ArchiveTreeModel(QAbstractItemModel):
                     row["name"], "dir", node,
                     tape_label=row["tape_label"],
                     directory_id=row["directory_id"],
-                    normalized_path=row["normalized_path"]))
+                    normalized_path=row["normalized_path"],
+                    recursive_bytes=row.get("recursive_bytes", 0),
+                    recursive_file_count=row.get("recursive_file_count", 0)))
             self.endInsertRows()
         node.cursor = result["next_cursor"]
         node.has_more = bool(result["has_more"])
@@ -402,6 +428,10 @@ class BrowseWidget(QWidget):
         self.tree_model = ArchiveTreeModel(db_path, self)
         self.tree.setModel(self.tree_model)
         self.tree.setHeaderHidden(False)
+        tree_header = self.tree.header()
+        tree_header.setStretchLastSection(False)
+        tree_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        tree_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.tree.selectionModel().selectionChanged.connect(self._on_tree_selection)
         self.tree_model.load_error.connect(self._show_error)
         splitter.addWidget(self.tree)

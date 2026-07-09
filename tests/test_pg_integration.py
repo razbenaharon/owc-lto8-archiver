@@ -31,6 +31,7 @@ else:
         errors = None
         dict_row = None
 
+from src.inspector_repository import InspectorRepository
 from src.pg_bulk import build_conninfo
 
 
@@ -206,6 +207,41 @@ class PgIntegrationTests(unittest.TestCase):
             "SELECT normalized_path FROM catalog_directories "
             "WHERE tape_label = %s", ("TW",))}
         self.assertEqual(paths, {"LOCAL", "LOCAL/Users", "LOCAL/Users/me"})
+
+    def test_inspector_subtree_sizes_are_recursive(self):
+        self.db.register_tape("TSS")
+        self.db.bulk_upsert_files([
+            self._loose("/srv/proj/a.txt", "TSS", size=100),
+            self._loose("/srv/proj/sub/b.txt", "TSS", size=20),
+            self._loose("/srv/proj/sub/c.txt", "TSS", size=5),
+            self._loose("/srv/other/d.txt", "TSS", size=1),
+        ])
+        by_path = {
+            r["normalized_path"]: r["directory_id"]
+            for r in self._query(
+                "SELECT directory_id, normalized_path FROM catalog_directories "
+                "WHERE tape_label = %s", ("TSS",))
+        }
+        with InspectorRepository(self.conninfo) as repo:
+            sizes = repo.subtree_sizes([
+                by_path["so02/srv/proj"],
+                by_path["so02/srv/proj/sub"],
+                by_path["so02/srv/other"],
+            ])
+        # A directory's total rolls up every descendant, not just direct files.
+        proj = sizes[by_path["so02/srv/proj"]]
+        self.assertEqual(proj["recursive_bytes"], 125)
+        self.assertEqual(proj["recursive_file_count"], 3)
+        sub = sizes[by_path["so02/srv/proj/sub"]]
+        self.assertEqual(sub["recursive_bytes"], 25)
+        self.assertEqual(sub["recursive_file_count"], 2)
+        other = sizes[by_path["so02/srv/other"]]
+        self.assertEqual(other["recursive_bytes"], 1)
+        self.assertEqual(other["recursive_file_count"], 1)
+
+    def test_inspector_subtree_sizes_empty_input(self):
+        with InspectorRepository(self.conninfo) as repo:
+            self.assertEqual(repo.subtree_sizes([]), {})
 
     # -- §2.4 upsert stats via RETURNING ------------------------------------
 
