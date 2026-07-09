@@ -187,10 +187,25 @@ class ResourceGovernor:
     def _soft_memory_ok(self):
         return self._memory_pct() < self.ram_soft_limit_pct
 
-    def _tape_allows(self, flag_name):
+    def _tape_blocks(self, action):
+        """Tape-gate blocking state for a stage decision.
+
+        A *pending* tape write must only block new stage STARTS. A stage that
+        is already running ("continue" checkpoints) must be allowed to drain
+        and finish, because the tape's own start gate waits for the active
+        stage flags to clear — blocking mid-stage checkpoints on `pending`
+        creates a circular wait (producer waits for pending to clear, tape
+        waits for fetch/pack_active to clear: deadlock). An ACTIVE tape write
+        still pauses mid-stage work, protecting RAM/IO while robocopy streams.
+        """
+        if action == "start":
+            return self.tape_write_active or self.tape_write_pending
+        return self.tape_write_active
+
+    def _tape_allows(self, flag_name, action="start"):
         if not self.tape_write_exclusive:
             return True
-        if not (self.tape_write_active or self.tape_write_pending):
+        if not self._tape_blocks(action):
             return True
         return _bool_config(self.cfg, flag_name, False)
 
@@ -243,14 +258,16 @@ class ResourceGovernor:
                 dec.effective_min_free_gb = min_free / GB
                 if available is not None and available < min_free:
                     dec.reasons.append("fetch_min_free_ram")
-                if not self._tape_allows("allow_fetch_during_tape_write"):
+                if not self._tape_allows("allow_fetch_during_tape_write",
+                                         action):
                     dec.reasons.append("tape_active")
                 if self.db_sync_active:
                     dec.reasons.append("db_sync_active")
                 if self.pack_active and not self._soft_memory_ok():
                     dec.reasons.append("pack_memory_pressure")
             elif stage == "pack":
-                if not self._tape_allows("allow_pack_during_tape_write"):
+                if not self._tape_allows("allow_pack_during_tape_write",
+                                         action):
                     dec.reasons.append("tape_active")
                 if self.db_sync_active:
                     dec.reasons.append("db_sync_active")
@@ -269,7 +286,8 @@ class ResourceGovernor:
                 if self.tape_write_active or self.fetch_active or self.pack_active or self.db_sync_active:
                     dec.reasons.append("heavy_stage_active")
             elif stage == "db_sync":
-                if not self._tape_allows("allow_db_sync_during_tape_write"):
+                if not self._tape_allows("allow_db_sync_during_tape_write",
+                                         action):
                     dec.reasons.append("tape_active")
                 if not _bool_config(self.cfg, "allow_db_sync_during_fetch", False):
                     if self.fetch_active:
@@ -285,13 +303,18 @@ class ResourceGovernor:
             if (stage in ("fetch", "pack", "db_sync") and
                     _bool_config(self.cfg, "governor_tape_exclusive_heavy_stages",
                                  False) and
-                    (self.tape_write_active or self.tape_write_pending)):
+                    self._tape_blocks(action)):
                 if "tape_active" not in dec.reasons:
                     dec.reasons.append("tape_active")
+            # RAM reserve for the tape writer: enforced whenever a tape write
+            # is actually running (any action), but a merely *pending* write
+            # only blocks new starts — a mid-stage checkpoint must drain so
+            # the tape's heavy_stage_active wait can resolve. The hard RAM
+            # limit above still applies unconditionally to every action.
             if (stage in ("fetch", "pack", "db_sync") and
                     _bool_config(self.cfg, "governor_tape_pause_other_stages",
                                  True) and
-                    (self.tape_write_active or self.tape_write_pending) and
+                    self._tape_blocks(action) and
                     available is not None and
                     available < self.tape_min_free_ram_bytes):
                 dec.effective_min_free_gb = max(

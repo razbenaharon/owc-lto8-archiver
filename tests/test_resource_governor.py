@@ -173,6 +173,109 @@ class ResourceGovernorTests(unittest.TestCase):
             self.assertFalse(gov.can_start_cold_migration())
 
 
+class TapeGateAsymmetryTests(unittest.TestCase):
+    """Regression coverage for ResourceGovernor._tape_blocks(action).
+
+    A *pending* tape write must only block new stage STARTS (producer side);
+    an *active* tape write must also pause mid-stage "continue" checkpoints.
+    Blocking "continue" on a merely pending write created a circular wait:
+    the producer (fetch/pack) never reaches a point where it can drain, so
+    the tape's own start gate (which waits for fetch/pack_active to clear)
+    never opens either. See src/resource_governor.py _tape_blocks docstring.
+    """
+
+    def _governor(self, cfg=None, vm=None, disk=None):
+        cfg = cfg or _cfg()
+        gov = ResourceGovernor(cfg, staging_dir=cfg.staging_dir,
+                               sleep_seconds=0.01)
+        patches = [
+            mock.patch("src.resource_governor.psutil.virtual_memory",
+                       return_value=vm or _vm()),
+            mock.patch("src.resource_governor.shutil.disk_usage",
+                       return_value=disk or _disk()),
+        ]
+        return gov, patches
+
+    def _relaxed_cfg(self, **overrides):
+        data = dict(
+            ram_hard_limit_pct=100,
+            governor_fetch_min_free_floor_gb=0.5,
+            governor_fetch_target_free_ram_gb=0.5,
+            governor_tape_min_free_ram_gb=0.5,
+        )
+        data.update(overrides)
+        return _cfg(**data)
+
+    def test_pending_tape_write_blocks_fetch_start_but_not_continue(self):
+        gov, patches = self._governor(cfg=self._relaxed_cfg())
+        with patches[0], patches[1]:
+            gov.tape_write_pending = True
+            start = gov.decision("fetch", "start")
+            cont = gov.decision("fetch", "continue")
+        self.assertFalse(start.allowed)
+        self.assertIn("tape_active", start.reasons)
+        self.assertTrue(cont.allowed, cont.reasons)
+
+    def test_active_tape_write_blocks_fetch_continue(self):
+        gov, patches = self._governor(cfg=self._relaxed_cfg())
+        with patches[0], patches[1]:
+            gov.tape_write_active = True
+            cont = gov.decision("fetch", "continue")
+        self.assertFalse(cont.allowed)
+        self.assertIn("tape_active", cont.reasons)
+
+    def test_pending_tape_write_blocks_pack_start_but_not_continue(self):
+        gov, patches = self._governor(cfg=self._relaxed_cfg())
+        with patches[0], patches[1]:
+            gov.tape_write_pending = True
+            start = gov.decision("pack", "start")
+            cont = gov.decision("pack", "continue")
+        self.assertFalse(start.allowed)
+        self.assertIn("tape_active", start.reasons)
+        self.assertTrue(cont.allowed, cont.reasons)
+
+    def test_active_tape_write_blocks_pack_continue(self):
+        gov, patches = self._governor(cfg=self._relaxed_cfg())
+        with patches[0], patches[1]:
+            gov.tape_write_active = True
+            cont = gov.decision("pack", "continue")
+        self.assertFalse(cont.allowed)
+        self.assertIn("tape_active", cont.reasons)
+
+    def test_no_deadlock_fetch_active_and_tape_pending_breaks_the_cycle(self):
+        gov, patches = self._governor(cfg=self._relaxed_cfg())
+        with patches[0], patches[1]:
+            gov.fetch_active = True
+            gov.tape_write_pending = True
+            tape_start = gov.decision("tape", "start")
+            fetch_cont = gov.decision("fetch", "continue")
+        # The tape write cannot start while fetch is actively running...
+        self.assertFalse(tape_start.allowed)
+        self.assertIn("heavy_stage_active", tape_start.reasons)
+        # ...but fetch's own mid-stage checkpoints are NOT blocked by the
+        # pending tape write, so fetch can finish and clear fetch_active,
+        # which is exactly what lets the tape's heavy_stage_active gate open.
+        self.assertTrue(fetch_cont.allowed, fetch_cont.reasons)
+
+    def test_tape_ram_reserve_applies_only_when_tape_write_is_active(self):
+        low_available = int(0.2 * 1024**3)  # below governor_tape_min_free_ram_gb=0.5
+        vm = _vm(percent=10, available=low_available, total=64 * 1024**3)
+
+        gov_active, patches_active = self._governor(
+            cfg=self._relaxed_cfg(), vm=vm)
+        with patches_active[0], patches_active[1]:
+            gov_active.tape_write_active = True
+            active_cont = gov_active.decision("fetch", "continue")
+        self.assertIn("tape_ram_reserve", active_cont.reasons)
+
+        gov_pending, patches_pending = self._governor(
+            cfg=self._relaxed_cfg(), vm=vm)
+        with patches_pending[0], patches_pending[1]:
+            gov_pending.tape_write_pending = True
+            pending_cont = gov_pending.decision("fetch", "continue")
+        self.assertNotIn("tape_ram_reserve", pending_cont.reasons)
+
+
 class _FakeDB:
     def tape_exists(self, tape_label):
         return True
