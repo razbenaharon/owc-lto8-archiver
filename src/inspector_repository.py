@@ -399,6 +399,45 @@ class InspectorRepository:
         ).fetchall()
         return self._page(rows, page_size, ("name", "directory_id"))
 
+    def subtree_sizes(self, directory_ids):
+        """Recursive file-byte and file-count totals per directory subtree.
+
+        Sizes are not stored on catalog_directories, so each directory's total
+        is the sum of files_index rows across the directory and all of its
+        descendants. The recursive descent rides idx_catalog_dirs_parent_id and
+        the per-directory sum rides the (directory_id, file_size_bytes) index,
+        so one batched query covers a whole page of sibling directories.
+        """
+        self._require_v3()
+        ids = [int(directory_id) for directory_id in (directory_ids or [])]
+        if not ids:
+            return {}
+        rows = self._execute(
+            """WITH RECURSIVE subtree AS (
+                   SELECT directory_id AS root_id, directory_id
+                   FROM catalog_directories
+                   WHERE directory_id = ANY(%s)
+                   UNION ALL
+                   SELECT s.root_id, c.directory_id
+                   FROM catalog_directories c
+                   JOIN subtree s ON c.parent_id = s.directory_id
+               )
+               SELECT s.root_id,
+                      COALESCE(SUM(f.file_size_bytes), 0) AS recursive_bytes,
+                      COUNT(f.file_id) AS recursive_file_count
+               FROM subtree s
+               LEFT JOIN files_index f ON f.directory_id = s.directory_id
+               GROUP BY s.root_id""",
+            (ids,),
+        ).fetchall()
+        return {
+            row["root_id"]: {
+                "recursive_bytes": row["recursive_bytes"] or 0,
+                "recursive_file_count": row["recursive_file_count"] or 0,
+            }
+            for row in rows
+        }
+
     def list_directory_files(self, directory_id, sort="name", filters=None, cursor=None,
                              limit=None):
         self._require_v3()
