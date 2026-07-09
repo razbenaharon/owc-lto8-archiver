@@ -1114,6 +1114,8 @@ class RemoteOrchestrator:
                         stage_stats=desc,
                         source_host=self.remote_host.split('.', 1)[0],
                         skipped_tracker=self.skipped_tracker,
+                        remote_session_id=session_id,
+                        remote_chunk_index=chunk_index,
                     )
             else:
                 self._backup_writer(backup_cls).run(
@@ -1124,6 +1126,8 @@ class RemoteOrchestrator:
                     stage_stats=desc,
                     source_host=self.remote_host.split('.', 1)[0],
                     skipped_tracker=self.skipped_tracker,
+                    remote_session_id=session_id,
+                    remote_chunk_index=chunk_index,
                 )
         except Exception as e:
             if CANCEL.is_set():

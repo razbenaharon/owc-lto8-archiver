@@ -7,6 +7,7 @@ import subprocess
 import threading
 
 from .remote_transport import _ssh_run, _ssh_stream_command
+from .runtime import CANCEL, _kill_proc_tree, register_proc, unregister_proc
 from .planning import DirectoryPlanUnit
 from .skipped import SkippedFileTracker
 from .ui import ConsoleUI
@@ -218,6 +219,9 @@ class StreamingRemoteScanner(RemoteScanner):
             stderr=subprocess.PIPE,
             env=env,
         )
+        # Register so a global Ctrl+C (CANCEL) can reap the ssh/find tree the
+        # same way the tar fetch path does.
+        register_proc(proc)
         stderr_chunks = []
 
         def _drain_stderr():
@@ -230,17 +234,36 @@ class StreamingRemoteScanner(RemoteScanner):
             except OSError:
                 return
 
+        # proc.stdout.read() blocks while the remote find is slow, so a
+        # top-of-loop stop check alone cannot cancel a stalled scan. This
+        # watcher kills the ssh (and thus remote find) tree as soon as stop_evt
+        # or CANCEL is set, which unblocks the read and stops the local process.
+        aborted = threading.Event()
+        watcher_done = threading.Event()
+
+        def _abort_watch():
+            while not watcher_done.is_set():
+                if (stop_evt is not None and stop_evt.is_set()) or CANCEL.is_set():
+                    aborted.set()
+                    _kill_proc_tree(proc)
+                    return
+                watcher_done.wait(0.25)
+
         stderr_thread = threading.Thread(
             target=_drain_stderr, name='streaming-find-stderr', daemon=True)
         stderr_thread.start()
+        abort_thread = threading.Thread(
+            target=_abort_watch, name='streaming-find-abort', daemon=True)
+        abort_thread.start()
 
         decoder = codecs.getincrementaldecoder('utf-8')('replace')
         buffer = ''
         saw_record = False
         try:
             while True:
-                if stop_evt is not None and stop_evt.is_set():
-                    proc.terminate()
+                if (stop_evt is not None and stop_evt.is_set()) or CANCEL.is_set():
+                    _kill_proc_tree(proc)
+                    aborted.set()
                     break
                 chunk = proc.stdout.read(65536) if proc.stdout else b''
                 if not chunk:
@@ -257,19 +280,26 @@ class StreamingRemoteScanner(RemoteScanner):
             tail = decoder.decode(b'', final=True)
             if tail:
                 buffer += tail
-            if buffer:
+            if buffer and not aborted.is_set():
                 self.ui.warning(
                     "[REMOTE] Scan stream ended mid-record (truncated transfer?); "
                     "the partial record was discarded and recorded as skipped."
                 )
                 self._parse_record(buffer, root)
         finally:
+            watcher_done.set()
             try:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                _kill_proc_tree(proc)
                 proc.wait()
+            unregister_proc(proc)
             stderr_thread.join(timeout=5)
+            abort_thread.join(timeout=5)
+
+        if aborted.is_set():
+            # Cancelled scans stop quietly; the non-zero ssh exit is expected.
+            return
 
         stderr = b''.join(stderr_chunks).decode('utf-8', errors='replace').strip()
         if proc.returncode == 255:

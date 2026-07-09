@@ -271,8 +271,12 @@ class PgCatalogMixin:
                 record.get("source_host") or LEGACY_DEFAULT_SOURCE_HOST)
             session_id = record.get("local_session_id")
             chunk_index = record.get("local_chunk_index")
+            remote_session_id = record.get("remote_session_id")
+            remote_chunk_index = record.get("remote_chunk_index")
             key = _file_record_key(
-                original_path, tape_label, session_id, chunk_index, source_host)
+                original_path, tape_label, session_id, chunk_index, source_host,
+                remote_session_id=remote_session_id,
+                remote_chunk_index=remote_chunk_index)
             container = record.get("container_name")
             bundle_id = bundle_ids.get((tape_label, container))
             if record.get("is_packed") and bundle_id is None:
@@ -292,6 +296,8 @@ class PgCatalogMixin:
                 "stored_path": record.get("stored_path") or "",
                 "local_session_id": session_id,
                 "local_chunk_index": chunk_index,
+                "remote_session_id": remote_session_id,
+                "remote_chunk_index": remote_chunk_index,
                 "bundle_id": bundle_id,
                 "record_key": key,
                 "archive_run_id": archive_run_id,
@@ -328,6 +334,7 @@ class PgCatalogMixin:
         columns = (
             "original_path", "file_size_bytes", "tape_label", "source_host",
             "is_packed", "stored_path", "local_session_id", "local_chunk_index",
+            "remote_session_id", "remote_chunk_index",
             "bundle_id", "record_key", "archive_run_id", "directory_id",
             "catalog_name", "catalog_backup_date",
         )

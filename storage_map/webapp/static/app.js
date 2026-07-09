@@ -31,8 +31,53 @@ function human(bytes) {
   }
 }
 
+/* ------------------------------------------------------------- auth -- */
+/* The API requires X-Auth-Token on every /api/* call when a token is
+ * configured (mandatory for non-loopback binds). The server reads the header
+ * only, so the token is supplied client-side: bootstrapped once from a
+ * ?token=... link, kept in localStorage, and re-prompted on a 401. */
+const AUTH_KEY = 'storageMapToken';
+
+function bootstrapToken() {
+  const url = new URL(location.href);
+  const q = url.searchParams.get('token');
+  if (q) {
+    localStorage.setItem(AUTH_KEY, q.trim());
+    url.searchParams.delete('token');
+    history.replaceState(null, '', url.pathname + url.search + url.hash);
+  }
+}
+
+function authHeaders(base) {
+  const headers = Object.assign({}, base || {});
+  const token = localStorage.getItem(AUTH_KEY) || '';
+  if (token) headers['X-Auth-Token'] = token;
+  return headers;
+}
+
+function promptForToken() {
+  const token = window.prompt(
+    'This dashboard requires an access token (X-Auth-Token):');
+  if (token && token.trim()) {
+    localStorage.setItem(AUTH_KEY, token.trim());
+    return true;
+  }
+  return false;
+}
+
+async function authFetch(url, options) {
+  const opts = Object.assign({}, options);
+  opts.headers = authHeaders(opts.headers);
+  let resp = await fetch(url, opts);
+  if (resp.status === 401 && promptForToken()) {
+    opts.headers = authHeaders(options && options.headers);
+    resp = await fetch(url, opts);
+  }
+  return resp;
+}
+
 async function getJSON(url) {
-  const resp = await fetch(url);
+  const resp = await authFetch(url);
   if (!resp.ok) {
     const body = await resp.json().catch(() => ({}));
     throw new Error(body.detail || `${resp.status} ${resp.statusText}`);
@@ -214,8 +259,8 @@ async function refreshJobs() {
 async function postAction(url, startNote) {
   setStatus(startNote);
   try {
-    const resp = await fetch(url, {method: 'POST',
-                                   headers: {'Content-Type': 'application/json'}});
+    const resp = await authFetch(url, {method: 'POST',
+                                       headers: {'Content-Type': 'application/json'}});
     if (!resp.ok) {
       const body = await resp.json().catch(() => ({}));
       throw new Error(body.detail || `${resp.status} ${resp.statusText}`);
@@ -272,6 +317,7 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
   loadOverviewAndTreemap();
 });
 
+bootstrapToken();
 loadOverviewAndTreemap();
 loadCoverage();
 refreshJobs();
