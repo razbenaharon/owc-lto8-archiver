@@ -316,6 +316,24 @@ def _ssh_stream_command(remote_user, remote_host, command, password='', cipher='
     ], None, None
 
 
+def _is_recoverable_remote_tar_warning(line):
+    """Return True for tar warnings the caller can verify per file.
+
+    The fetch caller checks every expected local output after tar exits. These
+    warnings identify individual source files that tar could not read, so the
+    caller can mark only those absent files as source_missing. Other tar
+    warnings stay fatal because they may mean the stream itself is incomplete or
+    corrupt.
+    """
+    if not line.startswith('tar: '):
+        return False
+    return line.endswith(
+        'Warning: Cannot stat: No such file or directory'
+    ) or line.endswith(
+        'Warning: Cannot open: Permission denied'
+    )
+
+
 def _remote_tar_fetch(remote_user, remote_host, remote_base, rel_paths, local_dest_dir,
                       password='', cipher='', use_mbuffer=False, mbuffer_size='2G',
                       fetch_cores=None, abort_evt=None):
@@ -356,12 +374,13 @@ def _remote_tar_fetch(remote_user, remote_host, remote_base, rel_paths, local_de
     # corrupt entry that names a directory makes tar mirror that entire tree
     # (a one-line truncated scan record once ballooned a 100 GB chunk to
     # ~900 GB of unplanned data this way).
-    # Missing inputs are reported on stderr but do not abort the stream; the
-    # caller verifies every expected local file and records exact omissions.
+    # Missing/unreadable inputs are reported on stderr but do not abort the
+    # stream; the caller verifies every expected local file and records exact
+    # omissions.
     # LC_ALL=C pins tar's diagnostics to English: the recoverable-warning
-    # filter below matches the literal "Cannot stat: No such file or
-    # directory" text, and a localized remote would otherwise turn every
-    # legitimately-missing file into a fatal fetch error.
+    # filter below matches literal English diagnostics, and a localized remote
+    # would otherwise turn every legitimately-missing/unreadable file into a
+    # fatal fetch error.
     tar_core = (
         f"LC_ALL=C tar -C {shlex.quote(remote_base)} -b 512 --sparse "
         "--no-recursion --ignore-failed-read -cf - --null -T -"
@@ -483,9 +502,10 @@ def _remote_tar_fetch(remote_user, remote_host, remote_base, rel_paths, local_de
             parts.append(f"local tar exit {tar_rc}: {tar_err_text}")
         return False, '\n'.join(parts)
 
-    # --ignore-failed-read also suppresses nonzero exits for permission/read
-    # warnings. Only a genuinely missing input is recoverable; all other GNU
-    # tar warnings remain fatal. Non-tar SSH diagnostics retain their previous
+    # --ignore-failed-read also suppresses nonzero exits for some failed inputs.
+    # Only per-file missing/unreadable warnings are recoverable; the caller then
+    # verifies every expected file and records exact omissions. Other GNU tar
+    # warnings remain fatal. Non-tar SSH diagnostics retain their previous
     # behavior and are ignored when the SSH process itself succeeded.
     tar_diagnostics = [
         line for line in ssh_err_text.splitlines()
@@ -493,7 +513,7 @@ def _remote_tar_fetch(remote_user, remote_host, remote_base, rel_paths, local_de
     ]
     fatal_warnings = [
         line for line in tar_diagnostics
-        if not line.endswith('Warning: Cannot stat: No such file or directory')
+        if not _is_recoverable_remote_tar_warning(line)
     ]
     if fatal_warnings:
         return False, "remote tar warning:\n" + '\n'.join(fatal_warnings)

@@ -19,6 +19,7 @@ from src.pipeline_types import StagedChunk
 from src.remote_transport import (
     _ASKPASS_HELPERS,
     _cleanup_askpass_helpers,
+    _is_recoverable_remote_tar_warning,
     _openssh_askpass_env,
     _ssh_run,
     _ssh_stream_command,
@@ -287,6 +288,20 @@ class RemotePasswordSafetyTests(unittest.TestCase):
         self.assertIsNone(env)
         assert err is not None
         self.assertIn("disabled", err)
+
+    def test_remote_tar_permission_denied_warning_is_recoverable(self):
+        line = (
+            "tar: D/shared-data/suture_1/mvsanywhere/scans/scan2/images/"
+            "image_1.png: Warning: Cannot open: Permission denied"
+        )
+        self.assertTrue(_is_recoverable_remote_tar_warning(line))
+
+    def test_remote_tar_non_permission_open_warning_stays_fatal(self):
+        line = (
+            "tar: D/shared-data/project/file.bin: "
+            "Warning: Cannot open: Input/output error"
+        )
+        self.assertFalse(_is_recoverable_remote_tar_warning(line))
 
 
 class RemoteScannerTests(unittest.TestCase):
