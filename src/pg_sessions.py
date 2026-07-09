@@ -2,6 +2,7 @@
 import hashlib
 import os
 
+from .pg_bulk import copy_rows
 from .pg_core import (_coerce_timestamp_kwargs, _now_utc, _row, _rows,
                       _valid_columns)
 
@@ -513,11 +514,12 @@ class PgSessionMixin:
             (snapshot_id,),
         ).fetchone()["n"]
         if not existing:
+            # COPY, not executemany: multi-million-file snapshots insert in
+            # one stream instead of a pipelined statement per row.
             with conn.cursor() as cur:
-                cur.executemany(
-                    """INSERT INTO remote_snapshot_files
-                       (snapshot_id, remote_path, file_size_bytes)
-                       VALUES (%s, %s, %s)""",
+                copy_rows(
+                    cur, "remote_snapshot_files",
+                    ("snapshot_id", "remote_path", "file_size_bytes"),
                     ((snapshot_id, path, size)
                      for path, size in by_path.items()),
                 )
@@ -547,10 +549,9 @@ class PgSessionMixin:
                 ).fetchall()
             }
             with conn.cursor() as cur:
-                cur.executemany(
-                    """INSERT INTO remote_plan_files
-                       (plan_id, snapshot_file_id, chunk_index, ordinal)
-                       VALUES (%s, %s, %s, %s)""",
+                copy_rows(
+                    cur, "remote_plan_files",
+                    ("plan_id", "snapshot_file_id", "chunk_index", "ordinal"),
                     ((plan_id, ids[_canonical_remote_path(row[1])],
                       int(row[0]), ordinal)
                      for ordinal, row in enumerate(rows)),
