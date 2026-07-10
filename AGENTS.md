@@ -91,6 +91,36 @@ resolved with one multi-row upsert per tree depth
 (`PgDatabaseManager._ensure_directories`) instead of one round-trip per file.
 Dedup lookups use the unique `record_key` index.
 
+### The three real-world limiters (measured 2026-07-10) and how to reason about them
+
+The remote pipeline has three independent limiters. Full analysis, numbers, the
+fix stack, measurement methodology, and future tuning live in
+**`docs/performance_insights_and_recommendations.md`** — read it before any
+perf work. In brief:
+
+1. **RAM — phantom file cache.** Buffered `tar` extraction into staging fills the
+   Windows file cache; `psutil` counts that *reclaimable* cache as "used", so the
+   governor sees ~90-94 % and can deadlock on nothing. The archiver process
+   itself is tiny (RSS 44-585 MB). `ResourceGovernor._drain_stage_relaxed` lets
+   the low-RAM drains (`pack`/`db_sync`) proceed past the ceiling; the real
+   consumers (`fetch`/`tape`) are never relaxed. `config.ini [PERFORMANCE]` is
+   host-calibrated (soft 90 / hard 95, low floors) because the psutil signal is
+   cache, not crash risk; the 8.8 GB pagefile is the true OOM guard.
+2. **Tape write — LTFS index sync.** robocopy transfers at full LTO-8 speed
+   (100-320 MB/s) but IBM LTFS default `sync_type=time@5` re-syncs the index
+   every 5 min, and each sync seeks across a filling tape → *effective* per-chunk
+   speed collapses to 8-46 MB/s and the collapse worsens as the cartridge fills.
+   Two fixes: `sync_type=unmount` in `ltfs.conf.local` (syncs once at the single
+   end-of-session eject; applies only on the next physical remount), and **bigger
+   chunks** (`chunk_max_files`) that amortise the fixed overhead — a 135 GB chunk
+   wrote at **208.6 MB/s effective**. After the remount, dial chunks back to
+   ~150-200k files (huge chunks then only add fetch latency / RAM / staging).
+3. **Fetch — single-stream small-file latency.** One SSH/tar stream over 100k
+   tiny files is per-file-latency bound at ~15 MB/s. `[PERFORMANCE]
+   fetch_parallel_streams` (default 1) runs N concurrent tar streams
+   (`RemoteOrchestrator._fetch_batches_parallel`); 3 measured ~30 MB/s. Once the
+   tape is fast (unmount), fetch becomes the binding constraint.
+
 ## Storage Map & Analytics (`storage_map/`)
 
 A self-contained, two-stage remote disk-usage mapper for the lab servers,
@@ -168,3 +198,28 @@ hardware/manual verification if relevant, and any database/config changes. For
   Unnecessary reading right after writing causes wear and tear and damages the
   tape. Rely solely on copy tool success reports (for example, `robocopy`) and
   minimize tape reads as a critical architectural rule.
+
+### Operating a live run (assistant/operator playbook)
+
+- **Never eject the tape remotely.** `LtfsCmdEject` is physical; a cartridge
+  ejected with nobody at the drive cannot be reloaded remotely. Changes that need
+  a remount (e.g. LTFS `sync_type`) must be *staged* and applied when someone is
+  physically present — never force-eject to apply them.
+- **Never kill `Code.exe` to free RAM** — the assistant session may run inside
+  VS Code; killing it ends the session. Ask the operator to close windows.
+- **Before stopping `run.py`, confirm no tape write is active** (`tasklist` for
+  `robocopy` — case-insensitive; a WMI `Name='robocopy.exe'` filter *misses* it
+  because it is `Robocopy.exe`). Sessions are resumable (chunks are re-fetched
+  and re-packed on resume; nothing is committed to tape mid-write), but
+  interrupting a live tape write is not acceptable.
+- **Measure with kernel perf counters only, never by reading the tape or walking
+  the LTFS drive.** `backup_logs/_tape_sampler.ps1` samples per-process I/O/CPU +
+  NIC + RAM every 10 s with negligible overhead; `du`/`ls`/`Get-Volume` on `E:`
+  touches the media and can trigger shoe-shining.
+- **`wsl --shutdown` frees WSL-ballooned RAM but bounces the shared hot DB** — do
+  it only with the operator's OK, only when `run.py` is stopped and the cold
+  container is already stopped (so only the hot DB auto-returns → no Docker port
+  cross-wiring). Verify the port + `current_database()` afterwards.
+- **Chunk-size / config changes apply to newly-scanned chunks only** (already-
+  planned chunks keep their old plan) and need a `run.py` restart to be read.
+  LTFS `sync_type` needs a physical remount. Neither is retroactive.
