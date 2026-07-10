@@ -4,8 +4,10 @@ services:
     container_name: lto_pg
     restart: unless-stopped
     # Keep PostgreSQL from starving the archiver/robocopy under heavy Phase-3
-    # sync + maintenance load; size to the workstation's RAM.
-    mem_limit: 6g
+    # sync + maintenance load; size to the workstation's RAM. Lowered from 6g
+    # on the 15.6 GB host: the fetch/pack/tape pipeline needs the headroom, and
+    # the hot catalog runs comfortably in 4g with shared_buffers=1GB.
+    mem_limit: 4g
     environment:
       POSTGRES_DB: lto_archive
       POSTGRES_USER: lto
@@ -24,18 +26,19 @@ services:
       - "-c"
       - "max_connections=50"
       - "-c"
-      - "shared_buffers=2GB"
-      # Sized against mem_limit (6g): maintenance_work_mem is a real
-      # allocation per maintenance worker, so 2GB of it on top of 2GB
-      # shared_buffers + work_mem risked a cgroup OOM kill during large GIN
+      - "shared_buffers=1GB"
+      # Sized against mem_limit (4g) on the 15.6 GB host so PostgreSQL leaves
+      # RAM for the fetch/pack/tape pipeline: maintenance_work_mem is a real
+      # allocation per maintenance worker, so keeping it at 512MB on top of 1GB
+      # shared_buffers + work_mem avoids a cgroup OOM kill during large GIN
       # index builds; effective_cache_size is planner advice and must not
       # exceed what the capped container can actually cache.
       - "-c"
-      - "effective_cache_size=4GB"
+      - "effective_cache_size=2GB"
       - "-c"
       - "work_mem=64MB"
       - "-c"
-      - "maintenance_work_mem=1GB"
+      - "maintenance_work_mem=512MB"
       - "-c"
       - "max_wal_size=8GB"
       - "-c"
