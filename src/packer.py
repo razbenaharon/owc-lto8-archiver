@@ -1,4 +1,5 @@
 """LTOAnalyzer and LTOPacker."""
+import gc
 import io
 import json
 import os
@@ -388,6 +389,12 @@ class LTOPacker:
 
         pack_file_batch_size = max(1, int(pack_file_batch_size or 10000))
         for entry_index, entry in enumerate(file_entries):
+            if entry_index and entry_index % pack_file_batch_size == 0:
+                # Reclaim per-batch garbage (closed file objects, spool buffers,
+                # metadata churn) proactively so a long pack of millions of
+                # small files does not let the Python heap drift upward between
+                # governor checkpoints.
+                gc.collect()
             if (governor is not None and
                     entry_index % pack_file_batch_size == 0):
                 governor.wait_or_pause("pack", "continue")
