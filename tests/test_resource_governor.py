@@ -338,5 +338,68 @@ class TapeWriteGovernorLifecycleTests(unittest.TestCase):
         self.assertFalse(gov.tape_write_active)
 
 
+class DrainStageRelaxTests(unittest.TestCase):
+    """Regression coverage for ResourceGovernor._drain_stage_relaxed.
+
+    Pack and db_sync are low-RAM drain stages: blocking them cannot lower host
+    RAM (they are not the consumer) and stalls the pipeline with a whole chunk
+    stuck on the staging disk. After the soft-relax window they must proceed
+    despite the RAM ceiling, provided a small absolute floor of memory is free.
+    Fetch (a real consumer) is never relaxed. See src/resource_governor.py.
+    """
+
+    def _governor(self, vm):
+        cfg = _cfg(governor_soft_relax_after_seconds=120)
+        gov = ResourceGovernor(cfg, staging_dir=".", sleep_seconds=0.01)
+        patches = [
+            mock.patch("src.resource_governor.psutil.virtual_memory",
+                       return_value=vm),
+            mock.patch("src.resource_governor.shutil.disk_usage",
+                       return_value=_disk()),
+        ]
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+        return gov
+
+    # Host at 93% RAM, ~1 GB free: exactly the stuck-pack state observed live.
+    _STUCK_VM = _vm(percent=93, available=1024**3, total=16 * 1024**3)
+
+    def test_pack_blocked_before_relax_window(self):
+        gov = self._governor(self._STUCK_VM)
+        dec = gov.decision("pack", "continue", wait_seconds=10)
+        self.assertFalse(dec.allowed)
+        self.assertIn("hard_ram_limit", dec.reasons)
+
+    def test_pack_proceeds_after_relax_window(self):
+        gov = self._governor(self._STUCK_VM)
+        dec = gov.decision("pack", "continue", wait_seconds=130)
+        self.assertTrue(dec.allowed, dec.reasons)
+        self.assertNotIn("hard_ram_limit", dec.reasons)
+        self.assertNotIn("ram_soft_limit", dec.reasons)
+
+    def test_db_sync_proceeds_after_relax_window(self):
+        gov = self._governor(self._STUCK_VM)
+        dec = gov.decision("db_sync", "continue", wait_seconds=130)
+        self.assertTrue(dec.allowed, dec.reasons)
+
+    def test_fetch_never_relaxed(self):
+        # A real consumer stays blocked at the ceiling no matter how long it
+        # has waited — relaxing it would push the box toward OOM.
+        gov = self._governor(self._STUCK_VM)
+        dec = gov.decision("fetch", "continue", wait_seconds=6000)
+        self.assertFalse(dec.allowed)
+        self.assertIn("hard_ram_limit", dec.reasons)
+
+    def test_pack_not_relaxed_below_absolute_floor(self):
+        # Even after the window, refuse when almost no memory is free, so a
+        # relaxed drain never tips the host into hard thrashing.
+        vm = _vm(percent=99, available=128 * 1024**2, total=16 * 1024**3)
+        gov = self._governor(vm)
+        dec = gov.decision("pack", "continue", wait_seconds=130)
+        self.assertFalse(dec.allowed)
+        self.assertIn("hard_ram_limit", dec.reasons)
+
+
 if __name__ == "__main__":
     unittest.main()

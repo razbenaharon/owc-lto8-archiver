@@ -228,6 +228,27 @@ class ResourceGovernor:
                 target = int(target * (factor ** steps))
         return max(floor, target)
 
+    # A drain stage (pack, db_sync) reads staged data off disk and writes a ZIP
+    # or streams a COPY: its own footprint is tiny (tens of MB), and blocking it
+    # can never lower host RAM because it is not the consumer. The RAM ceiling
+    # exists to throttle the real consumers (fetch fills page cache with a whole
+    # chunk; the tape writer). Gating drains on global RAM% therefore deadlocks
+    # the pipeline: the consumer filled memory, and the drain that would free
+    # the staging disk is refused. After the soft-relax window a drain is let
+    # through despite the ceiling, provided a small absolute floor of memory is
+    # still free so we never push the box into hard thrashing.
+    _DRAIN_STAGE_MIN_FREE_BYTES = 512 * 1024**2
+
+    def _drain_stage_relaxed(self, stage, wait_seconds):
+        if stage not in ("pack", "db_sync"):
+            return False
+        window = self.soft_relax_after_seconds
+        if window <= 0 or wait_seconds < window:
+            return False
+        available = self._memory_available()
+        return (available is None or
+                available >= self._DRAIN_STAGE_MIN_FREE_BYTES)
+
     def _base_decision(self, stage, action, wait_seconds=0):
         available = self._memory_available()
         available_gb = 0.0 if available is None else available / GB
@@ -250,7 +271,8 @@ class ResourceGovernor:
             action = str(action)
             dec = self._base_decision(stage, action, wait_seconds)
             available = self._memory_available()
-            if not self._hard_memory_ok():
+            drain_relaxed = self._drain_stage_relaxed(stage, wait_seconds)
+            if not self._hard_memory_ok() and not drain_relaxed:
                 dec.reasons.append("hard_ram_limit")
 
             if stage == "fetch":
@@ -277,7 +299,8 @@ class ResourceGovernor:
                     dec.reasons.append("fetch_active")
                 if (not self._soft_memory_ok() and
                         not _bool_config(self.cfg, "allow_pack_above_ram_soft",
-                                         False)):
+                                         False) and
+                        not drain_relaxed):
                     dec.reasons.append("ram_soft_limit")
             elif stage == "tape":
                 dec.effective_min_free_gb = self.tape_min_free_ram_bytes / GB
