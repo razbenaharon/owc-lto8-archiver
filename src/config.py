@@ -419,6 +419,14 @@ class ConfigManager:
             'PERFORMANCE', 'governor_metadata_batch_size', 10000,
             minimum=1)
     @property
+    def fetch_parallel_streams(self):
+        """Number of concurrent SSH/tar fetch streams per chunk (default 1 =
+        legacy single-stream). Small-file chunks are per-file-latency bound on a
+        single stream; 2-3 parallel streams overlap those stalls up to the WAN
+        ceiling. Bounded by cores/RAM — keep modest on small hosts."""
+        return self._get_int(
+            'PERFORMANCE', 'fetch_parallel_streams', 1, minimum=1)
+    @property
     def governor_pack_file_batch_size(self):
         return self._get_int(
             'PERFORMANCE', 'governor_pack_file_batch_size', 10000,
