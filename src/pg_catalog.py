@@ -962,6 +962,86 @@ class PgCatalogMixin:
         with self._pool.connection() as conn:
             return _rows(conn.execute(sql, params).fetchall())
 
+    def find_directory_restore_bundles(self, dir_path, source_host=None,
+                                       tape_label=None):
+        """Map a SOURCE directory to the ZIP bundle(s) that physically hold its
+        subtree, for a *bundle-complete* restore (whole directory, including the
+        small files that were never given individual ``files_index`` rows).
+
+        Uses ``directory_tree_index`` (whose ``original_dir_path`` is the
+        canonical SOURCE path — unlike ``directory_archive_bundles``, whose root
+        is the transient staging path). Returns one dict per distinct bundle:
+        ``{tape_label, stored_bundle_path, base_path}``. ``base_path`` is the
+        SOURCE prefix that ZIP entry names are relative to, so the caller can
+        reconstruct each entry's full source path (``base_path + '/' + entry``)
+        and extract only the entries under ``dir_path`` — with no per-small-file
+        catalog lookup and no manifest read.
+        """
+        self._require_directory_catalog_schema()
+        needle = _norm_source_path(dir_path)
+        if not needle:
+            return []
+        where = ["(t.original_dir_path = %s "
+                 "OR t.original_dir_path ILIKE %s ESCAPE '\\')"]
+        params: List[Any] = [needle, prefix_pattern(needle + "/")]
+        if source_host:
+            where.append("t.source_host = %s")
+            params.append(_short_source_host(source_host))
+        if tape_label:
+            where.append("t.tape_label = %s")
+            params.append(tape_label)
+        with self._pool.connection() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT t.tape_label, t.stored_bundle_path, "
+                "       t.remote_session_id "
+                "FROM directory_tree_index t "
+                "WHERE " + " AND ".join(where) +
+                " AND t.stored_bundle_path IS NOT NULL",
+                params,
+            ).fetchall()
+            out = []
+            for row in rows:
+                out.append({
+                    "tape_label": row["tape_label"],
+                    "stored_bundle_path": row["stored_bundle_path"],
+                    "base_path": self._derive_bundle_base_path(
+                        conn, row["stored_bundle_path"],
+                        row["remote_session_id"]),
+                })
+        return out
+
+    @staticmethod
+    def _derive_bundle_base_path(conn, stored_bundle_path, remote_session_id):
+        """SOURCE prefix that a bundle's ZIP entry names are relative to.
+
+        Derived from any indexed (>= threshold) packed row in the same physical
+        bundle — ``original_path`` (canonical) minus ``stored_path`` (the ZIP
+        entry) — linked by the on-tape ZIP path. Falls back to the remote
+        session's ``remote_path`` when the bundle has only small (unindexed)
+        files. Empty string means "unknown" (caller then extracts the whole
+        bundle)."""
+        row = conn.execute(
+            "SELECT f.original_path, f.stored_path "
+            "FROM files_index f "
+            "JOIN archive_bundles b ON b.bundle_id = f.bundle_id "
+            "WHERE b.tape_path = %s AND f.is_packed "
+            "AND f.original_path <> '' AND f.stored_path <> '' LIMIT 1",
+            (stored_bundle_path,),
+        ).fetchone()
+        if row:
+            op = str(row["original_path"]).replace("\\", "/")
+            sp = str(row["stored_path"]).replace("\\", "/").lstrip("/")
+            if sp and op.endswith(sp):
+                return op[:len(op) - len(sp)].rstrip("/")
+        if remote_session_id is not None:
+            srow = conn.execute(
+                "SELECT remote_path FROM remote_sessions WHERE session_id=%s",
+                (remote_session_id,),
+            ).fetchone()
+            if srow and srow["remote_path"]:
+                return str(srow["remote_path"]).replace("\\", "/").rstrip("/")
+        return ""
+
     def validate_directory_catalog(self, tape_label=None):
         self._require_directory_catalog_schema()
         params = []

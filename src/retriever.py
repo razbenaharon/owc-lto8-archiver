@@ -168,9 +168,16 @@ class LTORetriever:
         print("1. Search by filename / wildcard  (e.g. *.mov, IMG_*)")
         print("2. Search by date range")
         print("3. Search by both")
-        print("4. Restore full directory")
+        print("4. Restore full directory  (indexed files >= threshold only)")
         print("5. Restore full backup session")
-        opt = input("Option (1-5): ").strip()
+        print("6. Restore full directory — COMPLETE  (whole bundles; includes "
+              "the small files that have no individual DB row)")
+        opt = input("Option (1-6): ").strip()
+
+        if opt == '6':
+            dir_q = input("Original directory path: ").strip()
+            self._restore_directory_complete(dir_q)
+            return
 
         fetch_page = None
         fetch_after = None      # keyset pager for ALL-restores (O(n), not O(n^2))
@@ -543,3 +550,114 @@ class LTORetriever:
                 os.remove(local_zip)
             except OSError:
                 pass
+
+    # ------------------------------------------------------------------
+    # Bundle-complete directory restore (includes small files with no
+    # individual files_index row). Driven by the 007 directory catalog +
+    # the ZIP's own entry list — never by a per-small-file lookup.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _canonical_from_zip_entry(base_path, entry_name):
+        """Full SOURCE path of a file = its bundle base + the ZIP entry path."""
+        entry = str(entry_name).replace("\\", "/").lstrip("/")
+        base = str(base_path or "").replace("\\", "/").rstrip("/")
+        return (base + "/" + entry) if base else entry
+
+    @staticmethod
+    def _entry_under_directory(canonical, dir_path):
+        """True if a reconstructed file path lies within the requested dir."""
+        c = str(canonical).replace("\\", "/")
+        d = str(dir_path).replace("\\", "/").rstrip("/")
+        return bool(d) and (c == d or c.startswith(d + "/"))
+
+    def _restore_directory_complete(self, dir_q):
+        """Restore a whole SOURCE directory — small files included — by pulling
+        each bundle ZIP that covers its subtree from tape and extracting ONLY
+        the entries under it. No per-file catalog lookup, no manifest read: the
+        007 directory catalog gives the bundle(s), and the ZIP's own entry list
+        (reconstructed to full source paths) decides what to extract."""
+        needle = (dir_q or "").strip().strip('"').replace("\\", "/").rstrip("/")
+        if not needle:
+            return
+        try:
+            bundles = self.db.find_directory_restore_bundles(needle)
+        except RuntimeError as e:
+            print(str(e))
+            return
+        if not bundles:
+            print("[RETRIEVER] No directory-catalog bundle found for that path. "
+                  "(Bundle-complete restore needs the 007 directory catalog; "
+                  "for loose/large files use option 4.)")
+            return
+        restore_base = posixpath.dirname(needle)
+        os.makedirs(self.restore_dir, exist_ok=True)
+        by_tape = defaultdict(list)
+        for bundle in bundles:
+            by_tape[bundle["tape_label"]].append(bundle)
+        print(f"\n[RESTORE] {len(bundles)} bundle(s) across "
+              f"{len(by_tape)} tape(s) cover '{needle}'.")
+        total = 0
+        for tape_label, tape_bundles in by_tape.items():
+            self._check_cancelled()
+            self._verify_tape(tape_label)
+            for bundle in tape_bundles:
+                total += self._extract_bundle_subtree(
+                    bundle["stored_bundle_path"], bundle["base_path"],
+                    needle, restore_base)
+        print(f"\n[RESTORE] Directory restore complete: {total} file(s) "
+              f"extracted to {self.restore_dir}")
+
+    def _extract_bundle_subtree(self, tape_zip_path, base_path, dir_path,
+                                restore_base):
+        """Copy one bundle ZIP from tape and extract only the entries whose
+        reconstructed source path is under ``dir_path``. Returns the count."""
+        tape_zip_path = self._resolve_tape_path(tape_zip_path)
+        local_zip = os.path.join(
+            self.staging_dir, os.path.basename(tape_zip_path))
+        print(f"\n[RESTORE] Copying {os.path.basename(tape_zip_path)} "
+              "from tape to staging...")
+        os.makedirs(self.staging_dir, exist_ok=True)
+        if not self._bundle_staging_space_ok(tape_zip_path):
+            return 0
+        _acquire_tape_io_lock(f"restore {os.path.basename(tape_zip_path)}")
+        try:
+            ok = _robocopy_file(tape_zip_path, local_zip)
+        finally:
+            _release_tape_io_lock()
+        if not ok:
+            print("[ERROR] Could not copy ZIP from tape: robocopy error")
+            return 0
+        extracted = 0
+        try:
+            with zipfile.ZipFile(local_zip, 'r') as zf:
+                for entry in zf.namelist():
+                    if entry.endswith("/"):
+                        continue
+                    canonical = self._canonical_from_zip_entry(base_path, entry)
+                    if not self._entry_under_directory(canonical, dir_path):
+                        continue
+                    self._check_cancelled()
+                    rel = (canonical[len(restore_base):]
+                           if restore_base and canonical.startswith(restore_base)
+                           else canonical)
+                    dst = self._unique_dest_path(os.path.join(
+                        self.restore_dir, self._safe_restore_relpath(rel)))
+                    os.makedirs(os.path.dirname(os.path.abspath(dst)),
+                                exist_ok=True)
+                    with zf.open(entry) as zsrc, open(dst, "wb") as out:
+                        shutil.copyfileobj(zsrc, out)
+                    extracted += 1
+                    if extracted % 500 == 0:
+                        print(f"[RESTORE] {extracted} file(s) extracted...")
+        except Exception as e:
+            print(f"[ERROR] Extraction failed for "
+                  f"{os.path.basename(tape_zip_path)}: {e}")
+        finally:
+            try:
+                os.remove(local_zip)
+            except OSError:
+                pass
+        print(f"[RESTORE] {os.path.basename(tape_zip_path)}: "
+              f"{extracted} file(s) extracted.")
+        return extracted
