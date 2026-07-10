@@ -98,5 +98,66 @@ class RestoreCollisionTests(unittest.TestCase):
             ])
 
 
+class DirectoryCompleteRestoreTests(unittest.TestCase):
+    """Bundle-complete directory restore extracts the small files that have no
+    individual files_index row, and only the requested directory's subtree —
+    driven by the ZIP's own entry list + a derived base, not per-file lookups."""
+
+    def setUp(self):
+        CANCEL.clear()
+        self.tmp = tempfile.mkdtemp(prefix="lto_dircomplete_")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.tape = os.path.join(self.tmp, "tape")
+        self.restore = os.path.join(self.tmp, "restore")
+        os.makedirs(self.tape)
+        os.makedirs(self.restore)
+        tmp_drive = os.path.splitdrive(os.path.abspath(self.tmp))[0] + "\\"
+        # ZIP entries are relative to the source base (here '/strg'); mix two
+        # tiny files under the requested dir with a sibling dir's file.
+        import zipfile as _zip
+        self.zip_path = os.path.join(self.tape, "Bundle_001.zip")
+        with _zip.ZipFile(self.zip_path, "w") as zf:
+            zf.writestr("D/shared/APAS/feat/fold 1/a.npy", "AAA")
+            zf.writestr("D/shared/APAS/feat/fold 1/sub/b.npy", "BBB")
+            zf.writestr("D/shared/suture_1/other.png", "XXX")   # sibling — skip
+            zf.writestr("D/shared/APAS/feat_v2/c.npy", "CCC")    # prefix trap — skip
+
+        class _DB:
+            def find_directory_restore_bundles(_self, dir_path,
+                                               source_host=None, tape_label=None):
+                return [{"tape_label": "T1",
+                         "stored_bundle_path": self.zip_path,
+                         "base_path": "/strg"}]
+        self.retriever = LTORetriever(
+            db=cast(Any, _DB()), tape_drive=tmp_drive,
+            staging_dir=os.path.join(self.tmp, "staging"),
+            restore_dir=self.restore)
+        self.retriever._verify_tape = lambda label: None  # no real tape
+        self._orig_robocopy = retriever_mod._robocopy_file
+        retriever_mod._robocopy_file = _fake_robocopy
+        self.addCleanup(
+            setattr, retriever_mod, "_robocopy_file", self._orig_robocopy)
+
+    def _restored(self):
+        found = []
+        for root, _dirs, files in os.walk(self.restore):
+            for f in files:
+                found.append(os.path.relpath(
+                    os.path.join(root, f), self.restore).replace("\\", "/"))
+        return sorted(found)
+
+    def test_extracts_small_files_and_only_the_requested_subtree(self):
+        self.retriever._restore_directory_complete(
+            "/strg/D/shared/APAS/feat")
+        restored = self._restored()
+        # both tiny files under feat/ are restored (they have no DB row)...
+        self.assertIn("feat/fold 1/a.npy", restored)
+        self.assertIn("feat/fold 1/sub/b.npy", restored)
+        # ...and the sibling dir + the "feat_v2" prefix trap are NOT.
+        self.assertTrue(all("suture_1" not in r for r in restored))
+        self.assertTrue(all("feat_v2" not in r for r in restored))
+        self.assertEqual(len(restored), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
