@@ -146,6 +146,7 @@ class ConfigManager:
         }
         self.config['COLD_MANIFEST_DB'] = {
             'enabled': 'true',
+            'pause_during_archive': 'true',
             'host': 'localhost',
             'port': '55432',
             'database': 'lto_cold_manifest',
@@ -543,6 +544,14 @@ class ConfigManager:
     @property
     def cold_manifest_enabled(self):
         return self._get_bool('COLD_MANIFEST_DB', 'enabled', True)
+
+    @property
+    def cold_pause_during_archive(self):
+        """Stop the cold-manifest Docker DB during a tape archive run so it does
+        not compete for RAM with fetch/pack/tape. Restored automatically when the
+        run ends. Set false to leave the cold DB running during archives."""
+        return self._get_bool(
+            'COLD_MANIFEST_DB', 'pause_during_archive', True)
 
     @property
     def cold_pg_host(self):

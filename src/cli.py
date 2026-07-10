@@ -1,5 +1,7 @@
 """Main menu, archiver entry points, DB management submenu."""
 import os
+import shutil
+import subprocess
 from typing import TYPE_CHECKING
 
 from .config import ConfigManager
@@ -19,6 +21,61 @@ if TYPE_CHECKING:
     from .pg_db import PgDatabaseManager
 
 
+COLD_MANIFEST_CONTAINER = "lto_cold_manifest_pg"
+
+
+def _docker_container_running(container):
+    if shutil.which("docker") is None:
+        return False
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Running}}", container],
+            capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and result.stdout.strip().lower() == "true"
+
+
+def _pause_cold_manifest_db(cfg):
+    """Stop the cold-manifest DB for the duration of an archive run.
+
+    The cold catalog is a separate PostgreSQL container that shares the host's
+    (and WSL's) RAM. During a tape archive the fetch/pack/tape stages need every
+    spare gigabyte, and the cold DB is never read while archiving. Stopping it
+    hands that RAM back to the pipeline; ``_resume_cold_manifest_db`` restores
+    it in the caller's ``finally`` so a crash or Ctrl+C still brings it back.
+
+    Returns True only if WE stopped a running container (so we know to restart).
+    """
+    if not getattr(cfg, "cold_pause_during_archive", True):
+        return False
+    if not _docker_container_running(COLD_MANIFEST_CONTAINER):
+        return False
+    try:
+        subprocess.run(
+            ["docker", "stop", COLD_MANIFEST_CONTAINER],
+            capture_output=True, text=True, timeout=90)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"[COLD] Could not pause {COLD_MANIFEST_CONTAINER}: {e}")
+        return False
+    print(f"[COLD] Paused {COLD_MANIFEST_CONTAINER} to free RAM for the archive "
+          "run; it will be restarted automatically when the run finishes.")
+    return True
+
+
+def _resume_cold_manifest_db(was_paused):
+    if not was_paused:
+        return
+    try:
+        subprocess.run(
+            ["docker", "start", COLD_MANIFEST_CONTAINER],
+            capture_output=True, text=True, timeout=90)
+        print(f"[COLD] Restarted {COLD_MANIFEST_CONTAINER}.")
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"[COLD] Could not restart {COLD_MANIFEST_CONTAINER}: {e}. "
+              f"Start it manually with: docker start {COLD_MANIFEST_CONTAINER}")
+
+
 def run_archiver(cfg: ConfigManager, db: "PgDatabaseManager"):
     # Cross-process single-writer guard: the in-process tape I/O lock cannot
     # stop a second `python run.py` instance from interleaving tape writes.
@@ -27,6 +84,7 @@ def run_archiver(cfg: ConfigManager, db: "PgDatabaseManager"):
     except RuntimeError as e:
         print(str(e))
         return
+    cold_paused = _pause_cold_manifest_db(cfg)
     added_exclusion = _prepare_robocopy_exclusion()
     reset_cancel()
     install_cancel_handler()
@@ -51,6 +109,7 @@ def run_archiver(cfg: ConfigManager, db: "PgDatabaseManager"):
         if added_exclusion:
             _remove_robocopy_exclusion()
         db.release_archiver_lock()
+        _resume_cold_manifest_db(cold_paused)
 
 
 def run_remote_archiver(cfg: ConfigManager, db: "PgDatabaseManager"):
@@ -70,6 +129,7 @@ def run_remote_archiver(cfg: ConfigManager, db: "PgDatabaseManager"):
     except RuntimeError as e:
         print(str(e))
         return
+    cold_paused = _pause_cold_manifest_db(cfg)
     added_exclusion = _prepare_robocopy_exclusion()
     reset_cancel()
     install_cancel_handler()
@@ -93,6 +153,7 @@ def run_remote_archiver(cfg: ConfigManager, db: "PgDatabaseManager"):
         if added_exclusion:
             _remove_robocopy_exclusion()
         db.release_archiver_lock()
+        _resume_cold_manifest_db(cold_paused)
 
 
 def _print_tapes_table(db):
