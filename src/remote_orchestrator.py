@@ -1,4 +1,5 @@
 """RemoteOrchestrator: streaming remote-host -> staging -> tape pipeline."""
+import gc
 import os
 import time
 import queue
@@ -1041,6 +1042,10 @@ class RemoteOrchestrator:
         # Free the raw fetched copy now that packing is done — this halves the
         # per-chunk staging footprint so the prefetch buffer stays under the cap.
         self._cleanup_dir(fetch_dir)
+        # A chunk's packer metadata and per-file dicts are the largest transient
+        # Python allocation in the pipeline; reclaim them now, before the next
+        # chunk's fetch grows the process again.
+        gc.collect()
 
         staged_bytes = _dir_tree_size(pack_dir)
         with self._staged_lock:
