@@ -80,6 +80,7 @@ class RemoteOrchestrator:
         self.chunk_max_files  = cfg.chunk_max_files
         self.metadata_batch_size = cfg.governor_metadata_batch_size
         self.pack_file_batch_size = cfg.governor_pack_file_batch_size
+        self.fetch_parallel_streams = cfg.fetch_parallel_streams
         self.ram_sample_interval = cfg.governor_memory_sample_interval_seconds
         self.heartbeat_secs    = cfg.telegram_heartbeat_minutes * 60
         self.ssh_cipher        = cfg.ssh_cipher
@@ -1345,39 +1346,39 @@ class RemoteOrchestrator:
             for row, remote_base, rel, local_rel, local_path in pending:
                 pending_by_base[remote_base].append((row, rel, local_path))
 
+            # One work item per (base, metadata-sized batch). Streams > 1 run
+            # these concurrently to overlap per-file stalls; the default (1)
+            # keeps the exact legacy single-stream behaviour.
+            work_items = []
+            for remote_base, base_pending in pending_by_base.items():
+                for start in range(
+                        0, len(base_pending), self.metadata_batch_size):
+                    work_items.append(
+                        (remote_base,
+                         base_pending[start:start + self.metadata_batch_size]))
+
+            streams = max(1, int(getattr(self, 'fetch_parallel_streams', 1)))
+
             try:
-                for remote_base, base_pending in pending_by_base.items():
-                    if CANCEL.is_set():
-                        return False, source_missing_files, fetched_file_count
-                    for start in range(
-                            0, len(base_pending), self.metadata_batch_size):
+                if streams <= 1 or len(work_items) <= 1:
+                    for remote_base, base_batch in work_items:
+                        if CANCEL.is_set():
+                            return False, source_missing_files, fetched_file_count
                         if governor := getattr(self, 'governor', None):
                             governor.wait_or_pause("fetch", "continue")
-                        base_batch = base_pending[
-                            start:start + self.metadata_batch_size]
-                        ok, err = _remote_tar_fetch(
-                            self.remote_user,
-                            self.remote_host,
-                            remote_base,
-                            [rel for _, rel, _ in base_batch],
-                            fetch_dir,
-                            password=self.remote_password,
-                            cipher=self.ssh_cipher,
-                            use_mbuffer=self.use_mbuffer,
-                            mbuffer_size=self.mbuffer_size,
-                            fetch_cores=self.fetch_cores,
-                            abort_evt=fetch_abort,
-                        )
+                        ok, err = self._fetch_one_batch(
+                            remote_base, base_batch, fetch_dir, fetch_abort)
                         if not ok:
                             if CANCEL.is_set():
                                 return False, source_missing_files, fetched_file_count
                             print(f"\n[REMOTE] Tar fetch failed:\n{err}")
                             self.db.update_manifest_rows_fetch_failed(
                                 (row['manifest_id'] for row, _, _ in base_batch),
-                                err,
-                                session_id=session_id,
-                            )
+                                err, session_id=session_id)
                             return False, source_missing_files, fetched_file_count
+                elif not self._fetch_batches_parallel(
+                        work_items, fetch_dir, fetch_abort, session_id, streams):
+                    return False, source_missing_files, fetched_file_count
 
                 # Renamed files can't ride the shared stream (bsdtar would
                 # extract them onto the primary's path), so fetch each alone
@@ -1479,6 +1480,75 @@ class RemoteOrchestrator:
                 session_id=session_id)
         fetched_file_count = len(fetched_updates)
         return True, source_missing_files, fetched_file_count
+
+    def _fetch_one_batch(self, remote_base, base_batch, fetch_dir, fetch_abort):
+        """Fetch one metadata-sized batch as a single tar stream.
+        Returns (ok, err) — the shared shape used by both fetch paths."""
+        return _remote_tar_fetch(
+            self.remote_user,
+            self.remote_host,
+            remote_base,
+            [rel for _, rel, _ in base_batch],
+            fetch_dir,
+            password=self.remote_password,
+            cipher=self.ssh_cipher,
+            use_mbuffer=self.use_mbuffer,
+            mbuffer_size=self.mbuffer_size,
+            fetch_cores=self.fetch_cores,
+            abort_evt=fetch_abort,
+        )
+
+    def _fetch_batches_parallel(self, work_items, fetch_dir, fetch_abort,
+                                session_id, streams):
+        """Fetch work items with up to ``streams`` concurrent tar streams.
+
+        Batches are disjoint file lists extracted into the same fetch dir, so
+        concurrency is safe. On the first non-cancel failure the shared
+        ``fetch_abort`` is set (killing the other streams' ssh/tar trees) and
+        the failing batch's rows are marked fetch_failed. Returns True on full
+        success, False on failure (caller re-fetches the chunk on resume)."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        governor = getattr(self, 'governor', None)
+        failure = {}
+        failure_lock = threading.Lock()
+
+        def _worker(item):
+            remote_base, base_batch = item
+            if CANCEL.is_set() or fetch_abort.is_set():
+                return item, False, "cancelled"
+            ok, err = self._fetch_one_batch(
+                remote_base, base_batch, fetch_dir, fetch_abort)
+            if not ok and not CANCEL.is_set():
+                with failure_lock:
+                    if not failure:
+                        failure['err'] = err
+                        failure['batch'] = base_batch
+                        fetch_abort.set()  # stop the sibling streams
+            return item, ok, err
+
+        _status('FETCH', f"Parallel fetch: {streams} concurrent stream(s) over "
+                         f"{len(work_items)} batch(es).")
+        with ThreadPoolExecutor(max_workers=streams) as pool:
+            futures = []
+            for item in work_items:
+                if CANCEL.is_set() or fetch_abort.is_set():
+                    break
+                if governor:
+                    governor.wait_or_pause("fetch", "continue")
+                futures.append(pool.submit(_worker, item))
+            for fut in futures:
+                fut.result()
+
+        if failure:
+            if CANCEL.is_set():
+                return False
+            print(f"\n[REMOTE] Tar fetch failed:\n{failure['err']}")
+            self.db.update_manifest_rows_fetch_failed(
+                (row['manifest_id'] for row, _, _ in failure['batch']),
+                failure['err'], session_id=session_id)
+            return False
+        return not (CANCEL.is_set() or fetch_abort.is_set())
 
     def _fetch_collisions(self, session_id, collisions, fetch_dir,
                           source_missing_files, abort_evt=None):
