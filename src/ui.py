@@ -1,4 +1,4 @@
-"""Console and non-interactive UI adapters."""
+"""Console UI adapter."""
 
 
 class ConsoleUI:
@@ -19,13 +19,3 @@ class ConsoleUI:
 
     def confirm(self, message, expected='yes'):
         return self.prompt(message).strip().lower() == expected.lower()
-
-
-class NonInteractiveUI(ConsoleUI):
-    def prompt(self, message, default=None):
-        if default is not None:
-            return default
-        raise RuntimeError(f"Non-interactive operation requires input: {message}")
-
-    def confirm(self, message, expected='yes'):
-        raise RuntimeError(f"Non-interactive operation requires confirmation: {message}")

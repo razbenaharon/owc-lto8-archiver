@@ -49,21 +49,6 @@ def _fmt_bytes(num):
         value /= 1024.0
 
 
-def _speed_str(num_bytes, seconds, with_rate=False):
-    """Human throughput like '220.4 MiB/s'; with_rate also appends GiB/h."""
-    try:
-        seconds = float(seconds or 0)
-    except (TypeError, ValueError):
-        seconds = 0.0
-    if seconds <= 0:
-        return "n/a"
-    mib_s = (float(num_bytes or 0) / 1024**2) / seconds
-    if not with_rate:
-        return f"{mib_s:.1f} MiB/s"
-    gib_h = (float(num_bytes or 0) / 1024**3) / (seconds / 3600)
-    return f"{mib_s:.1f} MiB/s | {gib_h:.1f} GiB/h"
-
-
 def _progress_line(text):
     """Render a live progress line without fighting normal status output."""
     global _PROGRESS_ACTIVE
@@ -197,7 +182,7 @@ def _terminate_all_procs():
         _kill_proc_tree(p)
 
 
-def _cancel_handler(signum, frame):
+def _cancel_handler(_signum, _frame):
     """First Ctrl+C: cancel gracefully + kill active transfers. Second: hard exit."""
     if CANCEL.is_set():
         print("\n[ABORTED] Second interrupt — forcing immediate exit.")

@@ -278,7 +278,7 @@ class TapeManager:
     def tape_info(self):
         """Run LtfsCmdDrives.exe to display connected tape drives and status."""
         exe = os.path.join(LTFS_DIR, 'LtfsCmdDrives.exe')
-        print(f"\n[INFO] Running: LtfsCmdDrives.exe")
+        print("\n[INFO] Running: LtfsCmdDrives.exe")
         try:
             result = subprocess.run([exe], text=True, capture_output=True, cwd=LTFS_DIR)
             output = (result.stdout or '') + (result.stderr or '')

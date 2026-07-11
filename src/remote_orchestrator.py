@@ -23,7 +23,7 @@ from .paths import (_LEGACY_PATH_LIMIT, _dir_tree_size,
                     _reserved_name_component, _volume_cluster_size,
                     _winsafe_extracted_rel)
 from .pipeline_types import StagedChunk, StreamState
-from .planning import ChunkPlanner, StreamingChunkBuilder
+from .planning import StreamingChunkBuilder
 from .ram_telemetry import RamStageSampler
 from .remote_transport import _remote_tar_fetch
 from .resource_governor import ResourceGovernor
@@ -32,7 +32,7 @@ from .runtime import (CANCEL, _fmt_eta, _phase, _priority_class,
                       _progress_done, _progress_line, _status,
                       compute_affinity_sets, pin_current_process,
                       unpin_current_process)
-from .scanning import RemoteScanner, StreamingRemoteScanner
+from .scanning import StreamingRemoteScanner
 from .skipped import SkippedFileTracker
 from .telegram_notify import TelegramNotifier, send_best_effort
 from .ui import ConsoleUI
@@ -301,21 +301,7 @@ class RemoteOrchestrator:
     # ------------------------------------------------------------------
     # Remote scanning
     # ------------------------------------------------------------------
-
-    def _scan_remote(self):
-        """SSH find with -printf '%s %p\0' to get size + path for every file."""
-        scanner = RemoteScanner(
-            self.remote_user,
-            self.remote_host,
-            remote_password=self.remote_password,
-            timeout=self.ssh_timeout,
-            skipped_tracker=self.skipped_tracker,
-            ui=self.ui,
-        )
-        return scanner.scan(self.remote_scan_paths)
-
-    # ------------------------------------------------------------------
-    # Bin-packing
+    # Staging budget
     # ------------------------------------------------------------------
 
     def _chunk_budget(self):
@@ -326,23 +312,6 @@ class RemoteOrchestrator:
         usable = max(0, free - LOCAL_STAGING_RESERVE_BYTES)
         free_budget = int(usable * self.fill_pct)
         return min(free_budget, self.chunk_cap_bytes)
-
-    def _bin_pack(self, manifest):
-        """Greedy largest-first bin-packing into chunks that fit staging budget.
-        Files larger than the budget get their own single-file chunk."""
-        budget = self._chunk_budget()
-        planner = ChunkPlanner(
-            budget,
-            alloc_unit=_volume_cluster_size(self.staging_dir),
-            padding_factor=self.staging_padding,
-            max_files=self.chunk_max_files,
-        )
-        for remote_path, fsize in sorted(manifest, key=lambda x: x[1], reverse=True):
-            if planner.footprint(fsize) > budget:
-                print(f"[WARN] File exceeds staging budget "
-                      f"({fsize/1024**3:.2f} GB > {budget/1024**3:.2f} GB), "
-                      f"placing in dedicated chunk: {os.path.basename(remote_path)}")
-        return planner.plan(manifest)
 
     # ------------------------------------------------------------------
     # Pipeline execution

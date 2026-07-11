@@ -428,7 +428,7 @@ class LTORetriever:
         if ok:
             print(f"[RESTORE] Saved to: {dst}")
         else:
-            print(f"[ERROR] Restore failed: robocopy error")
+            print("[ERROR] Restore failed: robocopy error")
 
     @staticmethod
     def _resolve_zip_entry(zip_names, stored_in_zip, file_name):
@@ -461,7 +461,7 @@ class LTORetriever:
         local_zip     = os.path.join(self.staging_dir, os.path.basename(tape_zip_path))
 
         print(f"\n[RESTORE] Packed file inside {os.path.basename(tape_zip_path)}")
-        print(f"[RESTORE] Step 1/3: Copying ZIP from tape to staging...")
+        print("[RESTORE] Step 1/3: Copying ZIP from tape to staging...")
 
         os.makedirs(self.staging_dir, exist_ok=True)
         if not self._bundle_staging_space_ok(tape_zip_path):
@@ -472,7 +472,7 @@ class LTORetriever:
         finally:
             _release_tape_io_lock()
         if not ok:
-            print(f"[ERROR] Could not copy ZIP from tape: robocopy error")
+            print("[ERROR] Could not copy ZIP from tape: robocopy error")
             return
 
         print(f"[RESTORE] Step 2/3: Extracting '{record['file_name']}' from ZIP...")
@@ -516,7 +516,7 @@ class LTORetriever:
         finally:
             _release_tape_io_lock()
         if not ok:
-            print(f"[ERROR] Could not copy ZIP from tape: robocopy error")
+            print("[ERROR] Could not copy ZIP from tape: robocopy error")
             return
         print(f"[RESTORE] Extracting {len(records)} file(s)...")
         try:

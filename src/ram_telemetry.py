@@ -1,6 +1,5 @@
 """Lightweight RAM sampling for archive pipeline stages."""
 import threading
-import time
 
 try:
     import psutil
@@ -44,7 +43,7 @@ class RamStageSampler:
         self._thread.start()
         return self
 
-    def __exit__(self, exc_type, exc, tb):
+    def __exit__(self, _exc_type, _exc, _tb):
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2)

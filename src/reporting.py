@@ -89,8 +89,7 @@ def _seconds(value):
         return ''
 
 
-def _blank_row():
-    # type: () -> Dict[str, Any]
+def _blank_row() -> Dict[str, Any]:
     return {column: '' for column in SUMMARY_COLUMNS}
 
 
