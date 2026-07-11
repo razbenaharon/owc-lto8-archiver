@@ -75,7 +75,23 @@ header.top .sub { color:var(--ink-2); font-size:14px; }
 footer { color:var(--muted); font-size:12.5px; margin-top:28px; text-align:center; }
 
 /* --- coverage tables ------------------------------------------------------ */
+.cov-toggle { display:inline-flex; align-items:center; gap:7px; font-size:13px;
+  color:var(--ink-2); cursor:pointer; user-select:none; white-space:nowrap; }
+.cov-toggle input { accent-color:var(--series); margin:0; }
+.age-badge { display:inline-block; padding:2px 9px; border-radius:999px;
+  font-size:11.5px; font-weight:600; letter-spacing:0.02em; vertical-align:1px; }
+.age-badge.warn { color:#7a5200; background:rgba(250,178,25,0.18);
+  border:1px solid rgba(250,178,25,0.55); }
+@media (prefers-color-scheme: dark) {
+  .age-badge.warn { color:#fab219; }
+}
 .cov-mount { margin-top:18px; }
+.cov-mount-head { display:flex; justify-content:space-between;
+  align-items:baseline; gap:12px; flex-wrap:wrap; margin-bottom:8px; }
+.cov-mount-head h3 { margin:0; }
+.cov-mount-sum { display:inline-flex; align-items:center; gap:8px;
+  font-size:12.5px; color:var(--ink-2);
+  font-variant-numeric:tabular-nums; white-space:nowrap; }
 .cov-mount h3 { margin:0 0 8px; font-size:14px; font-weight:600; }
 .cov-scroll { overflow-x:auto; }
 table.cov { width:100%; border-collapse:collapse; font-size:13.5px; }
@@ -95,6 +111,11 @@ table.cov tr.depth-0 td.dir { font-weight:650; }
 .cov-track { width:64px; height:8px; background:var(--track); border-radius:4px;
   overflow:hidden; flex:none; }
 .cov-fill { height:100%; border-radius:4px; background:var(--series); min-width:2px; }
+/* Fill hue mirrors the status badge (never the only carrier — the % text and
+   badge label always accompany it). */
+.cov-fill.s-full { background:var(--status-good); }
+.cov-fill.s-partial { background:var(--status-warn); }
+.cov-fill.s-none { background:var(--status-crit); }
 
 /* Status badges: reserved status colors, always paired with a text label so
    state is never carried by color alone. */
