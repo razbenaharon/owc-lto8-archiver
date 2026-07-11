@@ -186,9 +186,6 @@ def _run_robocopy_tuned(cmd, priority=None, affinity=None):
     return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
 
 
-ROBOCOPY_PROCESS_NAME = 'robocopy.exe'
-
-
 def _is_admin():
     """True if the current process is running with Administrator privileges.
 

@@ -382,13 +382,6 @@ class ResourceGovernor:
                 return False
             return True
 
-    def wait_for_memory(self, stop_evt=None):
-        while not (stop_evt is not None and stop_evt.is_set()):
-            if self._hard_memory_ok():
-                return True
-            time.sleep(self.sleep_seconds)
-        return False
-
     def wait_until(self, predicate, label, stop_evt=None):
         warned = False
         while not (stop_evt is not None and stop_evt.is_set()):

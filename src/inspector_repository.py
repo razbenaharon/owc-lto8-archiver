@@ -517,13 +517,6 @@ class InspectorRepository:
             "has_more": len(rows) > page_size,
         }
 
-    def get_file(self, file_id):
-        row = self._execute(
-            self._file_select() + " WHERE f.file_id=%s",
-            (file_id,),
-        ).fetchone()
-        return self._hydrate(row) if row else None
-
     @staticmethod
     def _file_select():
         prefix = """SELECT f.*, b.tape_path AS bundle_tape_path,

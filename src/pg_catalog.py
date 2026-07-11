@@ -718,24 +718,6 @@ class PgCatalogMixin:
                 "SELECT 1 FROM files_index WHERE record_key=%s", (key,)
             ).fetchone())
 
-    def insert_file(self, file_name, original_path, file_size_bytes,
-                    tape_label, is_packed, container_name, stored_path,
-                    local_session_id=None, local_chunk_index=None,
-                    source_host="local"):
-        stats = self.bulk_upsert_files([{
-            "file_name": file_name,
-            "original_path": original_path,
-            "file_size_bytes": file_size_bytes,
-            "tape_label": tape_label,
-            "source_host": source_host,
-            "is_packed": is_packed,
-            "container_name": container_name,
-            "stored_path": stored_path,
-            "local_session_id": local_session_id,
-            "local_chunk_index": local_chunk_index,
-        }])
-        return bool(stats["inserted"])
-
     def search_files(self, name_query=None, date_from=None, date_to=None,
                      limit=None, offset=None, source_host=None, after_id=None):
         return self.search_catalog(

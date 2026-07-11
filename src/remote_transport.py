@@ -473,7 +473,7 @@ def _remote_tar_fetch(remote_user, remote_host, remote_base, rel_paths, local_de
         except OSError:
             pass
 
-        tar_stdout, tar_stderr = tar_proc.communicate()
+        _tar_stdout, tar_stderr = tar_proc.communicate()
         ssh_rc = ssh_proc.wait()
         stderr_thread.join(timeout=2)
         tar_rc = tar_proc.returncode

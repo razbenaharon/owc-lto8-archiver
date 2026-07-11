@@ -1,7 +1,6 @@
 """Path cleaning, sanitization and long-path helpers."""
 import os
 import re
-import time
 import posixpath
 
 
@@ -12,17 +11,6 @@ def _safe_log_token(value, default='item'):
     text = re.sub(r'[^A-Za-z0-9._-]+', '_', text or default)
     text = text.strip('._-')
     return (text or default)[:80]
-
-
-def _unique_path(path):
-    if not os.path.exists(path):
-        return path
-    root, ext = os.path.splitext(path)
-    for idx in range(2, 1000):
-        candidate = f"{root}_{idx}{ext}"
-        if not os.path.exists(candidate):
-            return candidate
-    return f"{root}_{int(time.time() * 1000)}{ext}"
 
 
 def _clean_config_path(value):

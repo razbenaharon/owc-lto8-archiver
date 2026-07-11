@@ -176,16 +176,6 @@ class PgSessionMixin:
             f"[DB] Local chunk not found: session {session_id}, chunk {chunk_index}",
         )
 
-    def update_local_manifest_row(self, manifest_id, **kwargs):
-        if not kwargs:
-            return
-        kwargs["updated_at"] = _now_utc()
-        kwargs = _coerce_timestamp_kwargs(kwargs)
-        self._update_local_manifest(
-            kwargs, "manifest_id=%s", [manifest_id],
-            f"[DB] Local manifest row not found: {manifest_id}",
-        )
-
     def _update_local_manifest(self, kwargs, where, params, missing):
         _valid_columns(kwargs)
         sets = ", ".join(f"{key}=%s" for key in kwargs)

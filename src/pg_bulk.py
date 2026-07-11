@@ -88,11 +88,3 @@ def copy_rows(cur, table, columns, rows):
     with cur.copy(f"COPY {table} ({col_sql}) FROM STDIN") as copy:
         for row in rows:
             copy.write_row(row)
-
-
-def execute_sql_file(conn, path):
-    with open(path, "r", encoding="utf-8") as handle:
-        sql = handle.read()
-    with conn.cursor() as cur:
-        cur.execute(sql)
-    conn.commit()

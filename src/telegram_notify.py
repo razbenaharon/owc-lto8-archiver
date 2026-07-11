@@ -9,10 +9,6 @@ TELEGRAM_API_BASE = "https://api.telegram.org"
 MAX_TELEGRAM_TEXT = 3900
 
 
-def _boolish(value):
-    return str(value or "").strip().lower() in ("1", "true", "yes", "on")
-
-
 def _clean_secret(value):
     value = (value or "").strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):

@@ -194,10 +194,6 @@ class PgTapeMixin:
         ).fetchone()
         return row["used"]
 
-    def estimate_tape_used_space(self, volume_label):
-        with self._pool.connection() as conn:
-            return self._calculate_tape_used_space_conn(conn, volume_label)
-
     def delete_tape(self, volume_label):
         def operation(conn):
             self._delete_tape_records(conn, volume_label)

@@ -153,12 +153,6 @@ def _backup_with_local_pg_dump(cfg, output_path):
     ], env=_pg_env(cfg))
 
 
-def _restore_list_with_docker(backup_path, restore_list_path):
-    container = DOCKER_DB_CONTAINER
-    _restore_list_with_docker_container(
-        backup_path, restore_list_path, container)
-
-
 def _restore_list_with_docker_container(
         backup_path, restore_list_path, container_name):
     container_path = f"/tmp/{backup_path.name}"
