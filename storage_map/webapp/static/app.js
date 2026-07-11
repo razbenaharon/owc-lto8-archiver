@@ -11,6 +11,15 @@ const HUES_DARK = ['#3987e5', '#199e70', '#c98500', '#008300',
                    '#9085e9', '#e66767', '#d55181', '#d95926'];
 const BADGE_LABELS = {full: 'full', partial: 'partial',
                       none: 'not on tape', tape_only: 'tape only'};
+const ARCHIVED_ONLY_KEY = 'storageMapArchivedOnly';
+const DB_FRESH_HOURS = 24;
+
+/* Last payload of each endpoint, kept so the KPI row (which mixes overview and
+ * coverage numbers) and the archived-only toggle can re-render without a
+ * refetch. */
+let lastOverview = null;
+let lastCoverage = null;
+let autoRefreshedOnce = false;
 
 const $ = (sel) => document.querySelector(sel);
 const darkMode = () => matchMedia('(prefers-color-scheme: dark)').matches;
@@ -106,15 +115,43 @@ function barRow(label, valueText, pctWidth, hue, title) {
     <div class="bar-value">${esc(valueText)}</div></div>`;
 }
 
-function renderOverview(data) {
+function coverageTapeTotal(report) {
+  // Each mount's depth-0 row carries that mount's cumulative tape bytes, and
+  // every DB prefix lands in exactly one mount bucket — so summing the roots
+  // counts every archived file once.
+  let bytes = 0;
+  for (const srv of report.servers || [])
+    for (const m of srv.mounts)
+      for (const r of m.rows)
+        if (r.depth === 0) bytes += r.tape_bytes || 0;
+  return bytes;
+}
+
+function renderKpis() {
+  const data = lastOverview || {servers: [], grand_total: 0};
   const servers = data.servers || [];
   const nMounts = servers.reduce((n, s) => n + s.mounts.length, 0);
   const lastScan = servers.map((s) => s.generated_at).filter(Boolean).sort().pop();
+  let tapeKpis = '';
+  if (lastCoverage) {
+    const tape = coverageTapeTotal(lastCoverage);
+    const pct = data.grand_total ? (tape / data.grand_total) * 100 : null;
+    tapeKpis =
+      kpi(human(tape), 'on tape (archive DB)') +
+      kpi(pct == null ? '—' : `${pct.toFixed(1)}%`, 'overall coverage');
+  }
   $('#kpis').innerHTML =
     kpi(human(data.grand_total), 'total used (all servers)', true) +
+    tapeKpis +
     kpi(String(servers.length), 'servers') +
     kpi(String(nMounts), 'mounts scanned') +
     kpi(lastScan ? lastScan.replace('T', ' ') : '—', 'last scan');
+}
+
+function renderOverview(data) {
+  lastOverview = data;
+  renderKpis();
+  const servers = data.servers || [];
 
   $('#server-panels').innerHTML = servers.map((srv) => {
     // Hue is assigned by mount order within the server (fixed, never cycled
@@ -169,14 +206,20 @@ async function loadTreemap() {
 }
 
 /* ------------------------------------------------------------ coverage -- */
+function covBar(pct, status) {
+  // Fill color repeats the status-badge hue so the table scans at a glance.
+  const cls = status === 'full' ? ' s-full'
+    : status === 'partial' ? ' s-partial' : ' s-none';
+  return `<span class="cov-bar"><span class="cov-track"><span class="cov-fill${cls}"
+       style="width:${Math.max(0, Math.min(100, pct)).toFixed(1)}%"></span></span>
+     <span${pct > 100 ? ' title="More bytes on tape than on the server — the directory shrank since it was archived"' : ''}>
+       ${pct.toFixed(1)}%</span></span>`;
+}
+
 function covRow(row) {
   const pct = row.coverage_pct;
   const pctCell = pct == null
-    ? '<span class="muted">—</span>'
-    : `<span class="cov-bar"><span class="cov-track"><span class="cov-fill"
-         style="width:${Math.max(0, Math.min(100, pct)).toFixed(1)}%"></span></span>
-       <span${pct > 100 ? ' title="More bytes on tape than on the server — the directory shrank since it was archived"' : ''}>
-         ${pct.toFixed(1)}%</span></span>`;
+    ? '<span class="muted">—</span>' : covBar(pct, row.status);
   const last = row.last_backup ? row.last_backup.slice(0, 10) : '—';
   return `<tr class="depth-${row.depth}">
     <td class="dir" style="padding-left:${10 + row.depth * 22}px"
@@ -190,21 +233,62 @@ function covRow(row) {
   </tr>`;
 }
 
-function renderCoverage(report) {
-  $('#coverage-sub').textContent = report.stale
-    ? 'No database snapshot yet — click "Refresh DB coverage" to aggregate the tape catalog.'
-    : `Server directories vs the archive database · DB aggregated ` +
-      `${(report.generated_at_db || '').replace('T', ' ')} · ` +
-      `top layer, shared-data depth ${report.match_depth}`;
+function ageHoursOf(iso) {
+  if (!iso) return null;
+  const t = new Date(iso).getTime();
+  return Number.isFinite(t) ? (Date.now() - t) / 3600000 : null;
+}
 
+function mountHead(m) {
+  // Depth-0 is the mount root: du total vs cumulative tape bytes for the
+  // whole mount, i.e. exactly the one-line summary an operator scans for.
+  const root = m.rows.find((r) => r.depth === 0 && r.path === m.mount);
+  let sum = '';
+  if (root && root.coverage_pct != null) {
+    sum = `<span class="cov-mount-sum">${esc(human(root.tape_bytes))} of
+      ${esc(human(root.server_bytes))} on tape ${covBar(root.coverage_pct, root.status)}</span>`;
+  } else if (root && root.tape_bytes) {
+    sum = `<span class="cov-mount-sum">${esc(human(root.tape_bytes))} on tape</span>`;
+  }
+  return `<div class="cov-mount-head"><h3>${esc(m.mount)}</h3>${sum}</div>`;
+}
+
+function renderCoverage(report) {
+  lastCoverage = report;
+  renderKpis();
+
+  const age = ageHoursOf(report.generated_at_db);
+  const ageBadge = report.stale
+    ? ' <span class="age-badge warn">no DB snapshot</span>'
+    : (age != null && age > DB_FRESH_HOURS
+       ? ` <span class="age-badge warn">DB snapshot ${Math.floor(age / 24)}d ` +
+         `${Math.floor(age % 24)}h old</span>`
+       : '');
+  $('#coverage-sub').innerHTML = report.stale
+    ? 'No database snapshot yet — aggregating the tape catalog…' + ageBadge
+    : 'Server directories vs the archive database · DB aggregated ' +
+      `${esc((report.generated_at_db || '').replace('T', ' '))} · ` +
+      `top layer, shared-data depth ${esc(String(report.match_depth))}` + ageBadge;
+
+  const archivedOnly = $('#cov-archived-only').checked;
   $('#coverage').innerHTML = (report.servers || []).map((srv) => {
-    const mounts = srv.mounts.filter((m) => m.rows.length);
+    // Tape bytes accumulate into every ancestor row, so filtering on
+    // tape_bytes > 0 never drops a parent whose child is archived.
+    const mounts = srv.mounts
+      .map((m) => ({mount: m.mount,
+                    rows: archivedOnly
+                      ? m.rows.filter((r) => r.tape_bytes > 0) : m.rows}))
+      .filter((m) => m.rows.length);
     if (!mounts.length) return '';
-    const note = srv.in_config
+    const lastBk = srv.mounts
+      .flatMap((m) => m.rows.map((r) => r.last_backup))
+      .filter(Boolean).sort().pop();
+    let note = srv.in_config
       ? (srv.scanned_at ? `scanned ${srv.scanned_at}` : 'no scan data — DB side only')
       : 'appears in the database but not in [STORAGE_MAP] config';
+    note += ` · last backup ${lastBk ? lastBk.slice(0, 10) : 'never'}`;
     const tables = mounts.map((m) => `<div class="cov-mount">
-      <h3>${esc(m.mount)}</h3>
+      ${mountHead(m)}
       <div class="cov-scroll"><table class="cov">
         <thead><tr>
           <th>Directory</th><th class="num">On server</th>
@@ -218,7 +302,22 @@ function renderCoverage(report) {
         <h2 style="font-size:16px;margin:0">${esc(srv.name)}</h2>
         <div class="panel-sub">${esc(note)}</div>
       </div>${tables}</div>`;
-  }).join('') || '<div class="placeholder">Nothing to show yet.</div>';
+  }).join('') || `<div class="placeholder">${archivedOnly
+    ? 'Nothing on tape yet for the configured servers.'
+    : 'Nothing to show yet.'}</div>`;
+}
+
+function maybeAutoRefreshCoverage(report) {
+  /* A snapshot older than DB_FRESH_HOURS silently hides everything archived
+   * since, so re-aggregate once per page load instead of waiting for a manual
+   * click. Job completion re-renders through the /api/jobs poller. */
+  if (autoRefreshedOnce) return;
+  const age = ageHoursOf(report.generated_at_db);
+  if (report.stale || age == null || age > DB_FRESH_HOURS) {
+    autoRefreshedOnce = true;
+    postAction('/api/coverage/refresh',
+               'DB snapshot is stale — re-aggregating the tape catalog…');
+  }
 }
 
 /* -------------------------------------------------------------- actions -- */
@@ -300,7 +399,9 @@ async function loadOverviewAndTreemap() {
 
 async function loadCoverage() {
   try {
-    renderCoverage(await getJSON('/api/coverage'));
+    const report = await getJSON('/api/coverage');
+    renderCoverage(report);
+    maybeAutoRefreshCoverage(report);
   } catch (err) {
     $('#coverage').innerHTML = `<div class="placeholder">${esc(err.message)}</div>`;
   }
@@ -315,6 +416,13 @@ $('#btn-coverage').addEventListener('click', () =>
 $('#btn-status').addEventListener('click', checkStatus);
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
   loadOverviewAndTreemap();
+});
+
+const archivedOnlyBox = $('#cov-archived-only');
+archivedOnlyBox.checked = localStorage.getItem(ARCHIVED_ONLY_KEY) === '1';
+archivedOnlyBox.addEventListener('change', () => {
+  localStorage.setItem(ARCHIVED_ONLY_KEY, archivedOnlyBox.checked ? '1' : '0');
+  if (lastCoverage) renderCoverage(lastCoverage);
 });
 
 bootstrapToken();
