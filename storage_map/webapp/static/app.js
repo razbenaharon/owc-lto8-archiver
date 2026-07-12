@@ -1,10 +1,10 @@
-/* Storage Map v2 frontend — plain JS, no build step.
- * Data: /api/overview, /api/treemap, /api/coverage. Actions POST to /api/*
+/* Storage Map frontend — plain JS, no build step.
+ * Data: /api/overview and /api/coverage. Actions POST to /api/*
  * and are tracked by polling /api/jobs while anything runs. */
 'use strict';
 
 /* Categorical mount hues — the validated palette, light and dark steps,
- * matching MOUNT_HUES in storage_map/lib (so bars match treemap tiles). */
+ * matching MOUNT_HUES in storage_map/lib. */
 const HUES_LIGHT = ['#2a78d6', '#1baf7a', '#eda100', '#008300',
                     '#4a3aa7', '#e34948', '#e87ba4', '#eb6834'];
 const HUES_DARK = ['#3987e5', '#199e70', '#c98500', '#008300',
@@ -40,49 +40,8 @@ function human(bytes) {
   }
 }
 
-/* ------------------------------------------------------------- auth -- */
-/* The API requires X-Auth-Token on every /api/* call when a token is
- * configured (mandatory for non-loopback binds). The server reads the header
- * only, so the token is supplied client-side: bootstrapped once from a
- * ?token=... link, kept in localStorage, and re-prompted on a 401. */
-const AUTH_KEY = 'storageMapToken';
-
-function bootstrapToken() {
-  const url = new URL(location.href);
-  const q = url.searchParams.get('token');
-  if (q) {
-    localStorage.setItem(AUTH_KEY, q.trim());
-    url.searchParams.delete('token');
-    history.replaceState(null, '', url.pathname + url.search + url.hash);
-  }
-}
-
-function authHeaders(base) {
-  const headers = Object.assign({}, base || {});
-  const token = localStorage.getItem(AUTH_KEY) || '';
-  if (token) headers['X-Auth-Token'] = token;
-  return headers;
-}
-
-function promptForToken() {
-  const token = window.prompt(
-    'This dashboard requires an access token (X-Auth-Token):');
-  if (token && token.trim()) {
-    localStorage.setItem(AUTH_KEY, token.trim());
-    return true;
-  }
-  return false;
-}
-
 async function authFetch(url, options) {
-  const opts = Object.assign({}, options);
-  opts.headers = authHeaders(opts.headers);
-  let resp = await fetch(url, opts);
-  if (resp.status === 401 && promptForToken()) {
-    opts.headers = authHeaders(options && options.headers);
-    resp = await fetch(url, opts);
-  }
-  return resp;
+  return fetch(url, options);
 }
 
 async function getJSON(url) {
@@ -155,7 +114,7 @@ function renderOverview(data) {
 
   $('#server-panels').innerHTML = servers.map((srv) => {
     // Hue is assigned by mount order within the server (fixed, never cycled
-    // mid-render) so a mount keeps its color across panels and the treemap.
+    // mid-render) so a mount keeps its color across panels.
     const hueOf = {};
     srv.mounts.forEach((mt, i) => { hueOf[mt.mount] = hues()[i % hues().length]; });
     const mountBars = srv.mounts.map((mt) => {
@@ -192,28 +151,16 @@ function renderOverview(data) {
     '</div></section>';
 }
 
-/* ------------------------------------------------------------- treemap -- */
-async function loadTreemap() {
-  const el = $('#treemap');
-  try {
-    const fig = await getJSON('/api/treemap');
-    el.innerHTML = '';
-    Plotly.newPlot(el, fig.data, fig.layout,
-                   {displayModeBar: false, displaylogo: false, responsive: true});
-  } catch (err) {
-    el.innerHTML = `<div class="placeholder">${esc(err.message)}</div>`;
-  }
-}
-
 /* ------------------------------------------------------------ coverage -- */
 function covBar(pct, status) {
   // Fill color repeats the status-badge hue so the table scans at a glance.
   const cls = status === 'full' ? ' s-full'
     : status === 'partial' ? ' s-partial' : ' s-none';
+  const shown = status === 'full' ? 100 : pct;
   return `<span class="cov-bar"><span class="cov-track"><span class="cov-fill${cls}"
-       style="width:${Math.max(0, Math.min(100, pct)).toFixed(1)}%"></span></span>
+       style="width:${Math.max(0, Math.min(100, shown)).toFixed(1)}%"></span></span>
      <span${pct > 100 ? ' title="More bytes on tape than on the server — the directory shrank since it was archived"' : ''}>
-       ${pct.toFixed(1)}%</span></span>`;
+       ${shown.toFixed(1)}%</span></span>`;
 }
 
 function covRow(row) {
@@ -225,9 +172,9 @@ function covRow(row) {
     <td class="dir" style="padding-left:${10 + row.depth * 22}px"
         title="${esc(row.path)}">${esc(row.depth ? row.name : row.path)}</td>
     <td class="num">${esc(human(row.server_bytes))}</td>
-    <td class="num">${row.tape_bytes ? esc(human(row.tape_bytes)) : '<span class="muted">—</span>'}</td>
+    <td class="num">${esc(human(row.tape_bytes || 0))}</td>
     <td class="num">${pctCell}</td>
-    <td class="num">${row.tape_files ? row.tape_files.toLocaleString() : '<span class="muted">—</span>'}</td>
+    <td class="num">${Number(row.tape_files || 0).toLocaleString()}</td>
     <td class="num muted">${esc(last)}</td>
     <td><span class="badge ${esc(row.status)}">${esc(BADGE_LABELS[row.status] || row.status)}</span></td>
   </tr>`;
@@ -245,10 +192,12 @@ function mountHead(m) {
   const root = m.rows.find((r) => r.depth === 0 && r.path === m.mount);
   let sum = '';
   if (root && root.coverage_pct != null) {
-    sum = `<span class="cov-mount-sum">${esc(human(root.tape_bytes))} of
-      ${esc(human(root.server_bytes))} on tape ${covBar(root.coverage_pct, root.status)}</span>`;
+    sum = `<span class="cov-mount-sum">Hot DB: ${esc(human(root.tape_bytes))},
+      ${Number(root.tape_files || 0).toLocaleString()} files ·
+      ${esc(human(root.server_bytes))} on server ${covBar(root.coverage_pct, root.status)}</span>`;
   } else if (root && root.tape_bytes) {
-    sum = `<span class="cov-mount-sum">${esc(human(root.tape_bytes))} on tape</span>`;
+    sum = `<span class="cov-mount-sum">Hot DB: ${esc(human(root.tape_bytes))},
+      ${Number(root.tape_files || 0).toLocaleString()} files</span>`;
   }
   return `<div class="cov-mount-head"><h3>${esc(m.mount)}</h3>${sum}</div>`;
 }
@@ -292,8 +241,10 @@ function renderCoverage(report) {
       <div class="cov-scroll"><table class="cov">
         <thead><tr>
           <th>Directory</th><th class="num">On server</th>
-          <th class="num">On tape</th><th class="num">Coverage</th>
-          <th class="num">Files on tape</th><th class="num">Last backup</th><th>Status</th>
+          <th class="num" title="Recursive file size recorded in files_index">Hot DB size</th>
+          <th class="num">Coverage</th>
+          <th class="num" title="Recursive file count recorded in files_index">Hot DB files</th>
+          <th class="num">Last backup</th><th>Status</th>
         </tr></thead>
         <tbody>${m.rows.map(covRow).join('')}</tbody>
       </table></div></div>`).join('');
@@ -339,7 +290,7 @@ async function refreshJobs() {
     if (before && before.state === 'running' && job && job.state !== 'running') {
       notes.push(`${name}: ${job.state}${job.detail ? ` — ${job.detail}` : ''}`);
       if (job.state === 'done') {
-        if (name === 'fetch') { loadOverviewAndTreemap(); loadCoverage(); }
+        if (name === 'fetch') { loadOverview(); loadCoverage(); }
         if (name === 'coverage') loadCoverage();
       }
     }
@@ -387,14 +338,62 @@ async function checkStatus() {
   }
 }
 
+/* --------------------------------------------------------------- export -- */
+function downloadBlob(blob, filename) {
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  link.download = filename;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+}
+
+async function exportHtml() {
+  setStatus('Building static HTML snapshot...');
+  try {
+    const css = await fetch('/static/style.css').then(resp => resp.text());
+    const copy = document.querySelector('.wrap').cloneNode(true);
+    copy.querySelector('.actions')?.remove();
+    copy.querySelector('.cov-toggle')?.remove();
+    copy.querySelector('#statusline')?.remove();
+    const generated = new Date().toLocaleString();
+    const source = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Storage Map snapshot</title><style>${css}</style></head><body>
+${copy.outerHTML}<div class="snapshot-note">Static snapshot generated ${esc(generated)}</div>
+</body></html>`;
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    downloadBlob(new Blob([source], {type: 'text/html;charset=utf-8'}),
+                 `storage_map_${stamp}.html`);
+    setStatus('Static HTML snapshot exported.');
+  } catch (err) {
+    setStatus(`HTML export failed: ${err.message}`, true);
+  }
+}
+
+async function exportPdf() {
+  setStatus('Building PDF report...');
+  try {
+    const response = await authFetch('/api/export/pdf');
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(body.detail || `${response.status} ${response.statusText}`);
+    }
+    const disposition = response.headers.get('Content-Disposition') || '';
+    const match = disposition.match(/filename="?([^";]+)"?/i);
+    downloadBlob(await response.blob(), match ? match[1] : 'storage_map.pdf');
+    setStatus('PDF report exported.');
+  } catch (err) {
+    setStatus(`PDF export failed: ${err.message}`, true);
+  }
+}
+
 /* ----------------------------------------------------------------- init -- */
-async function loadOverviewAndTreemap() {
+async function loadOverview() {
   try {
     renderOverview(await getJSON('/api/overview'));
   } catch (err) {
     setStatus(err.message, true);
   }
-  await loadTreemap();
 }
 
 async function loadCoverage() {
@@ -414,8 +413,10 @@ $('#btn-fetch').addEventListener('click', () =>
 $('#btn-coverage').addEventListener('click', () =>
   postAction('/api/coverage/refresh', 'Aggregating the archive database…'));
 $('#btn-status').addEventListener('click', checkStatus);
+$('#btn-export-html').addEventListener('click', exportHtml);
+$('#btn-export-pdf').addEventListener('click', exportPdf);
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
-  loadOverviewAndTreemap();
+  loadOverview();
 });
 
 const archivedOnlyBox = $('#cov-archived-only');
@@ -425,7 +426,6 @@ archivedOnlyBox.addEventListener('change', () => {
   if (lastCoverage) renderCoverage(lastCoverage);
 });
 
-bootstrapToken();
-loadOverviewAndTreemap();
+loadOverview();
 loadCoverage();
 refreshJobs();
