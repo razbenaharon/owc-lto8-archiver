@@ -8,6 +8,7 @@ import time
 import unittest
 from unittest import mock
 
+from storage_map.lib import baseline as baseline_lib
 from storage_map.lib.core import ServerConfig, parse_raw_log
 from storage_map.webapp import coverage as cov
 
@@ -57,10 +58,215 @@ class CoverageSqlTests(unittest.TestCase):
         self.assertIn("GROUP BY 1, source_host, original_path, 2",
                       cov.COVERAGE_SQL)
 
+    def test_sql_merges_directory_catalog_small_files(self):
+        # Small packed files live only in the directory catalog, so coverage
+        # must add their totals to files_index...
+        self.assertIn("directory_tree_index", cov.COVERAGE_SQL)
+        self.assertIn("direct_small_file_bytes", cov.COVERAGE_SQL)
+        self.assertIn("%(threshold_bytes)s", cov.COVERAGE_SQL)
+        # ...while subtracting the packed-small subset already in files_index
+        # (pre-cutover rows + legacy backfill) so nothing double counts.
+        self.assertIn("ps_bytes", cov.COVERAGE_SQL)
+        self.assertIn("GREATEST(0", cov.COVERAGE_SQL)
+
     def test_max_segments_uses_deepest_mount(self):
         self.assertEqual(cov.max_segments(["/strg/D", "/", "/data"], 2), 4)
         self.assertEqual(cov.max_segments(["/"], 2), 2)
         self.assertEqual(cov.max_segments([], 2), 2)
+
+
+class RowStatusTests(unittest.TestCase):
+    """The file-count gate: du --inodes counts trump the block-inflated bytes."""
+
+    def test_tiny_file_dir_is_full_when_counts_match_despite_low_byte_ratio(self):
+        # 1M sub-block files (~1 KiB each): du allocates a full 4 KiB block per
+        # file -> ~4 GiB, while apparent bytes are ~1 GiB (25% byte ratio). The
+        # block band [4 - 1M*4KiB - m, 4 + m] still contains 1 GiB, and every
+        # file is present, so it is full.
+        pct, status = cov._row_status(
+            4 * GIB, 1 * GIB, server_files=1_000_000, tape_files=999_500)
+        self.assertEqual(status, "full")
+        self.assertEqual(pct, 100.0)
+
+    def test_count_mismatch_is_partial_even_with_high_byte_ratio(self):
+        # Bytes look 98% complete, but a fifth of the files are missing.
+        pct, status = cov._row_status(
+            100 * GIB, 98 * GIB, server_files=1_000_000, tape_files=800_000)
+        self.assertEqual(status, "partial")
+        self.assertLess(pct, 100.0)
+
+    def test_size_below_block_band_is_partial_even_when_counts_match(self):
+        # Few big files: the block band is tight ([~10 GiB, ~10 GiB]); only 6 GiB
+        # of apparent bytes means content is missing/truncated -> not full.
+        _pct, status = cov._row_status(
+            10 * GIB, 6 * GIB, server_files=1000, tape_files=1000)
+        self.assertEqual(status, "partial")
+
+    def test_size_above_du_is_partial_even_when_counts_match(self):
+        # Apparent bytes can't exceed du(allocated) + margin; a big overshoot
+        # means duplicated/inflated data, not a clean copy.
+        _pct, status = cov._row_status(
+            10 * GIB, 100 * GIB, server_files=1000, tape_files=1000)
+        self.assertEqual(status, "partial")
+
+    def test_no_counts_is_never_full(self):
+        # Byte ratio alone is not accurate enough to certify 'full'.
+        self.assertEqual(cov._row_status(100 * GIB, 96 * GIB)[1], "partial")
+        self.assertEqual(cov._row_status(100 * GIB, 100 * GIB)[1], "partial")
+        self.assertEqual(cov._row_status(100 * GIB, 50 * GIB)[1], "partial")
+        self.assertEqual(cov._row_status(100 * GIB, 0)[1], "none")
+
+    def test_source_file_count_prefers_exact_inodes_minus_dirs(self):
+        # baseline (exact) > inodes−dirs (exact) > raw inodes (approx).
+        self.assertEqual(
+            cov._source_file_count(1_000_000, 500, None), (999_500, True))
+        self.assertEqual(
+            cov._source_file_count(1_000_000, None, None), (1_000_000, False))
+        self.assertEqual(
+            cov._source_file_count(1_000_000, 500, 990_000), (990_000, True))
+        self.assertEqual(cov._source_file_count(None, None, None), (None, False))
+
+    def test_exact_count_catches_large_dir_gap_that_1pct_would_mask(self):
+        # APAS-style: a 3M-file dir missing 909 large files. du --inodes alone
+        # (1% = 30k slack) would mask it; inodes − dirs gives the exact source
+        # count (3,010,000 − 10,877 = 2,999,123), so 909 short reads partial.
+        _pct, status = cov._row_status(
+            82 * GIB, int(75.3 * GIB), server_files=3_010_000,
+            dir_count=10_877, tape_files=2_998_214)
+        self.assertEqual(status, "partial")
+
+    def test_exact_count_complete_large_dir_is_full(self):
+        # Same dir, backup now holds every file (>= exact source count) and the
+        # apparent bytes sit in the block band.
+        _pct, status = cov._row_status(
+            82 * GIB, int(75.3 * GIB), server_files=3_010_000,
+            dir_count=10_877, tape_files=2_999_123)
+        self.assertEqual(status, "full")
+
+    def test_exact_baseline_requires_full_count_no_tolerance(self):
+        # Exact find baseline: every source file must be present (sub-block
+        # files -> du 4 GiB, apparent 1 GiB, all inside the block band).
+        self.assertEqual(
+            cov._row_status(4 * GIB, 1 * GIB, server_files=1_000_000,
+                            tape_files=1_000_000, baseline_files=1_000_000)[1],
+            "full")
+        # One file short is partial under the baseline, even though the du-inode
+        # 1% tolerance would have accepted it.
+        self.assertEqual(
+            cov._row_status(4 * GIB, 1 * GIB, server_files=1_000_000,
+                            tape_files=999_999, baseline_files=1_000_000)[1],
+            "partial")
+
+    def test_baseline_takes_priority_over_du_inode_count(self):
+        # du --inodes would call this full (within 1%); the exact baseline says
+        # 5% of files are missing, so it is partial.
+        _pct, status = cov._row_status(
+            100 * GIB, 98 * GIB, server_files=1_000_000, tape_files=990_000,
+            baseline_files=1_000_000)
+        self.assertEqual(status, "partial")
+
+
+class BaselineTests(unittest.TestCase):
+    def test_remote_script_uses_find_type_f(self):
+        srv = ServerConfig("so01", "so01.x", "u", "", ["/strg/D"])
+        script = baseline_lib._remote_baseline_script(srv, 2)
+        self.assertIn("find /strg/D -xdev -type f", script)
+        self.assertIn("-printf '%h", script)
+        self.assertIn("baseline.sentinel", script)
+
+    def test_parse_counts_ignores_markers(self):
+        text = "\n".join([
+            "# storage-map exact-count baseline",
+            "##### MOUNT: /strg/D #####",
+            "1323147\t/strg/D/shared-data/jigsaws",
+            "5\t/strg/D",
+            "##### END #####",
+        ])
+        counts = baseline_lib.parse_baseline_counts(text)
+        self.assertEqual(counts["/strg/D/shared-data/jigsaws"], 1323147)
+        self.assertEqual(counts["/strg/D"], 5)
+
+    def test_write_then_load_round_trips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "coverage_baseline.json")
+            baseline_lib.write_baseline(
+                {"so01": {"/strg/D/shared-data/jigsaws": 1323147}}, path)
+            loaded = baseline_lib.load_baseline(path)
+        self.assertEqual(loaded["so01"]["/strg/D/shared-data/jigsaws"], 1323147)
+
+    def test_load_missing_file_is_empty(self):
+        self.assertEqual(baseline_lib.load_baseline("/no/such/baseline.json"), {})
+
+
+# A rawlog that includes the du --inodes pass. shared-data/op holds ~1M small
+# files: du allocates 12 GiB of blocks, apparent bytes are ~10 GiB, and the file
+# count matches — inside the block band, so it certifies full.
+SAMPLE_RAWLOG_WITH_INODES = "\n".join([
+    "# storage-map raw log",
+    "# server: so01.iem.technion.ac.il",
+    "# generated_at: 2026-07-01T02:00:00",
+    "# depth: 2",
+    "##### MOUNT: /strg/D #####",
+    "##### DF: 2199023255552 1099511627776 1099511627776 50% #####",
+    f"{12 * 1024**3}\t/strg/D/shared-data/op",
+    f"{12 * 1024**3}\t/strg/D/shared-data",
+    f"{12 * 1024**3}\t/strg/D",
+    "##### INODES #####",
+    "1000000\t/strg/D/shared-data/op",
+    "1000010\t/strg/D/shared-data",
+    "1000012\t/strg/D",
+    "##### END #####",
+    "",
+])
+
+
+class InodeParsingTests(unittest.TestCase):
+    def test_inode_counts_attach_to_matching_nodes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "so01.rawlog")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(SAMPLE_RAWLOG_WITH_INODES)
+            res = parse_raw_log(path, server_name="so01")
+        mount = res.mounts[0]
+        # Byte size still parsed from the -B1 section (not the inode section).
+        self.assertEqual(mount.root.size, 12 * GIB)
+        self.assertEqual(mount.root.count, 1000012)
+        op = next(c for c in mount.root.children
+                  if c.path == "/strg/D/shared-data")
+        self.assertEqual(op.count, 1000010)
+
+    def test_missing_inode_section_leaves_counts_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "so01.rawlog")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(SAMPLE_RAWLOG_B1)
+            res = parse_raw_log(path, server_name="so01")
+        self.assertIsNone(res.mounts[0].root.count)
+        self.assertIsNone(res.mounts[0].root.dir_count)
+
+    def test_dirs_section_gives_exact_file_count(self):
+        log = "\n".join([
+            "# server: so01.x", "# depth: 2",
+            "##### MOUNT: /strg/D #####",
+            f"{12 * 1024**3}\t/strg/D/shared-data/op",
+            f"{12 * 1024**3}\t/strg/D",
+            "##### INODES #####",
+            "1000000\t/strg/D/shared-data/op", "1000005\t/strg/D",
+            "##### DIRS #####",
+            "120\t/strg/D/shared-data/op", "130\t/strg/D",
+            "##### END #####", "",
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "so01.rawlog")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(log)
+            res = parse_raw_log(path, server_name="so01")
+        op = next(c for c in res.mounts[0].root.children
+                  if c.path == "/strg/D/shared-data/op")
+        self.assertEqual(op.count, 1000000)
+        self.assertEqual(op.dir_count, 120)
+        # exact recursive file count = inodes − dirs
+        self.assertEqual(op.count - op.dir_count, 999880)
 
 
 class HostMapTests(unittest.TestCase):
@@ -81,7 +287,7 @@ class HostMapTests(unittest.TestCase):
 
 
 class BuildCoverageTests(unittest.TestCase):
-    def _build(self, tmp, db_rows, match_depth=2):
+    def _build(self, tmp, db_rows, match_depth=2, baseline_by_server=None):
         return cov.build_coverage(
             [_scan_result(tmp)],
             db_rows,
@@ -91,6 +297,7 @@ class BuildCoverageTests(unittest.TestCase):
                 [ServerConfig("so01", "so01.iem.technion.ac.il", "u", "",
                               ["/strg/D", "/data"])]),
             db_generated_at="2026-07-07T10:00:00",
+            baseline_by_server=baseline_by_server,
         )
 
     def _rows(self, report, server="so01", mount="/strg/D"):
@@ -100,14 +307,17 @@ class BuildCoverageTests(unittest.TestCase):
 
     def test_statuses_and_cumulative_ancestor_sums(self):
         db_rows = [
-            # op fully archived; raw only half; nothing for 'other'.
+            # op fully archived (exact baseline confirms all 10 files); raw only
+            # half; nothing for 'other'.
             _db_row("so01", "/strg/D/shared-data/op", 600 * GIB, files=10,
                     last="2026-06-01T00:00:00"),
             _db_row("so01", "/strg/D/shared-data/raw", 100 * GIB, files=4,
                     last="2026-05-01T00:00:00"),
         ]
         with tempfile.TemporaryDirectory() as tmp:
-            report = self._build(tmp, db_rows)
+            report = self._build(
+                tmp, db_rows,
+                baseline_by_server={"so01": {"/strg/D/shared-data/op": 10}})
         rows = self._rows(report)
 
         op = rows["/strg/D/shared-data/op"]
@@ -148,17 +358,19 @@ class BuildCoverageTests(unittest.TestCase):
         self.assertEqual(rows["/strg/D/deleted-proj"]["status"], "tape_only")
         self.assertIsNone(rows["/strg/D/deleted-proj"]["coverage_pct"])
         self.assertIsNone(rows["/strg/D/deleted-proj"]["server_bytes"])
-        # Every row classified as full is presented as exactly 100%.
-        self.assertAlmostEqual(rows["/strg/D/other"]["coverage_pct"], 100.0)
-        self.assertEqual(rows["/strg/D/other"]["status"], "full")
+        # More bytes on tape than on disk: without a file count this is not
+        # certified full — the byte ratio alone never earns 'full'.
+        self.assertEqual(rows["/strg/D/other"]["status"], "partial")
 
-    def test_full_threshold_is_presented_as_100_percent(self):
+    def test_high_byte_ratio_without_counts_is_not_full(self):
+        # 216/224 GiB ~ 96% by bytes, but no file count exists, so it must not
+        # be reported full (this is the removed 95%-byte rule).
         with tempfile.TemporaryDirectory() as tmp:
             report = self._build(
                 tmp, [_db_row("so01", "/strg/D/other", 216 * GIB)])
         row = self._rows(report)["/strg/D/other"]
-        self.assertEqual(row["status"], "full")
-        self.assertEqual(row["coverage_pct"], 100.0)
+        self.assertEqual(row["status"], "partial")
+        self.assertIsNone(row["server_files"])
 
     def test_longest_mount_wins_and_deep_prefixes_roll_up(self):
         db_rows = [
@@ -201,6 +413,49 @@ class BuildCoverageTests(unittest.TestCase):
         self.assertEqual(rows["/strg/D"]["status"], "none")
         self.assertEqual(rows["/strg/D"]["server_bytes"], 1024 * GIB)
 
+    def test_inode_counts_flow_through_to_full_status(self):
+        # The scan carries du --inodes counts; a small-file dir whose apparent
+        # bytes sit in the block band and whose count matches reads full e2e.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "so01_latest.rawlog")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(SAMPLE_RAWLOG_WITH_INODES)
+            report = cov.build_coverage(
+                [parse_raw_log(path, server_name="so01")],
+                [_db_row("so01", "/strg/D/shared-data/op", 10 * GIB,
+                         files=1_000_000)],
+                {"so01": ["/strg/D"]},
+                2,
+                cov.resolve_host_map(
+                    [ServerConfig("so01", "so01.iem.technion.ac.il", "u", "",
+                                  ["/strg/D"])]),
+            )
+        op = self._rows(report)["/strg/D/shared-data/op"]
+        self.assertEqual(op["server_files"], 1_000_000)
+        self.assertEqual(op["status"], "full")
+        self.assertEqual(op["coverage_pct"], 100.0)
+
+    def test_exact_baseline_overrides_status_end_to_end(self):
+        # No du --inodes in this scan (byte-only rawlog); the exact baseline
+        # count alone certifies full when apparent bytes match du (600 GiB dir,
+        # 598 GiB on tape, all 500k files present).
+        with tempfile.TemporaryDirectory() as tmp:
+            report = cov.build_coverage(
+                [_scan_result(tmp)],
+                [_db_row("so01", "/strg/D/shared-data/op", 598 * GIB,
+                         files=500_000)],
+                {"so01": ["/strg/D"]},
+                2,
+                cov.resolve_host_map(
+                    [ServerConfig("so01", "so01.iem.technion.ac.il", "u", "",
+                                  ["/strg/D"])]),
+                baseline_by_server={
+                    "so01": {"/strg/D/shared-data/op": 500_000}},
+            )
+        op = self._rows(report)["/strg/D/shared-data/op"]
+        self.assertEqual(op["baseline_files"], 500_000)
+        self.assertEqual(op["status"], "full")
+
 
 # --------------------------------------------------------------------------- #
 # API tests                                                                    #
@@ -223,6 +478,7 @@ class _FakeCfg:
         self.remote_user = "labuser"
         self.remote_password = "sekret-hunter2"
         self.db_dsn = "postgresql://lto@127.0.0.1:5/x"
+        self.index_min_file_mb = 10
         self.env = {}
 
 
@@ -267,13 +523,25 @@ class WebAppApiTests(unittest.TestCase):
         self.assertEqual(mounts["/strg/D"]["free_bytes"], 1024 * GIB)
         self.assertTrue(srv["top_folders"])
 
-    def test_pdf_export_returns_downloadable_report(self):
-        response = self.client.get("/api/export/pdf")
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.headers["content-type"], "application/pdf")
-        self.assertIn("attachment;", response.headers["content-disposition"])
-        self.assertTrue(response.content.startswith(b"%PDF-"))
-        self.assertGreater(len(response.content), 2000)
+    def test_html_export_saves_snapshot_to_docs_dir(self):
+        from storage_map.webapp import app as webapp_app
+
+        with tempfile.TemporaryDirectory() as docs_dir:
+            with mock.patch.object(webapp_app, "_DOCS_DIR", docs_dir):
+                snapshot = "<!doctype html><html><body>snapshot</body></html>"
+                response = self.client.post(
+                    "/api/export/html", json={"html": snapshot})
+                self.assertEqual(response.status_code, 200)
+                saved = response.json()
+                self.assertTrue(saved["saved"].startswith("storage_map_"))
+                self.assertTrue(saved["saved"].endswith(".html"))
+                self.assertEqual(os.path.dirname(saved["path"]), docs_dir)
+                with open(saved["path"], encoding="utf-8") as fh:
+                    self.assertEqual(fh.read(), snapshot)
+
+    def test_html_export_rejects_empty_body(self):
+        response = self.client.post("/api/export/html", json={"html": "  "})
+        self.assertEqual(response.status_code, 400)
 
     def test_dashboard_labels_hot_db_directory_totals(self):
         app_js = self.client.get("/static/app.js").text
@@ -341,8 +609,9 @@ class WebAppApiTests(unittest.TestCase):
                 return self
             def __exit__(self, *args):
                 return False
-            def fetch_coverage_rows(self, max_segs):
+            def fetch_coverage_rows(self, max_segs, threshold_bytes=None):
                 assert max_segs == 4  # /strg/D (2 segs) + match_depth 2
+                assert threshold_bytes == 10 * 1024 * 1024  # index_min_file_mb
                 return rows
 
         # Before any refresh the report is stale but still shows du data.
@@ -366,7 +635,8 @@ class WebAppApiTests(unittest.TestCase):
         strg = next(m for m in srv["mounts"] if m["mount"] == "/strg/D")
         op = next(r for r in strg["rows"]
                   if r["path"] == "/strg/D/shared-data/op")
-        self.assertEqual(op["status"], "full")
+        # Byte-only scan (no du --inodes, no baseline) → not certified full.
+        self.assertEqual(op["status"], "partial")
 
     def test_no_response_ever_contains_the_ssh_password(self):
         with mock.patch("storage_map.lib.core._remote_status",

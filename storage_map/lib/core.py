@@ -205,6 +205,22 @@ def _shared_data_child(mount):
 # --------------------------------------------------------------------------- #
 # Stage 1 — Scanner (fire-and-forget)                                         #
 # --------------------------------------------------------------------------- #
+def path_segments(path):
+    """``/strg/D`` -> 2 segments; ``/`` -> 0. Used to size the awk rollup."""
+    return len([p for p in (path or '').strip('/').split('/') if p])
+
+
+def _dir_count_line(target, rel_depth):
+    """``find -type d | awk`` pipeline emitting recursive dir counts per dir."""
+    qt = shlex.quote(target)
+    return (
+        f"$PRE find {qt} -xdev -type d -not -path '/proc/*' "
+        f"-not -path '/sys/*' -printf '%p\\n' 2>>\"$DIR/scan.err\" | "
+        f'awk -F/ -v a={path_segments(target)} -v r={rel_depth} '
+        f'{shlex.quote(ROLLUP_AWK)} 2>>"$DIR/scan.err" || true'
+    )
+
+
 def _remote_launcher_script(server, depth):
     """Return the shell script (run.sh) executed on the remote host.
 
@@ -252,6 +268,35 @@ def _remote_launcher_script(server, depth):
                 f'--max-depth={TOP_LAYER_DEPTH} '
                 f"--exclude='/proc/*' --exclude='/sys/*' {shared} "
                 f'2>>"$DIR/scan.err" || true; fi')
+        # Inode (file+dir) counts for the same tree. Same cheap metadata walk as
+        # the byte du; lets coverage require a per-directory file-count match
+        # instead of trusting the byte ratio (block allocation inflates du bytes
+        # for directories of many tiny files). Older logs omit this block, so the
+        # parser and coverage treat a missing count as unknown.
+        lines.append('printf "##### INODES #####\\n"')
+        lines.append(
+            f'$PRE du -x --inodes --max-depth={TOP_LAYER_DEPTH} '
+            f"--exclude='/proc/*' --exclude='/sys/*' {qm} "
+            f'2>>"$DIR/scan.err" || true')
+        if depth >= SHARED_DATA_DEPTH:
+            shared = q(_shared_data_child(mount))
+            lines.append(
+                f'if [ -d {shared} ]; then $PRE du -x --inodes '
+                f'--max-depth={TOP_LAYER_DEPTH} '
+                f"--exclude='/proc/*' --exclude='/sys/*' {shared} "
+                f'2>>"$DIR/scan.err" || true; fi')
+        # Directory-only counts (find -type d, no per-file enumeration). The
+        # exact recursive file count is inodes − dirs, which lets coverage drop
+        # the du --inodes subdirectory tolerance and certify large directories
+        # precisely. -type d reads directory entries but does not stat every
+        # file, so it is lighter than the du passes.
+        lines.append('printf "##### DIRS #####\\n"')
+        lines.append(_dir_count_line(mount, TOP_LAYER_DEPTH))
+        if depth >= SHARED_DATA_DEPTH:
+            child = _shared_data_child(mount)
+            lines.append(
+                f'if [ -d {q(child)} ]; then '
+                + _dir_count_line(child, TOP_LAYER_DEPTH) + '; fi')
     lines.append(r'printf "##### END #####\n"')
     lines.append('} > "$DIR/scan.out" 2>>"$DIR/scan.err"')
     # The sentinel is written last, so its presence means the whole run finished.
@@ -484,15 +529,39 @@ def parse_size(token):
     return int(round(number * _UNIT_FACTORS.get(unit, 1)))
 
 
+# awk that rolls a list of paths into per-directory recursive counts at the
+# reporting depth (same tab format as du). Shared by the exact directory-count
+# pass here and the file-count baseline in :mod:`storage_map.lib.baseline`:
+# given ``a`` (the argument's path-segment count) and ``r`` (relative report
+# depth), each input path bumps every ancestor prefix from depth ``a`` to
+# ``a+r``. ``-F/`` makes ``NF-1`` the path's segment count; the empty key (mount
+# root ``/``) is normalized to ``/``.
+ROLLUP_AWK = (
+    '{segs=NF-1; maxd=a+r; '
+    'for(d=a; d<=maxd && d<=segs; d++){key=""; '
+    'for(i=2;i<=d+1;i++)key=key"/"$i; if(key=="")key="/"; c[key]++}} '
+    'END{for(k in c)printf "%d\\t%s\\n", c[k], k}'
+)
+
+
 class Node:
-    """A folder in the hierarchy with its byte size and children."""
+    """A folder in the hierarchy with its byte size and children.
 
-    __slots__ = ('path', 'name', 'size', 'children')
+    ``count`` is the recursive inode count from the ``du --inodes`` pass (files
+    plus subdirectories); ``dir_count`` is the recursive directory count from the
+    ``find -type d`` pass. Their difference is the exact recursive *file* count.
+    Both are ``None`` for logs written before those passes existed, so consumers
+    must treat a missing value as "unknown" rather than zero.
+    """
 
-    def __init__(self, path, size):
+    __slots__ = ('path', 'name', 'size', 'count', 'dir_count', 'children')
+
+    def __init__(self, path, size, count=None, dir_count=None):
         self.path = path
         self.name = posixpath.basename(path.rstrip('/')) or path
         self.size = size
+        self.count = count
+        self.dir_count = dir_count
         self.children = []
 
     def sorted_children(self):
@@ -566,11 +635,22 @@ def parse_raw_log(path, server_name=None):
                 current = {
                     'mount': marker.group(1).strip(),
                     'entries': [],
+                    'inode_entries': [],
+                    'dir_entries': [],
+                    'mode': 'bytes',
                     'capacity_bytes': None,
                     'used_bytes': None,
                     'free_bytes': None,
                 }
                 sections.append(current)
+                continue
+            if line.strip() == '##### INODES #####':
+                if current is not None:
+                    current['mode'] = 'inodes'
+                continue
+            if line.strip() == '##### DIRS #####':
+                if current is not None:
+                    current['mode'] = 'dirs'
                 continue
             df_marker = re.match(
                 r'#####\s*DF:\s*(\d+)\s+(\d+)\s+(\d+)\s+([0-9]+%?)\s*#####$',
@@ -601,13 +681,19 @@ def parse_raw_log(path, server_name=None):
             if len(parts) != 2:
                 continue
             size_token, entry_path = parts[0].strip(), parts[1].strip()
-            current['entries'].append((parse_size(size_token), entry_path))
+            # ``du``/``find`` emit "<count>\t<path>"; reuse parse_size to tolerate
+            # any thousands-formatting, though counts are integers.
+            bucket = {'inodes': 'inode_entries', 'dirs': 'dir_entries'}.get(
+                current['mode'], 'entries')
+            current[bucket].append((parse_size(size_token), entry_path))
 
     effective_depth = (SHARED_DATA_DEPTH if depth <= 0
                        else min(depth, SHARED_DATA_DEPTH))
     mounts = []
     for sec in sections:
         root = _build_tree(sec['entries'], sec['mount'])
+        _apply_counts(root, sec['inode_entries'], 'count')
+        _apply_counts(root, sec['dir_entries'], 'dir_count')
         _limit_tree_depth(root, effective_depth)
         mounts.append(MountTree(sec['mount'], root,
                                 sec['capacity_bytes'], sec['used_bytes'],
@@ -642,6 +728,30 @@ def _build_tree(entries, mount):
         else:
             node.size = size
     return root
+
+
+def _apply_counts(root, count_entries, attr):
+    """Overlay recursive counts (inodes or dirs) onto the byte tree by path.
+
+    Counts are only set on nodes that already exist in the byte tree; the byte
+    ``du`` and the count passes walk the same tree at the same depth, so the
+    paths line up. Nodes with no matching line keep ``attr`` at ``None``.
+    """
+    def norm(p):
+        p = p.rstrip('/')
+        return p or '/'
+
+    by_path = {}
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        by_path[node.path] = node
+        stack.extend(node.children)
+
+    for count, entry in count_entries:
+        node = by_path.get(norm(entry))
+        if node is not None:
+            setattr(node, attr, int(count))
 
 
 def _limit_tree_depth(node, max_depth, depth=0):

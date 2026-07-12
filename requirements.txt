@@ -18,4 +18,3 @@ zstandard>=0.23
 rich>=13        # Stage 2: color-coded terminal dashboard
 fastapi>=0.110  # Storage Map web app (storage_map/run_app.py)
 uvicorn>=0.29   # Storage Map local web server
-reportlab>=4    # Storage Map PDF state export
