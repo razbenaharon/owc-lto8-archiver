@@ -40,9 +40,17 @@ class CoverageRepository:
     def __exit__(self, _exc_type, _exc, _tb):
         self.close()
 
-    def fetch_coverage_rows(self, max_segs):
-        """Run the aggregation and return JSON-safe row dicts."""
-        cursor = self.conn.execute(COVERAGE_SQL, {'max_segs': int(max_segs)})
+    def fetch_coverage_rows(self, max_segs, threshold_bytes=10 * 1024 * 1024):
+        """Run the aggregation and return JSON-safe row dicts.
+
+        ``threshold_bytes`` is the ``index_min_file_mb`` boundary: packed files
+        below it live only in the directory catalog, so the query adds their
+        per-directory totals on top of ``files_index`` (see :data:`COVERAGE_SQL`).
+        """
+        cursor = self.conn.execute(COVERAGE_SQL, {
+            'max_segs': int(max_segs),
+            'threshold_bytes': int(threshold_bytes),
+        })
         rows = []
         for row in cursor:
             last = row.get('last_backup')

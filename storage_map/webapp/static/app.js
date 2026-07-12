@@ -339,14 +339,6 @@ async function checkStatus() {
 }
 
 /* --------------------------------------------------------------- export -- */
-function downloadBlob(blob, filename) {
-  const link = document.createElement('a');
-  link.href = URL.createObjectURL(blob);
-  link.download = filename;
-  link.click();
-  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
-}
-
 async function exportHtml() {
   setStatus('Building static HTML snapshot...');
   try {
@@ -361,29 +353,18 @@ async function exportHtml() {
 <title>Storage Map snapshot</title><style>${css}</style></head><body>
 ${copy.outerHTML}<div class="snapshot-note">Static snapshot generated ${esc(generated)}</div>
 </body></html>`;
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    downloadBlob(new Blob([source], {type: 'text/html;charset=utf-8'}),
-                 `storage_map_${stamp}.html`);
-    setStatus('Static HTML snapshot exported.');
-  } catch (err) {
-    setStatus(`HTML export failed: ${err.message}`, true);
-  }
-}
-
-async function exportPdf() {
-  setStatus('Building PDF report...');
-  try {
-    const response = await authFetch('/api/export/pdf');
+    const response = await authFetch('/api/export/html', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({html: source}),
+    });
+    const body = await response.json().catch(() => ({}));
     if (!response.ok) {
-      const body = await response.json().catch(() => ({}));
       throw new Error(body.detail || `${response.status} ${response.statusText}`);
     }
-    const disposition = response.headers.get('Content-Disposition') || '';
-    const match = disposition.match(/filename="?([^";]+)"?/i);
-    downloadBlob(await response.blob(), match ? match[1] : 'storage_map.pdf');
-    setStatus('PDF report exported.');
+    setStatus(`Static HTML snapshot saved to ${body.path || body.saved}.`);
   } catch (err) {
-    setStatus(`PDF export failed: ${err.message}`, true);
+    setStatus(`HTML export failed: ${err.message}`, true);
   }
 }
 
@@ -414,7 +395,6 @@ $('#btn-coverage').addEventListener('click', () =>
   postAction('/api/coverage/refresh', 'Aggregating the archive database…'));
 $('#btn-status').addEventListener('click', checkStatus);
 $('#btn-export-html').addEventListener('click', exportHtml);
-$('#btn-export-pdf').addEventListener('click', exportPdf);
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
   loadOverview();
 });

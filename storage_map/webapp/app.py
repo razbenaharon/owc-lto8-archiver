@@ -23,14 +23,17 @@ except ImportError as exc:  # pragma: no cover - dependency hint
 from src.config import ConfigManager
 from src.telegram_notify import TelegramNotifier
 from storage_map.lib import core
+from storage_map.lib import baseline as baseline_lib
 from storage_map.lib.dashboard import _server_leaves
 from storage_map.webapp import coverage as cov
-from storage_map.webapp.exports import build_pdf
 from storage_map.webapp.jobs import JobBusy, JobManager
 from storage_map.webapp.repository import CoverageRepository
 from storage_map.webapp.settings import load_webapp_config
 
 _STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
+_DOCS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    'docs')
 def _cache_path(smcfg):
     return os.path.join(smcfg.output_dir, 'coverage_cache.json')
 
@@ -147,6 +150,7 @@ def create_app(cfg=None):
             host_map,
             db_generated_at=(cache or {}).get('generated_at'),
             default_mounts=all_mounts,
+            baseline_by_server=baseline_lib.load_baseline(),
         )
         report['stale'] = cache is None
         return report
@@ -167,23 +171,19 @@ def create_app(cfg=None):
     def api_coverage():
         return _coverage_payload()
 
-    @app.get('/api/export/pdf')
-    def api_export_pdf():
-        results = _results()
-        if not results:
-            raise HTTPException(status_code=404,
-                                detail='No fetched state is available to export.')
-        generated = datetime.now().isoformat(timespec='seconds')
-        try:
-            data = build_pdf(_overview_payload(smcfg, results),
-                             _coverage_payload(), generated)
-        except RuntimeError as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
+    @app.post('/api/export/html')
+    def api_export_html(payload: dict = Body(default=None)):
+        html = (payload or {}).get('html')
+        if not isinstance(html, str) or not html.strip():
+            raise HTTPException(status_code=400,
+                                detail="'html' snapshot content is required.")
+        os.makedirs(_DOCS_DIR, exist_ok=True)
         stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        return Response(
-            data, media_type='application/pdf',
-            headers={'Content-Disposition':
-                     f'attachment; filename="storage_map_{stamp}.pdf"'})
+        filename = f'storage_map_{stamp}.html'
+        path = os.path.join(_DOCS_DIR, filename)
+        with open(path, 'w', encoding='utf-8') as fh:
+            fh.write(html)
+        return {'saved': filename, 'path': path}
 
     # ------------------------------------------------------------ actions --
     def _start(name, fn, conflicts=()):
@@ -239,7 +239,8 @@ def create_app(cfg=None):
     def api_coverage_refresh():
         def run():
             with CoverageRepository(cfg.db_dsn) as repo:
-                rows = repo.fetch_coverage_rows(max_segs)
+                rows = repo.fetch_coverage_rows(
+                    max_segs, int(cfg.index_min_file_mb * 1024 * 1024))
             _write_cache(smcfg, {
                 'generated_at': datetime.now().isoformat(timespec='seconds'),
                 'max_segments': max_segs,
@@ -248,6 +249,41 @@ def create_app(cfg=None):
             return f'aggregated {len(rows)} directory prefixes from the DB'
 
         return _start('coverage', run)
+
+    # Exact-count baseline (find -type f): a deliberate, one-time refresh of the
+    # committed baseline file. Launch walks every inode, so run it in a quiet
+    # window — never while an archive is fetching from the same server.
+    @app.post('/api/coverage/baseline/launch')
+    def api_baseline_launch(payload: dict = Body(default=None)):
+        servers = _servers((payload or {}).get('servers'))
+
+        def run():
+            rc = baseline_lib.launch_baseline(smcfg, servers)
+            names = ', '.join(s.name for s in servers)
+            if rc:
+                raise RuntimeError(f'baseline launch failed on one of {names}')
+            return f'exact-count baseline launched on {names}'
+
+        return _start('baseline', run, conflicts=('fetch', 'scan'))
+
+    @app.post('/api/coverage/baseline/collect')
+    def api_baseline_collect(payload: dict = Body(default=None)):
+        servers = _servers((payload or {}).get('servers'))
+
+        def run():
+            result = baseline_lib.collect_baseline(smcfg, servers)
+            if not result['fetched']:
+                raise RuntimeError('no completed baseline runs were retrieved '
+                                   '(still pending or unreachable)')
+            return f"baseline updated for {', '.join(result['fetched'])}"
+
+        return _start('baseline', run)
+
+    @app.get('/api/coverage/baseline/status')
+    def api_baseline_status():
+        states = {srv.name: baseline_lib._baseline_status(srv)
+                  for srv in smcfg.servers}
+        return {'servers': states}
 
     @app.get('/api/jobs')
     def api_jobs():
