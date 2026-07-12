@@ -1,4 +1,4 @@
-"""Tests for the storage_map v2 web dashboard (coverage math + API routes)."""
+"""Tests for the Storage Map web dashboard (coverage math + API routes)."""
 import configparser
 import json
 import os
@@ -148,9 +148,17 @@ class BuildCoverageTests(unittest.TestCase):
         self.assertEqual(rows["/strg/D/deleted-proj"]["status"], "tape_only")
         self.assertIsNone(rows["/strg/D/deleted-proj"]["coverage_pct"])
         self.assertIsNone(rows["/strg/D/deleted-proj"]["server_bytes"])
-        # Real percentage is reported, never clamped.
-        self.assertAlmostEqual(rows["/strg/D/other"]["coverage_pct"], 200.0)
+        # Every row classified as full is presented as exactly 100%.
+        self.assertAlmostEqual(rows["/strg/D/other"]["coverage_pct"], 100.0)
         self.assertEqual(rows["/strg/D/other"]["status"], "full")
+
+    def test_full_threshold_is_presented_as_100_percent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = self._build(
+                tmp, [_db_row("so01", "/strg/D/other", 216 * GIB)])
+        row = self._rows(report)["/strg/D/other"]
+        self.assertEqual(row["status"], "full")
+        self.assertEqual(row["coverage_pct"], 100.0)
 
     def test_longest_mount_wins_and_deep_prefixes_roll_up(self):
         db_rows = [
@@ -215,6 +223,7 @@ class _FakeCfg:
         self.remote_user = "labuser"
         self.remote_password = "sekret-hunter2"
         self.db_dsn = "postgresql://lto@127.0.0.1:5/x"
+        self.env = {}
 
 
 class WebAppApiTests(unittest.TestCase):
@@ -223,7 +232,7 @@ class WebAppApiTests(unittest.TestCase):
             from fastapi.testclient import TestClient
         except ImportError:
             self.skipTest("fastapi is not installed "
-                          "(optional storage_map v2 dependency)")
+                          "(optional Storage Map dependency)")
         from storage_map.webapp.app import create_app
 
         self._tmp = tempfile.TemporaryDirectory()
@@ -258,12 +267,20 @@ class WebAppApiTests(unittest.TestCase):
         self.assertEqual(mounts["/strg/D"]["free_bytes"], 1024 * GIB)
         self.assertTrue(srv["top_folders"])
 
-    def test_treemap_returns_plotly_figure_json(self):
-        resp = self.client.get("/api/treemap")
-        self.assertEqual(resp.status_code, 200)
-        fig = resp.json()
-        self.assertIn("data", fig)
-        self.assertEqual(fig["data"][0]["type"], "treemap")
+    def test_pdf_export_returns_downloadable_report(self):
+        response = self.client.get("/api/export/pdf")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "application/pdf")
+        self.assertIn("attachment;", response.headers["content-disposition"])
+        self.assertTrue(response.content.startswith(b"%PDF-"))
+        self.assertGreater(len(response.content), 2000)
+
+    def test_dashboard_labels_hot_db_directory_totals(self):
+        app_js = self.client.get("/static/app.js").text
+        self.assertIn("Hot DB size", app_js)
+        self.assertIn("Hot DB files", app_js)
+        self.assertIn("human(row.tape_bytes || 0)", app_js)
+        self.assertIn("Number(row.tape_files || 0).toLocaleString()", app_js)
 
     def test_scan_status_route_uses_remote_status(self):
         with mock.patch("storage_map.lib.core._remote_status",
@@ -362,6 +379,18 @@ class WebAppApiTests(unittest.TestCase):
             ]
         for body in bodies:
             self.assertNotIn("sekret-hunter2", body)
+
+
+class RunAppTests(unittest.TestCase):
+    def test_open_chrome_uses_detected_executable(self):
+        from storage_map import run_app
+
+        with mock.patch.object(run_app, "_chrome_path",
+                               return_value=r"C:\Chrome\chrome.exe"), \
+                mock.patch.object(run_app.subprocess, "Popen") as popen:
+            self.assertTrue(run_app._open_chrome("http://127.0.0.1:8765/"))
+        popen.assert_called_once_with(
+            [r"C:\Chrome\chrome.exe", "http://127.0.0.1:8765/"])
 
 
 if __name__ == "__main__":

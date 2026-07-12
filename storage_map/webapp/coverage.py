@@ -49,7 +49,6 @@ FROM per_file
 GROUP BY 1, 2
 """
 
-
 def norm(path):
     """The same normalization rule as ``core._build_tree``."""
     path = (path or '').rstrip('/')
@@ -117,7 +116,7 @@ def _row_status(server_bytes, tape_bytes):
         return None, ('tape_only' if tape_bytes else 'none')
     pct = tape_bytes / server_bytes * 100.0
     if pct >= FULL_THRESHOLD_PCT:
-        return pct, 'full'
+        return 100.0, 'full'
     return pct, ('partial' if tape_bytes else 'none')
 
 

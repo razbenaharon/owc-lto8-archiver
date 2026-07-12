@@ -3,35 +3,29 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Storage Map v2</title>
-<link rel="stylesheet" href="/static/style.css">
+<title>Storage Map</title>
+<link rel="stylesheet" href="/static/style.css?v=20260712-3">
 </head>
 <body>
 <div class="wrap">
   <header class="top">
     <div>
-      <h1>Storage Map <span class="muted">v2</span></h1>
+      <h1>Storage Map</h1>
       <div class="sub" id="subtitle">lab disk usage &amp; tape coverage</div>
     </div>
     <div class="actions">
       <button id="btn-scan" title="Launch a fire-and-forget du scan on the servers (runs for hours; safe to close this page)">Start scan</button>
       <button id="btn-status" title="Ask each server whether its scan has finished">Check status</button>
-      <button id="btn-fetch" class="primary" title="Download finished scan logs and refresh the dashboard">Fetch &amp; rebuild</button>
+      <button id="btn-fetch" class="primary" title="Fetch completed scan results from every configured server and refresh the dashboard">Refresh servers</button>
       <button id="btn-coverage" title="Re-aggregate the tape catalog database">Refresh DB coverage</button>
+      <button id="btn-export-html" title="Download the visible dashboard as one self-contained HTML file">Export HTML</button>
+      <button id="btn-export-pdf" title="Download a paginated disk-usage and tape-coverage report">Export PDF</button>
     </div>
   </header>
   <div id="statusline"></div>
 
   <div class="kpi-row" id="kpis"></div>
   <div id="server-panels"></div>
-
-  <section class="panel">
-    <div class="panel-head"><div>
-      <h2>Interactive treemap</h2>
-      <div class="panel-sub">Click any block to drill in · click the crumb to zoom out</div>
-    </div></div>
-    <div class="treemap" id="treemap"><div class="placeholder">Loading…</div></div>
-  </section>
 
   <section class="panel">
     <div class="panel-head"><div>
@@ -46,7 +40,6 @@
 
   <footer>Storage Map &amp; Analytics · interactive dashboard · data stays on this machine</footer>
 </div>
-<script src="/static/plotly.min.js"></script>
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=20260712-3"></script>
 </body>
 </html>

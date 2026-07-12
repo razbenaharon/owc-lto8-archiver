@@ -305,8 +305,8 @@ def scan(smcfg, servers, notifier=None):
 
     print("\n[SCAN] Fire-and-forget complete. The scan(s) continue on the "
           "server(s) after this process exits.")
-    print("[SCAN] Run 'python storage_map/check_status_create_dashboard.py' "
-          "later to check progress and build the dashboard when ready.")
+    print("[SCAN] Use the Storage Map web app later to check progress and "
+          "refresh completed server results.")
     send_best_effort(notifier, format_storage_scan_summary(launched, failed))
     return 1 if failures else 0
 

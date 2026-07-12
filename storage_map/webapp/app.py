@@ -1,7 +1,7 @@
-"""FastAPI application for the storage_map v2 interactive dashboard.
+"""FastAPI application for the interactive Storage Map dashboard.
 
 Serves a single-page frontend plus a small JSON API around the v1 engine
-(:mod:`storage_map.lib.core`): live overview/treemap from the fetched raw
+(:mod:`storage_map.lib.core`): live overview from the fetched raw
 logs, in-app scan/status/fetch actions, and the tape-coverage view backed by
 one read-only PostgreSQL aggregation. Every endpoint is a sync ``def`` on
 purpose — SSH status checks block for up to a minute and must run in the
@@ -17,7 +17,7 @@ try:
     from fastapi.staticfiles import StaticFiles
 except ImportError as exc:  # pragma: no cover - dependency hint
     raise RuntimeError(
-        "storage_map v2 needs FastAPI and uvicorn: "
+        "The Storage Map app needs FastAPI and uvicorn: "
         "pip install fastapi uvicorn") from exc
 
 from src.config import ConfigManager
@@ -25,13 +25,12 @@ from src.telegram_notify import TelegramNotifier
 from storage_map.lib import core
 from storage_map.lib.dashboard import _server_leaves
 from storage_map.webapp import coverage as cov
+from storage_map.webapp.exports import build_pdf
 from storage_map.webapp.jobs import JobBusy, JobManager
 from storage_map.webapp.repository import CoverageRepository
 from storage_map.webapp.settings import load_webapp_config
 
 _STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static')
-
-
 def _cache_path(smcfg):
     return os.path.join(smcfg.output_dir, 'coverage_cache.json')
 
@@ -104,19 +103,13 @@ def create_app(cfg=None):
     max_segs = cov.max_segments(all_mounts, webcfg.match_depth)
     host_map = cov.resolve_host_map(smcfg.servers, webcfg.host_map)
 
-    app = FastAPI(title='Storage Map v2', docs_url=None, redoc_url=None)
+    app = FastAPI(title='Storage Map', docs_url=None, redoc_url=None)
     app.state.webcfg = webcfg
     app.state.smcfg = smcfg
 
     @app.middleware('http')
     async def _api_guard(request, call_next):
         if request.url.path.startswith('/api/'):
-            # Auth: required on every API call when a token is configured
-            # (mandatory for non-loopback binds — see ensure_bind_safe).
-            if (webcfg.auth_token and
-                    request.headers.get('x-auth-token') != webcfg.auth_token):
-                return JSONResponse({'detail': 'unauthorized'},
-                                    status_code=401)
             # CSRF: a cross-origin "simple" POST (text/plain, empty body)
             # would otherwise fire actions like /api/scan from any web page
             # the operator has open. Requiring application/json forces a CORS
@@ -144,39 +137,7 @@ def create_app(cfg=None):
     def _results():
         return core._load_results(smcfg, smcfg.servers)
 
-    # ------------------------------------------------------------- pages --
-    @app.get('/', include_in_schema=False)
-    def index():
-        return FileResponse(os.path.join(_STATIC_DIR, 'index.html'))
-
-    @app.get('/static/plotly.min.js', include_in_schema=False)
-    def plotly_js():
-        # Served from the installed plotly package so the page needs no CDN.
-        from plotly.offline import get_plotlyjs
-        return Response(get_plotlyjs(), media_type='application/javascript',
-                        headers={'Cache-Control': 'max-age=86400'})
-
-    # --------------------------------------------------------------- data --
-    @app.get('/api/overview')
-    def api_overview():
-        return _overview_payload(smcfg, _results())
-
-    @app.get('/api/treemap')
-    def api_treemap():
-        results = _results()
-        if not results:
-            raise HTTPException(status_code=404,
-                                detail='No fetched raw logs yet. Run a scan, '
-                                       'then Fetch & rebuild.')
-        fig = core.build_treemap_figure(results)
-        if fig is None:
-            raise HTTPException(status_code=503,
-                                detail='Plotly is not installed '
-                                       '(pip install plotly).')
-        return Response(fig.to_json(), media_type='application/json')
-
-    @app.get('/api/coverage')
-    def api_coverage():
+    def _coverage_payload():
         cache = _load_cache(smcfg)
         report = cov.build_coverage(
             _results(),
@@ -189,6 +150,40 @@ def create_app(cfg=None):
         )
         report['stale'] = cache is None
         return report
+
+    # ------------------------------------------------------------- pages --
+    @app.get('/', include_in_schema=False)
+    def index():
+        return FileResponse(
+            os.path.join(_STATIC_DIR, 'index.html'),
+            headers={'Cache-Control': 'no-store, max-age=0'})
+
+    # --------------------------------------------------------------- data --
+    @app.get('/api/overview')
+    def api_overview():
+        return _overview_payload(smcfg, _results())
+
+    @app.get('/api/coverage')
+    def api_coverage():
+        return _coverage_payload()
+
+    @app.get('/api/export/pdf')
+    def api_export_pdf():
+        results = _results()
+        if not results:
+            raise HTTPException(status_code=404,
+                                detail='No fetched state is available to export.')
+        generated = datetime.now().isoformat(timespec='seconds')
+        try:
+            data = build_pdf(_overview_payload(smcfg, results),
+                             _coverage_payload(), generated)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        return Response(
+            data, media_type='application/pdf',
+            headers={'Content-Disposition':
+                     f'attachment; filename="storage_map_{stamp}.pdf"'})
 
     # ------------------------------------------------------------ actions --
     def _start(name, fn, conflicts=()):
@@ -258,8 +253,6 @@ def create_app(cfg=None):
     def api_jobs():
         return jobs.snapshot()
 
-    # Mounted last so the explicit /static/plotly.min.js route above wins;
-    # a mount registered earlier would shadow it and 404.
     app.mount('/static', StaticFiles(directory=_STATIC_DIR), name='static')
 
     return app

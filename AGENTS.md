@@ -123,12 +123,11 @@ perf work. In brief:
 
 ## Storage Map & Analytics (`storage_map/`)
 
-A self-contained, two-stage remote disk-usage mapper for the lab servers,
+A self-contained remote disk-usage mapper for the lab servers,
 **decoupled from the tape pipeline** (it does not touch `src/cli.py`,
-`lto_archive.db`, or the LTFS drive). It lives in the `storage_map/` package:
-`storage_map/create_dashboard.py` launches scans and exits, while
-`storage_map/check_status_create_dashboard.py` checks status and builds the
-dashboard when scans are done. Internal code lives in `storage_map/lib/`.
+`lto_archive.db`, or the LTFS drive). `storage_map/run_app.py` is its single
+top-level Python entrypoint; internal code lives in `storage_map/lib/` and
+`storage_map/webapp/`.
 
 - **Stage 1 — `scan` (fire-and-forget).** Connects to each configured server
   over SSH (reusing `remote_transport._ssh_run`), launches a low-priority
@@ -148,18 +147,20 @@ dashboard when scans are done. Internal code lives in `storage_map/lib/`.
   HTML treemap (`treemap`). `rich`
   and `plotly` are **optional** — each visualizer prints a `pip install` hint if
   its library is missing.
-- **v2 — interactive web dashboard (`python storage_map/serve.py [--open]`).**
+- **Interactive web dashboard (`python storage_map/run_app.py [--open-chrome]`).**
   A FastAPI + uvicorn app (`storage_map/webapp/`) that serves the same
-  overview/treemap live from the fetched raw logs, adds in-browser action
-  buttons (start scan / check status / fetch & rebuild), and a **tape-coverage
+  overview live from the fetched raw logs, adds in-browser action
+  buttons (start scan / check status / refresh servers), static HTML/PDF state
+  exports, and a **tape-coverage
   table** matching each mount's directories (mount + `match_depth` levels,
   default 2 — never individual files) against the PostgreSQL catalog: one
   read-only aggregation of `files_index.original_path` prefixes
   (`webapp/coverage.py`), cached in `storage_map/logs/coverage_cache.json`
   and refreshed only via the "Refresh DB coverage" button. Binds to
-  `127.0.0.1:8765` by default (`web_host`/`web_port`/`match_depth`/`host_map`
-  keys in `[STORAGE_MAP]`, all optional). `fastapi`/`uvicorn` are optional
-  dependencies used only by v2; the v1 scripts keep working without them.
+  `127.0.0.1:8765` (`web_port`/`match_depth`/`host_map`
+  keys in `[STORAGE_MAP]`, all optional). The app is intentionally local-only
+  and binds to `127.0.0.1`. `fastapi`/`uvicorn` are optional
+  dependencies used only by the web app.
   Tests: `tests/test_storage_map_webapp.py`.
 
 Mount points and servers are **config-driven, never hardcoded** — see the
@@ -169,11 +170,9 @@ Mount points and servers are **config-driven, never hardcoded** — see the
 `storage_map/logs/` and generated `storage_map/index.html` (gitignored like
 `backup_logs/`).
 
-Typical nightly use (Windows Task Scheduler): schedule
-`python storage_map/create_dashboard.py` at night and, hours later,
-`python storage_map/check_status_create_dashboard.py --open`. Unit
-tests: `tests/test_storage_map.py` (pure parser + launcher-script coverage, no
-hardware/network).
+Run `python storage_map/run_app.py --open-chrome`, then use the in-app Start
+scan, Check status, and Refresh servers controls. Unit tests:
+`tests/test_storage_map.py` (pure parser + launcher coverage, no hardware/network).
 
 ## Commit & Pull Request Guidelines
 
