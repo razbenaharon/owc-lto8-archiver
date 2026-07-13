@@ -1,0 +1,2489 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Storage Map snapshot</title><style>/* Storage Map — same validated palette/tokens as the static dashboard
+   (storage_map/lib/dashboard.py), extended with action-bar, badge and
+   coverage-table styles. Light/dark swap through the custom properties. */
+:root {
+  --plane:#f9f9f7; --surface:#fcfcfb;
+  --ink:#0b0b0b; --ink-2:#52514e; --muted:#898781;
+  --grid:#e1e0d9; --border:rgba(11,11,11,0.10);
+  --series:#2a78d6; --track:#ecebe4;
+  --status-good:#0ca30c; --status-warn:#fab219; --status-crit:#d03b3b;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --plane:#0d0d0d; --surface:#1a1a19;
+    --ink:#ffffff; --ink-2:#c3c2b7; --muted:#898781;
+    --grid:#2c2c2a; --border:rgba(255,255,255,0.10);
+    --series:#3987e5; --track:#26261f;
+  }
+}
+* { box-sizing:border-box; }
+body {
+  margin:0; background:var(--plane); color:var(--ink);
+  font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+  font-size:15px; line-height:1.45;
+}
+.wrap { max-width:1180px; margin:0 auto; padding:32px 24px 64px; }
+header.top { display:flex; justify-content:space-between; align-items:flex-end;
+  gap:20px; flex-wrap:wrap; margin-bottom:8px; }
+header.top h1 { margin:0 0 4px; font-size:26px; letter-spacing:-0.01em; }
+header.top .sub { color:var(--ink-2); font-size:14px; }
+
+/* --- action bar ---------------------------------------------------------- */
+.actions { display:flex; gap:10px; flex-wrap:wrap; }
+.snapshot-note { color:var(--muted); font-size:12px; text-align:center; padding:0 24px 28px; }
+.actions button {
+  background:var(--surface); color:var(--ink); border:1px solid var(--border);
+  border-radius:10px; padding:8px 14px; font-size:13.5px; font-weight:600;
+  font-family:inherit; cursor:pointer;
+}
+.actions button:hover:not(:disabled) { border-color:var(--series); }
+.actions button.primary { background:var(--series); color:#fff; border-color:transparent; }
+.actions button:disabled { opacity:0.5; cursor:default; }
+#statusline { color:var(--ink-2); font-size:13px; margin:10px 0 2px; min-height:20px; }
+#statusline .err { color:var(--status-crit); }
+
+/* --- KPIs & panels (as v1) ----------------------------------------------- */
+.kpi-row { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+  gap:14px; margin:20px 0 8px; }
+.kpi { background:var(--surface); border:1px solid var(--border);
+  border-radius:12px; padding:16px 18px; }
+.kpi-accent { border-color:var(--series); }
+.kpi-value { font-size:22px; font-weight:650; letter-spacing:-0.01em; }
+.kpi-label { color:var(--muted); font-size:12.5px; text-transform:uppercase;
+  letter-spacing:0.04em; margin-top:2px; }
+.panel { background:var(--surface); border:1px solid var(--border);
+  border-radius:16px; padding:22px 24px; margin-top:22px; }
+.panel-head { display:flex; justify-content:space-between; align-items:flex-start;
+  gap:20px; flex-wrap:wrap; margin-bottom:6px; }
+.panel-head h2 { margin:0; font-size:19px; }
+.panel-sub { color:var(--ink-2); font-size:13px; margin-top:2px; }
+.panel-grid { display:grid; grid-template-columns:1fr 1fr; gap:28px; margin-top:16px; }
+@media (max-width:760px){ .panel-grid { grid-template-columns:1fr; } }
+.chart-block h3 { margin:0 0 12px; font-size:14px; font-weight:600; }
+.chart-block h3 .muted { color:var(--muted); font-weight:400; }
+.bars { display:flex; flex-direction:column; gap:9px; }
+.bar-row { display:grid; grid-template-columns:150px 1fr auto; align-items:center;
+  gap:12px; }
+.bar-label { font-size:13px; overflow:hidden; text-overflow:ellipsis;
+  white-space:nowrap; }
+.bar-track { height:12px; background:var(--track); border-radius:6px; overflow:hidden; }
+.bar-fill { height:100%; border-radius:6px; min-width:3px; }
+.bar-value { font-size:12.5px; color:var(--ink-2); white-space:nowrap;
+  font-variant-numeric:tabular-nums; }
+.muted { color:var(--muted); }
+.placeholder { color:var(--muted); font-size:13.5px; padding:14px 2px; }
+footer { color:var(--muted); font-size:12.5px; margin-top:28px; text-align:center; }
+
+/* --- coverage tables ------------------------------------------------------ */
+.cov-toggle { display:inline-flex; align-items:center; gap:7px; font-size:13px;
+  color:var(--ink-2); cursor:pointer; user-select:none; white-space:nowrap; }
+.cov-toggle input { accent-color:var(--series); margin:0; }
+.age-badge { display:inline-block; padding:2px 9px; border-radius:999px;
+  font-size:11.5px; font-weight:600; letter-spacing:0.02em; vertical-align:1px; }
+.age-badge.warn { color:#7a5200; background:rgba(250,178,25,0.18);
+  border:1px solid rgba(250,178,25,0.55); }
+@media (prefers-color-scheme: dark) {
+  .age-badge.warn { color:#fab219; }
+}
+.cov-mount { margin-top:18px; }
+.cov-mount-head { display:flex; justify-content:space-between;
+  align-items:baseline; gap:12px; flex-wrap:wrap; margin-bottom:8px; }
+.cov-mount-head h3 { margin:0; }
+.cov-mount-sum { display:inline-flex; align-items:center; gap:8px;
+  font-size:12.5px; color:var(--ink-2);
+  font-variant-numeric:tabular-nums; white-space:nowrap; }
+.cov-mount h3 { margin:0 0 8px; font-size:14px; font-weight:600; }
+.cov-scroll { overflow-x:auto; }
+table.cov { width:100%; border-collapse:collapse; font-size:13.5px; }
+table.cov th {
+  text-align:left; color:var(--muted); font-size:11.5px; font-weight:600;
+  text-transform:uppercase; letter-spacing:0.04em;
+  border-bottom:1px solid var(--grid); padding:6px 10px;
+}
+table.cov td { padding:6px 10px; border-bottom:1px solid var(--grid); }
+table.cov tr:last-child td { border-bottom:none; }
+table.cov td.num, table.cov th.num { text-align:right;
+  font-variant-numeric:tabular-nums; white-space:nowrap; }
+table.cov td.dir { max-width:380px; overflow:hidden; text-overflow:ellipsis;
+  white-space:nowrap; }
+table.cov tr.depth-0 td.dir { font-weight:650; }
+.cov-bar { display:inline-flex; align-items:center; gap:8px; }
+.cov-track { width:64px; height:8px; background:var(--track); border-radius:4px;
+  overflow:hidden; flex:none; }
+.cov-fill { height:100%; border-radius:4px; background:var(--series); min-width:2px; }
+/* Fill hue mirrors the status badge (never the only carrier — the % text and
+   badge label always accompany it). */
+.cov-fill.s-full { background:var(--status-good); }
+.cov-fill.s-partial { background:var(--status-warn); }
+.cov-fill.s-none { background:var(--status-crit); }
+
+/* Status badges: reserved status colors, always paired with a text label so
+   state is never carried by color alone. */
+.badge { display:inline-flex; align-items:center; gap:6px; font-size:12px;
+  font-weight:600; color:var(--ink-2); white-space:nowrap; }
+.badge::before { content:""; width:8px; height:8px; border-radius:50%;
+  background:var(--muted); flex:none; }
+.badge.full::before { background:var(--status-good); }
+.badge.partial::before { background:var(--status-warn); }
+.badge.none::before { background:var(--status-crit); }
+.badge.tape_only::before { background:var(--muted); }
+</style></head><body>
+<div class="wrap">
+  <header class="top">
+    <div>
+      <h1>Storage Map</h1>
+      <div class="sub" id="subtitle">lab disk usage &amp; tape coverage</div>
+    </div>
+    
+  </header>
+  
+
+  <div class="kpi-row" id="kpis"><div class="kpi kpi-accent">
+    <div class="kpi-value">59.3 TiB</div>
+    <div class="kpi-label">total used (all servers)</div></div><div class="kpi">
+    <div class="kpi-value">8.3 TiB</div>
+    <div class="kpi-label">on tape (archive DB)</div></div><div class="kpi">
+    <div class="kpi-value">14.0%</div>
+    <div class="kpi-label">overall coverage</div></div><div class="kpi">
+    <div class="kpi-value">2</div>
+    <div class="kpi-label">servers</div></div><div class="kpi">
+    <div class="kpi-value">12</div>
+    <div class="kpi-label">mounts scanned</div></div><div class="kpi">
+    <div class="kpi-value">2026-07-12 13:36:54+03:00</div>
+    <div class="kpi-label">last scan</div></div></div>
+  <div id="server-panels"><section class="panel">
+      <div class="panel-head"><div>
+        <h2>so01</h2>
+        <div class="panel-sub">so01.iem.technion.ac.il ·
+          scanned 2026-07-12T13:36:54+03:00</div>
+      </div>
+      <div class="panel-sub">total used <strong>28.9 TiB</strong></div></div>
+      <div class="panel-grid">
+        <div class="chart-block"><h3>Usage by mount</h3>
+          <div class="bars"><div class="bar-row">
+    <div class="bar-label" title="/strg/E">/strg/E</div>
+    <div class="bar-track"><div class="bar-fill" style="width:86.64%;background:#2a78d6"></div></div>
+    <div class="bar-value">12.5 TiB used · 1.2 TiB left · 8.3% left</div></div><div class="bar-row">
+    <div class="bar-label" title="/strg/D">/strg/D</div>
+    <div class="bar-track"><div class="bar-fill" style="width:93.22%;background:#1baf7a"></div></div>
+    <div class="bar-value">8.4 TiB used · 160.9 GiB left · 1.7% left</div></div><div class="bar-row">
+    <div class="bar-label" title="/strg/C">/strg/C</div>
+    <div class="bar-track"><div class="bar-fill" style="width:79.49%;background:#eda100"></div></div>
+    <div class="bar-value">7.2 TiB used · 1.4 TiB left · 15.5% left</div></div><div class="bar-row">
+    <div class="bar-label" title="/data">/data</div>
+    <div class="bar-track"><div class="bar-fill" style="width:91.42%;background:#008300"></div></div>
+    <div class="bar-value">3.3 TiB used · 128.2 GiB left · 3.5% left</div></div><div class="bar-row">
+    <div class="bar-label" title="/">/</div>
+    <div class="bar-track"><div class="bar-fill" style="width:21.86%;background:#4a3aa7"></div></div>
+    <div class="bar-value">102.2 GiB used · 341.4 GiB left · 73.0% left</div></div><div class="bar-row">
+    <div class="bar-label" title="/data_ssd">/data_ssd</div>
+    <div class="bar-track"><div class="bar-fill" style="width:47.53%;background:#e34948"></div></div>
+    <div class="bar-value">445.7 GiB used · 444.4 GiB left · 47.4% left</div></div></div></div>
+        <div class="chart-block"><h3>Top folders <span class="muted">(largest 12)</span></h3>
+          <div class="bars"><div class="bar-row">
+    <div class="bar-label" title="/strg/E/shared-data/Shahaf">Shahaf</div>
+    <div class="bar-track"><div class="bar-fill" style="width:100.00%;background:#2a78d6"></div></div>
+    <div class="bar-value">6.2 TiB · 21.5%</div></div><div class="bar-row">
+    <div class="bar-label" title="/strg/E/shared-data/nitzan_projects">nitzan_projects</div>
+    <div class="bar-track"><div class="bar-fill" style="width:52.35%;background:#2a78d6"></div></div>
+    <div class="bar-value">3.3 TiB · 11.2%</div></div><div class="bar-row">
+    <div class="bar-label" title="/strg/C/or-berman">or-berman</div>
+    <div class="bar-track"><div class="bar-fill" style="width:37.07%;background:#eda100"></div></div>
+    <div class="bar-value">2.3 TiB · 8.0%</div></div><div class="bar-row">
+    <div class="bar-label" title="/strg/C/shared-data/Action_Segmentation">Action_Segmentation</div>
+    <div class="bar-track"><div class="bar-fill" style="width:33.24%;background:#eda100"></div></div>
+    <div class="bar-value">2.1 TiB · 7.1%</div></div><div class="bar-row">
+    <div class="bar-label" title="/strg/D/shared-data/Additional_datasets">Additional_datasets</div>
+    <div class="bar-track"><div class="bar-fill" style="width:28.79%;background:#1baf7a"></div></div>
+    <div class="bar-value">1.8 TiB · 6.2%</div></div><div class="bar-row">
+    <div class="bar-label" title="/strg/D/shared-data/Activity Datasets">Activity Datasets</div>
+    <div class="bar-track"><div class="bar-fill" style="width:22.69%;background:#1baf7a"></div></div>
+    <div class="bar-value">1.4 TiB · 4.9%</div></div><div class="bar-row">
+    <div class="bar-label" title="/strg/D/shared-data/Assembly101">Assembly101</div>
+    <div class="bar-track"><div class="bar-fill" style="width:17.77%;background:#1baf7a"></div></div>
+    <div class="bar-value">1.1 TiB · 3.8%</div></div><div class="bar-row">
+    <div class="bar-label" title="/data/home">home</div>
+    <div class="bar-track"><div class="bar-fill" style="width:16.16%;background:#008300"></div></div>
+    <div class="bar-value">1.0 TiB · 3.5%</div></div><div class="bar-row">
+    <div class="bar-label" title="/strg/E/shared-data/AIxSuture">AIxSuture</div>
+    <div class="bar-track"><div class="bar-fill" style="width:11.14%;background:#2a78d6"></div></div>
+    <div class="bar-value">708.2 GiB · 2.4%</div></div><div class="bar-row">
+    <div class="bar-label" title="/strg/D/shared-data/TSM_features">TSM_features</div>
+    <div class="bar-track"><div class="bar-fill" style="width:10.09%;background:#1baf7a"></div></div>
+    <div class="bar-value">642.0 GiB · 2.2%</div></div><div class="bar-row">
+    <div class="bar-label" title="/strg/D/shared-data/TSM">TSM</div>
+    <div class="bar-track"><div class="bar-fill" style="width:10.01%;background:#1baf7a"></div></div>
+    <div class="bar-value">636.7 GiB · 2.2%</div></div><div class="bar-row">
+    <div class="bar-label" title="/strg/E/shared-data/Shahaf_and_Fadi">Shahaf_and_Fadi</div>
+    <div class="bar-track"><div class="bar-fill" style="width:9.98%;background:#2a78d6"></div></div>
+    <div class="bar-value">635.0 GiB · 2.1%</div></div></div></div>
+      </div></section><section class="panel">
+      <div class="panel-head"><div>
+        <h2>so02</h2>
+        <div class="panel-sub">so02.iem.technion.ac.il ·
+          scanned 2026-07-12T13:32:05+03:00</div>
+      </div>
+      <div class="panel-sub">total used <strong>30.4 TiB</strong></div></div>
+      <div class="panel-grid">
+        <div class="chart-block"><h3>Usage by mount</h3>
+          <div class="bars"><div class="bar-row">
+    <div class="bar-label" title="/strg/E">/strg/E</div>
+    <div class="bar-track"><div class="bar-fill" style="width:93.61%;background:#2a78d6"></div></div>
+    <div class="bar-value">13.5 TiB used · 199.2 GiB left · 1.3% left</div></div><div class="bar-row">
+    <div class="bar-label" title="/strg/D">/strg/D</div>
+    <div class="bar-track"><div class="bar-fill" style="width:94.10%;background:#1baf7a"></div></div>
+    <div class="bar-value">8.5 TiB used · 79.0 GiB left · 0.9% left</div></div><div class="bar-row">
+    <div class="bar-label" title="/strg/C">/strg/C</div>
+    <div class="bar-track"><div class="bar-fill" style="width:94.01%;background:#eda100"></div></div>
+    <div class="bar-value">8.5 TiB used · 88.1 GiB left · 1.0% left</div></div><div class="bar-row">
+    <div class="bar-label" title="/data">/data</div>
+    <div class="bar-track"><div class="bar-fill" style="width:91.31%;background:#008300"></div></div>
+    <div class="bar-value">3.3 TiB used · 132.3 GiB left · 3.6% left</div></div><div class="bar-row">
+    <div class="bar-label" title="/">/</div>
+    <div class="bar-track"><div class="bar-fill" style="width:17.14%;background:#4a3aa7"></div></div>
+    <div class="bar-value">80.1 GiB used · 363.5 GiB left · 77.8% left</div></div><div class="bar-row">
+    <div class="bar-label" title="/data_ssd">/data_ssd</div>
+    <div class="bar-track"><div class="bar-fill" style="width:18.52%;background:#e34948"></div></div>
+    <div class="bar-value">173.7 GiB used · 716.4 GiB left · 76.4% left</div></div></div></div>
+        <div class="chart-block"><h3>Top folders <span class="muted">(largest 12)</span></h3>
+          <div class="bars"><div class="bar-row">
+    <div class="bar-label" title="/strg/D/shared-data/UW_2023">UW_2023</div>
+    <div class="bar-track"><div class="bar-fill" style="width:100.00%;background:#1baf7a"></div></div>
+    <div class="bar-value">4.8 TiB · 15.7%</div></div><div class="bar-row">
+    <div class="bar-label" title="/strg/E/shared-data/assembly101">assembly101</div>
+    <div class="bar-track"><div class="bar-fill" style="width:80.06%;background:#2a78d6"></div></div>
+    <div class="bar-value">3.8 TiB · 12.6%</div></div><div class="bar-row">
+    <div class="bar-label" title="/strg/E/shared-data/INJECTIONS">INJECTIONS</div>
+    <div class="bar-track"><div class="bar-fill" style="width:72.04%;background:#2a78d6"></div></div>
+    <div class="bar-value">3.4 TiB · 11.3%</div></div><div class="bar-row">
+    <div class="bar-label" title="/strg/D/shared-data/MVPSP_DATASET">MVPSP_DATASET</div>
+    <div class="bar-track"><div class="bar-fill" style="width:60.59%;background:#1baf7a"></div></div>
+    <div class="bar-value">2.9 TiB · 9.5%</div></div><div class="bar-row">
+    <div class="bar-label" title="/strg/C/shared-data/ACS_2019_data">ACS_2019_data</div>
+    <div class="bar-track"><div class="bar-fill" style="width:53.52%;background:#eda100"></div></div>
+    <div class="bar-value">2.6 TiB · 8.4%</div></div><div class="bar-row">
+    <div class="bar-label" title="/strg/C/shared-data/assembly101_outputs">assembly101_outputs</div>
+    <div class="bar-track"><div class="bar-fill" style="width:27.38%;background:#eda100"></div></div>
+    <div class="bar-value">1.3 TiB · 4.3%</div></div><div class="bar-row">
+    <div class="bar-label" title="/strg/C/shared-data/Activity Datasets">Activity Datasets</div>
+    <div class="bar-track"><div class="bar-fill" style="width:23.48%;background:#eda100"></div></div>
+    <div class="bar-value">1.1 TiB · 3.7%</div></div><div class="bar-row">
+    <div class="bar-label" title="/strg/E/shared-data/INJECTIONS_SIM">INJECTIONS_SIM</div>
+    <div class="bar-track"><div class="bar-fill" style="width:22.80%;background:#2a78d6"></div></div>
+    <div class="bar-value">1.1 TiB · 3.6%</div></div><div class="bar-row">
+    <div class="bar-label" title="/strg/E/shared-data/talaloni">talaloni</div>
+    <div class="bar-track"><div class="bar-fill" style="width:18.87%;background:#2a78d6"></div></div>
+    <div class="bar-value">924.0 GiB · 3.0%</div></div><div class="bar-row">
+    <div class="bar-label" title="/data/home">home</div>
+    <div class="bar-track"><div class="bar-fill" style="width:16.88%;background:#008300"></div></div>
+    <div class="bar-value">826.9 GiB · 2.7%</div></div><div class="bar-row">
+    <div class="bar-label" title="/strg/E/shared-data/leg_suture_data">leg_suture_data</div>
+    <div class="bar-track"><div class="bar-fill" style="width:16.52%;background:#2a78d6"></div></div>
+    <div class="bar-value">809.1 GiB · 2.6%</div></div><div class="bar-row">
+    <div class="bar-label" title="/strg/E/shared-data/Anesthesia Event 2025">Anesthesia Event 2025</div>
+    <div class="bar-track"><div class="bar-fill" style="width:13.18%;background:#2a78d6"></div></div>
+    <div class="bar-value">645.6 GiB · 2.1%</div></div></div></div>
+      </div></section></div>
+
+  <section class="panel">
+    <div class="panel-head"><div>
+      <h2>Tape coverage</h2>
+      <div class="panel-sub" id="coverage-sub">Server directories vs the archive database · DB aggregated 2026-07-12 18:21:34 · top layer, shared-data depth 2</div>
+    </div>
+    </div>
+    <div id="coverage"><div class="cov-server">
+      <div class="panel-head" style="margin-top:16px">
+        <h2 style="font-size:16px;margin:0">so01</h2>
+        <div class="panel-sub">scanned 2026-07-12T13:36:54+03:00 · last backup 2026-07-12</div>
+      </div><div class="cov-mount">
+      <div class="cov-mount-head"><h3>/strg/D</h3><span class="cov-mount-sum">Hot DB: 1.1 TiB,
+      7,320,920 files ·
+      8.1 TiB on server <span class="cov-bar"><span class="cov-track"><span class="cov-fill s-partial" style="width:13.4%"></span></span>
+     <span>
+       13.4%</span></span></span></div>
+      <div class="cov-scroll"><table class="cov">
+        <thead><tr>
+          <th>Directory</th><th class="num">On server</th>
+          <th class="num" title="Recursive file size recorded in files_index">Hot DB size</th>
+          <th class="num">Coverage</th>
+          <th class="num" title="Recursive file count recorded in files_index">Hot DB files</th>
+          <th class="num">Last backup</th><th>Status</th>
+        </tr></thead>
+        <tbody><tr class="depth-0">
+    <td class="dir" style="padding-left:10px" title="/strg/D">/strg/D</td>
+    <td class="num">8.1 TiB</td>
+    <td class="num">1.1 TiB</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-partial" style="width:13.4%"></span></span>
+     <span>
+       13.4%</span></span></td>
+    <td class="num">7,320,920</td>
+    <td class="num muted">2026-07-12</td>
+    <td><span class="badge partial">partial</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/strg/D/lost+found">lost+found</td>
+    <td class="num">16.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/strg/D/shared-data">shared-data</td>
+    <td class="num">8.1 TiB</td>
+    <td class="num">1.1 TiB</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-partial" style="width:13.4%"></span></span>
+     <span>
+       13.4%</span></span></td>
+    <td class="num">7,320,920</td>
+    <td class="num muted">2026-07-12</td>
+    <td><span class="badge partial">partial</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/50salads">50salads</td>
+    <td class="num">514.7 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/APAS">APAS</td>
+    <td class="num">81.9 GiB</td>
+    <td class="num">75.3 GiB</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-full" style="width:100.0%"></span></span>
+     <span>
+       100.0%</span></span></td>
+    <td class="num">2,998,214</td>
+    <td class="num muted">2026-07-10</td>
+    <td><span class="badge full">full</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/Activity Datasets">Activity Datasets</td>
+    <td class="num">1.4 TiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/Additional_datasets">Additional_datasets</td>
+    <td class="num">1.8 TiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/Assembly probs">Assembly probs</td>
+    <td class="num">6.9 GiB</td>
+    <td class="num">6.8 GiB</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-full" style="width:100.0%"></span></span>
+     <span>
+       100.0%</span></span></td>
+    <td class="num">78,798</td>
+    <td class="num muted">2026-07-08</td>
+    <td><span class="badge full">full</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/Assembly101">Assembly101</td>
+    <td class="num">1.1 TiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/TSM">TSM</td>
+    <td class="num">636.7 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/TSM_features">TSM_features</td>
+    <td class="num">642.0 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/TSM_my_features">TSM_my_features</td>
+    <td class="num">428.7 GiB</td>
+    <td class="num">12.4 GiB</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-partial" style="width:2.9%"></span></span>
+     <span>
+       2.9%</span></span></td>
+    <td class="num">1,599,992</td>
+    <td class="num muted">2026-07-12</td>
+    <td><span class="badge partial">partial</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/TSM_to_delete">TSM_to_delete</td>
+    <td class="num">20.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/cholec80">cholec80</td>
+    <td class="num">577.5 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/cholecT50">cholecT50</td>
+    <td class="num">117.7 GiB</td>
+    <td class="num">117.5 GiB</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-full" style="width:100.0%"></span></span>
+     <span>
+       100.0%</span></span></td>
+    <td class="num">100,919</td>
+    <td class="num muted">2026-07-10</td>
+    <td><span class="badge full">full</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/haven">haven</td>
+    <td class="num">235.8 GiB</td>
+    <td class="num">235.8 GiB</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-full" style="width:100.0%"></span></span>
+     <span>
+       100.0%</span></span></td>
+    <td class="num">679</td>
+    <td class="num muted">2026-07-11</td>
+    <td><span class="badge full">full</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/haven_indoor">haven_indoor</td>
+    <td class="num">3.3 GiB</td>
+    <td class="num">3.3 GiB</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-full" style="width:100.0%"></span></span>
+     <span>
+       100.0%</span></span></td>
+    <td class="num">138</td>
+    <td class="num muted">2026-07-08</td>
+    <td><span class="badge full">full</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/jigsaws">jigsaws</td>
+    <td class="num">171.4 GiB</td>
+    <td class="num">167.6 GiB</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-full" style="width:100.0%"></span></span>
+     <span>
+       100.0%</span></span></td>
+    <td class="num">1,323,147</td>
+    <td class="num muted">2026-07-11</td>
+    <td><span class="badge full">full</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/op">op</td>
+    <td class="num">21.8 GiB</td>
+    <td class="num">21.4 GiB</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-full" style="width:100.0%"></span></span>
+     <span>
+       100.0%</span></span></td>
+    <td class="num">230,206</td>
+    <td class="num muted">2026-07-08</td>
+    <td><span class="badge full">full</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/suture_1">suture_1</td>
+    <td class="num">104.3 GiB</td>
+    <td class="num">102.8 GiB</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-partial" style="width:98.5%"></span></span>
+     <span>
+       98.5%</span></span></td>
+    <td class="num">988,811</td>
+    <td class="num muted">2026-07-10</td>
+    <td><span class="badge partial">partial</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/ziped_TSM_features">ziped_TSM_features</td>
+    <td class="num">375.0 GiB</td>
+    <td class="num">375.0 GiB</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-full" style="width:100.0%"></span></span>
+     <span>
+       100.0%</span></span></td>
+    <td class="num">16</td>
+    <td class="num muted">2026-07-11</td>
+    <td><span class="badge full">full</span></td>
+  </tr></tbody>
+      </table></div></div><div class="cov-mount">
+      <div class="cov-mount-head"><h3>/strg/E</h3><span class="cov-mount-sum">Hot DB: 505.3 GiB,
+      150,100 files ·
+      12.5 TiB on server <span class="cov-bar"><span class="cov-track"><span class="cov-fill s-partial" style="width:4.0%"></span></span>
+     <span>
+       4.0%</span></span></span></div>
+      <div class="cov-scroll"><table class="cov">
+        <thead><tr>
+          <th>Directory</th><th class="num">On server</th>
+          <th class="num" title="Recursive file size recorded in files_index">Hot DB size</th>
+          <th class="num">Coverage</th>
+          <th class="num" title="Recursive file count recorded in files_index">Hot DB files</th>
+          <th class="num">Last backup</th><th>Status</th>
+        </tr></thead>
+        <tbody><tr class="depth-0">
+    <td class="dir" style="padding-left:10px" title="/strg/E">/strg/E</td>
+    <td class="num">12.5 TiB</td>
+    <td class="num">505.3 GiB</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-partial" style="width:4.0%"></span></span>
+     <span>
+       4.0%</span></span></td>
+    <td class="num">150,100</td>
+    <td class="num muted">2026-07-06</td>
+    <td><span class="badge partial">partial</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/strg/E/lost+found">lost+found</td>
+    <td class="num">16.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/strg/E/or-berman">or-berman</td>
+    <td class="num">314.4 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/strg/E/shared-data">shared-data</td>
+    <td class="num">12.2 TiB</td>
+    <td class="num">505.3 GiB</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-partial" style="width:4.1%"></span></span>
+     <span>
+       4.1%</span></span></td>
+    <td class="num">150,100</td>
+    <td class="num muted">2026-07-06</td>
+    <td><span class="badge partial">partial</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/AIxSuture">AIxSuture</td>
+    <td class="num">708.2 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/AIxSuture first output">AIxSuture first output</td>
+    <td class="num">3.3 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/AIxSuture.HANDS.yolov8">AIxSuture.HANDS.yolov8</td>
+    <td class="num">49.2 MiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/AIxSuture.L_R_HANDS.yolov8">AIxSuture.L_R_HANDS.yolov8</td>
+    <td class="num">48.7 MiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/AIxSuture.Tools_n_Hands_v2.yolov8">AIxSuture.Tools_n_Hands_v2.yolov8</td>
+    <td class="num">48.8 MiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/INJECTIONS">INJECTIONS</td>
+    <td class="num">50.6 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/SA-1B">SA-1B</td>
+    <td class="num">21.5 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/Shahaf">Shahaf</td>
+    <td class="num">6.2 TiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/Shahaf_and_Fadi">Shahaf_and_Fadi</td>
+    <td class="num">635.0 GiB</td>
+    <td class="num">505.3 GiB</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-partial" style="width:79.6%"></span></span>
+     <span>
+       79.6%</span></span></td>
+    <td class="num">150,100</td>
+    <td class="num muted">2026-07-06</td>
+    <td><span class="badge partial">partial</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/Simulator-stitch-detector.yolov8">Simulator-stitch-detector.yolov8</td>
+    <td class="num">2.6 MiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/TALTUL_INJECTIONS">TALTUL_INJECTIONS</td>
+    <td class="num">1.1 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/UW_2024_big">UW_2024_big</td>
+    <td class="num">648.6 MiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/UW_2025_July">UW_2025_July</td>
+    <td class="num">15.5 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/UW_YOLO_dataset">UW_YOLO_dataset</td>
+    <td class="num">28.8 MiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/adi">adi</td>
+    <td class="num">199.4 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/bop-benchmark">bop-benchmark</td>
+    <td class="num">537.6 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/check_mvpsp_nitzan">check_mvpsp_nitzan</td>
+    <td class="num">7.6 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/d.yehezkel">d.yehezkel</td>
+    <td class="num">286.8 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/docker_miccai">docker_miccai</td>
+    <td class="num">452.5 MiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/docker_miccai_idan">docker_miccai_idan</td>
+    <td class="num">448.9 MiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/docker_miccai_latest">docker_miccai_latest</td>
+    <td class="num">111.9 MiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/docker_miccai_roi">docker_miccai_roi</td>
+    <td class="num">111.7 MiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/docker_miccai_roi_local">docker_miccai_roi_local</td>
+    <td class="num">153.0 MiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/nitzan_projects">nitzan_projects</td>
+    <td class="num">3.3 TiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/ori">ori</td>
+    <td class="num">151.4 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/spektor">spektor</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/talaloni">talaloni</td>
+    <td class="num">1.2 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/temp">temp</td>
+    <td class="num">60.5 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/uw_data_new">uw_data_new</td>
+    <td class="num">8.4 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/uw_saved_regression_weights">uw_saved_regression_weights</td>
+    <td class="num">8.9 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/uw_skill_assessment_dataset">uw_skill_assessment_dataset</td>
+    <td class="num">72.3 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr></tbody>
+      </table></div></div><div class="cov-mount">
+      <div class="cov-mount-head"><h3>/data</h3><span class="cov-mount-sum">Hot DB: 0.0 B,
+      0 files ·
+      1.0 TiB on server <span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></span></div>
+      <div class="cov-scroll"><table class="cov">
+        <thead><tr>
+          <th>Directory</th><th class="num">On server</th>
+          <th class="num" title="Recursive file size recorded in files_index">Hot DB size</th>
+          <th class="num">Coverage</th>
+          <th class="num" title="Recursive file count recorded in files_index">Hot DB files</th>
+          <th class="num">Last backup</th><th>Status</th>
+        </tr></thead>
+        <tbody><tr class="depth-0">
+    <td class="dir" style="padding-left:10px" title="/data">/data</td>
+    <td class="num">1.0 TiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/data/home">home</td>
+    <td class="num">1.0 TiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/data/lost+found">lost+found</td>
+    <td class="num">16.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/data/var">var</td>
+    <td class="num">12.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr></tbody>
+      </table></div></div><div class="cov-mount">
+      <div class="cov-mount-head"><h3>/strg/C</h3><span class="cov-mount-sum">Hot DB: 0.0 B,
+      0 files ·
+      7.2 TiB on server <span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></span></div>
+      <div class="cov-scroll"><table class="cov">
+        <thead><tr>
+          <th>Directory</th><th class="num">On server</th>
+          <th class="num" title="Recursive file size recorded in files_index">Hot DB size</th>
+          <th class="num">Coverage</th>
+          <th class="num" title="Recursive file count recorded in files_index">Hot DB files</th>
+          <th class="num">Last backup</th><th>Status</th>
+        </tr></thead>
+        <tbody><tr class="depth-0">
+    <td class="dir" style="padding-left:10px" title="/strg/C">/strg/C</td>
+    <td class="num">7.2 TiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/strg/C/lost+found">lost+found</td>
+    <td class="num">16.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/strg/C/or-berman">or-berman</td>
+    <td class="num">2.3 TiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/strg/C/shared-data">shared-data</td>
+    <td class="num">4.9 TiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/Action_Segmentation">Action_Segmentation</td>
+    <td class="num">2.1 TiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/HANDAL">HANDAL</td>
+    <td class="num">24.7 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/bedward">bedward</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/clipart">clipart</td>
+    <td class="num">55.1 MiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/coco">coco</td>
+    <td class="num">71.0 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/comic">comic</td>
+    <td class="num">9.4 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/imagenet">imagenet</td>
+    <td class="num">316.0 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/kitti">kitti</td>
+    <td class="num">29.3 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/openImages">openImages</td>
+    <td class="num">24.2 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/orrubin">orrubin</td>
+    <td class="num">215.5 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/sivanniv">sivanniv</td>
+    <td class="num">69.9 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/spektor">spektor</td>
+    <td class="num">274.7 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/ssaricha_backup">ssaricha_backup</td>
+    <td class="num">398.3 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/uvo">uvo</td>
+    <td class="num">304.2 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/voc">voc</td>
+    <td class="num">9.3 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/watercolor">watercolor</td>
+    <td class="num">3.8 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr></tbody>
+      </table></div></div><div class="cov-mount">
+      <div class="cov-mount-head"><h3>/data_ssd</h3><span class="cov-mount-sum">Hot DB: 0.0 B,
+      0 files ·
+      28.0 KiB on server <span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></span></div>
+      <div class="cov-scroll"><table class="cov">
+        <thead><tr>
+          <th>Directory</th><th class="num">On server</th>
+          <th class="num" title="Recursive file size recorded in files_index">Hot DB size</th>
+          <th class="num">Coverage</th>
+          <th class="num" title="Recursive file count recorded in files_index">Hot DB files</th>
+          <th class="num">Last backup</th><th>Status</th>
+        </tr></thead>
+        <tbody><tr class="depth-0">
+    <td class="dir" style="padding-left:10px" title="/data_ssd">/data_ssd</td>
+    <td class="num">28.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/data_ssd/lost+found">lost+found</td>
+    <td class="num">16.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/data_ssd/shared-data">shared-data</td>
+    <td class="num">8.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/data_ssd/shared-data/scalpel">scalpel</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr></tbody>
+      </table></div></div><div class="cov-mount">
+      <div class="cov-mount-head"><h3>/</h3><span class="cov-mount-sum">Hot DB: 0.0 B,
+      0 files ·
+      100.1 GiB on server <span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></span></div>
+      <div class="cov-scroll"><table class="cov">
+        <thead><tr>
+          <th>Directory</th><th class="num">On server</th>
+          <th class="num" title="Recursive file size recorded in files_index">Hot DB size</th>
+          <th class="num">Coverage</th>
+          <th class="num" title="Recursive file count recorded in files_index">Hot DB files</th>
+          <th class="num">Last backup</th><th>Status</th>
+        </tr></thead>
+        <tbody><tr class="depth-0">
+    <td class="dir" style="padding-left:10px" title="/">/</td>
+    <td class="num">100.1 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">2026-07-12</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/ansible">ansible</td>
+    <td class="num">40.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/boot">boot</td>
+    <td class="num">717.2 MiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/cdrom">cdrom</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/etc">etc</td>
+    <td class="num">7.8 MiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/hcp_cgroup">hcp_cgroup</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/lost+found">lost+found</td>
+    <td class="num">16.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/media">media</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/mnt">mnt</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/opt">opt</td>
+    <td class="num">8.6 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/root">root</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/snap">snap</td>
+    <td class="num">28.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/srv">srv</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/strg">strg</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">2026-07-12</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/tmp">tmp</td>
+    <td class="num">46.6 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/usr">usr</td>
+    <td class="num">28.1 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/var">var</td>
+    <td class="num">8.0 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr></tbody>
+      </table></div></div></div><div class="cov-server">
+      <div class="panel-head" style="margin-top:16px">
+        <h2 style="font-size:16px;margin:0">so02</h2>
+        <div class="panel-sub">scanned 2026-07-12T13:32:05+03:00 · last backup 2026-06-22</div>
+      </div><div class="cov-mount">
+      <div class="cov-mount-head"><h3>/strg/D</h3><span class="cov-mount-sum">Hot DB: 0.0 B,
+      0 files ·
+      8.5 TiB on server <span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></span></div>
+      <div class="cov-scroll"><table class="cov">
+        <thead><tr>
+          <th>Directory</th><th class="num">On server</th>
+          <th class="num" title="Recursive file size recorded in files_index">Hot DB size</th>
+          <th class="num">Coverage</th>
+          <th class="num" title="Recursive file count recorded in files_index">Hot DB files</th>
+          <th class="num">Last backup</th><th>Status</th>
+        </tr></thead>
+        <tbody><tr class="depth-0">
+    <td class="dir" style="padding-left:10px" title="/strg/D">/strg/D</td>
+    <td class="num">8.5 TiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/strg/D/lost+found">lost+found</td>
+    <td class="num">16.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/strg/D/shared-data">shared-data</td>
+    <td class="num">8.5 TiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/Activity Datasets">Activity Datasets</td>
+    <td class="num">38.6 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/Dolev">Dolev</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/Eddie">Eddie</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/Ido">Ido</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/MVPSP_DATASET">MVPSP_DATASET</td>
+    <td class="num">2.9 TiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/UW_2023">UW_2023</td>
+    <td class="num">4.8 TiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/UW_2023_action_segmentation">UW_2023_action_segmentation</td>
+    <td class="num">201.9 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/UW_2023_action_segmentation2">UW_2023_action_segmentation2</td>
+    <td class="num">201.9 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/UW_2024">UW_2024</td>
+    <td class="num">223.5 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/imagenet">imagenet</td>
+    <td class="num">164.0 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/D/shared-data/ori">ori</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr></tbody>
+      </table></div></div><div class="cov-mount">
+      <div class="cov-mount-head"><h3>/strg/E</h3><span class="cov-mount-sum">Hot DB: 6.7 TiB,
+      4,252,372 files ·
+      12.9 TiB on server <span class="cov-bar"><span class="cov-track"><span class="cov-fill s-partial" style="width:52.2%"></span></span>
+     <span>
+       52.2%</span></span></span></div>
+      <div class="cov-scroll"><table class="cov">
+        <thead><tr>
+          <th>Directory</th><th class="num">On server</th>
+          <th class="num" title="Recursive file size recorded in files_index">Hot DB size</th>
+          <th class="num">Coverage</th>
+          <th class="num" title="Recursive file count recorded in files_index">Hot DB files</th>
+          <th class="num">Last backup</th><th>Status</th>
+        </tr></thead>
+        <tbody><tr class="depth-0">
+    <td class="dir" style="padding-left:10px" title="/strg/E">/strg/E</td>
+    <td class="num">12.9 TiB</td>
+    <td class="num">6.7 TiB</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-partial" style="width:52.2%"></span></span>
+     <span>
+       52.2%</span></span></td>
+    <td class="num">4,252,372</td>
+    <td class="num muted">2026-06-22</td>
+    <td><span class="badge partial">partial</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/strg/E/lost+found">lost+found</td>
+    <td class="num">16.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/strg/E/shared-data">shared-data</td>
+    <td class="num">12.9 TiB</td>
+    <td class="num">6.7 TiB</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-partial" style="width:52.2%"></span></span>
+     <span>
+       52.2%</span></span></td>
+    <td class="num">4,252,372</td>
+    <td class="num muted">2026-06-22</td>
+    <td><span class="badge partial">partial</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/Anesthesia Event 2025">Anesthesia Event 2025</td>
+    <td class="num">645.6 GiB</td>
+    <td class="num">645.6 GiB</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-full" style="width:100.0%"></span></span>
+     <span>
+       100.0%</span></span></td>
+    <td class="num">153</td>
+    <td class="num muted">2026-06-22</td>
+    <td><span class="badge full">full</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/FLS cut Circle">FLS cut Circle</td>
+    <td class="num">107.1 GiB</td>
+    <td class="num">107.1 GiB</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-full" style="width:100.0%"></span></span>
+     <span>
+       100.0%</span></span></td>
+    <td class="num">410</td>
+    <td class="num muted">2026-06-22</td>
+    <td><span class="badge full">full</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/INJECTIONS">INJECTIONS</td>
+    <td class="num">3.4 TiB</td>
+    <td class="num">3.4 TiB</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-partial" style="width:99.9%"></span></span>
+     <span>
+       99.9%</span></span></td>
+    <td class="num">2,262,754</td>
+    <td class="num muted">2026-06-22</td>
+    <td><span class="badge partial">partial</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/INJECTIONS_SIM">INJECTIONS_SIM</td>
+    <td class="num">1.1 TiB</td>
+    <td class="num">1.1 TiB</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-full" style="width:100.0%"></span></span>
+     <span>
+       100.0%</span></span></td>
+    <td class="num">753,159</td>
+    <td class="num muted">2026-06-22</td>
+    <td><span class="badge full">full</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/Shahaf">Shahaf</td>
+    <td class="num">159.8 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/Shahaf_and_Fadi">Shahaf_and_Fadi</td>
+    <td class="num">635.0 GiB</td>
+    <td class="num">634.3 GiB</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-full" style="width:100.0%"></span></span>
+     <span>
+       100.0%</span></span></td>
+    <td class="num">299,045</td>
+    <td class="num muted">2026-06-22</td>
+    <td><span class="badge full">full</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/Shahaf_and_Fadi_2">Shahaf_and_Fadi_2</td>
+    <td class="num">151.5 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/UW_datasets">UW_datasets</td>
+    <td class="num">22.9 GiB</td>
+    <td class="num">22.9 GiB</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-full" style="width:100.0%"></span></span>
+     <span>
+       100.0%</span></span></td>
+    <td class="num">78</td>
+    <td class="num muted">2026-06-16</td>
+    <td><span class="badge full">full</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/adi">adi</td>
+    <td class="num">112.0 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/assembly101">assembly101</td>
+    <td class="num">3.8 TiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/assembly101_outputs">assembly101_outputs</td>
+    <td class="num">77.2 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/d.yehezkel">d.yehezkel</td>
+    <td class="num">57.4 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/for_ori">for_ori</td>
+    <td class="num">17.0 GiB</td>
+    <td class="num">16.9 GiB</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-full" style="width:100.0%"></span></span>
+     <span>
+       100.0%</span></span></td>
+    <td class="num">40,559</td>
+    <td class="num muted">2026-06-22</td>
+    <td><span class="badge full">full</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/gabrielg">gabrielg</td>
+    <td class="num">272.3 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/leg_suture_data">leg_suture_data</td>
+    <td class="num">809.1 GiB</td>
+    <td class="num">807.6 GiB</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-full" style="width:100.0%"></span></span>
+     <span>
+       100.0%</span></span></td>
+    <td class="num">880,609</td>
+    <td class="num muted">2026-06-22</td>
+    <td><span class="badge full">full</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/nitzan_projects">nitzan_projects</td>
+    <td class="num">500.2 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/ori">ori</td>
+    <td class="num">81.4 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/tal_old_projects">tal_old_projects</td>
+    <td class="num">11.8 GiB</td>
+    <td class="num">11.7 GiB</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-full" style="width:100.0%"></span></span>
+     <span>
+       100.0%</span></span></td>
+    <td class="num">15,605</td>
+    <td class="num muted">2026-06-22</td>
+    <td><span class="badge full">full</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/talaloni">talaloni</td>
+    <td class="num">924.0 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/E/shared-data/temp">temp</td>
+    <td class="num">27.7 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr></tbody>
+      </table></div></div><div class="cov-mount">
+      <div class="cov-mount-head"><h3>/data</h3><span class="cov-mount-sum">Hot DB: 0.0 B,
+      0 files ·
+      826.9 GiB on server <span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></span></div>
+      <div class="cov-scroll"><table class="cov">
+        <thead><tr>
+          <th>Directory</th><th class="num">On server</th>
+          <th class="num" title="Recursive file size recorded in files_index">Hot DB size</th>
+          <th class="num">Coverage</th>
+          <th class="num" title="Recursive file count recorded in files_index">Hot DB files</th>
+          <th class="num">Last backup</th><th>Status</th>
+        </tr></thead>
+        <tbody><tr class="depth-0">
+    <td class="dir" style="padding-left:10px" title="/data">/data</td>
+    <td class="num">826.9 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/data/home">home</td>
+    <td class="num">826.9 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/data/lost+found">lost+found</td>
+    <td class="num">16.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr></tbody>
+      </table></div></div><div class="cov-mount">
+      <div class="cov-mount-head"><h3>/strg/C</h3><span class="cov-mount-sum">Hot DB: 0.0 B,
+      0 files ·
+      8.1 TiB on server <span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></span></div>
+      <div class="cov-scroll"><table class="cov">
+        <thead><tr>
+          <th>Directory</th><th class="num">On server</th>
+          <th class="num" title="Recursive file size recorded in files_index">Hot DB size</th>
+          <th class="num">Coverage</th>
+          <th class="num" title="Recursive file count recorded in files_index">Hot DB files</th>
+          <th class="num">Last backup</th><th>Status</th>
+        </tr></thead>
+        <tbody><tr class="depth-0">
+    <td class="dir" style="padding-left:10px" title="/strg/C">/strg/C</td>
+    <td class="num">8.1 TiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/strg/C/lost+found">lost+found</td>
+    <td class="num">16.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/strg/C/shared-data">shared-data</td>
+    <td class="num">8.1 TiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/ACS_2019_data">ACS_2019_data</td>
+    <td class="num">2.6 TiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/Action_Segmentation">Action_Segmentation</td>
+    <td class="num">427.0 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/Activity Datasets">Activity Datasets</td>
+    <td class="num">1.1 TiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/CUB_200_2011">CUB_200_2011</td>
+    <td class="num">1.2 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/Dolev">Dolev</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/Eddie">Eddie</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/Ido">Ido</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/ImageNetVID">ImageNetVID</td>
+    <td class="num">119.8 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/KITTI">KITTI</td>
+    <td class="num">444.1 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/OneHand10K">OneHand10K</td>
+    <td class="num">9.9 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/Peg-Transfer">Peg-Transfer</td>
+    <td class="num">10.2 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/Room_8">Room_8</td>
+    <td class="num">244.2 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/Shahaf_and_Fadi">Shahaf_and_Fadi</td>
+    <td class="num">7.1 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/TSM">TSM</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/UW_surgery_Skill">UW_surgery_Skill</td>
+    <td class="num">462.8 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/YCB_Video_Dataset">YCB_Video_Dataset</td>
+    <td class="num">90.7 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/assembly101_outputs">assembly101_outputs</td>
+    <td class="num">1.3 TiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/clipart">clipart</td>
+    <td class="num">54.6 MiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/coco">coco</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/comic">comic</td>
+    <td class="num">1.1 MiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/d.yehezkel">d.yehezkel</td>
+    <td class="num">34.7 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/imagenet_eig_vecs_8">imagenet_eig_vecs_8</td>
+    <td class="num">586.8 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/kitti">kitti</td>
+    <td class="num">11.7 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/m2cai16">m2cai16</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/objects365">objects365</td>
+    <td class="num">255.4 MiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/openImages">openImages</td>
+    <td class="num">12.1 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/or-berman">or-berman</td>
+    <td class="num">439.5 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/orrubin">orrubin</td>
+    <td class="num">226.2 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/output_dataset_hybrid_from_so01">output_dataset_hybrid_from_so01</td>
+    <td class="num">48.8 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/surgical_hands_dataset">surgical_hands_dataset</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/test_depth_data">test_depth_data</td>
+    <td class="num">85.4 MiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/uvo">uvo</td>
+    <td class="num">26.5 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/vitaldb">vitaldb</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/voc">voc</td>
+    <td class="num">8.5 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/strg/C/shared-data/watercolor">watercolor</td>
+    <td class="num">3.8 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr></tbody>
+      </table></div></div><div class="cov-mount">
+      <div class="cov-mount-head"><h3>/data_ssd</h3><span class="cov-mount-sum">Hot DB: 0.0 B,
+      0 files ·
+      28.0 KiB on server <span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></span></div>
+      <div class="cov-scroll"><table class="cov">
+        <thead><tr>
+          <th>Directory</th><th class="num">On server</th>
+          <th class="num" title="Recursive file size recorded in files_index">Hot DB size</th>
+          <th class="num">Coverage</th>
+          <th class="num" title="Recursive file count recorded in files_index">Hot DB files</th>
+          <th class="num">Last backup</th><th>Status</th>
+        </tr></thead>
+        <tbody><tr class="depth-0">
+    <td class="dir" style="padding-left:10px" title="/data_ssd">/data_ssd</td>
+    <td class="num">28.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/data_ssd/lost+found">lost+found</td>
+    <td class="num">16.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/data_ssd/shared-data">shared-data</td>
+    <td class="num">8.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-2">
+    <td class="dir" style="padding-left:54px" title="/data_ssd/shared-data/scalpel">scalpel</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr></tbody>
+      </table></div></div><div class="cov-mount">
+      <div class="cov-mount-head"><h3>/</h3><span class="cov-mount-sum">Hot DB: 0.0 B,
+      0 files ·
+      70.4 GiB on server <span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></span></div>
+      <div class="cov-scroll"><table class="cov">
+        <thead><tr>
+          <th>Directory</th><th class="num">On server</th>
+          <th class="num" title="Recursive file size recorded in files_index">Hot DB size</th>
+          <th class="num">Coverage</th>
+          <th class="num" title="Recursive file count recorded in files_index">Hot DB files</th>
+          <th class="num">Last backup</th><th>Status</th>
+        </tr></thead>
+        <tbody><tr class="depth-0">
+    <td class="dir" style="padding-left:10px" title="/">/</td>
+    <td class="num">70.4 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">2026-06-22</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/ansible">ansible</td>
+    <td class="num">40.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/boot">boot</td>
+    <td class="num">610.4 MiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/cdrom">cdrom</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/etc">etc</td>
+    <td class="num">7.8 MiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/hcp_cgroup">hcp_cgroup</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/lost+found">lost+found</td>
+    <td class="num">16.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/media">media</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/mnt">mnt</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/opt">opt</td>
+    <td class="num">8.6 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/root">root</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/snap">snap</td>
+    <td class="num">32.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/srv">srv</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/strg">strg</td>
+    <td class="num">4.0 KiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">2026-06-22</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/tmp">tmp</td>
+    <td class="num">18.6 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/usr">usr</td>
+    <td class="num">27.3 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr><tr class="depth-1">
+    <td class="dir" style="padding-left:32px" title="/var">var</td>
+    <td class="num">7.2 GiB</td>
+    <td class="num">0.0 B</td>
+    <td class="num"><span class="cov-bar"><span class="cov-track"><span class="cov-fill s-none" style="width:0.0%"></span></span>
+     <span>
+       0.0%</span></span></td>
+    <td class="num">0</td>
+    <td class="num muted">—</td>
+    <td><span class="badge none">not on tape</span></td>
+  </tr></tbody>
+      </table></div></div></div></div>
+  </section>
+
+  <footer>Storage Map &amp; Analytics · interactive dashboard · data stays on this machine</footer>
+</div><div class="snapshot-note">Static snapshot generated 7/13/2026, 8:35:58 AM</div>
+</body></html>
