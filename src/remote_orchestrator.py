@@ -80,6 +80,7 @@ class RemoteOrchestrator:
         self.chunk_max_files  = cfg.chunk_max_files
         self.metadata_batch_size = cfg.governor_metadata_batch_size
         self.pack_file_batch_size = cfg.governor_pack_file_batch_size
+        self.pack_parallel_workers = cfg.pack_parallel_workers
         self.fetch_parallel_streams = cfg.fetch_parallel_streams
         self.ram_sample_interval = cfg.governor_memory_sample_interval_seconds
         self.heartbeat_secs    = cfg.telegram_heartbeat_minutes * 60
@@ -960,6 +961,7 @@ class RemoteOrchestrator:
                             on_existing='clean',
                             governor=governor,
                             pack_file_batch_size=self.pack_file_batch_size,
+                            pack_parallel_workers=self.pack_parallel_workers,
                         )
                 else:
                     metadata = packer.run(
@@ -973,6 +975,7 @@ class RemoteOrchestrator:
                         on_existing='clean',
                         governor=governor,
                         pack_file_batch_size=self.pack_file_batch_size,
+                        pack_parallel_workers=self.pack_parallel_workers,
                     )
             ram_stats.update(pack_sampler.as_details("pack"))
         except Exception as e:

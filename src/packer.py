@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import zipfile
 from typing import List, Optional
 
@@ -54,42 +55,51 @@ def ensure_staging_space(staging_dir, required_bytes, context="staging"):
 
 
 class StagingSpaceBudget:
-    """Batch-scoped free-space guard that avoids one disk_usage call per file."""
+    """Batch-scoped free-space guard that avoids one disk_usage call per file.
+
+    The reentrant lock makes a single budget instance safe to share across the
+    parallel-pack worker threads (see packer_parallel). It is uncontended and
+    negligible in the default serial path.
+    """
 
     def __init__(self, staging_dir, planned_bytes=0, context="staging"):
         self.staging_dir = staging_dir
         self.planned_bytes = max(0, int(planned_bytes or 0))
         self.context = context
         self.available = 0
+        self._lock = threading.RLock()
         self.refresh()
 
     def refresh(self):
-        os.makedirs(self.staging_dir, exist_ok=True)
-        free = shutil.disk_usage(self.staging_dir).free
-        overhead = _staging_write_overhead(self.planned_bytes)
-        floor = LOCAL_STAGING_RESERVE_BYTES
-        self.available = free - overhead - floor
-        if self.available < 0:
-            raise StagingSpaceError(
-                f"Insufficient local staging space for {self.context}. "
-                f"Need {_gib(self.planned_bytes):.2f} GiB + "
-                f"{_gib(overhead):.2f} GiB overhead + "
-                f"{_gib(floor):.0f} GiB reserve; "
-                f"current free on '{self.staging_dir}': {_gib(free):.2f} GiB."
-            )
-        return free
+        with self._lock:
+            os.makedirs(self.staging_dir, exist_ok=True)
+            free = shutil.disk_usage(self.staging_dir).free
+            overhead = _staging_write_overhead(self.planned_bytes)
+            floor = LOCAL_STAGING_RESERVE_BYTES
+            self.available = free - overhead - floor
+            if self.available < 0:
+                raise StagingSpaceError(
+                    f"Insufficient local staging space for {self.context}. "
+                    f"Need {_gib(self.planned_bytes):.2f} GiB + "
+                    f"{_gib(overhead):.2f} GiB overhead + "
+                    f"{_gib(floor):.0f} GiB reserve; "
+                    f"current free on '{self.staging_dir}': {_gib(free):.2f} GiB."
+                )
+            return free
 
     def consume(self, required_bytes, context="staging"):
         required_bytes = max(0, int(required_bytes or 0))
-        if required_bytes > self.available:
-            self.refresh()
-        if required_bytes > self.available:
-            raise StagingSpaceError(
-                f"Insufficient local staging space for {context}. "
-                f"Need {_gib(required_bytes):.2f} GiB; "
-                f"available batch budget: {_gib(max(0, self.available)):.2f} GiB."
-            )
-        self.available -= required_bytes
+        with self._lock:
+            if required_bytes > self.available:
+                self.refresh()
+            if required_bytes > self.available:
+                raise StagingSpaceError(
+                    f"Insufficient local staging space for {context}. "
+                    f"Need {_gib(required_bytes):.2f} GiB; "
+                    f"available batch budget: "
+                    f"{_gib(max(0, self.available)):.2f} GiB."
+                )
+            self.available -= required_bytes
 
 
 class LTOAnalyzer:
@@ -366,13 +376,20 @@ class LTOPacker:
                       source_name='local', session_id=None, chunk_index=None,
                       governor=None, pack_file_batch_size=10000,
                       heading="Offline phase - tape idle",
-                      done_label="Offline phase done") -> List[FileRecord]:
+                      done_label="Offline phase done",
+                      budget=None, quiet_progress=False) -> List[FileRecord]:
+        # ``budget`` may be an externally-owned StagingSpaceBudget shared across
+        # parallel-pack workers (one disk, one shared free-space accounting); it
+        # is thread-safe. When None we own a private budget, exactly as before.
+        # ``quiet_progress`` suppresses the per-file carriage-return progress so
+        # concurrent workers do not garble the log; the serial path keeps it.
         skipped_tracker = skipped_tracker or SkippedFileTracker()
-        budget = StagingSpaceBudget(
-            dest,
-            sum(int(entry.get('size') or 0) for entry in file_entries),
-            context=heading,
-        )
+        if budget is None:
+            budget = StagingSpaceBudget(
+                dest,
+                sum(int(entry.get('size') or 0) for entry in file_entries),
+                context=heading,
+            )
         metadata             = []
         zip_idx              = 1
         zipf                 = None
@@ -384,8 +401,10 @@ class LTOPacker:
         total_packed         = 0
         total_loose          = 0
 
-        print(f"\n[PACKER] {heading}. "
-              f"(Threshold: {threshold_mb:.0f} MB | Max ZIP: {self.max_zip_size_gb:.0f} GB)")
+        if not quiet_progress:
+            print(f"\n[PACKER] {heading}. "
+                  f"(Threshold: {threshold_mb:.0f} MB | "
+                  f"Max ZIP: {self.max_zip_size_gb:.0f} GB)")
 
         pack_file_batch_size = max(1, int(pack_file_batch_size or 10000))
         for entry_index, entry in enumerate(file_entries):
@@ -487,7 +506,7 @@ class LTOPacker:
                         'original_root_dir': source_root or '',
                     })
 
-                    if total_packed % 500 == 0:
+                    if not quiet_progress and total_packed % 500 == 0:
                         _progress_line(f"[PACKING] {total_packed} files packed")
 
                 else:
@@ -556,7 +575,8 @@ class LTOPacker:
     def run(self, source, dest, threshold_mb, skipped_tracker=None,
             source_name='local', session_id=None, chunk_index=None,
             on_existing='ask', governor=None,
-            pack_file_batch_size=10000) -> Optional[List[FileRecord]]:
+            pack_file_batch_size=10000,
+            pack_parallel_workers=1) -> Optional[List[FileRecord]]:
         """
         Pack small files into ZIP bundles; copy large files loose.
 
@@ -566,6 +586,11 @@ class LTOPacker:
                       they must never block on stdin, and a failed rmtree
                       raises so the chunk stays resumable)
             'reuse' — keep the existing staging, return []
+
+        pack_parallel_workers > 1 shards the file list across that many worker
+        threads, each writing its own uniquely-named bundle(s)/manifest(s) via
+        the identical per-file logic (see packer_parallel.pack_entries_parallel).
+        The default 1 keeps the unchanged serial path.
 
         Returns:
             list of dicts  — full metadata (staged backup ready for DB)
@@ -611,6 +636,24 @@ class LTOPacker:
                     skipped_tracker.add(
                         source_name, src, e, "scan",
                         session_id=session_id, chunk_index=chunk_index)
+
+        workers = max(1, int(pack_parallel_workers or 1))
+        if workers > 1 and len(entries) > 1:
+            # Isolated, config-gated parallel path. Import locally so the serial
+            # default never pulls in the threading machinery.
+            from .packer_parallel import pack_entries_parallel
+            return pack_entries_parallel(
+                self, dest, threshold_mb, entries,
+                workers=workers,
+                source_root=source,
+                bundle_prefix="Bundle",
+                skipped_tracker=skipped_tracker,
+                source_name=source_name,
+                session_id=session_id,
+                chunk_index=chunk_index,
+                governor=governor,
+                pack_file_batch_size=pack_file_batch_size,
+            )
 
         return self._pack_entries(
             dest, threshold_mb, entries,

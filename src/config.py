@@ -122,6 +122,7 @@ class ConfigManager:
             'governor_memory_sample_interval_seconds': '5',
             'governor_metadata_batch_size': '10000',
             'governor_pack_file_batch_size': '10000',
+            'pack_parallel_workers': '1',
             'tape_write_exclusive':  'true',
             'allow_fetch_during_tape_write':   'false',
             'allow_pack_during_tape_write':    'false',
@@ -431,6 +432,16 @@ class ConfigManager:
         return self._get_int(
             'PERFORMANCE', 'governor_pack_file_batch_size', 10000,
             minimum=1)
+    @property
+    def pack_parallel_workers(self):
+        """Number of concurrent PACK worker threads (default 1 = legacy serial
+        packer, byte-for-byte unchanged path). >1 shards each chunk's files
+        across threads, each writing its own uniquely-named bundle(s)/
+        manifest(s) through the identical per-file logic; all workers pass
+        through the Resource Governor, so a tape write still pauses them all.
+        Independent of fetch_parallel_streams and of the tape CPU affinity."""
+        return self._get_int(
+            'PERFORMANCE', 'pack_parallel_workers', 1, minimum=1)
     @property
     def tape_write_exclusive(self):
         return self._get_bool('PERFORMANCE', 'tape_write_exclusive', True)
