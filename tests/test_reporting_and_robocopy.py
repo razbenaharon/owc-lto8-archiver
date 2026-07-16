@@ -72,8 +72,9 @@ class ReportingAndRobocopyTests(unittest.TestCase):
 
             self.assertIn("skipped_files_count", header)
             self.assertIn("skipped_files_report", header)
+            self.assertIn("governor_wait_reasons", header)
             self.assertEqual(header[-2:], [
-                "governor_wait_seconds", "governor_wait_reasons"])
+                "tape_stall_seconds", "tape_stall_count"])
             self.assertEqual(rows[-1]["tape_used_after_bytes"], "3633327538007")
             self.assertEqual(rows[-1]["robocopy_exit_code"], "0")
             self.assertEqual(rows[-1]["robocopy_speed_mbs"], "342.1")
@@ -148,8 +149,13 @@ class ReportingAndRobocopyTests(unittest.TestCase):
             self.assertEqual(rows[0]["pack_process_peak_mb"], "3100.0")
             self.assertEqual(rows[0]["governor_wait_reasons"], "tape_active")
             self.assertEqual(rows[0]["db_sync_ram_peak_pct"], "")
+            # New tape-write phase columns are appended and blank when absent.
+            self.assertIn("tape_stream_mbs", header)
+            self.assertEqual(rows[0]["tape_stream_mbs"], "")
+            self.assertEqual(rows[0]["tape_stall_count"], "")
+            self.assertIn("governor_wait_reasons", header)
             self.assertEqual(header[-2:], [
-                "governor_wait_seconds", "governor_wait_reasons"])
+                "tape_stall_seconds", "tape_stall_count"])
 
     def test_robocopy_bytes_parser_accepts_integer_byte_summary(self):
         output = """

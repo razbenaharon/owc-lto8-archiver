@@ -327,11 +327,12 @@ class PgSessionMixin:
             ).fetchone())
 
     def get_remote_session(self, session_id):
-        with self._pool.connection() as conn:
-            return _row(conn.execute(
+        return self._run_read(
+            lambda conn: _row(conn.execute(
                 "SELECT * FROM remote_sessions WHERE session_id=%s",
                 (session_id,),
-            ).fetchone())
+            ).fetchone()),
+            f"get_remote_session({session_id})")
 
     @staticmethod
     def _validate_remote_manifest_rows(rows):
@@ -562,8 +563,8 @@ class PgSessionMixin:
         return plan_id
 
     def get_chunk_files(self, session_id, chunk_index):
-        with self._pool.connection() as conn:
-            return _rows(conn.execute(
+        return self._run_read(
+            lambda conn: _rows(conn.execute(
                 """SELECT pf.plan_file_id AS manifest_id,
                           sf.remote_path, sf.file_size_bytes,
                           st.local_rel_path,
@@ -582,7 +583,8 @@ class PgSessionMixin:
                    WHERE s.session_id=%s AND pf.chunk_index=%s
                    ORDER BY pf.ordinal""",
                 (session_id, chunk_index),
-            ).fetchall())
+            ).fetchall()),
+            f"get_chunk_files(session {session_id}, chunk {chunk_index})")
 
     def get_chunk_size_summary(self, session_id, chunk_index=None):
         """Per-chunk byte totals without materializing millions of file rows.
@@ -598,8 +600,8 @@ class PgSessionMixin:
         if chunk_index is not None:
             where += " AND pf.chunk_index=%s"
             params.append(chunk_index)
-        with self._pool.connection() as conn:
-            rows = conn.execute(
+        rows = self._run_read(
+            lambda conn: conn.execute(
                 f"""SELECT pf.chunk_index,
                            COALESCE(SUM(sf.file_size_bytes), 0) AS planned_bytes,
                            COALESCE(SUM(sf.file_size_bytes) FILTER (
@@ -615,7 +617,8 @@ class PgSessionMixin:
                     WHERE {where}
                     GROUP BY pf.chunk_index""",
                 params,
-            ).fetchall()
+            ).fetchall(),
+            f"get_chunk_size_summary(session {session_id})")
         return {
             row["chunk_index"]: (int(row["planned_bytes"]),
                                  int(row["present_bytes"]),
@@ -755,37 +758,40 @@ class PgSessionMixin:
             operation, f"normalized chunk {chunk_index + 1} status update")
 
     def get_pending_chunks(self, session_id):
-        with self._pool.connection() as conn:
-            rows = conn.execute(
+        rows = self._run_read(
+            lambda conn: conn.execute(
                 """SELECT chunk_index FROM remote_chunks
                    WHERE session_id=%s AND status!='done'
                    ORDER BY chunk_index""",
                 (session_id,),
-            ).fetchall()
+            ).fetchall(),
+            f"get_pending_chunks({session_id})")
         return [row["chunk_index"] for row in rows]
 
     def count_chunks(self, session_id):
-        with self._pool.connection() as conn:
-            return conn.execute(
+        return self._run_read(
+            lambda conn: conn.execute(
                 "SELECT COUNT(*) AS n FROM remote_chunks WHERE session_id=%s",
                 (session_id,),
-            ).fetchone()["n"]
+            ).fetchone()["n"],
+            f"count_chunks({session_id})")
 
     def get_next_remote_chunk_index(self, session_id):
-        with self._pool.connection() as conn:
-            value = conn.execute(
+        value = self._run_read(
+            lambda conn: conn.execute(
                 """SELECT COALESCE(MAX(chunk_index) + 1, 0) AS next_index
                    FROM remote_chunks WHERE session_id=%s""",
                 (session_id,),
-            ).fetchone()["next_index"]
+            ).fetchone()["next_index"],
+            f"get_next_remote_chunk_index({session_id})")
         return int(value)
 
     def get_remote_existing_snapshot_paths(self, session_id, paths):
         paths = [_canonical_remote_path(path) for path in paths]
         if not paths:
             return set()
-        with self._pool.connection() as conn:
-            rows = conn.execute(
+        rows = self._run_read(
+            lambda conn: conn.execute(
                 """SELECT sf.remote_path
                    FROM remote_sessions s
                    JOIN remote_plans p ON p.plan_id=s.plan_id
@@ -793,12 +799,13 @@ class PgSessionMixin:
                     ON sf.snapshot_id=p.snapshot_id
                    WHERE s.session_id=%s AND sf.remote_path = ANY(%s)""",
                 (session_id, paths),
-            ).fetchall()
+            ).fetchall(),
+            f"get_remote_existing_snapshot_paths({session_id})")
         return {row["remote_path"] for row in rows}
 
     def get_pending_remote_reserved_bytes(self, session_id):
-        with self._pool.connection() as conn:
-            value = conn.execute(
+        value = self._run_read(
+            lambda conn: conn.execute(
                 """SELECT COALESCE(SUM(sf.file_size_bytes), 0) AS n
                    FROM remote_sessions s
                    JOIN remote_chunks c ON c.session_id=s.session_id
@@ -808,7 +815,8 @@ class PgSessionMixin:
                     ON sf.snapshot_file_id=pf.snapshot_file_id
                    WHERE s.session_id=%s AND c.status!='done'""",
                 (session_id,),
-            ).fetchone()["n"]
+            ).fetchone()["n"],
+            f"get_pending_remote_reserved_bytes({session_id})")
         return int(value)
 
     def mark_remote_scan_complete(self, session_id):

@@ -71,6 +71,17 @@ SUMMARY_COLUMNS = [
     'db_sync_process_peak_mb',
     'governor_wait_seconds',
     'governor_wait_reasons',
+    # Isolated tape-write phase metrics (TapeWriteProfiler). Appended only, at the
+    # end of the schema, so existing SUMMARY.csv rows migrate without shifting.
+    # tape_stream_mbs is the CLEAN streaming rate (bytes moved while actively
+    # writing / active seconds), distinct from robocopy_speed_mbs which divides
+    # by the whole elapsed time (open + stream + flush).
+    'tape_stream_mbs',
+    'tape_stream_peak_mbs',
+    'tape_open_seconds',
+    'tape_close_seconds',
+    'tape_stall_seconds',
+    'tape_stall_count',
 ]
 
 
@@ -307,6 +318,12 @@ def append_backup_summary_row(log_dir=None, details=None, robocopy_result=None):
         'db_sync_process_peak_mb': details.get('db_sync_process_peak_mb', ''),
         'governor_wait_seconds': details.get('governor_wait_seconds', ''),
         'governor_wait_reasons': details.get('governor_wait_reasons', ''),
+        'tape_stream_mbs': details.get('tape_stream_mbs', ''),
+        'tape_stream_peak_mbs': details.get('tape_stream_peak_mbs', ''),
+        'tape_open_seconds': details.get('tape_open_seconds', ''),
+        'tape_close_seconds': details.get('tape_close_seconds', ''),
+        'tape_stall_seconds': details.get('tape_stall_seconds', ''),
+        'tape_stall_count': details.get('tape_stall_count', ''),
     })
     return _append_row(log_dir, row)
 

@@ -162,13 +162,18 @@ def _run_robocopy_capture(cmd):
     )
 
 
-def _run_robocopy_tuned(cmd, priority=None, affinity=None):
+def _run_robocopy_tuned(cmd, priority=None, affinity=None, on_start=None):
     """Run robocopy as a tracked, cancellable child with optional CPU priority
     and core affinity (the tape-write step). Returns a CompletedProcess with
     .stdout/.returncode so it is a drop-in for _run_robocopy_capture.
 
     Registering the process lets Ctrl+C terminate the live tape write; the HIGH
-    priority + dedicated cores keep the LTO drive streaming without contention."""
+    priority + dedicated cores keep the LTO drive streaming without contention.
+
+    ``on_start`` (optional) is called once with the live Popen right after the
+    process is created and tuned, so a passive profiler can read the robocopy
+    process's own I/O counters. It must not block or touch the process; any
+    exception it raises is swallowed so it can never disturb the tape write."""
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -179,6 +184,11 @@ def _run_robocopy_tuned(cmd, priority=None, affinity=None):
     )
     register_proc(proc)
     _apply_proc_tuning(proc, priority=priority, affinity=affinity, label='robocopy-tape')
+    if on_start is not None:
+        try:
+            on_start(proc)
+        except Exception:
+            pass
     try:
         out, err = proc.communicate()
     finally:

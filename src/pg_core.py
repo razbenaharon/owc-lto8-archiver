@@ -201,6 +201,30 @@ class PgConnectionCore:
                 time.sleep(wait_s)
         raise RuntimeError(f"[DB] Transaction attempts exhausted: {description}")
 
+    def _run_read(self, operation, description, attempts=5) -> Any:
+        # Read-only counterpart to _transaction. Connection checkout can raise
+        # PoolTimeout (a brief pool-exhaustion spike) or OperationalError (a
+        # Docker-PG restart / momentary drop); without a retry here that
+        # transient condition escapes a bare `with self._pool.connection()` on
+        # a read straight into a pipeline thread's generic handler and tears
+        # down a long streaming run — even though the same blip on a write is
+        # absorbed by _transaction. Reads are naturally idempotent, so
+        # re-running is always safe; back off like the write path so a
+        # restarting server has time to come back.
+        retryable = (psycopg.OperationalError, PoolTimeout)
+        for attempt in range(1, attempts + 1):
+            try:
+                with self._pool.connection() as conn:
+                    return operation(conn)
+            except retryable as e:
+                if attempt == attempts:
+                    raise
+                wait_s = min(30, 2 ** attempt)
+                print(f"[DB] {type(e).__name__} during {description}; "
+                      f"retrying in {wait_s}s ({attempt}/{attempts})...")
+                time.sleep(wait_s)
+        raise RuntimeError(f"[DB] Read attempts exhausted: {description}")
+
     @staticmethod
     def _require_updated(cur, message):
         if cur.rowcount == 0:
