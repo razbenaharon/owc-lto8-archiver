@@ -165,7 +165,25 @@ def format_backup_summary(details, robocopy_result=None):
         f"Duration: {_minutes(details.get('total_time_seconds'))}",
     ]
     if exit_code != "":
-        lines.append(f"Robocopy: exit {exit_code}, speed {_safe_float(rc_sum.get('speed_mbs')):.1f} MB/s")
+        # Report the CLEAN isolated streaming rate (bytes moved while actively
+        # writing), NOT robocopy's bytes-over-total-time average — the latter is
+        # dragged down by the tape open/close/flush overhead on small chunks and
+        # misreads as "slow". Fall back only when the profiler produced nothing.
+        stream = _safe_float(details.get("tape_stream_mbs"))
+        if stream > 0:
+            open_s = _safe_float(details.get("tape_open_seconds"))
+            close_s = _safe_float(details.get("tape_close_seconds"))
+            stall_s = _safe_float(details.get("tape_stall_seconds"))
+            stall_n = _safe_int(details.get("tape_stall_count"))
+            peak = _safe_float(details.get("tape_stream_peak_mbs"))
+            lines.append(
+                f"Tape stream: {stream:.1f} MB/s (peak {peak:.0f})"
+                f" | open {open_s:.0f}s, close {close_s:.0f}s,"
+                f" stalls {stall_n}/{stall_s:.0f}s | robocopy exit {exit_code}"
+            )
+        else:
+            lines.append(
+                f"Tape stream: n/a (profiler unavailable) | robocopy exit {exit_code}")
     if counts:
         lines.append(f"DB: inserted {inserted}, updated {updated}, skipped {skipped}")
     source_missing = details.get("source_missing_files") or []

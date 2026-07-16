@@ -16,7 +16,7 @@ except ImportError:  # optional dependency; priority/affinity degrade gracefully
 from .constants import BACKUP_LOG_DIR, LTFS_WRITE_WARNING
 from .logsetup import get_logger
 from .ltfs import _ensure_lto_drive_ready, eject_tape_drive
-from .ram_telemetry import RamStageSampler
+from .ram_telemetry import RamStageSampler, TapeWriteProfiler
 from .reporting import append_backup_summary_row
 from .robocopy import _parse_robocopy_summary, _run_robocopy_tuned
 from .runtime import CANCEL, _acquire_tape_io_lock, _fmt_eta, _phase, _progress_done, _progress_line, _release_tape_io_lock
@@ -332,11 +332,15 @@ class LTOBackup:
             tape_guard = contextlib.nullcontext()
         try:
             with RamStageSampler("tape", _ram_interval()) as tape_sampler:
-                with tape_guard:
-                    rc = _run_robocopy_tuned(
-                        robocopy_cmd,
-                        priority=self.tape_priority,
-                        affinity=self.tape_affinity)
+                # Passive per-second profiler: reads only robocopy's own I/O
+                # counter (never the tape) to isolate open/stream/close/stalls.
+                with TapeWriteProfiler(interval_seconds=1.0) as tape_profiler:
+                    with tape_guard:
+                        rc = _run_robocopy_tuned(
+                            robocopy_cmd,
+                            priority=self.tape_priority,
+                            affinity=self.tape_affinity,
+                            on_start=tape_profiler.attach)
         finally:
             stop_evt.set()
             mon.join(timeout=2)
@@ -394,6 +398,7 @@ class LTOBackup:
                         if skipped_tracker and skipped_tracker.has_items() else '',
                     **_stage_ram_details(),
                     **tape_sampler.as_details("tape"),
+                    **tape_profiler.as_details("tape"),
                 },
                 packer_metadata,
                 loose_map,
@@ -603,6 +608,7 @@ class LTOBackup:
                 'skipped_files_report': skipped_report,
                 **_stage_ram_details(),
                 **tape_sampler.as_details("tape"),
+                **tape_profiler.as_details("tape"),
                 **db_sampler.as_details("db_sync"),
             },
             packer_metadata,
