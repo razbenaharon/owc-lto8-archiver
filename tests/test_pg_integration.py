@@ -12,10 +12,12 @@ PGPASSWORD); the local ``docker compose up -d db`` default works out of the box
 with ``PGPASSWORD=change_me_local``.
 """
 import os
+import tempfile
 import unittest
 import uuid
 from pathlib import Path
 from typing import Any, TYPE_CHECKING, cast
+from unittest import mock
 
 if TYPE_CHECKING:
     import psycopg
@@ -32,6 +34,8 @@ else:
         dict_row = None
 
 from src.inspector_repository import InspectorRepository
+from src.local_manifest_archive import (
+    dry_run_export, execute_export, prune_export, validate_export)
 from src.pg_bulk import build_conninfo
 
 
@@ -309,6 +313,100 @@ class PgIntegrationTests(unittest.TestCase):
         self.assertEqual(remote_run["session_kind"], "remote")
         self.assertIsNone(remote_run["local_session_id"])
         self.assertIsNone(remote_run["remote_session_id"])
+
+    def test_local_manifest_eligibility_query_accepts_only_terminal_local_work(self):
+        self.db.register_tape("TMAN")
+        session_id = self.db.create_local_session(
+            "MANIFEST_DONE", "/manifest",
+            [[{"name": "top", "size_bytes": 5}]], "pack")
+        self.db.bulk_upsert_files([{
+            "original_path": "/manifest/top/tiny.txt",
+            "file_size_bytes": 5, "tape_label": "TMAN",
+            "source_host": "so02", "is_packed": False,
+            "container_name": None,
+            "stored_path": "/manifest/top/tiny.txt",
+            "local_session_id": session_id, "local_chunk_index": 0,
+        }])
+        before = dry_run_export(self.conninfo)
+        before_eligible = before["eligible_rows"]
+        self.db.update_local_chunk_status(session_id, 0, "backed_up")
+        self.db.update_local_session(
+            session_id, status="completed", completed_at="2026-07-16T00:00:00Z")
+        after = dry_run_export(self.conninfo)
+        self.assertEqual(after["eligible_rows"], before_eligible + 1)
+
+    def test_zz_local_manifest_export_validate_prune_preserves_operations(self):
+        eligible_before = dry_run_export(self.conninfo)["eligible_rows"]
+        self.assertGreaterEqual(eligible_before, 1)
+        operational_tables = (
+            "remote_snapshot_files", "remote_plan_files", "remote_file_state",
+            "remote_chunks", "remote_sessions", "local_chunks_manifest",
+            "local_sessions",
+        )
+        before = {table: self._query(
+            f"SELECT COUNT(*) AS n FROM {table}")[0]["n"]
+            for table in operational_tables}
+        with tempfile.TemporaryDirectory() as root:
+            backup = os.path.join(root, "verified_hot.dump")
+            with open(backup, "wb") as handle:
+                handle.write(b"test-only throwaway database backup marker")
+            exported = execute_export(self.conninfo, root, backup)
+            export_id = exported["export_id"]
+            validation = validate_export(self.conninfo, export_id)
+            self.assertTrue(validation["passed"])
+            owned = self._query(
+                "SELECT local_session_id FROM local_manifest_export_rows "
+                "WHERE export_id=%s AND eligible "
+                "AND local_session_id IS NOT NULL LIMIT 1", (export_id,))[0]
+            self._exec(
+                "UPDATE local_sessions SET status='active', completed_at=NULL "
+                "WHERE session_id=%s", (owned["local_session_id"],))
+            with self.assertRaisesRegex(RuntimeError, "terminal ownership"):
+                prune_export(
+                    self.conninfo, export_id, backup, execute=True,
+                    batch_size=1)
+            partial = self._query(
+                "SELECT COUNT(*) AS n FROM local_manifest_export_rows "
+                "WHERE export_id=%s AND eligible AND pruned_at IS NOT NULL",
+                (export_id,))[0]["n"]
+            # The batch containing the newly active session is rolled back.
+            self.assertEqual(partial, 0)
+            self._exec(
+                "UPDATE local_sessions SET status='completed', "
+                "completed_at=now() WHERE session_id=%s",
+                (owned["local_session_id"],))
+            fake_process = {
+                "pid": 999, "name": "robocopy.exe", "command": "test"}
+            with mock.patch(
+                    "src.local_manifest_archive.active_archive_processes",
+                    side_effect=[[], [], [fake_process]]):
+                with self.assertRaisesRegex(
+                        RuntimeError, "process appeared"):
+                    prune_export(
+                        self.conninfo, export_id, backup, execute=True,
+                        batch_size=1)
+            partial = self._query(
+                "SELECT COUNT(*) AS n FROM local_manifest_export_rows "
+                "WHERE export_id=%s AND eligible AND pruned_at IS NOT NULL",
+                (export_id,))[0]["n"]
+            # The completed first batch remains durable when the next batch is
+            # blocked before it starts.
+            self.assertEqual(partial, 1)
+            pruned = prune_export(
+                self.conninfo, export_id, backup, execute=True,
+                batch_size=1)
+            self.assertEqual(pruned["deleted_rows"], eligible_before)
+            self.assertGreaterEqual(len(pruned["batches"]), 1)
+            self.assertEqual(self._query(
+                "SELECT COUNT(*) AS n FROM local_manifest_export_rows "
+                "WHERE export_id=%s", (export_id,))[0]["n"], 0)
+            self.assertEqual(self._query(
+                "SELECT status FROM local_manifest_exports WHERE export_id=%s",
+                (export_id,))[0]["status"], "pruned")
+        after = {table: self._query(
+            f"SELECT COUNT(*) AS n FROM {table}")[0]["n"]
+            for table in operational_tables}
+        self.assertEqual(after, before)
 
     def test_archive_runs_fk_rejects_unknown_local_session(self):
         self.db.register_tape("TXFK")

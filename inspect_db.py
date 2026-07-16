@@ -11,17 +11,17 @@ from src.constants import PROJECT_ROOT
 os.chdir(PROJECT_ROOT)
 
 from src.config import ConfigManager
-from src.cold_migration import (
-    ColdBackupConfig,
-    backup_is_after_validation,
-    cold_conninfo,
-    dry_run_migration,
-    execute_migration,
-    migration_info,
-    migration_status,
-    remove_migrated_hot_rows,
-    search_cold,
-    validate_migration,
+from src.local_manifest_archive import (
+    active_archive_processes,
+    dry_run_export,
+    execute_export,
+    export_legacy_cold_database,
+    export_status,
+    prune_export,
+    pruned_manifest_paths,
+    search_manifests,
+    validate_archive_root,
+    validate_export,
 )
 from src.db import create_database_manager
 from src.directory_catalog_validation import (
@@ -32,13 +32,11 @@ from src.directory_catalog_validation import (
 )
 from src.pg_backup import (
     apply_directory_catalog_schema_to_database,
-    create_database_backup,
     create_migrated_database_from_backup,
     create_verified_production_backup,
     verify_backup_file,
 )
 from src.pg_bulk import build_conninfo
-from src.resource_governor import ResourceGovernor
 
 
 class _DbOverrideConfig:
@@ -101,22 +99,18 @@ def _open_db(cfg):
         raise SystemExit(1) from exc
 
 
-def _cold_backup_cfg(cfg):
-    return ColdBackupConfig(cfg)
-
-
 def _require_maintenance_safe(cfg):
     holders = archiver_lock_status(_conninfo(cfg))
     if holders:
         raise RuntimeError(
-            "[COLD] Refusing maintenance while the archiver lock is held.")
-    governor = ResourceGovernor(cfg, staging_dir=cfg.staging_dir,
-                                sleep_seconds=0.25)
-    if not governor.can_start_cold_migration():
+            "[MANIFEST] Refusing maintenance while the archiver lock is held.")
+    processes = active_archive_processes()
+    if processes:
         raise RuntimeError(
-            "[COLD] Resource Governor refused cold maintenance; archive "
-            "activity is active or local RAM/disk/I/O is unsafe.")
-    return governor
+            "[MANIFEST] Refusing maintenance while archive/transfer processes "
+            f"are running: {processes}")
+    return validate_archive_root(
+        cfg.local_manifest_archive_root, (cfg.staging_dir,))
 
 
 def _verify_hot_backup(cfg, path):
@@ -126,113 +120,84 @@ def _verify_hot_backup(cfg, path):
             "verified": True}
 
 
-def _verify_cold_backup(cfg, path):
-    cold_cfg = _cold_backup_cfg(cfg)
-    restore_list = verify_backup_file(cold_cfg, path)
-    return {"backup_path": os.path.abspath(path),
-            "restore_list_path": restore_list,
-            "verified": True}
-
-
-def _backup_cold_postgres(cfg):
-    cold_cfg = _cold_backup_cfg(cfg)
-    path = create_database_backup(
-        cold_cfg, prefix="cold_small_file_catalog", verify=True)
-    return {
-        "database": cold_cfg.pg_dbname,
-        "target": cold_cfg.db_display_ref,
-        "backup_path": path,
-        "restore_list_path": os.path.splitext(path)[0] + ".restore_list.txt",
-    }
-
-
-def _run_cold_migrate(cfg, args):
-    governor = _require_maintenance_safe(cfg)
-    hot = _conninfo(cfg)
-    cold = cold_conninfo(cfg)
+def _run_manifest_export(cfg, args):
+    root = _require_maintenance_safe(cfg)
     if args.dry_run == args.execute:
         raise RuntimeError(
-            "--cold-migrate-small-files requires exactly one of --dry-run "
+            "--export-small-file-manifests requires exactly one of --dry-run "
             "or --execute")
     if args.dry_run:
-        _print_json(dry_run_migration(hot, cfg))
+        _print_json(dry_run_export(_conninfo(cfg)))
         return 0
     if not args.yes:
         raise RuntimeError("--execute requires --yes")
     if not args.hot_backup_path:
         raise RuntimeError("--execute requires --hot-backup-path")
     hot_backup = _verify_hot_backup(cfg, args.hot_backup_path)
-    result = execute_migration(
-        hot, cold, cfg, hot_backup_path=args.hot_backup_path,
-        governor=governor)
+    result = execute_export(
+        _conninfo(cfg), root, args.hot_backup_path)
     result["hot_backup_verification"] = hot_backup
     _print_json(result)
     return 0
 
 
-def _run_cold_validate(cfg, args):
+def _run_manifest_validate(cfg, args):
     if not args.heavy:
         raise RuntimeError(
-            "--cold-validate-small-file-migration requires --heavy")
-    if args.migration_id is None:
-        raise RuntimeError("--migration-id is required")
-    governor = _require_maintenance_safe(cfg)
-    _print_json(validate_migration(
-        _conninfo(cfg), cold_conninfo(cfg), args.migration_id,
-        governor=governor))
+            "--validate-local-manifest-export requires --heavy")
+    if args.export_id is None:
+        raise RuntimeError("--export-id is required")
+    _require_maintenance_safe(cfg)
+    _print_json(validate_export(_conninfo(cfg), args.export_id))
     return 0
 
 
-def _run_cold_search(cfg, args):
-    governor = _require_maintenance_safe(cfg)
-    print("[COLD] Warning: cold small-file search is unindexed and may be slow.")
-    rows = search_cold(
-        cold_conninfo(cfg), args.cold_search, limit=args.limit,
-        fetch_rows=cfg.cold_fetch_rows, governor=governor)
+def _run_manifest_search(cfg, args):
+    root = validate_archive_root(
+        cfg.local_manifest_archive_root, (cfg.staging_dir,))
+    rows = search_manifests(
+        root, args.manifest_search, limit=args.limit,
+        allowed_paths=pruned_manifest_paths(_conninfo(cfg)))
     _print_json({"limit": args.limit, "rows": rows})
     return 0
 
 
-def _run_hot_remove(cfg, args):
-    governor = _require_maintenance_safe(cfg)
-    if args.migration_id is None:
-        raise RuntimeError("--migration-id is required")
+def _run_manifest_prune(cfg, args):
+    _require_maintenance_safe(cfg)
+    if args.export_id is None:
+        raise RuntimeError("--export-id is required")
     if args.dry_run == args.execute:
         raise RuntimeError(
-            "--hot-remove-migrated-small-files requires exactly one of "
+            "--prune-exported-small-files requires exactly one of "
             "--dry-run or --execute")
     hot_backup = None
-    cold_backup = None
-    cold_verified = False
     if args.execute:
         if not args.yes:
             raise RuntimeError("--execute requires --yes")
-        if not args.hot_backup_path or not args.cold_backup_path:
-            raise RuntimeError(
-                "--execute requires --hot-backup-path and --cold-backup-path")
+        if not args.hot_backup_path:
+            raise RuntimeError("--execute requires --hot-backup-path")
         hot_backup = _verify_hot_backup(cfg, args.hot_backup_path)
-        cold_backup = _verify_cold_backup(cfg, args.cold_backup_path)
-        info = migration_info(_conninfo(cfg), args.migration_id)
-        if not info or not info.get("validation_passed"):
-            raise RuntimeError(
-                "[COLD] Migration has not passed validation.")
-        if not backup_is_after_validation(
-                args.cold_backup_path, info.get("validated_at")):
-            raise RuntimeError(
-                "[COLD] Cold backup must be created after successful "
-                "migration validation.")
-        cold_verified = True
-    result = remove_migrated_hot_rows(
-        _conninfo(cfg), cfg, args.migration_id,
+    result = prune_export(
+        _conninfo(cfg), args.export_id,
         hot_backup_path=args.hot_backup_path,
-        cold_backup_path=args.cold_backup_path,
-        cold_backup_verified=cold_verified,
         execute=args.execute,
-        governor=governor,
+        batch_size=args.prune_batch_size,
     )
     result["hot_backup_verification"] = hot_backup
-    result["cold_backup_verification"] = cold_backup
     _print_json(result)
+    return 0
+
+
+def _run_legacy_cold_export(cfg, args):
+    root = _require_maintenance_safe(cfg)
+    if not args.execute or not args.yes:
+        raise RuntimeError(
+            "--export-legacy-cold-db requires --execute --yes")
+    if not args.legacy_cold_dsn or not args.cold_backup_path:
+        raise RuntimeError(
+            "--legacy-cold-dsn and --cold-backup-path are required")
+    _print_json(export_legacy_cold_database(
+        args.legacy_cold_dsn, root, args.cold_backup_path))
     return 0
 
 
@@ -295,8 +260,6 @@ def _build_parser():
                         help="Print configured target and read-only DB identity.")
     parser.add_argument("--backup-postgres", action="store_true",
                         help="Create and verify a custom-format PostgreSQL dump.")
-    parser.add_argument("--backup-cold-postgres", action="store_true",
-                        help="Create and verify a cold catalog PostgreSQL dump.")
     parser.add_argument("--create-migrated-db", action="store_true",
                         help="Create, restore, and schema-migrate a new DB.")
     parser.add_argument("--backup-file",
@@ -319,26 +282,32 @@ def _build_parser():
     parser.add_argument("--with-db", help="Target DB for row-count comparison.")
     parser.add_argument("--cleanup-session-data", action="store_true",
                         help="Clean unreferenced remote session data.")
-    parser.add_argument("--cold-status", action="store_true",
-                        help="Print recent cold small-file migrations.")
-    parser.add_argument("--cold-migrate-small-files", action="store_true",
-                        help="Copy hot small files into the cold DB.")
-    parser.add_argument("--cold-validate-small-file-migration",
+    parser.add_argument("--manifest-status", action="store_true",
+                        help="Print recent local-manifest exports.")
+    parser.add_argument("--export-small-file-manifests", action="store_true",
+                        help="Export terminal small-file rows to local manifests.")
+    parser.add_argument("--validate-local-manifest-export",
                         action="store_true",
-                        help="Validate a cold small-file migration.")
-    parser.add_argument("--cold-search",
-                        help="Search the cold small-file DB with a LIMIT.")
-    parser.add_argument("--hot-remove-migrated-small-files",
+                        help="Hash and exactly validate a local manifest export.")
+    parser.add_argument("--manifest-search",
+                        help="Search permanent local small-file manifests.")
+    parser.add_argument("--prune-exported-small-files",
                         action="store_true",
-                        help="Remove validated migrated small rows from hot DB.")
-    parser.add_argument("--migration-id", type=int,
-                        help="Cold migration id for validation/removal.")
+                        help="Prune only a validated immutable export snapshot.")
+    parser.add_argument("--export-id", type=int,
+                        help="Local manifest export id for validation/pruning.")
+    parser.add_argument("--export-legacy-cold-db", action="store_true",
+                        help="One-time read-only export before cold DB retirement.")
+    parser.add_argument("--legacy-cold-dsn",
+                        help="Explicit DSN for the legacy cold database.")
     parser.add_argument("--hot-backup-path",
                         help="Verified hot DB backup path.")
     parser.add_argument("--cold-backup-path",
-                        help="Verified cold DB backup path.")
+                        help="Verified legacy cold DB backup path.")
     parser.add_argument("--limit", type=int, default=100,
-                        help="Result limit for cold search.")
+                        help="Result limit for local-manifest search.")
+    parser.add_argument("--prune-batch-size", type=int, default=100000,
+                        help="Maximum files_index rows committed per prune batch.")
     return parser
 
 
@@ -359,11 +328,6 @@ def main(argv=None):
     if args.backup_postgres:
         print(f"[DB BACKUP] Target: {cfg.db_display_ref}")
         _print_json(create_verified_production_backup(cfg))
-        return 0
-
-    if args.backup_cold_postgres:
-        print(f"[DB BACKUP] Cold target: {cfg.cold_db_display_ref}")
-        _print_json(_backup_cold_postgres(cfg))
         return 0
 
     if args.create_migrated_db:
@@ -401,21 +365,24 @@ def main(argv=None):
     if args.backfill_directory_catalog:
         return _run_backfill(_open_db(cfg), args)
 
-    if args.cold_status:
-        _print_json(migration_status(_conninfo(cfg)))
+    if args.manifest_status:
+        _print_json(export_status(_conninfo(cfg)))
         return 0
 
-    if args.cold_migrate_small_files:
-        return _run_cold_migrate(cfg, args)
+    if args.export_small_file_manifests:
+        return _run_manifest_export(cfg, args)
 
-    if args.cold_validate_small_file_migration:
-        return _run_cold_validate(cfg, args)
+    if args.validate_local_manifest_export:
+        return _run_manifest_validate(cfg, args)
 
-    if args.cold_search:
-        return _run_cold_search(cfg, args)
+    if args.manifest_search:
+        return _run_manifest_search(cfg, args)
 
-    if args.hot_remove_migrated_small_files:
-        return _run_hot_remove(cfg, args)
+    if args.prune_exported_small_files:
+        return _run_manifest_prune(cfg, args)
+
+    if args.export_legacy_cold_db:
+        return _run_legacy_cold_export(cfg, args)
 
     db = _open_db(cfg)
     from src.db_inspector_qt import run_qt_inspector
