@@ -164,6 +164,21 @@ def _table_exists(conn, name):
     ).fetchone() is not None
 
 
+# Remote chunks are staged into, and written to tape from, a directory named by
+# RemoteOrchestrator (see remote_orchestrator._process_chunk):
+#
+#     f"_pack_s{session_id:04d}_{chunk_index:03d}"
+#
+# so an on-tape bundle path like ``E:\_pack_s0034_000\Bundle_001.zip`` records
+# the owning *remote* session and chunk in the only place some legacy rows still
+# carry it.  LocalOrchestrator._batch_name uses the disjoint ``_local_s...``
+# prefix, so a ``_pack_s`` component is never a local session.  The pattern is
+# anchored to whole path components and requires the exact zero-padded widths;
+# anything else yields NULL and the row stays fail-closed as
+# ``session_ownership_unknown``.
+_PACK_DIR_OWNERSHIP_RE = r'(?:^|\\)_pack_s([0-9]{4})_([0-9]{3})(?:\\|$)'
+
+
 def _classification_inputs(conn):
     """Build set-based ownership SQL for the production classifier.
 
@@ -175,8 +190,8 @@ def _classification_inputs(conn):
     local = "COALESCE(f.local_session_id, ar.local_session_id)"
     remote = "COALESCE(f.remote_session_id, ar.remote_session_id)"
     if not _table_exists(conn, "directory_archive_bundles"):
-        return "", "FALSE", local, remote, ""
-    prelude = """bundle_ownership AS MATERIALIZED (
+        return "", "FALSE", local, remote, "", "f.remote_chunk_index"
+    prelude = ("""bundle_ownership AS MATERIALIZED (
             SELECT dab.tape_label, dab.stored_bundle_path,
                    CASE WHEN COUNT(DISTINCT dab.local_session_id)=1
                           AND COUNT(DISTINCT dab.remote_session_id)=0
@@ -188,31 +203,42 @@ def _classification_inputs(conn):
                      AS bundle_remote_session_id
             FROM directory_archive_bundles dab
             GROUP BY dab.tape_label, dab.stored_bundle_path
-        ),"""
+        ), pack_dir_ownership AS MATERIALIZED (
+            SELECT ab.bundle_id,
+                   (regexp_match(ab.tape_path, '""" + _PACK_DIR_OWNERSHIP_RE
+               + """'))[1]::BIGINT AS pack_remote_session_id,
+                   (regexp_match(ab.tape_path, '""" + _PACK_DIR_OWNERSHIP_RE
+               + """'))[2]::INT AS pack_remote_chunk_index
+            FROM archive_bundles ab
+        ),""")
     coverage = """(
         f.bundle_id IS NOT NULL AND b.tape_path IS NOT NULL
         AND bo.stored_bundle_path IS NOT NULL
     )"""
     bundle_join = """LEFT JOIN bundle_ownership bo
               ON bo.tape_label=f.tape_label
-             AND bo.stored_bundle_path=b.tape_path"""
+             AND bo.stored_bundle_path=b.tape_path
+            LEFT JOIN pack_dir_ownership pdo
+              ON pdo.bundle_id=f.bundle_id"""
     return (
         prelude,
         coverage,
         "COALESCE(f.local_session_id, ar.local_session_id, "
         "bo.bundle_local_session_id)",
         "COALESCE(f.remote_session_id, ar.remote_session_id, "
-        "bo.bundle_remote_session_id)",
+        "bo.bundle_remote_session_id, pdo.pack_remote_session_id)",
         bundle_join,
+        "COALESCE(f.remote_chunk_index, pdo.pack_remote_chunk_index)",
     )
 
 
 def _classification_cte(coverage_expression, local_owner=None,
                         remote_owner=None, *, prelude="", bundle_join="",
-                        file_predicate=""):
+                        file_predicate="", remote_chunk=None):
     """SQL CTE that assigns one conservative eligibility decision per row."""
     local_owner = local_owner or "COALESCE(f.local_session_id, ar.local_session_id)"
     remote_owner = remote_owner or "COALESCE(f.remote_session_id, ar.remote_session_id)"
+    remote_chunk = remote_chunk or "f.remote_chunk_index"
     return f"""
         WITH {prelude} local_chunk_state AS MATERIALIZED (
             SELECT lc.session_id,
@@ -242,9 +268,10 @@ def _classification_cte(coverage_expression, local_owner=None,
                        AS owner_local_session_id,
                    {remote_owner}
                        AS owner_remote_session_id,
-                   COALESCE(f.local_chunk_index, f.remote_chunk_index)
+                   COALESCE(f.local_chunk_index, {remote_chunk})
                        AS owner_chunk_index,
-                   f.local_chunk_index, f.remote_chunk_index, f.bundle_id,
+                   f.local_chunk_index,
+                   {remote_chunk} AS remote_chunk_index, f.bundle_id,
                    f.is_packed, ar.session_kind, ar.completed_at AS run_completed,
                    {coverage_expression} AS covered_by_directory_catalog
             FROM files_index f
@@ -326,11 +353,12 @@ def _classification_cte(coverage_expression, local_owner=None,
 
 
 def _classification_cte_for_connection(conn, *, file_predicate=""):
-    prelude, coverage, local, remote, bundle_join = (
+    prelude, coverage, local, remote, bundle_join, remote_chunk = (
         _classification_inputs(conn))
     return _classification_cte(
         coverage, local, remote, prelude=prelude,
-        bundle_join=bundle_join, file_predicate=file_predicate)
+        bundle_join=bundle_join, file_predicate=file_predicate,
+        remote_chunk=remote_chunk)
 
 
 def dry_run_export(conninfo, threshold_bytes=SMALL_FILE_THRESHOLD_BYTES):
