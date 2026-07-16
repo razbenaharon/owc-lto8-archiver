@@ -54,6 +54,76 @@ class EligibilitySafetyTests(unittest.TestCase):
         self.assertIn("LEFT JOIN bundle_ownership bo", sql)
         self.assertNotIn("FROM directory_archive_bundles dab\n        WHERE", sql)
 
+
+class PackDirOwnershipTests(unittest.TestCase):
+    """Ownership recovered from the on-tape ``_pack_sNNNN_NNN`` bundle path.
+
+    Legacy remote rows carry no ownership column anywhere, but the tape path
+    written by RemoteOrchestrator still names the owning session and chunk.
+    """
+
+    class _Conn:
+        @staticmethod
+        def execute(_sql, _params):
+            class _Result:
+                @staticmethod
+                def fetchone():
+                    return (1,)
+            return _Result()
+
+    def test_pattern_matches_remote_pack_dir_and_captures_session_and_chunk(self):
+        import re
+        pattern = archive._PACK_DIR_OWNERSHIP_RE
+        match = re.search(pattern, r"E:\_pack_s0034_000\Bundle_001.zip")
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(1), "0034")
+        self.assertEqual(match.group(2), "000")
+
+    def test_pattern_ignores_local_session_dirs(self):
+        import re
+        pattern = archive._PACK_DIR_OWNERSHIP_RE
+        self.assertIsNone(
+            re.search(pattern, r"E:\_local_s0034_c001_b001\Bundle_001.zip"))
+
+    def test_pattern_requires_whole_path_components(self):
+        import re
+        pattern = archive._PACK_DIR_OWNERSHIP_RE
+        for path in (r"E:\not_pack_s0034_000\B.zip",
+                     r"E:\_pack_s34_0\B.zip",
+                     r"E:\_pack_s0034_000_extra\B.zip"):
+            self.assertIsNone(re.search(pattern, path), path)
+
+    def test_derivation_is_last_resort_and_never_overrides_stored_ownership(self):
+        sql = archive._classification_cte_for_connection(self._Conn())
+        self.assertIn("pack_dir_ownership AS MATERIALIZED", sql)
+        self.assertIn("LEFT JOIN pack_dir_ownership pdo", sql)
+        # Recorded ownership always wins; the derived value is the final
+        # COALESCE fallback, so a row that already knows its session is
+        # unaffected by the tape path.
+        self.assertIn(
+            "COALESCE(f.remote_session_id, ar.remote_session_id, "
+            "bo.bundle_remote_session_id, pdo.pack_remote_session_id)", sql)
+
+    def test_derived_chunk_feeds_the_terminal_chunk_gate(self):
+        sql = archive._classification_cte_for_connection(self._Conn())
+        self.assertIn(
+            "COALESCE(f.remote_chunk_index, pdo.pack_remote_chunk_index)", sql)
+        # The derived chunk must still be checked for terminal status.
+        self.assertIn("owner_remote_chunk_terminal IS DISTINCT FROM TRUE", sql)
+
+    def test_derivation_absent_without_directory_archive_bundles(self):
+        class _NoTable:
+            @staticmethod
+            def execute(_sql, _params):
+                class _Result:
+                    @staticmethod
+                    def fetchone():
+                        return None
+                return _Result()
+
+        sql = archive._classification_cte_for_connection(_NoTable())
+        self.assertNotIn("pack_dir_ownership", sql)
+
     def test_prune_is_snapshot_identity_driven(self):
         source = inspect.getsource(archive.prune_export)
         self.assertIn("source_file_id", source)
