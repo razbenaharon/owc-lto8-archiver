@@ -14,7 +14,8 @@ from .retriever import LTORetriever
 from .robocopy import _prepare_robocopy_exclusion, _remove_robocopy_exclusion
 from .remote_transport import _cleanup_askpass_helpers
 from .runtime import _terminate_all_procs, install_cancel_handler, reset_cancel, uninstall_cancel_handler, unpin_current_process
-from .windows_update_guard import (pause_windows_updates, pending_reboot_reasons,
+from .windows_update_guard import (managed_update_policy, pause_windows_updates,
+                                   pending_reboot_reasons, print_guard_status,
                                    restore_stale_guard, resume_windows_updates)
 
 if TYPE_CHECKING:
@@ -50,7 +51,12 @@ def _start_windows_update_guard(cfg: ConfigManager):
             return False, False
         print("[WU] block_on_pending_reboot = false — proceeding anyway.")
 
-    return True, pause_windows_updates(cfg.windows_update_pause_days)
+    applied = pause_windows_updates(cfg.windows_update_pause_days)
+    # The pause can be written successfully and still be ignored by a managed
+    # host's Windows Update Agent, so report what protection actually exists
+    # rather than the fact that the registry write returned success.
+    print_guard_status(applied, managed_update_policy())
+    return True, applied
 
 
 def run_archiver(cfg: ConfigManager, db: "PgDatabaseManager"):

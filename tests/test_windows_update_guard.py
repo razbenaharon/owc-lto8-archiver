@@ -174,6 +174,118 @@ class PendingRebootTests(_GuardTestCase):
             self.assertEqual(wug.pending_reboot_reasons(), [])
 
 
+class ManagedPolicyTests(_GuardTestCase):
+    """The host that lost 126 GB is WSUS-managed; the pause is cosmetic there."""
+
+    def test_unmanaged_host_reports_not_managed(self):
+        info = wug.managed_update_policy()
+        self.assertFalse(info["managed"])
+        self.assertFalse(info["pause_disabled"])
+        self.assertEqual(info["notes"], [])
+
+    def test_wsus_managed_host_is_detected(self):
+        self.reg.data[(wug._WU_POLICY_PATH, "WUServer")] = (
+            "https://wsus.example:8531", REG_SZ)
+        self.reg.data[(wug._AU_PATH, "UseWUServer")] = (1, REG_DWORD)
+        info = wug.managed_update_policy()
+        self.assertTrue(info["managed"])
+        self.assertIn("wsus.example", info["notes"][0])
+
+    def test_pause_disabled_by_policy_is_detected(self):
+        """SetDisablePauseUXAccess=1 means the pause we write is ignored."""
+        self.reg.data[(wug._WU_POLICY_PATH, "SetDisablePauseUXAccess")] = (
+            1, REG_DWORD)
+        info = wug.managed_update_policy()
+        self.assertTrue(info["managed"])
+        self.assertTrue(info["pause_disabled"])
+
+    def test_compliance_deadline_is_reported_with_days(self):
+        self.reg.data[(wug._WU_POLICY_PATH, "SetComplianceDeadline")] = (
+            1, REG_DWORD)
+        self.reg.data[(wug._WU_POLICY_PATH,
+                       "ConfigureDeadlineForQualityUpdates")] = (2, REG_DWORD)
+        info = wug.managed_update_policy()
+        self.assertTrue(info["managed"])
+        self.assertEqual(info["deadline_days"], 2)
+
+    def test_managed_host_status_never_claims_it_is_paused(self):
+        """A false 'paused' line is worse than none — it invites trust."""
+        self.reg.data[(wug._WU_POLICY_PATH, "SetDisablePauseUXAccess")] = (
+            1, REG_DWORD)
+        policy = wug.managed_update_policy()
+        with mock.patch("builtins.print") as p:
+            wug.print_guard_status(True, policy)
+        out = " ".join(str(c.args[0]) for c in p.call_args_list if c.args)
+        self.assertIn("NOT reliable protection", out)
+        self.assertNotIn("Windows Update paused for this run", out)
+
+    def test_unmanaged_host_status_confirms_the_pause(self):
+        policy = wug.managed_update_policy()
+        with mock.patch("builtins.print") as p:
+            wug.print_guard_status(True, policy)
+        out = " ".join(str(c.args[0]) for c in p.call_args_list if c.args)
+        self.assertIn("paused for this run", out)
+
+
+class RebootSentinelTests(_GuardTestCase):
+    """The sentinel is the only real guard on an admin-managed host."""
+
+    def test_sentinel_sets_stop_event_when_restart_is_staged(self):
+        stop = wug.threading.Event()
+        s = wug.RebootSentinel(stop, poll_seconds=0.01)
+        with mock.patch.object(wug, "pending_reboot_reasons",
+                               lambda: ["update staged"]):
+            s.start()
+            self.assertTrue(stop.wait(timeout=3),
+                            "sentinel must ask the pipeline to stop")
+        s.stop()
+        self.assertTrue(s.triggered)
+
+    def test_sentinel_stays_quiet_on_a_clean_host(self):
+        stop = wug.threading.Event()
+        s = wug.RebootSentinel(stop, poll_seconds=0.01)
+        with mock.patch.object(wug, "pending_reboot_reasons", lambda: []):
+            s.start()
+            self.assertFalse(stop.wait(timeout=0.5))
+        s.stop()
+        self.assertFalse(s.triggered)
+
+    def test_sentinel_fires_on_detect_callback(self):
+        stop = wug.threading.Event()
+        seen = []
+        s = wug.RebootSentinel(stop, poll_seconds=0.01, on_detect=seen.append)
+        with mock.patch.object(wug, "pending_reboot_reasons",
+                               lambda: ["staged"]):
+            s.start()
+            stop.wait(timeout=3)
+        s.stop()
+        self.assertEqual(seen, [["staged"]])
+
+    def test_registry_error_never_kills_the_pipeline(self):
+        stop = wug.threading.Event()
+        s = wug.RebootSentinel(stop, poll_seconds=0.01)
+        with mock.patch.object(wug, "pending_reboot_reasons",
+                               mock.Mock(side_effect=OSError("hive gone"))):
+            s.start()
+            self.assertFalse(stop.wait(timeout=0.4),
+                             "a registry hiccup must not stop the run")
+        s.stop()
+
+    def test_on_detect_failure_still_stops_the_pipeline(self):
+        """A broken Telegram notifier must not cost us the clean stop."""
+        stop = wug.threading.Event()
+
+        def boom(_reasons):
+            raise RuntimeError("notifier down")
+
+        s = wug.RebootSentinel(stop, poll_seconds=0.01, on_detect=boom)
+        with mock.patch.object(wug, "pending_reboot_reasons",
+                               lambda: ["staged"]):
+            s.start()
+            self.assertTrue(stop.wait(timeout=3))
+        s.stop()
+
+
 class CliWiringTests(unittest.TestCase):
     """The decision logic in cli._start_windows_update_guard."""
 

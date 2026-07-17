@@ -15,6 +15,7 @@ from .constants import (DEFAULT_TAPE_CAPACITY_GB, LOCAL_STAGING_RESERVE_BYTES,
                         LTFS_WRITE_WARNING, tape_budget_bytes)
 from .db import _apply_canonical_remote_paths
 from .logsetup import get_logger
+from .windows_update_guard import RebootSentinel
 from .ltfs import _ensure_lto_drive_ready, get_volume_label
 from .packer import LTOPacker
 from .paths import (_LEGACY_PATH_LIMIT, _dir_tree_size,
@@ -344,6 +345,16 @@ class RemoteOrchestrator:
         hb_stop = threading.Event()
         SENTINEL = object()
 
+        # Same forced-update protection as the resume path: stop at a chunk
+        # boundary while LTFS can still sync, rather than be killed mid-write.
+        reboot_sentinel = RebootSentinel(
+            stop_pipeline,
+            on_detect=lambda reasons: send_best_effort(
+                self.notifier,
+                "[PIPELINE] Windows staged a restart — stopping at the next "
+                "chunk boundary so the tape index is synced. Re-run option 6 "
+                "to resume after the host restarts.")).start()
+
         tape_context = self._remote_tape_capacity_context(
             tape_label, session_id=session_id)
         remaining_lock = threading.Lock()
@@ -540,6 +551,7 @@ class RemoteOrchestrator:
         finally:
             stop_pipeline.set()
             hb_stop.set()
+            reboot_sentinel.stop()
             try:
                 while True:
                     leftover = ready_q.get_nowait()
@@ -662,6 +674,16 @@ class RemoteOrchestrator:
         stop_pipeline = threading.Event()
         SENTINEL      = object()
 
+        # Race a forced update restart rather than trying to prevent one: stop
+        # at the next chunk boundary so LTFS syncs its index while it still can.
+        reboot_sentinel = RebootSentinel(
+            stop_pipeline,
+            on_detect=lambda reasons: send_best_effort(
+                self.notifier,
+                "[PIPELINE] Windows staged a restart — stopping at the next "
+                "chunk boundary so the tape index is synced. Re-run option 6 "
+                "to resume after the host restarts.")).start()
+
         def _producer():
             try:
                 for ci in pending_chunks:
@@ -727,6 +749,7 @@ class RemoteOrchestrator:
         finally:
             stop_pipeline.set()
             hb_stop.set()
+            reboot_sentinel.stop()
             # Drain the queue so a producer blocked on a full put() can exit,
             # and clean up any prefetched-but-unused chunks.
             try:
@@ -740,6 +763,11 @@ class RemoteOrchestrator:
             if self.fetch_cores:
                 unpin_current_process()
 
+        if reboot_sentinel.triggered:
+            print("\n[REMOTE] Stopped cleanly because Windows staged a "
+                  "restart. The tape index was synced and the session is "
+                  "resumable — re-run option 6 after the host restarts.")
+            return
         if CANCEL.is_set():
             print("\n[ABORTED] Stopped by user. Session saved — "
                   "re-run option 6 to resume from the interrupted chunk.")

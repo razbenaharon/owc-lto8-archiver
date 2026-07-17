@@ -19,13 +19,23 @@ This file is intentionally thin so the guidance has a single source of truth.
   2026-07-15 one interrupted session 37 and silently lost chunks 18-91 (~126 GB)
   from Tape_02 — the writes had been acknowledged and counted in
   `tape_used_after`, but the cartridge came back with only chunks 0-17 and the
-  span had to be re-fetched. `src/windows_update_guard.py` now pauses updates
-  for the run and restores the previous settings afterwards; it refuses to
-  start when a restart is already staged (pausing cannot cancel a staged
-  restart — reboot first). Note `NoAutoRebootWithLoggedOnUsers=1` was already
-  set on this host and did **not** prevent it; the pause is the real guard.
-  Configure via `[WINDOWS_UPDATE]` in `config.ini`. The guard needs
-  Administrator; without elevation it warns and the run proceeds unguarded.
+  span had to be re-fetched. **This host cannot pause its way out of it**: it is
+  domain-joined to `iem.technion.ac.il`, served by WSUS
+  (`dds-wsus.iem.technion.ac.il`), and policy sets `SetDisablePauseUXAccess=1`
+  (pause is removed) plus `SetComplianceDeadline` +
+  `ConfigureDeadlineForQualityUpdates=2` — a 2-day deadline restart that
+  overrides **both** ActiveHours and `NoAutoRebootWithLoggedOnUsers` (which was
+  already `1` here and did not help). The pause registry writes still *succeed*,
+  which is the trap.
+  `src/windows_update_guard.py` therefore has two layers: `managed_update_policy()`
+  detects the above and refuses to print a false "paused" line, and
+  **`RebootSentinel` is the guard that actually works** — it polls for a staged
+  restart during the run and sets the pipeline's `stop_pipeline` event, stopping
+  at the next chunk boundary so LTFS syncs its index and the session stays
+  resumable. It never kills the writer itself. Configure via `[WINDOWS_UPDATE]`
+  in `config.ini`; needs Administrator for the pause layer only — the sentinel
+  works unelevated. **The durable fix is organizational: ask IT to exempt this
+  host from the update deadline policy.**
 - **Never eject the tape remotely.** `LtfsCmdEject` is physical; a cartridge
   ejected with nobody at the drive cannot be reloaded remotely (no software
   "load" for a tape out of the slot). LTFS `sync_type` changes need a physical
