@@ -1,7 +1,5 @@
 """Main menu, archiver entry points, DB management submenu."""
 import os
-import shutil
-import subprocess
 from typing import TYPE_CHECKING
 
 from .config import ConfigManager
@@ -16,64 +14,43 @@ from .retriever import LTORetriever
 from .robocopy import _prepare_robocopy_exclusion, _remove_robocopy_exclusion
 from .remote_transport import _cleanup_askpass_helpers
 from .runtime import _terminate_all_procs, install_cancel_handler, reset_cancel, uninstall_cancel_handler, unpin_current_process
+from .windows_update_guard import (pause_windows_updates, pending_reboot_reasons,
+                                   restore_stale_guard, resume_windows_updates)
 
 if TYPE_CHECKING:
     from .pg_db import PgDatabaseManager
 
 
-COLD_MANIFEST_CONTAINER = "lto_cold_manifest_pg"
+def _start_windows_update_guard(cfg: ConfigManager):
+    """Move the Windows Update window outside this run.
 
-
-def _docker_container_running(container):
-    if shutil.which("docker") is None:
-        return False
-    try:
-        result = subprocess.run(
-            ["docker", "inspect", "-f", "{{.State.Running}}", container],
-            capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return result.returncode == 0 and result.stdout.strip().lower() == "true"
-
-
-def _pause_cold_manifest_db(cfg):
-    """Stop the cold-manifest DB for the duration of an archive run.
-
-    The cold catalog is a separate PostgreSQL container that shares the host's
-    (and WSL's) RAM. During a tape archive the fetch/pack/tape stages need every
-    spare gigabyte, and the cold DB is never read while archiving. Stopping it
-    hands that RAM back to the pipeline; ``_resume_cold_manifest_db`` restores
-    it in the caller's ``finally`` so a crash or Ctrl+C still brings it back.
-
-    Returns True only if WE stopped a running container (so we know to restart).
+    Returns ``(proceed, applied)``. ``proceed`` is False when a restart is
+    already staged and the operator has not opted to run into it; ``applied``
+    tells the caller whether to call resume_windows_updates() in its finally.
     """
-    if not getattr(cfg, "cold_pause_during_archive", True):
-        return False
-    if not _docker_container_running(COLD_MANIFEST_CONTAINER):
-        return False
-    try:
-        subprocess.run(
-            ["docker", "stop", COLD_MANIFEST_CONTAINER],
-            capture_output=True, text=True, timeout=90)
-    except (OSError, subprocess.SubprocessError) as e:
-        print(f"[COLD] Could not pause {COLD_MANIFEST_CONTAINER}: {e}")
-        return False
-    print(f"[COLD] Paused {COLD_MANIFEST_CONTAINER} to free RAM for the archive "
-          "run; it will be restarted automatically when the run finishes.")
-    return True
+    if not cfg.windows_update_guard:
+        return True, False
 
+    # Undo a pause a force-killed run left behind before installing a new one.
+    restore_stale_guard()
 
-def _resume_cold_manifest_db(was_paused):
-    if not was_paused:
-        return
-    try:
-        subprocess.run(
-            ["docker", "start", COLD_MANIFEST_CONTAINER],
-            capture_output=True, text=True, timeout=90)
-        print(f"[COLD] Restarted {COLD_MANIFEST_CONTAINER}.")
-    except (OSError, subprocess.SubprocessError) as e:
-        print(f"[COLD] Could not restart {COLD_MANIFEST_CONTAINER}: {e}. "
-              f"Start it manually with: docker start {COLD_MANIFEST_CONTAINER}")
+    reasons = pending_reboot_reasons()
+    if reasons:
+        print("\n[WU] Windows has a restart pending:")
+        for reason in reasons:
+            print(f"  - {reason}")
+        print("[WU] Pausing updates cannot cancel an already-staged restart. "
+              "A restart during a tape write corrupts the LTFS index and "
+              "loses every chunk written so far — this cost ~126 GB of "
+              "Tape_02 on 2026-07-15.")
+        if cfg.windows_update_block_on_pending_reboot:
+            print("[WU] Reboot this host first, then start the run. To "
+                  "override, set [WINDOWS_UPDATE] block_on_pending_reboot "
+                  "= false in config.ini.")
+            return False, False
+        print("[WU] block_on_pending_reboot = false — proceeding anyway.")
+
+    return True, pause_windows_updates(cfg.windows_update_pause_days)
 
 
 def run_archiver(cfg: ConfigManager, db: "PgDatabaseManager"):
@@ -84,7 +61,12 @@ def run_archiver(cfg: ConfigManager, db: "PgDatabaseManager"):
     except RuntimeError as e:
         print(str(e))
         return
-    cold_paused = _pause_cold_manifest_db(cfg)
+
+    proceed, wu_guard = _start_windows_update_guard(cfg)
+    if not proceed:
+        db.release_archiver_lock()
+        return
+
     added_exclusion = _prepare_robocopy_exclusion()
     reset_cancel()
     install_cancel_handler()
@@ -108,8 +90,9 @@ def run_archiver(cfg: ConfigManager, db: "PgDatabaseManager"):
         _cleanup_askpass_helpers()
         if added_exclusion:
             _remove_robocopy_exclusion()
+        if wu_guard:
+            resume_windows_updates()
         db.release_archiver_lock()
-        _resume_cold_manifest_db(cold_paused)
 
 
 def run_remote_archiver(cfg: ConfigManager, db: "PgDatabaseManager"):
@@ -129,7 +112,12 @@ def run_remote_archiver(cfg: ConfigManager, db: "PgDatabaseManager"):
     except RuntimeError as e:
         print(str(e))
         return
-    cold_paused = _pause_cold_manifest_db(cfg)
+
+    proceed, wu_guard = _start_windows_update_guard(cfg)
+    if not proceed:
+        db.release_archiver_lock()
+        return
+
     added_exclusion = _prepare_robocopy_exclusion()
     reset_cancel()
     install_cancel_handler()
@@ -152,8 +140,9 @@ def run_remote_archiver(cfg: ConfigManager, db: "PgDatabaseManager"):
         _cleanup_askpass_helpers()
         if added_exclusion:
             _remove_robocopy_exclusion()
+        if wu_guard:
+            resume_windows_updates()
         db.release_archiver_lock()
-        _resume_cold_manifest_db(cold_paused)
 
 
 def _print_tapes_table(db):
@@ -312,7 +301,9 @@ def main():
     configure_file_logging(cfg.backup_log_dir)
     db        = create_database_manager(cfg)
     tape_mgr  = TapeManager(db, cfg.lto_drive, cfg.ibm_eject_cmd)
-    retriever = LTORetriever(db, cfg.lto_drive, cfg.staging_dir, cfg.restore_dir)
+    retriever = LTORetriever(
+        db, cfg.lto_drive, cfg.staging_dir, cfg.restore_dir,
+        manifest_archive_root=cfg.local_manifest_archive_root)
 
     while True:
         print("\n" + "=" * 60)

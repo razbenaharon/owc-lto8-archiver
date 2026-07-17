@@ -4,7 +4,7 @@ import time
 import threading
 import subprocess
 
-from .runtime import CANCEL, _apply_proc_tuning, _progress_done, _progress_line, register_proc, unregister_proc
+from .runtime import CANCEL, _apply_proc_tuning, _is_admin, _progress_done, _progress_line, register_proc, unregister_proc
 
 
 def _robocopy_file(src, dst, display_name=None):
@@ -194,22 +194,6 @@ def _run_robocopy_tuned(cmd, priority=None, affinity=None, on_start=None):
     finally:
         unregister_proc(proc)
     return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
-
-
-def _is_admin():
-    """True if the current process is running with Administrator privileges.
-
-    Defender's exclusion list is only *readable* from an elevated context —
-    Get-MpPreference succeeds for non-elevated callers but returns empty
-    exclusion arrays, so we can't trust a negative result from there.
-    Checking elevation up-front is the only reliable way to decide whether
-    to touch Defender at all.
-    """
-    try:
-        import ctypes
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return False
 
 
 def _run_powershell(ps_command):

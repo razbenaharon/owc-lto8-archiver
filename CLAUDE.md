@@ -15,6 +15,17 @@ This file is intentionally thin so the guidance has a single source of truth.
 
 ### Operational best practices (learned the hard way — read before touching a live run)
 
+- **A forced Windows Update restart mid-write destroys the LTFS index.** On
+  2026-07-15 one interrupted session 37 and silently lost chunks 18-91 (~126 GB)
+  from Tape_02 — the writes had been acknowledged and counted in
+  `tape_used_after`, but the cartridge came back with only chunks 0-17 and the
+  span had to be re-fetched. `src/windows_update_guard.py` now pauses updates
+  for the run and restores the previous settings afterwards; it refuses to
+  start when a restart is already staged (pausing cannot cancel a staged
+  restart — reboot first). Note `NoAutoRebootWithLoggedOnUsers=1` was already
+  set on this host and did **not** prevent it; the pause is the real guard.
+  Configure via `[WINDOWS_UPDATE]` in `config.ini`. The guard needs
+  Administrator; without elevation it warns and the run proceeds unguarded.
 - **Never eject the tape remotely.** `LtfsCmdEject` is physical; a cartridge
   ejected with nobody at the drive cannot be reloaded remotely (no software
   "load" for a tape out of the slot). LTFS `sync_type` changes need a physical

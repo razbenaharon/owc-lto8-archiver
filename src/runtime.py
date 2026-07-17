@@ -13,6 +13,22 @@ except ImportError:  # optional dependency — priority/affinity degrade gracefu
 from .logsetup import get_logger
 
 
+def _is_admin():
+    """True if the current process is running with Administrator privileges.
+
+    Several guards this package installs before a run — the Defender process
+    exclusion and the Windows Update pause — are only readable/writable from
+    an elevated context, and both degrade to a no-op with a warning rather
+    than failing the run. Checking elevation up-front is the only reliable
+    way to decide whether to touch them at all.
+    """
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
 def _ts():
     """Wall-clock timestamp prefix for status lines."""
     return time.strftime('%H:%M:%S')
