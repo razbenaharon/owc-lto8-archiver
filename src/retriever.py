@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from .db import _fmt_ts
 from .ltfs import get_volume_label
+from .local_manifest_archive import find_manifest_record, search_manifests
 from .packer import StagingSpaceError, ensure_staging_space
 from .robocopy import _robocopy_file
 from .runtime import CANCEL, _acquire_tape_io_lock, _release_tape_io_lock
@@ -24,11 +25,13 @@ RESTORE_PAGE_SIZE = 250
 
 class LTORetriever:
     def __init__(self, db: "PgDatabaseManager", tape_drive: str,
-                 staging_dir: str, restore_dir: str):
+                 staging_dir: str, restore_dir: str,
+                 manifest_archive_root: str = None):
         self.db          = db
         self.tape_drive  = tape_drive
         self.staging_dir = staging_dir
         self.restore_dir = restore_dir
+        self.manifest_archive_root = manifest_archive_root
 
     @staticmethod
     def _source_path_module(path):
@@ -172,7 +175,12 @@ class LTORetriever:
         print("5. Restore full backup session")
         print("6. Restore full directory — COMPLETE  (whole bundles; includes "
               "the small files that have no individual DB row)")
-        opt = input("Option (1-6): ").strip()
+        print("7. Search/restore pruned small files from local manifests")
+        opt = input("Option (1-7): ").strip()
+
+        if opt == '7':
+            self._run_manifest_search()
+            return
 
         if opt == '6':
             dir_q = input("Original directory path: ").strip()
@@ -312,11 +320,52 @@ class LTORetriever:
             size_s = f"{(row['file_size_bytes'] or 0)/1024**2:.1f} MB"
             date_s = _fmt_ts(row['backup_date'])
             host_s = row.get('source_host') or 'so02'
-            print(f"{row['file_id']:>7}  {row['file_name']:<42}  "
+            print(f"{str(row['file_id']):>7}  {row['file_name']:<42}  "
                   f"{size_s:>10}  {date_s:<20}  {host_s:<8}  "
                   f"{row['tape_label']}")
         print(f"\nShowing {page_start:,}-{page_end:,} of "
               f"{total_results:,} matching file(s)")
+
+    def _run_manifest_search(self):
+        if not self.manifest_archive_root:
+            print("[RETRIEVER] Local manifest archive is not configured.")
+            return
+        query = input("Filename or pattern: ").strip() or "*"
+        allowed_paths = self.db.list_pruned_manifest_segments()
+        rows = search_manifests(
+            self.manifest_archive_root, query, limit=500,
+            allowed_paths=allowed_paths)
+        if not rows:
+            print("[RETRIEVER] No matching local-manifest files found.")
+            return
+        self._print_results_page(rows, 0, len(rows))
+        print("[RETRIEVER] Results are capped at 500; narrow the pattern if needed.")
+        selection = input(
+            "Enter manifest ID (M:<id>), ALL, or 0=cancel: ").strip()
+        if not selection or selection == "0":
+            return
+        os.makedirs(self.restore_dir, exist_ok=True)
+        if selection.upper() == "ALL":
+            confirm = input(
+                f"Restore all {len(rows):,} displayed file(s)? "
+                "Type RESTORE ALL to confirm: ").strip()
+            if confirm == "RESTORE ALL":
+                self._restore_many(rows)
+            return
+        try:
+            record = find_manifest_record(
+                self.manifest_archive_root, selection,
+                allowed_paths=allowed_paths)
+        except (TypeError, ValueError):
+            record = None
+        if not record:
+            print("[RETRIEVER] Manifest file ID not found.")
+            return
+        self._verify_tape(record["tape_label"])
+        if record["is_packed"]:
+            self._restore_packed(record)
+        else:
+            self._restore_loose(record)
 
     def _restore_all_pages(self, fetch_after, total_results, restore_base=None):
         # One tape at a time: a multi-tape restore used to interleave tapes

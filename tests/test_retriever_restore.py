@@ -10,8 +10,10 @@ import shutil
 import tempfile
 import unittest
 from typing import Any, cast
+from unittest import mock
 
 from src import retriever as retriever_mod
+from src import local_manifest_archive as manifest_archive
 from src.retriever import LTORetriever
 from src.runtime import CANCEL
 
@@ -96,6 +98,53 @@ class RestoreCollisionTests(unittest.TestCase):
                  "stored_path": "x", "file_name": "x",
                  "original_path": "/x"},
             ])
+
+
+class LocalManifestRestoreDispatchTests(unittest.TestCase):
+    def test_packed_and_unpacked_manifest_records_use_normal_restore_paths(self):
+        with tempfile.TemporaryDirectory() as root:
+            relpath = "T/session/mixed.jsonl.zst"
+            common = {
+                "source_record_key": "ab" * 32,
+                "tape_label": "T", "source_host": "host",
+                "backup_date": "2026-07-16T00:00:00+00:00",
+                "covered_by_directory_catalog": True,
+            }
+            manifest_archive._write_segment(root, relpath, [
+                dict(common, source_file_id=1,
+                     original_path="/src/packed.txt", file_size_bytes=1,
+                     is_packed=True, stored_path="packed.txt",
+                     container_name="E:/Bundle.zip", file_name="packed.txt"),
+                dict(common, source_file_id=2,
+                     original_path="/src/loose.txt", file_size_bytes=2,
+                     is_packed=False, stored_path="E:/loose.txt",
+                     container_name=None, file_name="loose.txt"),
+            ])
+            allowed = [os.path.join(root, *relpath.split("/"))]
+
+            class _DB:
+                @staticmethod
+                def list_pruned_manifest_segments():
+                    return allowed
+
+            retriever = LTORetriever(
+                db=cast(Any, _DB()), tape_drive="E:\\",
+                staging_dir=os.path.join(root, "stage"),
+                restore_dir=os.path.join(root, "restore"),
+                manifest_archive_root=root)
+            retriever._verify_tape = mock.Mock()
+            retriever._restore_packed = mock.Mock()
+            retriever._restore_loose = mock.Mock()
+            retriever._print_results_page = mock.Mock()
+
+            with mock.patch("builtins.input", side_effect=[
+                    "packed.txt", "M:1", "loose.txt", "M:2"]):
+                retriever._run_manifest_search()
+                retriever._run_manifest_search()
+
+            retriever._restore_packed.assert_called_once()
+            retriever._restore_loose.assert_called_once()
+            self.assertEqual(retriever._verify_tape.call_count, 2)
 
 
 class DirectoryCompleteRestoreTests(unittest.TestCase):

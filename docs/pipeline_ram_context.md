@@ -3,7 +3,6 @@
 > Living reference for how the remote/local archive pipeline behaves under
 > memory pressure on this workstation, what actually goes wrong, and how to get
 > unstuck. Started 2026-07-10 during a stalled resume of remote session 36.
-> Companion to `docs/cold_migration_host_tuning_and_ops.md` (same host, cold DB).
 
 ---
 
@@ -95,7 +94,6 @@ of reclaimable cache, and freeing the slack that is freeable.
 |---|---|
 | `de7eb84` | `ResourceGovernor._drain_stage_relaxed`: after the soft-relax window, let **pack/db_sync** proceed despite the RAM ceiling **iff** ≥512 MB is still free. `fetch`/`tape` (real consumers) are **never** relaxed. +5 regression tests. |
 | `772b0d8` | Periodic `gc.collect()` at each pack batch checkpoint and after a chunk's fetch dir is freed — keeps the Python heap from drifting between checkpoints. |
-| `aaab200` | Auto-pause the **cold-manifest** Docker DB during archive runs (`cli.py`), restored in `finally` so Ctrl+C/crash still brings it back. Gated by `[COLD_MANIFEST_DB] pause_during_archive` (default true). |
 | `679d7a7` | Hot PostgreSQL sized for this host: `shared_buffers` 2 GB→1 GB, `mem_limit` 6g→4g, `maintenance_work_mem` 1 GB→512 MB (`docker-compose.yml`). |
 
 ### 5.2 `config.ini` (host-local, gitignored — not in the repo)
@@ -118,15 +116,14 @@ Stock defaults (soft 70 / hard 85, fetch 4.0/2.5, tape 3.0) are *unreachable*
 on this box and deadlock the pipeline on phantom cache. Keep these host values
 in `config.ini`; they are intentionally **not** committed (per-host).
 
-### 5.3 One-time ops (to recover from a cold stall)
+### 5.3 One-time ops (to recover from a stalled pipeline)
 
 1. **Stop the stuck `run.py`** (resumable — nothing is committed to tape until
    the write succeeds; the fetched chunk on disk is same-size-skipped on resume).
 2. **`wsl --shutdown`** — resets the WSL memory balloon. Freed ~2.8 GB here
    (`vmmemWSL` 4.6 GB→1.8 GB). **Needs explicit user approval** (auto-mode blocks
-   it: it bounces the shared hot DB). Safe when `run.py` is stopped and the cold
-   container is already stopped, so only the hot DB auto-returns → no Docker
-   **port cross-wiring** (see cold-ops doc). Recreate/verify: `docker compose up
+   it: it bounces the shared hot DB). Safe when `run.py` is stopped. Recreate
+   and verify the database afterwards: `docker compose up
    -d db`, then confirm `docker port lto_pg` = `127.0.0.1:5432` and
    `SELECT current_database()` = `lto_archive`.
 3. **Kill leaked `pytest` processes** — repeated backgrounded test runs on this
@@ -182,9 +179,6 @@ the recalibrated thresholds are correct to let it proceed.
 - **Throughput vs. paging.** With hard=95 the box may page during a very large
   chunk (slow, not a crash). If throughput matters more than desktop use, run
   archives with spare apps closed, or add RAM.
-- **Cold DB stays down after an archive run** (it was already stopped when the
-  run started, so the auto-resume in `cli.py` has nothing to restart). Start it
-  manually before a cold-migration op: `docker start lto_cold_manifest_pg`.
 - **(2026-07-10) Non-RAM blocker discovered downstream:** after chunk 1 packed
   cleanly, the tape write was refused because the **directory-catalog schema
   (`007`) is not installed** on this DB (`directory_archive_bundles` absent).
@@ -196,9 +190,9 @@ the recalibrated thresholds are correct to let it proceed.
 
 ## 8. Cross-references
 
-- `docs/cold_migration_host_tuning_and_ops.md` — WSL cap, Docker port
-  cross-wiring, cold governor tuning on this same host.
+- `docs/local_small_file_manifest_runbook.md` — permanent local manifest
+  export, validation, prune, and legacy database retirement.
 - `src/resource_governor.py` — `_drain_stage_relaxed`, `_tape_blocks`, the
   decision logic and thresholds.
-- `docker-compose.yml` — hot/cold container memory sizing.
+- `docker-compose.yml` — hot database container memory sizing.
 - `config.ini` `[PERFORMANCE]` — the host-local governor thresholds (not in git).

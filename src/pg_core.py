@@ -106,6 +106,7 @@ class PgConnectionCore:
             "006_postgres_remote_streaming.sql",
             "008_postgres_remote_provenance.sql",
             "009_postgres_remote_session_fk.sql",
+            "010_postgres_local_manifest_archive.sql",
         )
         with self._pool.connection() as conn:
             with conn.cursor() as cur:

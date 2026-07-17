@@ -893,6 +893,19 @@ class PgCatalogMixin:
             ).fetchall()
         return [row["source_host"] for row in rows if row["source_host"]]
 
+    def list_pruned_manifest_segments(self):
+        """Absolute local files approved for post-prune search/restore."""
+        with self._pool.connection() as conn:
+            if not self._table_exists_conn(conn, "local_manifest_exports"):
+                return []
+            rows = conn.execute(
+                """SELECT e.archive_root, s.manifest_relpath
+                   FROM local_manifest_segments s
+                   JOIN local_manifest_exports e ON e.export_id=s.export_id
+                   WHERE e.status='pruned'""").fetchall()
+        return [os.path.abspath(os.path.join(
+            row["archive_root"], row["manifest_relpath"])) for row in rows]
+
     def list_directory_bundles(self, tape_label=None, limit=500):
         self._require_directory_catalog_schema()
         where = []

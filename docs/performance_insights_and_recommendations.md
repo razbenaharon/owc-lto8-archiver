@@ -5,8 +5,7 @@
 > 2026-07-10 deep-dive on the 15.6 GB Windows host while archiving remote session
 > 37 to LTO-8. Every number here was measured live, not estimated. Companion to
 > `docs/pipeline_ram_context.md` (RAM deep-dive) and the memory files
-> `archive-pipeline-ram-phantom-cache`, `tape-write-speed-ltfs-sync`,
-> `cold-migration-host-ops`.
+> `archive-pipeline-ram-phantom-cache` and `tape-write-speed-ltfs-sync`.
 
 ---
 
@@ -67,9 +66,6 @@ effective**), plus parallel fetch (3 streams → ~30 MB/s).
   producer/consumer deadlock).
 - **Periodic `gc.collect()`** in the pack loop and after each chunk's fetch dir
   is freed (defensive; the archiver heap is small anyway).
-- **Cold-manifest DB auto-pause** (src/cli.py `_pause_cold_manifest_db`): stops
-  `lto_cold_manifest_pg` during archive runs, restored in `finally`. Config gate
-  `[COLD_MANIFEST_DB] pause_during_archive=true`.
 - **Hot PostgreSQL sized down** (docker-compose.yml): `shared_buffers` 2GB→1GB,
   `mem_limit` 6g→4g, `maintenance_work_mem` 1GB→512MB.
 - **`config.ini` [PERFORMANCE] host-calibrated** (gitignored — per host):
@@ -79,10 +75,9 @@ effective**), plus parallel fetch (3 streams → ~30 MB/s).
   measure reclaimable cache on this box, not crash risk; the 8.8 GB pagefile is
   the real OOM guard. Stock defaults (soft 70/hard 85, floors 4.0/2.5/3.0) are
   unreachable here and deadlock on phantom cache.
-- **One-time ops:** `wsl --shutdown` freed ~2.8 GB (needs the operator's OK — it
-  bounces the shared hot DB; safe only when run.py is stopped and the cold
-  container is already stopped so only hot auto-returns → no Docker port
-  cross-wiring). A one-off ~2.5 GB Python "cache-buster" allocation forces
+- **One-time ops:** `wsl --shutdown` freed ~2.8 GB (needs the operator's OK; it
+  bounces the shared hot DB and is safe only when run.py is stopped). A one-off
+  ~2.5 GB Python "cache-buster" allocation forces
   Windows to trim the file cache when the fetch gate is stuck on phantom cache.
 
 ### 2.3 Verified behaviour

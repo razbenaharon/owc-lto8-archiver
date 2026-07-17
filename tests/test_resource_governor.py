@@ -125,54 +125,6 @@ class ResourceGovernorTests(unittest.TestCase):
         self.assertIn("tape_active", decision.reasons)
         self.assertIn("staging_reserve", decision.reasons)
 
-    def test_cold_migration_blocks_during_tape_write(self):
-        gov, patches = self._governor()
-        with patches[0], patches[1], \
-             mock.patch.object(gov, "_local_disk_io_busy", return_value=False), \
-             gov.mark_tape_write_active():
-            self.assertFalse(gov.can_start_cold_migration())
-
-    def test_cold_migration_blocks_during_fetch(self):
-        gov, patches = self._governor()
-        with patches[0], patches[1], \
-             mock.patch.object(gov, "_local_disk_io_busy", return_value=False), \
-             gov.mark_fetch_active():
-            self.assertFalse(gov.can_start_cold_migration())
-
-    def test_cold_migration_blocks_during_pack(self):
-        gov, patches = self._governor()
-        with patches[0], patches[1], \
-             mock.patch.object(gov, "_local_disk_io_busy", return_value=False), \
-             gov.mark_pack_active():
-            self.assertFalse(gov.can_start_cold_migration())
-
-    def test_cold_migration_blocks_during_db_sync(self):
-        gov, patches = self._governor()
-        with patches[0], patches[1], \
-             mock.patch.object(gov, "_local_disk_io_busy", return_value=False), \
-             gov.mark_db_sync_active():
-            self.assertFalse(gov.can_start_cold_migration())
-
-    def test_cold_migration_blocks_during_cleanup(self):
-        gov, patches = self._governor()
-        with patches[0], patches[1], \
-             mock.patch.object(gov, "_local_disk_io_busy", return_value=False), \
-             gov.mark_cleanup_active():
-            self.assertFalse(gov.can_start_cold_migration())
-
-    def test_cold_migration_blocks_unsafe_ram(self):
-        gov, patches = self._governor(vm=_vm(percent=75))
-        with patches[0], patches[1], \
-             mock.patch.object(gov, "_local_disk_io_busy", return_value=False):
-            self.assertFalse(gov.can_start_cold_migration())
-
-    def test_cold_migration_blocks_busy_local_disk_io(self):
-        gov, patches = self._governor()
-        with patches[0], patches[1], \
-             mock.patch.object(gov, "_local_disk_io_busy", return_value=True):
-            self.assertFalse(gov.can_start_cold_migration())
-
-
 class TapeGateAsymmetryTests(unittest.TestCase):
     """Regression coverage for ResourceGovernor._tape_blocks(action).
 

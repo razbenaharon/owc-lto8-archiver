@@ -157,6 +157,19 @@ class PgTapeMixin:
         return stats
 
     def _calculate_tape_used_space_conn(self, conn, volume_label):
+        manifest_bytes = 0
+        if self._table_exists_conn(conn, "local_manifest_folder_aggregates"):
+            row = conn.execute(
+                """SELECT COALESCE(SUM(
+                            CASE WHEN %s THEN a.direct_uncovered_bytes
+                                 ELSE a.direct_bytes END),0) AS used
+                   FROM local_manifest_folder_aggregates a
+                   JOIN local_manifest_exports e ON e.export_id=a.export_id
+                   WHERE a.tape_label=%s AND e.status='pruned'""",
+                (self._table_exists_conn(conn, "directory_archive_bundles"),
+                 volume_label),
+            ).fetchone()
+            manifest_bytes = int(row["used"] or 0)
         if not self._table_exists_conn(conn, "directory_archive_bundles"):
             row = conn.execute(
                 """SELECT COALESCE(SUM(file_size_bytes), 0) AS used
@@ -164,7 +177,7 @@ class PgTapeMixin:
                    WHERE tape_label=%s""",
                 (volume_label,),
             ).fetchone()
-            return row["used"]
+            return int(row["used"] or 0) + manifest_bytes
         row = conn.execute(
             """WITH bundle_paths AS (
                    SELECT stored_bundle_path
@@ -192,7 +205,7 @@ class PgTapeMixin:
                    + (SELECT n FROM directory_bundle_bytes) AS used""",
             (volume_label, volume_label, volume_label),
         ).fetchone()
-        return row["used"]
+        return int(row["used"] or 0) + manifest_bytes
 
     def delete_tape(self, volume_label):
         def operation(conn):
