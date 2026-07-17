@@ -216,9 +216,8 @@ hardware/manual verification if relevant, and any database/config changes. For
   NIC + RAM every 10 s with negligible overhead; `du`/`ls`/`Get-Volume` on `E:`
   touches the media and can trigger shoe-shining.
 - **`wsl --shutdown` frees WSL-ballooned RAM but bounces the shared hot DB** — do
-  it only with the operator's OK, only when `run.py` is stopped and the cold
-  container is already stopped (so only the hot DB auto-returns → no Docker port
-  cross-wiring). Verify the port + `current_database()` afterwards.
+  it only with the operator's OK and only when `run.py` is stopped. Verify the
+  port + `current_database()` afterwards.
 - **Chunk-size / config changes apply to newly-scanned chunks only** (already-
   planned chunks keep their old plan) and need a `run.py` restart to be read.
   LTFS `sync_type` needs a physical remount. Neither is retroactive.

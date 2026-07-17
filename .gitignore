@@ -16,6 +16,7 @@ venv/
 source/
 staging/
 restored/
+LOCAL_MANIFEST_ARCHIVE/
 backup_logs/
 storage_map_logs/
 storage_map/logs/
@@ -32,3 +33,7 @@ Framework & Drivers/
 # Secrets — real credentials live here, never commit them
 .env
 .env.local
+
+# Local scratch output from storage_map dev sessions
+storage_map/scratch_coverage.json
+storage_map/scratchpad_serve.log

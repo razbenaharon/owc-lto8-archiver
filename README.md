@@ -130,6 +130,8 @@ Choose a search mode:
 | 3 | Both filename and date range |
 | 4 | Restore full directory — partial path match against original paths |
 | 5 | Restore full backup session — select from a dated session list |
+| 6 | Restore a complete directory from bundle ZIP contents |
+| 7 | Search/restore pruned small files from permanent local manifests |
 
 Results are displayed in bounded pages showing file ID, filename, size, backup date, source host, and tape label.
 
@@ -209,13 +211,20 @@ tools on PATH.
 **`tapes`** — one row per tape
 - `volume_label`, `date_formatted`, `total_capacity`, `used_space`
 
-**`files_index`** — one row per file
+**`files_index`** — one row per indexed large/current file; validated rows
+smaller than 10 MiB may be pruned after permanent local export
 - `original_path`, `file_size_bytes`, `source_host`, `tape_label`
 - `is_packed`, `stored_path`, `local_session_id`, `local_chunk_index`
 - `record_key`, `archive_run_id`, `directory_id`, `catalog_name`,
   `catalog_backup_date`
 - ZIP bundle and run metadata are normalized through `archive_bundles` and
   `archive_runs`.
+
+**Local small-file archive** — immutable `jsonl.zst` segments under the
+configured `[LOCAL_MANIFEST_ARCHIVE] root`. PostgreSQL retains segment
+checksums and direct/recursive folder count and byte aggregates, but no
+per-file snapshot rows after pruning. See
+`docs/local_small_file_manifest_runbook.md`.
 
 The CLI also creates session tables for resumable work:
 

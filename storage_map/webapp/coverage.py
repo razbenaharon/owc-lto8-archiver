@@ -84,7 +84,7 @@ idx AS (
     FROM per_file
     GROUP BY 1, 2
 ),
-dir_small AS (
+dir_small_catalog AS (
     SELECT lower(split_part(source_host, '.', 1))    AS host,
            original_dir_path                         AS dirname,
            SUM(direct_small_file_bytes)::bigint      AS bytes,
@@ -93,6 +93,27 @@ dir_small AS (
     FROM directory_tree_index
     WHERE original_dir_path LIKE '/%%'
     GROUP BY 1, 2
+),
+local_manifest_uncovered AS (
+    SELECT lower(split_part(a.source_host, '.', 1)) AS host,
+           a.original_dir_path                      AS dirname,
+           SUM(a.direct_uncovered_bytes)::bigint    AS bytes,
+           SUM(a.direct_uncovered_file_count)::bigint AS files,
+           MAX(a.backup_date)                       AS last_backup
+    FROM local_manifest_folder_aggregates a
+    JOIN local_manifest_exports e ON e.export_id=a.export_id
+    WHERE a.original_dir_path LIKE '/%%' AND e.status='pruned'
+    GROUP BY 1, 2
+),
+dir_small AS (
+    SELECT host, dirname, SUM(bytes)::bigint AS bytes,
+           SUM(files)::bigint AS files, MAX(last_backup) AS last_backup
+    FROM (
+        SELECT * FROM dir_small_catalog
+        UNION ALL
+        SELECT * FROM local_manifest_uncovered
+    ) totals
+    GROUP BY host, dirname
 ),
 merged AS (
     SELECT COALESCE(i.host, d.host)       AS host,

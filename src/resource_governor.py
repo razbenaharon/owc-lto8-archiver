@@ -99,19 +99,6 @@ class ResourceGovernor:
         return float(getattr(self.cfg, "governor_soft_relax_factor", 0.75))
 
     @property
-    def cold_min_free_ram_bytes(self):
-        gb = float(getattr(self.cfg, "cold_min_free_ram_gb", 16))
-        return int(gb * 1024**3)
-
-    @property
-    def cold_max_ram_pct(self):
-        return float(getattr(self.cfg, "cold_max_ram_pct", 60))
-
-    @property
-    def cold_max_local_disk_io_mbs(self):
-        return float(getattr(self.cfg, "cold_max_local_disk_io_mbs", 200))
-
-    @property
     def tape_write_exclusive(self):
         return _bool_config(self.cfg, "tape_write_exclusive", True)
 
@@ -151,35 +138,6 @@ class ResourceGovernor:
             return total / 1024**2
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             return 0.0
-
-    def _cold_memory_ok(self):
-        available = self._memory_available()
-        if self._memory_pct() >= self.cold_max_ram_pct:
-            return False
-        if (available is not None and
-                available < self.cold_min_free_ram_bytes):
-            return False
-        return True
-
-    def _local_disk_io_busy(self):
-        if psutil is None:
-            return False
-        try:
-            first = psutil.disk_io_counters()
-            if first is None:
-                return False
-            time.sleep(0.05)
-            second = psutil.disk_io_counters()
-        except Exception:
-            return False
-        if second is None:
-            return False
-        delta = (
-            (second.read_bytes - first.read_bytes) +
-            (second.write_bytes - first.write_bytes)
-        )
-        mbs = delta / 0.05 / 1024**2
-        return mbs > self.cold_max_local_disk_io_mbs
 
     def _hard_memory_ok(self):
         return self._memory_pct() < self.ram_hard_limit_pct
@@ -367,20 +325,6 @@ class ResourceGovernor:
 
     def can_cleanup(self):
         return self.decision("cleanup", "start").allowed
-
-    def can_start_cold_migration(self):
-        with self._lock:
-            if (self.tape_write_active or self.tape_write_pending or
-                    self.fetch_active or self.pack_active or
-                    self.db_sync_active or self.cleanup_active):
-                return False
-            if not self._cold_memory_ok():
-                return False
-            if not self._staging_ok():
-                return False
-            if self._local_disk_io_busy():
-                return False
-            return True
 
     def wait_until(self, predicate, label, stop_evt=None):
         warned = False

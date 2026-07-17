@@ -430,13 +430,29 @@ class InspectorRepository:
                GROUP BY s.root_id""",
             (ids,),
         ).fetchall()
-        return {
+        totals = {
             row["root_id"]: {
                 "recursive_bytes": row["recursive_bytes"] or 0,
                 "recursive_file_count": row["recursive_file_count"] or 0,
             }
             for row in rows
         }
+        manifest_rows = self._execute(
+            """SELECT a.directory_id AS root_id,
+                      COALESCE(SUM(a.recursive_bytes),0) AS recursive_bytes,
+                      COALESCE(SUM(a.recursive_file_count),0)
+                        AS recursive_file_count
+               FROM local_manifest_catalog_aggregates a
+               JOIN local_manifest_exports e ON e.export_id=a.export_id
+               WHERE a.directory_id=ANY(%s) AND e.status='pruned'
+               GROUP BY a.directory_id""", (ids,)).fetchall()
+        for row in manifest_rows:
+            total = totals.setdefault(row["root_id"], {
+                "recursive_bytes": 0, "recursive_file_count": 0})
+            total["recursive_bytes"] += row["recursive_bytes"] or 0
+            total["recursive_file_count"] += (
+                row["recursive_file_count"] or 0)
+        return totals
 
     def list_directory_files(self, directory_id, sort="name", filters=None, cursor=None,
                              limit=None):
