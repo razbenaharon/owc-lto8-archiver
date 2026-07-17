@@ -145,22 +145,14 @@ class ConfigManager:
             'timeout_seconds': '10',
             'heartbeat_minutes': '30',
         }
-        self.config['COLD_MANIFEST_DB'] = {
-            'enabled': 'true',
-            'pause_during_archive': 'true',
-            'host': 'localhost',
-            'port': '55432',
-            'database': 'lto_cold_manifest',
-            'user': 'lto_cold',
-            'password_env': 'COLD_PGPASSWORD',
-            'sslmode': 'prefer',
-            'small_file_threshold_mb': '10',
-            'batch_rows': '25000',
-            'fetch_rows': '5000',
-            'sleep_between_batches_ms': '250',
-            'max_ram_pct': '60',
-            'min_free_ram_gb': '16',
-            'max_local_disk_io_mbs': '200',
+        self.config['LOCAL_MANIFEST_ARCHIVE'] = {
+            'root': os.path.join(PROJECT_ROOT, 'LOCAL_MANIFEST_ARCHIVE'),
+            'search_limit': '500',
+        }
+        self.config['WINDOWS_UPDATE'] = {
+            'guard': 'true',
+            'pause_days': '7',
+            'block_on_pending_reboot': 'true',
         }
         with open(self.config_path, 'w', encoding='utf-8') as f:
             self.config.write(f)
@@ -561,107 +553,25 @@ class ConfigManager:
             or self.config.get('TELEGRAM', 'chat_id', fallback='', raw=True))
 
     @property
-    def cold_manifest_enabled(self):
-        return self._get_bool('COLD_MANIFEST_DB', 'enabled', True)
+    def local_manifest_archive_root(self):
+        return _clean_config_path(self.config.get(
+            'LOCAL_MANIFEST_ARCHIVE', 'root',
+            fallback=os.path.join(PROJECT_ROOT, 'LOCAL_MANIFEST_ARCHIVE')))
 
     @property
-    def cold_pause_during_archive(self):
-        """Stop the cold-manifest Docker DB during a tape archive run so it does
-        not compete for RAM with fetch/pack/tape. Restored automatically when the
-        run ends. Set false to leave the cold DB running during archives."""
-        return self._get_bool(
-            'COLD_MANIFEST_DB', 'pause_during_archive', True)
-
-    @property
-    def cold_pg_host(self):
-        return self.config.get(
-            'COLD_MANIFEST_DB', 'host', fallback='localhost').strip()
-
-    @property
-    def cold_pg_port(self):
-        return self.config.get(
-            'COLD_MANIFEST_DB', 'port', fallback='55432').strip()
-
-    @property
-    def cold_pg_dbname(self):
-        return self.config.get(
-            'COLD_MANIFEST_DB', 'database',
-            fallback='lto_cold_manifest').strip()
-
-    @property
-    def cold_pg_user(self):
-        return self.config.get(
-            'COLD_MANIFEST_DB', 'user', fallback='lto_cold').strip()
-
-    @property
-    def cold_pg_password_env(self):
-        return self.config.get(
-            'COLD_MANIFEST_DB', 'password_env',
-            fallback='COLD_PGPASSWORD').strip()
-
-    @property
-    def cold_pg_password(self):
-        env_name = self.cold_pg_password_env or 'COLD_PGPASSWORD'
-        return _strip_quotes(
-            os.environ.get(env_name)
-            or self.env.get(env_name)
-            or self.config.get('COLD_MANIFEST_DB', 'password',
-                               fallback='', raw=True))
-
-    @property
-    def cold_pg_sslmode(self):
-        return self.config.get(
-            'COLD_MANIFEST_DB', 'sslmode', fallback='prefer').strip()
-
-    @property
-    def cold_db_dsn(self):
-        user = quote(self.cold_pg_user, safe='')
-        password = quote(self.cold_pg_password, safe='')
-        auth = f"{user}:{password}@" if password else f"{user}@"
-        return (
-            f"postgresql://{auth}{self.cold_pg_host}:{self.cold_pg_port}/"
-            f"{quote(self.cold_pg_dbname, safe='')}?sslmode={quote(self.cold_pg_sslmode, safe='')}"
-        )
-
-    @property
-    def cold_db_display_ref(self):
-        user = quote(self.cold_pg_user, safe='')
-        auth = f"{user}:***@" if self.cold_pg_password else f"{user}@"
-        return (
-            f"postgresql://{auth}{self.cold_pg_host}:{self.cold_pg_port}/"
-            f"{quote(self.cold_pg_dbname, safe='')}?sslmode={quote(self.cold_pg_sslmode, safe='')}"
-        )
-
-    @property
-    def cold_small_file_threshold_mb(self):
-        return self._get_float(
-            'COLD_MANIFEST_DB', 'small_file_threshold_mb', 10)
-
-    @property
-    def cold_batch_rows(self):
-        return self._get_int('COLD_MANIFEST_DB', 'batch_rows', 25000,
-                             minimum=1)
-
-    @property
-    def cold_fetch_rows(self):
-        return self._get_int('COLD_MANIFEST_DB', 'fetch_rows', 5000,
-                             minimum=1)
-
-    @property
-    def cold_sleep_between_batches_ms(self):
+    def local_manifest_search_limit(self):
         return self._get_int(
-            'COLD_MANIFEST_DB', 'sleep_between_batches_ms', 250,
-            minimum=0)
+            'LOCAL_MANIFEST_ARCHIVE', 'search_limit', 500, minimum=1)
 
     @property
-    def cold_max_ram_pct(self):
-        return self._get_float('COLD_MANIFEST_DB', 'max_ram_pct', 60)
+    def windows_update_guard(self):
+        return self._get_bool('WINDOWS_UPDATE', 'guard', True)
 
     @property
-    def cold_min_free_ram_gb(self):
-        return self._get_float('COLD_MANIFEST_DB', 'min_free_ram_gb', 16)
+    def windows_update_pause_days(self):
+        return self._get_int('WINDOWS_UPDATE', 'pause_days', 7, minimum=1)
 
     @property
-    def cold_max_local_disk_io_mbs(self):
-        return self._get_float(
-            'COLD_MANIFEST_DB', 'max_local_disk_io_mbs', 200)
+    def windows_update_block_on_pending_reboot(self):
+        return self._get_bool(
+            'WINDOWS_UPDATE', 'block_on_pending_reboot', True)
