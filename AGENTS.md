@@ -208,9 +208,31 @@ hardware/manual verification if relevant, and any database/config changes. For
   VS Code; killing it ends the session. Ask the operator to close windows.
 - **Before stopping `run.py`, confirm no tape write is active** (`tasklist` for
   `robocopy` — case-insensitive; a WMI `Name='robocopy.exe'` filter *misses* it
-  because it is `Robocopy.exe`). Sessions are resumable (chunks are re-fetched
-  and re-packed on resume; nothing is committed to tape mid-write), but
-  interrupting a live tape write is not acceptable.
+  because it is `Robocopy.exe`). Sessions are resumable and nothing is committed
+  to tape mid-write, but interrupting a live tape write is not acceptable.
+- **Stopping a *detached* run: use `scripts/graceful_stop.py <pid>`, never
+  `taskkill /F`.** A run launched detached (`printf '6\n1\n' | nohup python
+  run.py &`) has no terminal to press Ctrl+C in. The helper attaches to the
+  target's console and raises `CTRL_C_EVENT` there, which is the signal the
+  pipeline already handles — the writer finishes its current chunk, packs are
+  preserved, and the session stays resumable. Notes learned the hard way:
+  - Pass the PID of the **real** interpreter, not the launcher shim. A detached
+    run shows two `python.exe`: a ~1 MB `.venv\Scripts\python.exe run.py` parent
+    and the actual several-hundred-MB child. `Get-CimInstance Win32_Process`
+    shows both with their `ParentProcessId`.
+  - `CTRL_C_EVENT`, not `CTRL_BREAK_EVENT`.
+  - **Confirm `robocopy` is not running first.** The signal is only safe at a
+    chunk boundary.
+  - If the process is wedged in a native tape call, `CTRL_C` does nothing. Only
+    then is force-killing Python acceptable — the LTFS driver is a separate
+    process and the cartridge stays mounted. See the tape-stage deadlock notes.
+- **A stop preserves staged packs; it does not throw them away.** `_preserve_desc`
+  keeps the pack directory and writes an atomic `_resume_pack.json` marker
+  recording its exact file inventory. The next run reuses that pack with no
+  re-fetch and no re-pack (`_try_resume_pack`), but *only* on exact inventory
+  equality — a pack with no marker, or whose contents changed, is deleted and
+  re-fetched rather than risk writing a truncated chunk to tape and recording it
+  as good.
 - **Measure with kernel perf counters only, never by reading the tape or walking
   the LTFS drive.** `backup_logs/_tape_sampler.ps1` samples per-process I/O/CPU +
   NIC + RAM every 10 s with negligible overhead; `du`/`ls`/`Get-Volume` on `E:`
@@ -221,3 +243,45 @@ hardware/manual verification if relevant, and any database/config changes. For
 - **Chunk-size / config changes apply to newly-scanned chunks only** (already-
   planned chunks keep their old plan) and need a `run.py` restart to be read.
   LTFS `sync_type` needs a physical remount. Neither is retroactive.
+- **A transient network/DNS blip retries; it no longer kills the run.** On
+  2026-07-17 a momentary `ssh: Could not resolve hostname so01` (a Technion DNS
+  hiccup — Telegram failed the same instant with `getaddrinfo failed`, and the
+  machine never rebooted) stopped the streaming session at chunk 25. Because the
+  monitor was offline **on the same host that lost the network**, nothing
+  relaunched it and the run sat idle ~3 days. `_fetch_one_batch` now retries a
+  transient failure with exponential backoff before giving up
+  (`_is_transient_fetch_error`; `[PERFORMANCE] fetch_transient_retries` default
+  5, `fetch_transient_retry_base_seconds` default 5). Genuine errors (missing
+  file, permission) still fail fast. Two lessons that are *not* fixed in code and
+  still bite: (1) don't run the only monitor on the host doing the work — if that
+  host loses the network you lose the watchdog exactly when you need it; (2) there
+  is still no auto-relaunch, so a hard stop needs a human to re-run `6\n1\n`.
+- **The forced restart on this host comes from SCCM, not WSUS.** Evidence from
+  the 2026-07-15 loss (System log 1074): the initiator was `CcmExec.exe` —
+  *"Your computer will restart at 15/07/2026 10:39:01 to complete the
+  installation of applications and software updates"* — the Software Center
+  notification, **60 seconds** before the restart. WSUS/GPO deadline settings are
+  real on this host but were not the trigger. Consequences:
+  - Pausing Windows Update cannot influence an SCCM restart. Different control
+    plane. Escalate for an **SCCM maintenance window / deployment exemption**,
+    not a WSUS deadline exemption.
+  - 60 s of warning against a ~70 min chunk cycle means the sentinel's poll can
+    never save the chunk in flight. The protection that matters is
+    `_pre_tape_write_reboot_check`, which runs synchronously immediately before
+    each write and refuses to *start* one — so the loss is a deferred chunk
+    rather than a killed write.
+  - Query SCCM via `root\ccm\ClientSDK` →
+    `CCM_ClientUtilities.DetermineIfRebootPending`. Treat "could not ask" as
+    distinct from "no restart" (`sccm_reboot_status()['determinate']`).
+  - **The `RebootData` registry key's existence proves nothing** — verified
+    2026-07-17: present but empty while SCCM reported no pending restart. Read
+    its *values* (`RebootBy`, `HardReboot`), never its presence.
+- **Verify LTFS `sync_type` from the mount, not the config file.** The two drift
+  silently: an MSI reinstall of IBM Storage Archive SDE on 2026-07-16 13:52 reset
+  `ltfs.conf.local` to its packaged contents (which is why that file is dated
+  2024 and matches its own `.bak`). The mount states its own truth once, in the
+  LTFS Windows event log, event **61259**: `Sync type is "time", Sync time is
+  300 sec`. `ltfs_sync_mode_status()` reads that, and the pipeline refuses to
+  start tape writes under anything but `time@5` — under `sync_type=unmount` the
+  index is written only at unmount, so a forced restart loses every chunk since
+  the mount, which is exactly how chunks 18-91 (~126 GB) died.

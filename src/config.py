@@ -420,6 +420,28 @@ class ConfigManager:
         return self._get_int(
             'PERFORMANCE', 'fetch_parallel_streams', 1, minimum=1)
     @property
+    def fetch_transient_retries(self):
+        """How many times to retry a fetch batch that failed on a *transient*
+        network error (DNS resolution, ssh exit 255, connection reset/refused/
+        timeout) before giving up the chunk. 0 restores the old fail-fast.
+
+        This exists because on 2026-07-17 a single momentary DNS failure
+        ("Could not resolve hostname so01") killed the whole streaming session,
+        and with the monitor offline the run then sat idle for ~3 days. A
+        transient blip should cost a short backoff, not the run."""
+        return self._get_int(
+            'PERFORMANCE', 'fetch_transient_retries', 5, minimum=0)
+    @property
+    def fetch_transient_retry_base_seconds(self):
+        """Base delay for the exponential backoff between transient-error
+        retries (delay = base * 2**attempt, capped at 60s)."""
+        raw = self.config.get('PERFORMANCE', 'fetch_transient_retry_base_seconds',
+                              fallback='5').strip()
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            return 5.0
+    @property
     def governor_pack_file_batch_size(self):
         return self._get_int(
             'PERFORMANCE', 'governor_pack_file_batch_size', 10000,

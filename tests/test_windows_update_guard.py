@@ -53,6 +53,15 @@ class _GuardTestCase(unittest.TestCase):
             mock.patch.object(wug, "winreg", SimpleNamespace(
                 HKEY_LOCAL_MACHINE=0, REG_SZ=REG_SZ, REG_DWORD=REG_DWORD,
                 KEY_READ=0x20019, KEY_SET_VALUE=0x0002)),
+            # The sentinel now unions SCCM's own restart intent with the Windows
+            # markers. Stub it clear so these cases keep testing the markers;
+            # SCCM's own behaviour is covered in test_sccm_reboot_guard.py.
+            # Without this the sentinel would shell out to PowerShell mid-test.
+            mock.patch.object(wug, "sccm_reboot_status", lambda: dict(
+                installed=False, reboot_pending=False,
+                hard_reboot_pending=False, in_grace_period=False,
+                deadline=None, error=None, determinate=True,
+                registry_reboot_data=False)),
         ]
         for p in patches:
             p.start()

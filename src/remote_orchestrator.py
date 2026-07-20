@@ -1,5 +1,6 @@
 """RemoteOrchestrator: streaming remote-host -> staging -> tape pipeline."""
 import gc
+import json
 import os
 import time
 import queue
@@ -15,7 +16,9 @@ from .constants import (DEFAULT_TAPE_CAPACITY_GB, LOCAL_STAGING_RESERVE_BYTES,
                         LTFS_WRITE_WARNING, tape_budget_bytes)
 from .db import _apply_canonical_remote_paths
 from .logsetup import get_logger
-from .windows_update_guard import RebootSentinel
+from .windows_update_guard import (RebootSentinel, ltfs_sync_mode_status,
+                                   pending_reboot_reasons,
+                                   reboot_block_reasons)
 from .ltfs import _ensure_lto_drive_ready, get_volume_label
 from .packer import LTOPacker
 from .paths import (_LEGACY_PATH_LIMIT, _dir_tree_size,
@@ -41,6 +44,45 @@ from .ui import ConsoleUI
 # A fetch this far past its planned bytes gets one loud alert; the hard
 # abort threshold is the configurable fetch_overrun_abort_factor.
 _FETCH_OVERRUN_WARN_FACTOR = 1.10
+
+# Written inside a pack dir when a stop preserves it, and the only thing that
+# makes that pack reusable. Written last and atomically, so its presence means
+# the pack is complete — a pack interrupted mid-write simply has no marker.
+_RESUME_MARKER = "_resume_pack.json"
+
+# Substrings that mark a fetch failure as transient — a network/DNS hiccup worth
+# a retry, not a reason to abandon the chunk and stop the run. Drawn from the
+# 2026-07-17 incident (a momentary "Could not resolve hostname so01" killed the
+# session) and the usual ssh/tar transport failures. Matched case-insensitively.
+_TRANSIENT_FETCH_SIGNATURES = (
+    "could not resolve hostname",
+    "name or service not known",
+    "temporary failure in name resolution",
+    "getaddrinfo",
+    "exit 255",                 # ssh's catch-all for a connection it never made
+    "connection reset",
+    "connection timed out",
+    "connection refused",
+    "connection closed",
+    "broken pipe",
+    "network is unreachable",
+    "no route to host",
+    "kex_exchange_identification",
+    "banner exchange",
+)
+
+
+def _is_transient_fetch_error(err):
+    """True if a fetch error looks like a retryable network/DNS blip.
+
+    Deliberately conservative: an error that is not clearly transient is treated
+    as fatal, because retrying a genuine problem (missing file, permission,
+    corrupt source) just wastes time. A false negative costs a re-fetch on
+    resume; a false positive would spin on an unrecoverable error."""
+    if not err:
+        return False
+    low = str(err).lower()
+    return any(sig in low for sig in _TRANSIENT_FETCH_SIGNATURES)
 
 
 class RemoteOrchestrator:
@@ -78,6 +120,8 @@ class RemoteOrchestrator:
         self.prefetch_ahead    = cfg.prefetch_chunks_ahead
         self.staging_padding   = cfg.staging_padding_factor
         self.fetch_abort_factor = cfg.fetch_overrun_abort_factor
+        self.fetch_transient_retries = cfg.fetch_transient_retries
+        self.fetch_transient_retry_base = cfg.fetch_transient_retry_base_seconds
         self.chunk_max_files  = cfg.chunk_max_files
         self.metadata_batch_size = cfg.governor_metadata_batch_size
         self.pack_file_batch_size = cfg.governor_pack_file_batch_size
@@ -339,6 +383,9 @@ class RemoteOrchestrator:
                            f"staging cap {self.staging_max_bytes / 1024**3:.0f} GB")
         print(f"[WARNING] {LTFS_WRITE_WARNING}")
 
+        if not self._validate_ltfs_sync_mode():
+            return False
+
         chunk_q = queue.Queue(maxsize=max(1, self.prefetch_ahead * 2))
         ready_q = queue.Queue(maxsize=self.prefetch_ahead)
         stop_pipeline = threading.Event()
@@ -532,13 +579,33 @@ class RemoteOrchestrator:
 
         completed = 0
         failed = False
+        blocked_by_reboot = False
         try:
             while True:
                 desc = ready_q.get()
                 if desc is SENTINEL:
                     break
                 if CANCEL.is_set():
-                    self._discard_desc(desc)
+                    # Keep the pack. It cost a full fetch+pack cycle and it is
+                    # exactly what a resume wants; deleting it here is why an
+                    # interrupted run used to re-fetch work it already had.
+                    self._preserve_desc(session_id, desc, "cancelled before write")
+                    break
+                # A stop asked for mid-write must end the pipeline at THIS
+                # boundary, not after the queue drains. The sentinel sets
+                # stop_pipeline precisely so the next write never starts.
+                if stop_pipeline.is_set():
+                    self._preserve_desc(session_id, desc, "stop requested before write")
+                    break
+                # Synchronous, current re-check. The sentinel's poll can be up
+                # to 60s stale, and on 2026-07-15 SCCM gave 60s of warning —
+                # a stale answer is not good enough at this boundary.
+                reasons, sccm = self._pre_tape_write_reboot_check(
+                    session_id, desc, tape_label)
+                if reasons:
+                    self._preserve_desc(session_id, desc, "blocked by pending restart")
+                    blocked_by_reboot = True
+                    stop_pipeline.set()
                     break
                 if not self._write_chunk(
                         session_id, desc, tape_label, eject_after=False):
@@ -552,11 +619,13 @@ class RemoteOrchestrator:
             stop_pipeline.set()
             hb_stop.set()
             reboot_sentinel.stop()
+            # Anything still queued is a fully staged pack. Preserve it for the
+            # resume instead of deleting it.
             try:
                 while True:
                     leftover = ready_q.get_nowait()
                     if leftover is not SENTINEL:
-                        self._discard_desc(leftover)
+                        self._preserve_desc(session_id, leftover, "queued at shutdown")
             except queue.Empty:
                 pass
             # Drain chunk_q too: the scanner's _force_put(SENTINEL) can spin
@@ -733,10 +802,19 @@ class RemoteOrchestrator:
                 if desc is SENTINEL:
                     break
                 if CANCEL.is_set():
-                    self._discard_desc(desc)
+                    self._preserve_desc(session_id, desc, "cancelled before write")
+                    break
+                if stop_pipeline.is_set():
+                    self._preserve_desc(session_id, desc, "stop requested before write")
                     break
                 ci          = desc.chunk_index
                 eject_after = (ci == last_chunk)
+                reasons, _sccm = self._pre_tape_write_reboot_check(
+                    session_id, desc, tape_label)
+                if reasons:
+                    self._preserve_desc(session_id, desc, "blocked by pending restart")
+                    stop_pipeline.set()
+                    break
                 if not self._write_chunk(session_id, desc, tape_label, eject_after):
                     if not CANCEL.is_set():
                         # A failed chunk is re-fetched and repacked on resume,
@@ -750,13 +828,14 @@ class RemoteOrchestrator:
             stop_pipeline.set()
             hb_stop.set()
             reboot_sentinel.stop()
-            # Drain the queue so a producer blocked on a full put() can exit,
-            # and clean up any prefetched-but-unused chunks.
+            # Drain the queue so a producer blocked on a full put() can exit.
+            # Staged packs are kept, not deleted: each one is a whole fetch+pack
+            # cycle and the resume can write it straight to tape.
             try:
                 while True:
                     leftover = ready_q.get_nowait()
                     if leftover is not SENTINEL:
-                        self._discard_desc(leftover)
+                        self._preserve_desc(session_id, leftover, "queued at shutdown")
             except queue.Empty:
                 pass
             prod.join(timeout=15)
@@ -890,6 +969,22 @@ class RemoteOrchestrator:
             self.staging_dir, f"_fetch_s{session_id:04d}_{chunk_index:03d}")
         pack_dir  = os.path.join(
             self.staging_dir, f"_pack_s{session_id:04d}_{chunk_index:03d}")
+
+        # A pack this session preserved on an earlier stop can go straight to
+        # tape: it is the same deterministic path, and the marker proves it is
+        # complete. This is what makes a restart-driven stop cheap.
+        resumed = self._try_resume_pack(session_id, chunk_index, pack_dir)
+        if resumed is not None:
+            return resumed
+
+        # No usable pack. Any leftover pack dir is now known-untrustworthy, and
+        # packing into it would silently mix stale files into the chunk, so it
+        # goes before the packer runs.
+        if os.path.isdir(pack_dir):
+            get_logger().warning(
+                "clearing an unusable leftover pack dir before repacking "
+                "chunk %s: %s", chunk_index + 1, pack_dir)
+            self._cleanup_dir(pack_dir)
 
         # --- FETCH (remote -> PC) ---
         self.db.update_chunk_status(session_id, chunk_index, 'fetching')
@@ -1077,6 +1172,234 @@ class RemoteOrchestrator:
         self._cleanup_dir(desc.pack_dir)
         with self._staged_lock:
             self._staged_bytes = max(0, self._staged_bytes - desc.staged_bytes)
+
+    def _validate_ltfs_sync_mode(self):
+        """Block tape writes unless the live mount declared time@5.
+
+        Under ``sync_type=unmount`` LTFS writes its index only at unmount, so a
+        forced restart loses every chunk written since the mount — that is what
+        took chunks 18-91 (~126 GB) of session 37 on 2026-07-15, and no amount
+        of stopping cleanly recovers it, because a clean pipeline stop does not
+        unmount. Under time@5 the index is at most 5 minutes stale, which is
+        what makes the stop-at-a-boundary strategy sound in the first place.
+
+        Verified against the mount's own event-log declaration rather than the
+        config file, because the two demonstrably drift: an MSI reinstall reset
+        ``ltfs.conf.local`` on 2026-07-16 with nothing to announce it.
+        """
+        status = ltfs_sync_mode_status(expect_seconds=300)
+        if status["ok"]:
+            print(f"[TAPE] LTFS sync mode verified: "
+                  f"{status['sync_type']}@{status['sync_seconds']}s "
+                  f"(declared {status['declared_at']}).")
+            get_logger().info("ltfs_sync_mode_ok: type=%s seconds=%s at=%s",
+                              status["sync_type"], status["sync_seconds"],
+                              status["declared_at"])
+            return True
+
+        if not status["determinate"]:
+            # Could not read the declaration. Warn loudly but do not block: the
+            # event log is not load-bearing for correctness, and refusing to run
+            # because a log query failed would be its own outage.
+            print(f"[TAPE] WARNING: could not verify the LTFS sync mode "
+                  f"({status['error']}). Proceeding; if this host was recently "
+                  f"reinstalled, confirm the mount is time@5 before trusting a "
+                  f"forced-restart stop to be recoverable.")
+            get_logger().warning("ltfs_sync_mode_indeterminate: %s",
+                                 status["error"])
+            return True
+
+        declared = f"{status['sync_type']}@{status['sync_seconds']}s"
+        msg = (f"LTFS mount declared sync mode {declared}, expected time@300s. "
+               f"Refusing to start tape writes: under this mode a forced "
+               f"restart can lose every chunk written since the mount.")
+        print(f"\n[TAPE] {msg}")
+        print("[TAPE] Fix the mount's sync_type and reload the cartridge, then "
+              "re-run. See docs/performance_insights_and_recommendations.md.")
+        get_logger().error("ltfs_sync_mode_blocked: declared=%s at=%s",
+                           declared, status["declared_at"])
+        send_best_effort(self.notifier, f"[PIPELINE] {msg}")
+        return False
+
+    def _pack_inventory(self, pack_dir):
+        """(name, size) for every file under pack_dir, sorted. The integrity basis."""
+        items = []
+        for root, _dirs, files in os.walk(pack_dir):
+            for name in files:
+                if name == _RESUME_MARKER:
+                    continue
+                full = os.path.join(root, name)
+                rel = os.path.relpath(full, pack_dir).replace("\\", "/")
+                try:
+                    items.append([rel, os.path.getsize(full)])
+                except OSError:
+                    return None
+        return sorted(items)
+
+    def _preserve_desc(self, session_id, desc, why):
+        """Keep a staged pack on disk so the resume can write it directly.
+
+        The counterpart to ``_discard_desc``. The chunk's DB row is left alone —
+        it was never written, so it stays resumable — and the staging dirs are
+        left in place. Only the in-memory budget is released, because this
+        process is on its way out and the next one re-measures staging from disk.
+
+        A marker recording the descriptor is written *last*, and its presence is
+        what makes the pack reusable. A pack that was interrupted mid-write has
+        no marker, so a later run cannot mistake a partial pack for a complete
+        one — the failure mode that would put a truncated chunk on tape.
+        """
+        with self._staged_lock:
+            self._staged_bytes = max(0, self._staged_bytes - desc.staged_bytes)
+
+        marker_ok = False
+        try:
+            inventory = self._pack_inventory(desc.pack_dir)
+            if inventory is None:
+                raise OSError("pack directory is unreadable")
+            payload = {
+                "version": 1,
+                "session_id": session_id,
+                "chunk_index": desc.chunk_index,
+                "fetch_dir": desc.fetch_dir,
+                "pack_dir": desc.pack_dir,
+                "staged_bytes": desc.staged_bytes,
+                "skip_tape": desc.skip_tape,
+                "metadata": desc.metadata,
+                "source_missing_files": desc.source_missing_files,
+                "fetch_seconds": desc.fetch_seconds,
+                "fetch_bytes": desc.fetch_bytes,
+                "pack_seconds": desc.pack_seconds,
+                "pack_bytes": desc.pack_bytes,
+                "ram_stats": desc.ram_stats,
+                "pack_inventory": inventory,
+                "preserved_at": datetime.now().isoformat(),
+                "reason": why,
+            }
+            tmp = os.path.join(desc.pack_dir, _RESUME_MARKER + ".tmp")
+            final = os.path.join(desc.pack_dir, _RESUME_MARKER)
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+            os.replace(tmp, final)  # atomic: a half-written marker never appears
+            marker_ok = True
+        except Exception:
+            get_logger().exception(
+                "could not write the resume marker for chunk %s; the pack stays "
+                "on disk but the resume will re-fetch it", desc.chunk_index + 1)
+
+        msg = (f"pack_preserved_for_resume: chunk {desc.chunk_index + 1} "
+               f"({why}) kept at {desc.pack_dir} reusable={marker_ok}")
+        get_logger().warning(msg)
+        suffix = ("" if marker_ok
+                  else " (marker failed — resume will re-fetch this chunk)")
+        print(f"\n[PIPELINE] Chunk {desc.chunk_index + 1}: pack kept in staging "
+              f"for resume ({why}).{suffix}")
+
+    def _try_resume_pack(self, session_id, chunk_index, pack_dir):
+        """Return a StagedChunk for an intact preserved pack, else None.
+
+        Only a pack carrying a marker whose recorded inventory still matches the
+        directory byte-for-byte is reused. Anything else — no marker, changed
+        sizes, extra or missing files — is treated as untrustworthy and the
+        caller re-fetches. Being wrong here means writing a corrupt chunk to
+        tape and recording it as good, so the bar is exact equality, not
+        heuristics.
+        """
+        marker = os.path.join(pack_dir, _RESUME_MARKER)
+        if not os.path.isfile(marker):
+            return None
+        try:
+            with open(marker, encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except Exception:
+            get_logger().warning(
+                "resume marker for chunk %s is unreadable; re-fetching",
+                chunk_index + 1)
+            return None
+
+        if (payload.get("version") != 1
+                or payload.get("chunk_index") != chunk_index
+                or payload.get("session_id") != session_id):
+            get_logger().warning(
+                "resume marker at %s does not match session %s chunk %s; "
+                "re-fetching", pack_dir, session_id, chunk_index + 1)
+            return None
+
+        expected = payload.get("pack_inventory")
+        actual = self._pack_inventory(pack_dir)
+        if actual is None or [list(x) for x in expected or []] != [
+                list(x) for x in actual]:
+            get_logger().warning(
+                "preserved pack for chunk %s failed its integrity check "
+                "(inventory changed); re-fetching", chunk_index + 1)
+            print(f"[REMOTE] Preserved pack for chunk {chunk_index + 1} failed "
+                  f"its integrity check — re-fetching it.")
+            return None
+
+        desc = StagedChunk(
+            chunk_index=chunk_index,
+            fetch_dir=payload["fetch_dir"],
+            pack_dir=pack_dir,
+            metadata=payload.get("metadata") or [],
+            staged_bytes=int(payload.get("staged_bytes") or 0),
+            fetch_seconds=payload.get("fetch_seconds"),
+            fetch_bytes=payload.get("fetch_bytes"),
+            pack_seconds=payload.get("pack_seconds"),
+            pack_bytes=payload.get("pack_bytes"),
+            ram_stats=payload.get("ram_stats") or {},
+            source_missing_files=payload.get("source_missing_files") or [],
+            skip_tape=bool(payload.get("skip_tape")),
+        )
+        with self._staged_lock:
+            self._staged_bytes += desc.staged_bytes
+        get_logger().warning(
+            "resume_from_existing_pack: session=%s chunk=%s pack=%s bytes=%s "
+            "preserved_at=%s", session_id, chunk_index + 1, pack_dir,
+            desc.staged_bytes, payload.get("preserved_at"))
+        print(f"[REMOTE] Chunk {chunk_index + 1}: reusing the pack preserved at "
+              f"{payload.get('preserved_at')} — no re-fetch, no re-pack.")
+        return desc
+
+    def _pre_tape_write_reboot_check(self, session_id, desc, tape_label):
+        """Refuse a new tape write while a restart is staged. Returns reasons.
+
+        Called synchronously on the writer thread immediately before each write,
+        deliberately duplicating the sentinel's background poll. The sentinel
+        answers "has a restart appeared in the last 60s"; this answers "is it
+        safe to start a write *right now*", and on 2026-07-15 the gap between
+        those two questions was the whole failure — SCCM announced the restart
+        60 seconds before taking it.
+        """
+        log = get_logger()
+        log.info("pre_tape_write_reboot_check: session=%s chunk=%s tape=%s "
+                 "staging=%s", session_id, desc.chunk_index + 1, tape_label,
+                 desc.pack_dir)
+        try:
+            reasons, sccm = reboot_block_reasons(block_on_unknown=True)
+        except Exception:
+            # The gate itself must never take the pipeline down. Fall back to
+            # the Windows markers alone rather than blocking forever.
+            log.exception("pre_tape_write_reboot_check failed; "
+                          "falling back to Windows markers")
+            return list(pending_reboot_reasons()), None
+
+        if reasons:
+            detail = "; ".join(reasons)
+            log.warning(
+                "tape_write_blocked_by_reboot: session=%s chunk=%s tape=%s "
+                "staging=%s sccm=%s reasons=%s",
+                session_id, desc.chunk_index + 1, tape_label, desc.pack_dir,
+                sccm, detail)
+            print(f"\n[WU] Not starting the tape write for chunk "
+                  f"{desc.chunk_index + 1}: {detail}")
+            print("[WU] The pack is kept in staging. Let the host restart, then "
+                  "re-run option 6 — it resumes from this pack without "
+                  "re-fetching.")
+            send_best_effort(
+                self.notifier,
+                f"[PIPELINE] Tape write for chunk {desc.chunk_index + 1} "
+                f"blocked: {detail}. Pack kept in staging; stopping cleanly.")
+        return reasons, sccm
 
     # ------------------------------------------------------------------
     # Consumer: write a staged chunk to tape  (runs on the main thread)
@@ -1483,20 +1806,45 @@ class RemoteOrchestrator:
 
     def _fetch_one_batch(self, remote_base, base_batch, fetch_dir, fetch_abort):
         """Fetch one metadata-sized batch as a single tar stream.
-        Returns (ok, err) — the shared shape used by both fetch paths."""
-        return _remote_tar_fetch(
-            self.remote_user,
-            self.remote_host,
-            remote_base,
-            [rel for _, rel, _ in base_batch],
-            fetch_dir,
-            password=self.remote_password,
-            cipher=self.ssh_cipher,
-            use_mbuffer=self.use_mbuffer,
-            mbuffer_size=self.mbuffer_size,
-            fetch_cores=self.fetch_cores,
-            abort_evt=fetch_abort,
-        )
+
+        Returns (ok, err) — the shared shape used by both fetch paths. A batch
+        that fails on a transient network/DNS error is retried with exponential
+        backoff (``fetch_transient_retries``) before giving up, so a momentary
+        blip costs seconds rather than the whole streaming session. A cancel or
+        a sibling-stream abort ends the retries immediately."""
+        attempts = max(0, getattr(self, "fetch_transient_retries", 0))
+        base = getattr(self, "fetch_transient_retry_base", 5.0)
+        rel_paths = [rel for _, rel, _ in base_batch]
+
+        for attempt in range(attempts + 1):
+            if CANCEL.is_set() or fetch_abort.is_set():
+                return False, "cancelled"
+            ok, err = _remote_tar_fetch(
+                self.remote_user,
+                self.remote_host,
+                remote_base,
+                rel_paths,
+                fetch_dir,
+                password=self.remote_password,
+                cipher=self.ssh_cipher,
+                use_mbuffer=self.use_mbuffer,
+                mbuffer_size=self.mbuffer_size,
+                fetch_cores=self.fetch_cores,
+                abort_evt=fetch_abort,
+            )
+            if ok or attempt >= attempts or not _is_transient_fetch_error(err):
+                return ok, err
+            if CANCEL.is_set() or fetch_abort.is_set():
+                return False, "cancelled"
+            delay = min(60.0, base * (2 ** attempt))
+            msg = (f"transient fetch error (attempt {attempt + 1}/{attempts + 1}), "
+                   f"retrying in {delay:.0f}s: {str(err).strip()[:160]}")
+            get_logger().warning("fetch_transient_retry: %s", msg)
+            print(f"\n[REMOTE] {msg}")
+            # Interruptible wait: a cancel/abort during backoff returns at once.
+            if fetch_abort.wait(delay) or CANCEL.is_set():
+                return False, "cancelled"
+        return False, "retries exhausted"
 
     def _fetch_batches_parallel(self, work_items, fetch_dir, fetch_abort,
                                 session_id, streams):
