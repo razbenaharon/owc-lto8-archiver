@@ -40,6 +40,7 @@ puts them back.
 """
 import json
 import os
+import subprocess
 import threading
 from datetime import datetime, timedelta, timezone
 
@@ -55,6 +56,28 @@ from .runtime import _is_admin
 _UX_PATH = r"SOFTWARE\Microsoft\WindowsUpdate\UX\Settings"
 _AU_PATH = r"SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
 _WU_POLICY_PATH = r"SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
+
+# --- Configuration Manager (SCCM) -------------------------------------------
+# The 2026-07-15 restart was NOT a WSUS deadline restart. System log 1074 names
+# the initiator: CcmExec.exe, "Your computer will restart at 15/07/2026 10:39:01
+# to complete the installation of applications and software updates" — the
+# Software Center notification. SCCM is a separate control plane from Windows
+# Update, so pausing WU cannot influence it and the WU pending-restart markers
+# are not the authoritative source for it. The supported query is the client
+# SDK method below; the registry key is corroboration only.
+_SCCM_NAMESPACE = r"root\ccm\ClientSDK"
+_SCCM_CLASS = "CCM_ClientUtilities"
+_SCCM_METHOD = "DetermineIfRebootPending"
+_SCCM_REBOOT_DATA = (
+    r"SOFTWARE\Microsoft\SMS\Mobile Client\Reboot Management\RebootData")
+
+# The client SDK call is a local CIM call; it answers in well under a second on
+# a healthy client. The cap only exists so a wedged WMI service cannot stall a
+# pre-write check indefinitely.
+_SCCM_QUERY_TIMEOUT_S = 20
+
+# SCCM reports "no deadline" as the epoch rather than a null.
+_SCCM_EPOCH_YEAR = 1970
 
 # The Settings-app pause writes all five of these together. Windows honours
 # PauseUpdatesExpiryTime on its own, but the feature/quality pairs are what
@@ -143,6 +166,185 @@ def pending_reboot_reasons():
     if renames:
         reasons.append("Files are queued to be renamed on the next restart")
     return reasons
+
+
+def _sccm_query_client_sdk():
+    """Call CCM_ClientUtilities.DetermineIfRebootPending, or raise.
+
+    Python has no CIM client here, so this shells out to PowerShell and parses
+    JSON. Failures are raised rather than swallowed: callers about to start a
+    tape write need to distinguish "SCCM says no restart" from "SCCM could not
+    be asked", and those two must never collapse into the same answer.
+    """
+    script = (
+        "$ErrorActionPreference='Stop';"
+        f"$r = Invoke-CimMethod -Namespace '{_SCCM_NAMESPACE}' "
+        f"-ClassName {_SCCM_CLASS} -MethodName {_SCCM_METHOD};"
+        "[pscustomobject]@{"
+        "ReturnValue=$r.ReturnValue;"
+        "RebootPending=[bool]$r.RebootPending;"
+        "IsHardRebootPending=[bool]$r.IsHardRebootPending;"
+        "InGracePeriod=[bool]$r.InGracePeriod;"
+        "RebootDeadline=(&{if($r.RebootDeadline){$r.RebootDeadline.ToString('o')}else{''}})"
+        "} | ConvertTo-Json -Compress"
+    )
+    proc = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True, text=True, timeout=_SCCM_QUERY_TIMEOUT_S,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            (proc.stderr or "powershell returned "
+             f"{proc.returncode}").strip().splitlines()[0])
+    out = (proc.stdout or "").strip()
+    if not out:
+        raise RuntimeError("client SDK returned no data")
+    return json.loads(out)
+
+
+def _sccm_registry_reboot_data():
+    """Corroborating signal: SCCM writes restart scheduling values under this key.
+
+    Supplementary only — the client SDK is the authority.
+
+    The key's *existence* means nothing: verified on this host 2026-07-17, it is
+    present but completely empty while the SDK reports RebootPending=False. It
+    is the scheduling values that indicate a staged restart, so treating
+    presence as "pending" would have blocked every tape write whenever the SDK
+    was briefly unreachable.
+    """
+    if winreg is None:
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _SCCM_REBOOT_DATA,
+                            0, winreg.KEY_READ) as key:
+            for name in ("RebootBy", "HardReboot", "NotifyUI",
+                         "OverrideRebootWindowTime"):
+                try:
+                    value, _kind = winreg.QueryValueEx(key, name)
+                except OSError:
+                    continue
+                # RebootBy is a deadline stamp; 0 means "nothing scheduled".
+                if value:
+                    return True
+            return False
+    except Exception:
+        # Corroboration only. Any failure here — missing key, no permission, a
+        # stubbed winreg — means "no corroborating signal", never an error worth
+        # propagating into a guard the pipeline depends on.
+        return False
+
+
+def sccm_reboot_status():
+    """Ask the Configuration Manager client whether it intends to restart.
+
+    Returns a dict:
+      ``installed``           — the client SDK namespace answered at all
+      ``reboot_pending``      — SCCM wants a restart
+      ``hard_reboot_pending`` — the restart cannot be deferred by the user
+      ``in_grace_period``     — the countdown to a forced restart is running
+      ``deadline``            — ISO string, or None when SCCM reports none
+      ``error``               — why the query failed, or None
+      ``determinate``         — False means the state is UNKNOWN, not "clear"
+
+    ``determinate`` is the field that matters at a tape-write boundary. A host
+    with no SCCM client is determinate-and-clear; a host whose client could not
+    be reached is not, and callers must treat that conservatively.
+    """
+    info = {"installed": False, "reboot_pending": False,
+            "hard_reboot_pending": False, "in_grace_period": False,
+            "deadline": None, "error": None, "determinate": False,
+            "registry_reboot_data": False}
+    log = get_logger()
+    log.debug("sccm_reboot_check_started")
+
+    if os.name != "nt":
+        info["determinate"] = True
+        log.debug("sccm_reboot_check_completed: not Windows")
+        return info
+
+    info["registry_reboot_data"] = _sccm_registry_reboot_data()
+
+    try:
+        raw = _sccm_query_client_sdk()
+    except Exception as e:
+        msg = str(e)
+        # A host with no Configuration Manager client is a legitimate, fully
+        # determinate state — there is no SCCM to stage a restart. That is very
+        # different from a client that exists but would not answer.
+        if "Invalid namespace" in msg or "InvalidNamespace" in msg:
+            info["determinate"] = True
+            log.debug("sccm_reboot_check_completed: no SCCM client installed")
+            return info
+        info["error"] = msg
+        log.warning("sccm_check_failed: %s", msg)
+        if info["registry_reboot_data"]:
+            # The SDK is unreachable but SCCM has staged restart data. Report
+            # the restart; a false alarm costs one clean stop, a missed one
+            # costs the index.
+            info["reboot_pending"] = True
+            log.warning("sccm_reboot_pending: from registry RebootData "
+                        "(client SDK unreachable)")
+        return info
+
+    info["installed"] = True
+    info["determinate"] = True
+    info["reboot_pending"] = bool(raw.get("RebootPending"))
+    info["hard_reboot_pending"] = bool(raw.get("IsHardRebootPending"))
+    info["in_grace_period"] = bool(raw.get("InGracePeriod"))
+
+    deadline = (raw.get("RebootDeadline") or "").strip()
+    if deadline and not deadline.startswith(str(_SCCM_EPOCH_YEAR)):
+        info["deadline"] = deadline
+        log.warning("sccm_reboot_deadline: %s", deadline)
+
+    if info["reboot_pending"]:
+        log.warning("sccm_reboot_pending: deadline=%s grace=%s hard=%s",
+                    info["deadline"], info["in_grace_period"],
+                    info["hard_reboot_pending"])
+    if info["hard_reboot_pending"]:
+        log.warning("sccm_hard_reboot_pending")
+    if info["in_grace_period"]:
+        log.warning("sccm_grace_period: a forced restart countdown is running")
+
+    log.debug("sccm_reboot_check_completed: pending=%s determinate=%s",
+              info["reboot_pending"], info["determinate"])
+    return info
+
+
+def reboot_block_reasons(block_on_unknown=True):
+    """Every reason a new tape write must not start right now.
+
+    Unions the Windows pending-restart markers with the Configuration Manager
+    client's own intent. Returns ``(reasons, sccm)`` so callers can log the
+    structured SCCM state alongside the human-readable reasons.
+
+    ``block_on_unknown`` is the difference between the two callers, and the
+    asymmetry is deliberate. At a tape-write boundary an indeterminate SCCM
+    answer must block: starting a multi-minute write while blind to the restart
+    state is the exact bet that lost ~126 GB on 2026-07-15, and the cost of
+    being wrong is one deferred chunk. The background sentinel passes False,
+    because there a transient WMI hiccup would stop a perfectly healthy run for
+    no reason — it polls again in 60s, and the pre-write gate still backstops it.
+    """
+    reasons = list(pending_reboot_reasons())
+    sccm = sccm_reboot_status()
+
+    if sccm["reboot_pending"]:
+        detail = "Configuration Manager (SCCM) has a restart pending"
+        if sccm["in_grace_period"]:
+            detail += " and the forced-restart grace period is running"
+        if sccm["deadline"]:
+            detail += f" (deadline {sccm['deadline']})"
+        reasons.append(detail)
+    if sccm["hard_reboot_pending"]:
+        reasons.append("SCCM reports a hard restart that cannot be deferred")
+    if block_on_unknown and not sccm["determinate"]:
+        reasons.append(
+            "SCCM restart state could not be determined "
+            f"({sccm['error']}) — refusing to start a tape write blind")
+    return reasons, sccm
 
 
 def managed_update_policy():
@@ -244,11 +446,14 @@ class RebootSentinel:
         self._cancel = threading.Event()
 
     def _check_once(self):
-        reasons = pending_reboot_reasons()
+        # block_on_unknown=False: a transient WMI failure must not stop a
+        # healthy run. The pre-write gate refuses to start the next write while
+        # the state is unknown, so nothing slips past on the path that matters.
+        reasons, _sccm = reboot_block_reasons(block_on_unknown=False)
         if not reasons:
             return False
         self.triggered = True
-        message = ("[WU] A Windows restart is now staged while the run is "
+        message = ("[WU] A restart is now staged while the run is "
                    "active: " + "; ".join(reasons))
         print(f"\n{message}")
         print("[WU] Stopping at the next chunk boundary so the LTFS index is "
@@ -288,6 +493,70 @@ class RebootSentinel:
         self._cancel.set()
         if self._thread:
             self._thread.join(timeout=5)
+
+
+def ltfs_sync_mode_status(expect_seconds=300):
+    """Report what sync mode the *live* LTFS mount actually declared.
+
+    Read from the LTFS Windows event log, because that is the only place the
+    running mount states its own configuration. Event 61259 is emitted once per
+    mount: ``Sync type is "time", Sync time is 300 sec``.
+
+    This exists because the config file is not a reliable proxy for the mount.
+    On 2026-07-16 an MSI reinstall of IBM Storage Archive SDE 2.4.8.4 rewrote
+    ``ltfs.conf.local`` back to its packaged contents, silently discarding a
+    ``sync_type`` line someone had added — the file on disk and the behaviour of
+    the mount had drifted apart with nothing to flag it. Only the mount's own
+    declaration settles it.
+
+    Returns a dict with ``determinate``, ``ok``, ``sync_type``, ``sync_seconds``,
+    ``declared_at`` and ``error``.
+    """
+    info = {"determinate": False, "ok": False, "sync_type": None,
+            "sync_seconds": None, "declared_at": None, "error": None}
+    if os.name != "nt":
+        return info
+
+    script = (
+        "$ErrorActionPreference='Stop';"
+        "$e = Get-WinEvent -LogName LTFS -MaxEvents 4000 -ErrorAction Stop |"
+        " Where-Object { $_.Id -eq 61259 } |"
+        " Sort-Object TimeCreated -Descending | Select-Object -First 1;"
+        "if (-not $e) { 'NONE' } else {"
+        " $e.TimeCreated.ToString('o') + '|' + ($e.Message -replace '\\s+',' ') }"
+    )
+    try:
+        proc = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+             script],
+            capture_output=True, text=True, timeout=_SCCM_QUERY_TIMEOUT_S,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or "").strip().splitlines()[0]
+                               if proc.stderr else "Get-WinEvent failed")
+        out = (proc.stdout or "").strip()
+        if not out or out == "NONE":
+            raise RuntimeError("no LTFS mount declaration (event 61259) found")
+    except Exception as e:
+        info["error"] = str(e)
+        get_logger().warning("ltfs_sync_mode_check_failed: %s", e)
+        return info
+
+    stamp, _, message = out.partition("|")
+    info["declared_at"] = stamp
+    info["determinate"] = True
+
+    import re
+    m_type = re.search(r'Sync type is "([^"]+)"', message)
+    m_secs = re.search(r"Sync time is (\d+) sec", message)
+    if m_type:
+        info["sync_type"] = m_type.group(1)
+    if m_secs:
+        info["sync_seconds"] = int(m_secs.group(1))
+    info["ok"] = (info["sync_type"] == "time"
+                  and info["sync_seconds"] == expect_seconds)
+    return info
 
 
 def _snapshot():

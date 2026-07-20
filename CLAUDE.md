@@ -36,6 +36,21 @@ This file is intentionally thin so the guidance has a single source of truth.
   in `config.ini`; needs Administrator for the pause layer only — the sentinel
   works unelevated. **The durable fix is organizational: ask IT to exempt this
   host from the update deadline policy.**
+  > **CORRECTION (2026-07-17, evidence-based — read before acting on the bullet
+  > above).** The 2026-07-15 restart was **not** a WSUS deadline restart. System
+  > log event 1074 names the initiator: `CcmExec.exe` (SCCM) — *"Your computer
+  > will restart at 15/07/2026 10:39:01 to complete the installation of
+  > applications and software updates"*, i.e. **60 seconds** of warning against a
+  > ~70 min chunk cycle. The WSUS/GPO settings above are real but were not the
+  > trigger, so **"exempt this host from the update deadline policy" targets the
+  > wrong system** — ask IT for an **SCCM maintenance window / deployment
+  > exemption**. The sentinel alone cannot win a 60 s race either; the guard that
+  > holds is `_pre_tape_write_reboot_check`, which refuses to *start* a write.
+  > And the ~126 GB loss mechanism was `sync_type=unmount` (LTFS writes the index
+  > only at unmount), **not** the restart itself: the last write ended 17 min
+  > before shutdown, so `time@5` would have lost nothing. The current mount is
+  > verified `time@5`. Evidence and specifics: **AGENTS.md → "Operating a live
+  > run"**.
 - **Never eject the tape remotely.** `LtfsCmdEject` is physical; a cartridge
   ejected with nobody at the drive cannot be reloaded remotely (no software
   "load" for a tape out of the slot). LTFS `sync_type` changes need a physical
