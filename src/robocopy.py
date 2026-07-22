@@ -182,7 +182,11 @@ def _run_robocopy_tuned(cmd, priority=None, affinity=None, on_start=None):
         encoding='utf-8',
         errors='replace',
     )
-    register_proc(proc)
+    # Protected: a cooperative Ctrl+C must let the active tape write finish and
+    # commit rather than cut it and leave the chunk ambiguously 'backing'. Only a
+    # forced second Ctrl+C kills it. (A restore's per-file robocopy is a plain,
+    # cancellable child — reads are safe to interrupt.)
+    register_proc(proc, protected=True)
     _apply_proc_tuning(proc, priority=priority, affinity=affinity, label='robocopy-tape')
     if on_start is not None:
         try:

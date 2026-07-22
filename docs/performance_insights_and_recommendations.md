@@ -125,17 +125,40 @@ The 135 GB chunk wrote the **entire 135 GB in 11 min — less wall-time than a
 single 9 GB small chunk (16 min)** — because the ~15 min overhead is paid once
 and 135 GB then streams at full LTO speed.
 
-### 3.4 Two fixes
-1. **`sync_type=unmount`** — appended `option single-drive sync_type=unmount` to
+> **CORRECTION (2026-07-22) — `sync_type=unmount` is NOT compatible with this
+> pipeline's safety model. Do not re-enable it.** `unmount` is a supported,
+> valid LTFS mode — it is not "broken" or universally dangerous. But it does not
+> fit *this system's* recovery requirements: LTFS then writes its index **only at
+> unmount**, and a clean pipeline stop does **not** necessarily unmount, while
+> SCCM or Windows Update can force a reboot before that final unmount ever
+> happens. Under `unmount`, such a restart loses every chunk written since the
+> mount — this is exactly the ~126 GB Tape_02 loss of 2026-07-15 (see AGENTS.md /
+> CLAUDE.md). Therefore the pipeline **requires the current mount to be `time@5`**
+> before it will start a write, enforced in code by
+> `RemoteOrchestrator._verify_current_mount_time5` /
+> `windows_update_guard.ltfs_current_mount_status`, which read the mount's own
+> event-log declaration and bind it to the running LTFS process. Note precisely
+> what that check proves and does not: it verifies the **current mount** declared
+> `time@5`; it does **not** assert that each per-chunk periodic index sync
+> actually succeeded (there is no per-sync success event that we read or trust).
+> The
+> two staged edits below are kept only as a historical record of the 2026-07-10
+> throughput investigation; treat item 1 as **superseded**.
+
+### 3.4 Two fixes (item 1 SUPERSEDED — see the correction above)
+
+1. **`sync_type=unmount`** *(superseded — do not use; see the 2026-07-22
+   correction above)* — appended `option single-drive sync_type=unmount` to
    `C:\Program Files\IBM\LTFS\ltfs\ltfs.conf.local` (backup: `.bak_20260710`).
    The pipeline uses `_NoEjectBackup` for every chunk and ejects ONCE at session
    end, so `unmount` syncs the index only at that final eject → the per-chunk
    overhead vanishes entirely. **Takes effect only on the NEXT mount** (current
-   mount stays time@5 until the tape is ejected + reloaded). Trade-off accepted:
-   a crash before the final eject leaves the session's index unwritten (data is
-   on tape; recover with `LtfsCmdCheck`/`LtfsCmdRollback`). **Never eject remotely
-   to force this** — eject is physical; a tape ejected with nobody present cannot
-   be reloaded remotely.
+   mount stays time@5 until the tape is ejected + reloaded). The accepted
+   trade-off — "a crash before the final eject leaves the session's index
+   unwritten" — is precisely the incompatibility the correction describes: on
+   this managed host the crash is a *forced update restart*, not a rare event.
+   **Never eject remotely to force this** — eject is physical; a tape ejected
+   with nobody present cannot be reloaded remotely.
 2. **Bigger chunks** (workaround that works even under time@5):
    `chunk_max_files` 100k→400k, `chunk_cap_gb` 50→250. The *actual* limiter was
    file count (100k tiny files ≈ 8 GB), so raising it produced the 135 GB chunk
@@ -204,24 +227,25 @@ All in `config.ini [PERFORMANCE]` unless noted. Values shown are the tuned
 | `ram_soft_limit_pct` / `ram_hard_limit_pct` | 90 / 95 | Host-calibrated for phantom cache; do NOT lower on this box. |
 | `governor_fetch_*` / `governor_tape_min_free_ram_gb` | 0.8 / 0.5 / 1.0 | Low floors because psutil available under-reports here. |
 | `robocopy_priority` / `cpu_affinity` | high / auto (fetch 0-5, tape 6-7) | Already optimal; isolates tape cores. |
-| LTFS `sync_type` (ltfs.conf.local) | unmount (staged) | The real tape fix; applies next mount. |
+| LTFS `sync_type` (ltfs.conf.local) | **time@5 (required)** | Must stay `time@5` — the pipeline refuses to write otherwise. `unmount` is incompatible with this pipeline's crash/restart recovery (see the §3.4 correction). |
 
 ---
 
 ## 7. Future recommendations (ranked)
 
-1. **After the remount (unmount active): dial chunks BACK to ~150-200k
-   (~15-20 GB).** The 208 MB/s win from 400 k chunks was *purely* amortising the
-   time@5 overhead. Once `unmount` removes that overhead, every chunk writes at
-   full 200-320 MB/s regardless of size, and huge chunks become net-negative:
-   ~75-90 min fetch latency before the tape is fed, 270 GB+ staging, ~585 MB pack
-   RAM, and coarse resume granularity. Moderate chunks give full tape speed with
-   low latency and safe RAM/staging. (A tiny benefit remains for not-tiny chunks:
-   fewer robocopy/pipeline cycles — so ~150-200 k, not 100 k.)
-2. **After unmount, the bottleneck becomes fetch (~30 MB/s).** The pipeline is
-   then fetch-bound (a 20 GB chunk fetches in ~11 min, writes in ~1 min). To go
-   faster, invest in fetch: more parallel streams if the WAN/server allow, or a
-   faster link. Tape and RAM are solved.
+1. **Chunk sizing under the required `time@5` mount.** The 208 MB/s win from
+   400 k chunks came from amortising the `time@5` per-chunk index-sync overhead,
+   which is real and stays (the mount must be `time@5` — see the §3.4
+   correction; `unmount` is not an option here). Bigger chunks trade that tape
+   overhead against ~75-90 min fetch latency before the tape is fed, 270 GB+
+   staging, ~585 MB pack RAM, and coarse resume granularity. Tune the file-count
+   ceiling against those, not against a hypothetical `unmount` future.
+2. **The steady-state bottleneck is fetch (~30 MB/s).** The pipeline is
+   fetch-bound end to end. To go faster, invest in fetch: more parallel streams
+   if the WAN/server allow, or a faster link. The durable protection against the
+   forced-restart data-loss risk is organizational — an **SCCM maintenance-window
+   / deployment exemption** for this host (see AGENTS.md) — plus the in-code
+   `time@5` gate; it is *not* an LTFS `sync_type` change.
 3. **Keep the RAM governor host-calibrated.** Do not "restore defaults" — on this
    box the psutil signal is dominated by reclaimable cache; the tuned thresholds
    + pagefile are the correct, crash-safe configuration. The `_drain_stage_relaxed`
@@ -235,15 +259,18 @@ All in `config.ini [PERFORMANCE]` unless noted. Values shown are the tuned
    need for per-host RAM recalibration. Design note only; not implemented.
 6. **On a fresh/empty tape** the time@5 overhead is small (2026-07-06 hit
    176-268 MB/s) — the degradation is specifically appending to a filling tape.
-   `unmount` is the durable fix; a fresh tape is a temporary reset.
+   A fresh tape is a temporary reset; there is no `sync_type` fix available here,
+   because the mount must remain `time@5` for restart safety.
 
 ---
 
 ## 8. Quick decision tree for the next operator/LLM
 
 - *Tape writes slow (single chunk 8-45 MB/s effective, robocopy Speed high)?* →
-  LTFS time@5 index-sync on a filling tape. Real fix = `sync_type=unmount` +
-  remount. Interim = bigger chunks.
+  LTFS time@5 index-sync on a filling tape. This is the accepted cost of the
+  restart-safe `time@5` mount the pipeline requires; do **not** switch to
+  `sync_type=unmount` (incompatible — see §3.4 correction). Mitigate with chunk
+  sizing and faster fetch, not a `sync_type` change.
 - *Pipeline stalled at "producer chunk N", governor loops `hard_ram_limit` with
   tiny process_rss?* → phantom cache. Check §2; the tuned thresholds should let
   it run; if truly stuck, cache-buster (§5) or free desktop RAM (NOT VS Code).

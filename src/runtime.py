@@ -114,6 +114,14 @@ CANCEL = threading.Event()        # set by the SIGINT handler; polled by workers
 _PROCS = set()                    # live child Popen objects we may need to kill
 
 
+# Protected children are NOT killed by a cooperative (first) Ctrl+C. The active
+# tape-write robocopy registers here: interrupting a write mid-flight leaves the
+# chunk in an ambiguous 'backing' state (some/all data may be on tape), so a
+# cooperative stop must let the write finish and commit. Only a second, forced
+# Ctrl+C (a real interruption) kills these — see _cancel_handler.
+_PROTECTED_PROCS = set()
+
+
 _PROCS_LOCK = threading.RLock()
 
 
@@ -144,16 +152,20 @@ def _release_tape_io_lock():
     _TAPE_IO_LOCK.release()
 
 
-def register_proc(proc):
-    """Track a live subprocess so Ctrl+C can terminate it (and its children)."""
+def register_proc(proc, protected=False):
+    """Track a live subprocess so Ctrl+C can terminate it (and its children).
+
+    ``protected=True`` marks a process a cooperative (first) Ctrl+C must not
+    kill — used for the active tape write, which must be allowed to finish."""
     if proc is not None:
         with _PROCS_LOCK:
-            _PROCS.add(proc)
+            (_PROTECTED_PROCS if protected else _PROCS).add(proc)
 
 
 def unregister_proc(proc):
     with _PROCS_LOCK:
         _PROCS.discard(proc)
+        _PROTECTED_PROCS.discard(proc)
 
 
 def _kill_proc_tree(proc):
@@ -190,27 +202,41 @@ def _kill_proc_tree(proc):
         pass
 
 
-def _terminate_all_procs():
+def _terminate_all_procs(include_protected=False):
+    """Kill tracked children. Protected children (an active tape write) are
+    spared unless ``include_protected`` — a cooperative stop must never cut a
+    write mid-flight, only a forced second interrupt may."""
     with _PROCS_LOCK:
         procs = list(_PROCS)
         _PROCS.clear()
+        if include_protected:
+            procs += list(_PROTECTED_PROCS)
+            _PROTECTED_PROCS.clear()
     for p in procs:
         _kill_proc_tree(p)
 
 
 def _cancel_handler(_signum, _frame):
-    """First Ctrl+C: cancel gracefully + kill active transfers. Second: hard exit."""
+    """First Ctrl+C: cancel gracefully, stopping fetch/other transfers but
+    letting an active tape write finish and commit. Second Ctrl+C: force-quit,
+    killing even the active write (a real interruption — the chunk is then left
+    ambiguous for resume to reconcile)."""
     if CANCEL.is_set():
-        print("\n[ABORTED] Second interrupt — forcing immediate exit.")
-        get_logger().warning("second interrupt — forcing immediate exit")
-        _terminate_all_procs()
+        print("\n[ABORTED] Second interrupt — forcing immediate exit. Any "
+              "in-flight tape write is cut; that chunk needs manual "
+              "reconciliation on resume.")
+        get_logger().warning("second interrupt — forcing immediate exit "
+                             "(killing the protected tape write too)")
+        _terminate_all_procs(include_protected=True)
         raise KeyboardInterrupt
     CANCEL.set()
     get_logger().warning("cancellation requested (SIGINT/SIGBREAK)")
-    print("\n\n[STOP] Cancellation requested — stopping safely "
-          "(terminating active transfers).")
+    print("\n\n[STOP] Cancellation requested — stopping safely. An active tape "
+          "write is allowed to finish and commit; the pipeline stops before the "
+          "next chunk.")
     print("[STOP] The session is saved; re-run to resume. "
-          "Press Ctrl+C again to force-quit.")
+          "Press Ctrl+C again to force-quit (leaves the current write ambiguous).")
+    # Cooperative: kill fetch/ssh/tar etc., but NOT a protected tape write.
     _terminate_all_procs()
 
 

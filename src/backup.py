@@ -83,7 +83,8 @@ class LTOBackup:
             exclude_file_paths=None, exclude_dir_paths=None,
             local_session_id=None, local_chunk_index=None, stage_stats=None,
             tape_parent_dir=None, source_host='local', skipped_tracker=None,
-            remote_session_id=None, remote_chunk_index=None):
+            remote_session_id=None, remote_chunk_index=None,
+            on_write_start=None):
         print(f"[WARNING] {LTFS_WRITE_WARNING}")
         _acquire_tape_io_lock(f"backup write to {tape_drive}")
         try:
@@ -100,6 +101,7 @@ class LTOBackup:
                 skipped_tracker=skipped_tracker,
                 remote_session_id=remote_session_id,
                 remote_chunk_index=remote_chunk_index,
+                on_write_start=on_write_start,
             )
         finally:
             _release_tape_io_lock()
@@ -109,7 +111,8 @@ class LTOBackup:
                     local_session_id=None, local_chunk_index=None,
                     stage_stats=None, tape_parent_dir=None,
                     source_host='local', skipped_tracker=None,
-                    remote_session_id=None, remote_chunk_index=None):
+                    remote_session_id=None, remote_chunk_index=None,
+                    on_write_start=None):
         """
         Copy files from source to tape and commit to the database.
 
@@ -336,6 +339,13 @@ class LTOBackup:
                 # counter (never the tape) to isolate open/stream/close/stalls.
                 with TapeWriteProfiler(interval_seconds=1.0) as tape_profiler:
                     with tape_guard:
+                        # The write boundary: everything above (drive checks,
+                        # metadata, governor wait) is pre-write. From here the
+                        # tape may be touched, so signal the caller that the
+                        # write has STARTED — a failure past this point is
+                        # physically ambiguous (data may be partly on tape).
+                        if on_write_start is not None:
+                            on_write_start()
                         rc = _run_robocopy_tuned(
                             robocopy_cmd,
                             priority=self.tape_priority,
@@ -346,15 +356,18 @@ class LTOBackup:
             mon.join(timeout=2)
             _progress_done()
 
-        # If the user pressed Ctrl+C, robocopy was terminated mid-write. Skip the
-        # DB commit and the eject so the chunk stays resumable and the tape is
-        # left mounted for the next run.
-        if CANCEL.is_set():
-            raise RuntimeError("tape write cancelled by user")
-
         rc_sum = _parse_robocopy_summary(rc.stdout)
-
         rc_output = (rc.stdout or '') + '\n' + (rc.stderr or '')
+
+        # A cooperative Ctrl+C no longer implies the write was cut: the tape
+        # write is protected, so robocopy runs to completion. Therefore a
+        # COMPLETED, successful write must still commit — its data is on tape and
+        # skipping the commit would itself create the ambiguity we avoid. Only an
+        # INCOMPLETE write under cancel (a forced kill: no robocopy summary) is
+        # skipped, and it stays ambiguous ('backing') for the caller.
+        if CANCEL.is_set() and not rc_sum.get('summary_found'):
+            raise RuntimeError(
+                "tape write cut mid-flight before completion (cancelled)")
         # robocopy prints an ERROR line for EVERY failed attempt, including
         # transient errors it then retried successfully (/R:3 /W:10). The final
         # summary counters are the authoritative verdict, so the raw ERROR-line
@@ -636,7 +649,12 @@ class LTOBackup:
             print(f"CSV Summary     : {log_path}")
         print("-" * 60)
 
-        self.eject_tape(tape_drive)
+        # A successful write under a cooperative Ctrl+C still commits (above), but
+        # do NOT physically eject on cancel — the operator is stopping the run;
+        # a surprise eject of a still-loaded cartridge cannot be reloaded
+        # remotely. A clean (non-cancel) completion ejects as before.
+        if not CANCEL.is_set():
+            self.eject_tape(tape_drive)
 
 
 class _NoEjectBackup(LTOBackup):
