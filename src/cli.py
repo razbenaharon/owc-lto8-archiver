@@ -5,6 +5,9 @@ from typing import TYPE_CHECKING
 from .config import ConfigManager
 from .constants import CONFIG_FILE
 from .db import _fmt_ts, create_database_manager
+from .exit_codes import (ExitCode, StopResult, REASON_BAD_CONFIG,
+                         REASON_WINDOWS_REBOOT_PENDING,
+                         REASON_USER_REQUESTED_STOP)
 from .logsetup import configure_file_logging, get_logger
 from .ltfs import TapeManager
 from .orchestrators import LocalOrchestrator, RemoteOrchestrator
@@ -101,41 +104,70 @@ def run_archiver(cfg: ConfigManager, db: "PgDatabaseManager"):
         db.release_archiver_lock()
 
 
-def run_remote_archiver(cfg: ConfigManager, db: "PgDatabaseManager"):
-    """Menu option 6: pull files from a remote host and archive to LTO tape."""
+def run_remote_archiver(cfg: ConfigManager, db: "PgDatabaseManager",
+                        non_interactive=False, resume=False):
+    """Menu option 6 / headless entry: fetch from a remote host, archive to LTO.
+
+    Returns a :class:`StopResult`. Interactive callers use it only to preserve
+    the outcome across a subsequent stdin-closed menu prompt; the headless
+    wrapper maps ``result.exit_code`` to the process exit code. This function
+    owns the shared setup/teardown (advisory lock, Windows Update guard,
+    robocopy exclusion, cancel handler) for BOTH paths, so headless and
+    interactive can never diverge on cleanup.
+    """
     if not cfg.remote_host or not cfg.remote_user or not cfg.remote_path:
         print("\n[REMOTE] The [REMOTE] section in config.ini is incomplete.")
         print("  Required: remote_host, remote_user, remote_path")
         print("  Optional: remote_password, staging_fill_pct  (default 0.80)")
         cfg_abs = os.path.abspath(CONFIG_FILE)
         print(f"\n[INFO] Config path: {cfg_abs}")
-        if os.name == 'nt':
+        # Opening the file is an interactive convenience; never in headless mode.
+        if os.name == 'nt' and not non_interactive:
             os.startfile(cfg_abs)
-        return
+        return StopResult(
+            exit_code=ExitCode.FATAL_CONFIG, reason=REASON_BAD_CONFIG,
+            resumable=False, source="cli",
+            detailed_reason="[REMOTE] config section incomplete")
 
     try:
         db.acquire_archiver_lock()
     except RuntimeError as e:
         print(str(e))
-        return
+        return StopResult(
+            exit_code=ExitCode.FATAL_CONFIG, reason=REASON_BAD_CONFIG,
+            resumable=False, source="cli",
+            detailed_reason=f"could not acquire archiver lock: {e}")
 
     proceed, wu_guard = _start_windows_update_guard(cfg)
     if not proceed:
         db.release_archiver_lock()
-        return
+        # A restart is already staged: transient and self-clearing once the host
+        # reboots. Resumable, not a config error.
+        return StopResult(
+            exit_code=ExitCode.TRANSIENT_RESUMABLE,
+            reason=REASON_WINDOWS_REBOOT_PENDING, resumable=True, source="cli",
+            detailed_reason="a Windows/SCCM restart is already staged")
 
     added_exclusion = _prepare_robocopy_exclusion()
     reset_cancel()
     install_cancel_handler()
     print("[REMOTE] Press Ctrl+C at any time to stop safely "
           "(the session is saved and can be resumed).")
+    result = None
     try:
-        RemoteOrchestrator(cfg, db).run()
+        result = RemoteOrchestrator(cfg, db).run(
+            non_interactive=non_interactive, resume=resume)
     except RuntimeError as e:
         get_logger().exception("remote archive run stopped")
         print(str(e))
+        result = StopResult(
+            exit_code=ExitCode.FATAL_CONFIG, reason=REASON_BAD_CONFIG,
+            resumable=False, source="cli", detailed_reason=str(e))
     except KeyboardInterrupt:
         print("\n[REMOTE] Interrupted. Session state saved — re-run to resume.")
+        result = StopResult(
+            exit_code=ExitCode.USER_STOP, reason=REASON_USER_REQUESTED_STOP,
+            resumable=True, source="cli", detailed_reason="KeyboardInterrupt")
     finally:
         # Make sure no fetch/tape child survives, restore CPU affinity and the
         # default Ctrl+C behaviour, then drop the robocopy Defender exclusion.
@@ -149,6 +181,23 @@ def run_remote_archiver(cfg: ConfigManager, db: "PgDatabaseManager"):
         if wu_guard:
             resume_windows_updates()
         db.release_archiver_lock()
+    if result is None:
+        result = StopResult(
+            exit_code=ExitCode.USER_STOP, reason=REASON_USER_REQUESTED_STOP,
+            resumable=True, source="cli")
+    return result
+
+
+def run_remote_archiver_headless(cfg: ConfigManager, db: "PgDatabaseManager",
+                                 resume=True):
+    """Headless launcher for a stable manual/detached run. No menu, no input().
+
+    Reuses ``run_remote_archiver``'s setup/teardown and returns an integer exit
+    code (see :class:`ExitCode`). It never returns to a menu, so a closed stdin
+    can never turn into an ``EOFError`` traceback here.
+    """
+    result = run_remote_archiver(cfg, db, non_interactive=True, resume=resume)
+    return int(getattr(result, "exit_code", ExitCode.FATAL_CONFIG))
 
 
 def _print_tapes_table(db):
@@ -311,6 +360,11 @@ def main():
         db, cfg.lto_drive, cfg.staging_dir, cfg.restore_dir,
         manifest_archive_root=cfg.local_manifest_archive_root)
 
+    # The last terminal result from a sub-flow (e.g. the remote archiver). If
+    # stdin closes at the menu prompt after a sub-flow already produced a
+    # result, that result's exit code is preserved rather than replaced by a
+    # generic EOF code — the original failure (a network stop, say) wins.
+    last_result = None
     while True:
         print("\n" + "=" * 60)
         print("  MAIN MENU")
@@ -327,7 +381,21 @@ def main():
         print("  0. Exit")
         print("-" * 60)
 
-        choice = input("Choose: ").strip()
+        try:
+            choice = input("Choose: ").strip()
+        except EOFError:
+            # stdin is closed (e.g. a detached run). Exit cleanly with no
+            # traceback. If a sub-flow already produced a terminal result,
+            # preserve its exit code; otherwise a neutral clean exit.
+            code = int(getattr(last_result, "exit_code", 0)) if last_result else 0
+            reason = getattr(last_result, "reason", None)
+            print("\n[MENU] Standard input closed; exiting cleanly"
+                  + (f" (last result: {reason})." if reason else "."))
+            get_logger().warning(
+                "menu stdin closed (EOF); exiting with code %s (reason=%s)",
+                code, reason)
+            db.close()
+            raise SystemExit(code)
 
         if choice == '1':
             run_archiver(cfg, db)
@@ -387,7 +455,7 @@ def main():
                 os.startfile(cfg_abs)
 
         elif choice == '6':
-            run_remote_archiver(cfg, db)
+            last_result = run_remote_archiver(cfg, db)
 
         elif choice == '7':
             _db_management_menu(db)

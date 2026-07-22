@@ -63,6 +63,9 @@ class RemoteStagingSafetyTests(unittest.TestCase):
             self.assertTrue(os.path.isdir(orch.staging_dir))
 
     def test_remote_write_rejects_chunk_before_backing_status(self):
+        import threading as _threading
+        from src.exit_codes import ExitCode
+
         class FakeDB:
             def __init__(self):
                 self.statuses = []
@@ -86,9 +89,17 @@ class RemoteStagingSafetyTests(unittest.TestCase):
             def update_chunk_status(self, session_id, chunk_index, status):
                 self.statuses.append(status)
 
+        ro_mod = __import__("src.remote_orchestrator", fromlist=["x"])
+        ro_mod.CANCEL.clear()
+        self.addCleanup(ro_mod.CANCEL.clear)
         orch = self._orchestrator()
         orch.db = FakeDB()
         orch.cfg = SimpleNamespace(ibm_eject_cmd="", lto_drive="", backup_log_dir="")
+        orch._stop_lock = _threading.Lock()
+        orch._stop_result = None
+        orch.notifier = None
+        # Permit the write past the gate so the fits-tape check is what rejects.
+        orch._pre_write_safety_gate = lambda *a, **k: None
         desc = StagedChunk(
             chunk_index=0,
             pack_dir=r"C:\stage\pack",
@@ -96,7 +107,13 @@ class RemoteStagingSafetyTests(unittest.TestCase):
             metadata=[{"is_packed": True}],
             staged_bytes=0,
         )
-        self.assertFalse(orch._write_chunk(1, desc, "T1", eject_after=False))
+        result = orch._write_chunk(1, desc, "T1", eject_after=False,
+                                   stop_pipeline=_threading.Event())
+        # A chunk that does not fit is a re-fetchable safety block that leaves
+        # the chunk 'backup_failed' and does NOT transition it to 'backing'.
+        self.assertIsNotNone(result)
+        self.assertEqual(result.exit_code, ExitCode.SAFETY_BLOCK)
+        self.assertFalse(result.preserve_pack)
         self.assertEqual(orch.db.statuses, ["backup_failed"])
 
 

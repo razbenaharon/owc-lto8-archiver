@@ -559,6 +559,142 @@ def ltfs_sync_mode_status(expect_seconds=300):
     return info
 
 
+# The LTFS mount is served by a long-lived host process (IBM Storage Archive).
+# Its name has varied across SDE builds, so match any process whose name
+# contains "ltfs" rather than pinning one spelling.
+_LTFS_PROCESS_MATCH = "ltfs"
+
+
+def ltfs_current_mount_status(expect_seconds=300):
+    """Verify the *live* LTFS mount declared time@<expect_seconds>, and that the
+    declaration belongs to the mount that is running **right now**.
+
+    ``ltfs_sync_mode_status`` reads the newest event 61259, but a time@5 line
+    from a *previous* mount would wrongly approve a write after a remount that
+    changed the mode. This binds the evidence to the current mount: it finds the
+    running LTFS process, and requires the 61259 declaration to have been emitted
+    at or after that process started. If no LTFS process is running, or the
+    declaration predates it, or either fact cannot be read, the mount is
+    reported ``unverifiable`` and the caller fails closed.
+
+    Read-only: it correlates the Windows event log with process metadata. It
+    never probes, remounts, or writes to the drive.
+
+    Returns a dict with ``determinate``, ``ok``, ``sync_type``, ``sync_seconds``,
+    ``declared_at``, ``mount_identified``, ``bound_to_current``, ``reason``
+    (None / ``"not_time5"`` / ``"unverifiable"``) and ``error``.
+    """
+    info = {"determinate": False, "ok": False, "sync_type": None,
+            "sync_seconds": None, "declared_at": None,
+            "mount_identified": False, "mount_started_at": None,
+            "bound_to_current": False, "reason": "unverifiable", "error": None}
+    if os.name != "nt":
+        info["error"] = "not Windows — cannot verify the live LTFS mount"
+        return info
+
+    # One PowerShell round-trip returns both facts: the earliest start time
+    # among running LTFS processes, and the newest 61259 declaration. Parsing
+    # and the actual decision happen in Python so they are unit-testable.
+    script = (
+        "$ErrorActionPreference='Stop';"
+        "$p = Get-CimInstance Win32_Process "
+        f"-Filter \"Name LIKE '%{_LTFS_PROCESS_MATCH}%'\" "
+        "-ErrorAction SilentlyContinue |"
+        " Sort-Object CreationDate | Select-Object -First 1;"
+        "$pstart = if ($p) { $p.CreationDate.ToString('o') } else { '' };"
+        "$e = Get-WinEvent -LogName LTFS -MaxEvents 4000 -ErrorAction Stop |"
+        " Where-Object { $_.Id -eq 61259 } |"
+        " Sort-Object TimeCreated -Descending | Select-Object -First 1;"
+        "$etime = if ($e) { $e.TimeCreated.ToString('o') } else { '' };"
+        "$emsg = if ($e) { ($e.Message -replace '\\s+',' ') } else { '' };"
+        "[pscustomobject]@{ProcStart=$pstart; EventTime=$etime; "
+        "EventMsg=$emsg} | ConvertTo-Json -Compress"
+    )
+    try:
+        proc = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+             script],
+            capture_output=True, text=True, timeout=_SCCM_QUERY_TIMEOUT_S,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if proc.returncode != 0:
+            raise RuntimeError((proc.stderr or "").strip().splitlines()[0]
+                               if proc.stderr else "query failed")
+        out = (proc.stdout or "").strip()
+        if not out:
+            raise RuntimeError("mount verification query returned no data")
+        data = json.loads(out)
+    except Exception as e:
+        info["error"] = str(e)
+        get_logger().warning("ltfs_current_mount_check_failed: %s", e)
+        return info
+
+    proc_start = (data.get("ProcStart") or "").strip()
+    event_time = (data.get("EventTime") or "").strip()
+    message = (data.get("EventMsg") or "").strip()
+
+    if not proc_start:
+        info["error"] = "no running LTFS process found — the drive is not mounted"
+        get_logger().warning("ltfs_current_mount_unverifiable: %s", info["error"])
+        return info
+    info["mount_identified"] = True
+    info["mount_started_at"] = proc_start
+
+    if not event_time or not message:
+        info["error"] = ("no LTFS mount declaration (event 61259) for the "
+                         "running mount")
+        get_logger().warning("ltfs_current_mount_unverifiable: %s", info["error"])
+        return info
+    info["declared_at"] = event_time
+
+    import re
+    m_type = re.search(r'Sync type is "([^"]+)"', message)
+    m_secs = re.search(r"Sync time is (\d+) sec", message)
+    if m_type:
+        info["sync_type"] = m_type.group(1)
+    if m_secs:
+        info["sync_seconds"] = int(m_secs.group(1))
+
+    bound = _iso_at_or_after(event_time, proc_start)
+    info["bound_to_current"] = bound
+    if not bound:
+        # Only a stale declaration from a previous mount exists — the live
+        # mount's mode is unproven. Fail closed.
+        info["error"] = (f"newest LTFS declaration ({event_time}) predates the "
+                         f"running mount ({proc_start}); it is from a previous "
+                         "mount")
+        get_logger().warning("ltfs_current_mount_stale_declaration: %s",
+                             info["error"])
+        return info
+
+    # The declaration is bound to the live mount; the mount state is now known.
+    info["determinate"] = True
+    info["ok"] = (info["sync_type"] == "time"
+                  and info["sync_seconds"] == expect_seconds)
+    info["reason"] = None if info["ok"] else "not_time5"
+    return info
+
+
+def _iso_at_or_after(a_iso, b_iso):
+    """True if timestamp a_iso is at or after b_iso. Both are ISO-8601 'o' form.
+
+    Conservative: if either cannot be parsed, returns False so an unparseable
+    stamp fails closed rather than silently approving a write.
+    """
+    try:
+        from datetime import datetime as _dt
+        a = _dt.fromisoformat(a_iso.replace("Z", "+00:00"))
+        b = _dt.fromisoformat(b_iso.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return False
+    # Compare in a tz-aware way when possible; if one side is naive, drop tzinfo
+    # on both so the comparison never raises.
+    if (a.tzinfo is None) != (b.tzinfo is None):
+        a = a.replace(tzinfo=None)
+        b = b.replace(tzinfo=None)
+    return a >= b
+
+
 def _snapshot():
     """Capture the current values of everything pause_windows_updates() writes."""
     snap = {"ux": {}, "au": {}}

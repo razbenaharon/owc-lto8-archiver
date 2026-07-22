@@ -2,6 +2,7 @@
 import gc
 import json
 import os
+import random
 import time
 import queue
 import shutil
@@ -15,8 +16,25 @@ from .backup import LTOBackup, _NoEjectBackup
 from .constants import (DEFAULT_TAPE_CAPACITY_GB, LOCAL_STAGING_RESERVE_BYTES,
                         LTFS_WRITE_WARNING, tape_budget_bytes)
 from .db import _apply_canonical_remote_paths
+from .exit_codes import (
+    ExitCode, StopResult,
+    REASON_NETWORK_RETRY_EXHAUSTED, REASON_SCCM_REBOOT_PENDING,
+    REASON_WINDOWS_REBOOT_PENDING, REASON_STOPPED_AT_CHUNK_BOUNDARY,
+    REASON_TAPE_WRITE_FAILED,
+    REASON_AMBIGUOUS_BACKING_CHUNK, REASON_LTFS_SYNC_MODE_NOT_TIME5,
+    REASON_LTFS_MOUNT_UNVERIFIABLE, REASON_UNEXPECTED_TAPE_OR_DB_STATE,
+    REASON_AMBIGUOUS_ACTIVE_SESSIONS, REASON_SSH_AUTHENTICATION_FAILED,
+    REASON_SSH_PERMISSION_DENIED, REASON_SSH_HOST_KEY_MISMATCH,
+    REASON_MISSING_NONINTERACTIVE_CREDENTIAL, REASON_BAD_CONFIG,
+    REASON_NO_ACTIVE_SESSION, REASON_NONINTERACTIVE_REQUIRES_RESUME,
+    REASON_USER_REQUESTED_STOP, REASON_COMPLETED,
+    CLASS_DNS_RESOLUTION_FAILURE, CLASS_CONNECTION_TIMEOUT,
+    CLASS_CONNECTION_RESET, CLASS_CONNECTION_REFUSED,
+    CLASS_NETWORK_UNREACHABLE, CLASS_TEMPORARY_TRANSPORT_FAILURE)
 from .logsetup import get_logger
-from .windows_update_guard import (RebootSentinel, ltfs_sync_mode_status,
+from .status_file import write_status, write_last_failure
+from .windows_update_guard import (RebootSentinel, ltfs_current_mount_status,
+                                   ltfs_sync_mode_status,
                                    pending_reboot_reasons,
                                    reboot_block_reasons)
 from .ltfs import _ensure_lto_drive_ready, get_volume_label
@@ -32,10 +50,10 @@ from .ram_telemetry import RamStageSampler
 from .remote_transport import _remote_tar_fetch
 from .resource_governor import ResourceGovernor
 from .reporting import _write_source_missing_only_log
-from .runtime import (CANCEL, _fmt_eta, _phase, _priority_class,
-                      _progress_done, _progress_line, _status,
-                      compute_affinity_sets, pin_current_process,
-                      unpin_current_process)
+from .runtime import (CANCEL, _acquire_tape_io_lock, _fmt_eta, _phase,
+                      _priority_class, _progress_done, _progress_line,
+                      _release_tape_io_lock, _status, compute_affinity_sets,
+                      pin_current_process, unpin_current_process)
 from .scanning import StreamingRemoteScanner
 from .skipped import SkippedFileTracker
 from .telegram_notify import TelegramNotifier, send_best_effort
@@ -50,39 +68,81 @@ _FETCH_OVERRUN_WARN_FACTOR = 1.10
 # the pack is complete — a pack interrupted mid-write simply has no marker.
 _RESUME_MARKER = "_resume_pack.json"
 
-# Substrings that mark a fetch failure as transient — a network/DNS hiccup worth
-# a retry, not a reason to abandon the chunk and stop the run. Drawn from the
-# 2026-07-17 incident (a momentary "Could not resolve hostname so01" killed the
-# session) and the usual ssh/tar transport failures. Matched case-insensitively.
-_TRANSIENT_FETCH_SIGNATURES = (
-    "could not resolve hostname",
-    "name or service not known",
-    "temporary failure in name resolution",
-    "getaddrinfo",
-    "exit 255",                 # ssh's catch-all for a connection it never made
-    "connection reset",
-    "connection timed out",
-    "connection refused",
-    "connection closed",
-    "broken pipe",
-    "network is unreachable",
-    "no route to host",
-    "kex_exchange_identification",
-    "banner exchange",
+# Permanent fetch-failure signatures, checked FIRST. An auth/permission/host-key/
+# config failure is never a retryable network blip: retrying it just spins on an
+# unrecoverable error and — worse — could mask a real access problem behind a
+# "transient DNS" story. Each maps to the exit_codes reason the terminal uses.
+_PERMANENT_FETCH_SIGNATURES = (
+    ("host key verification failed", REASON_SSH_HOST_KEY_MISMATCH),
+    ("remote host identification has changed", REASON_SSH_HOST_KEY_MISMATCH),
+    ("no password-capable ssh helper", REASON_MISSING_NONINTERACTIVE_CREDENTIAL),
+    ("no non-interactive credential", REASON_MISSING_NONINTERACTIVE_CREDENTIAL),
+    ("permission denied", REASON_SSH_PERMISSION_DENIED),
+    ("too many authentication failures", REASON_SSH_AUTHENTICATION_FAILED),
+    ("no supported authentication methods", REASON_SSH_AUTHENTICATION_FAILED),
+    ("authentication failed", REASON_SSH_AUTHENTICATION_FAILED),
+    ("authentication failure", REASON_SSH_AUTHENTICATION_FAILED),
+    ("bad configuration option", REASON_BAD_CONFIG),
+    ("bad configuration", REASON_BAD_CONFIG),
+)
+
+# Transient network/transport signatures, checked only after no permanent one
+# matched. Each carries the precise error_classification (the operational
+# ``reason`` for all of these stays the generic ``network_retry_exhausted`` —
+# not every transient failure is DNS). Note that a bare ``exit 255`` is
+# deliberately NOT here: on its own it is ssh's catch-all and could hide an
+# auth failure, so a 255 is transient only when accompanied by one of these.
+_TRANSIENT_FETCH_CLASSES = (
+    ("could not resolve hostname", CLASS_DNS_RESOLUTION_FAILURE),
+    ("name or service not known", CLASS_DNS_RESOLUTION_FAILURE),
+    ("temporary failure in name resolution", CLASS_DNS_RESOLUTION_FAILURE),
+    ("nodename nor servname", CLASS_DNS_RESOLUTION_FAILURE),
+    ("getaddrinfo", CLASS_DNS_RESOLUTION_FAILURE),
+    ("connection timed out", CLASS_CONNECTION_TIMEOUT),
+    ("operation timed out", CLASS_CONNECTION_TIMEOUT),
+    ("timed out", CLASS_CONNECTION_TIMEOUT),
+    ("connection reset", CLASS_CONNECTION_RESET),
+    ("reset by peer", CLASS_CONNECTION_RESET),
+    ("connection refused", CLASS_CONNECTION_REFUSED),
+    ("network is unreachable", CLASS_NETWORK_UNREACHABLE),
+    ("no route to host", CLASS_NETWORK_UNREACHABLE),
+    ("connection closed", CLASS_TEMPORARY_TRANSPORT_FAILURE),
+    ("broken pipe", CLASS_TEMPORARY_TRANSPORT_FAILURE),
+    ("kex_exchange_identification", CLASS_TEMPORARY_TRANSPORT_FAILURE),
+    ("banner exchange", CLASS_TEMPORARY_TRANSPORT_FAILURE),
 )
 
 
+def _classify_fetch_error(err):
+    """Classify a fetch error as (kind, classification, permanent_reason).
+
+    ``kind`` is ``"permanent"``, ``"transient"`` or ``"unknown"``. Permanent
+    signatures are matched FIRST, so stderr that mixes a network hiccup with an
+    auth/host-key/config failure is classified permanent (no blind retry) — a
+    momentary network blip does not excuse an auth failure. ``classification`` is
+    the precise transport diagnosis for a transient error; ``permanent_reason``
+    is the exit_codes reason slug for a permanent one.
+    """
+    if not err:
+        return ("unknown", None, None)
+    low = str(err).lower()
+    for sig, reason in _PERMANENT_FETCH_SIGNATURES:
+        if sig in low:
+            return ("permanent", None, reason)
+    for sig, classification in _TRANSIENT_FETCH_CLASSES:
+        if sig in low:
+            return ("transient", classification, None)
+    return ("unknown", None, None)
+
+
 def _is_transient_fetch_error(err):
-    """True if a fetch error looks like a retryable network/DNS blip.
+    """True if a fetch error is a retryable network/transport blip.
 
     Deliberately conservative: an error that is not clearly transient is treated
-    as fatal, because retrying a genuine problem (missing file, permission,
-    corrupt source) just wastes time. A false negative costs a re-fetch on
-    resume; a false positive would spin on an unrecoverable error."""
-    if not err:
-        return False
-    low = str(err).lower()
-    return any(sig in low for sig in _TRANSIENT_FETCH_SIGNATURES)
+    as non-retryable, because retrying a genuine problem (missing file,
+    permission, corrupt source) just wastes time. A false negative costs a
+    re-fetch on resume; a false positive would spin on an unrecoverable error."""
+    return _classify_fetch_error(err)[0] == "transient"
 
 
 class RemoteOrchestrator:
@@ -140,6 +200,14 @@ class RemoteOrchestrator:
         self._staged_bytes = 0                 # bytes currently resident in staging
         self._staged_lock  = threading.Lock()
         self._producer_err = None              # first fatal producer error, if any
+        # The most specific stop reason recorded by whatever component decided to
+        # stop; the terminal paths return this unchanged rather than re-deriving
+        # a generic reason from the bare stop flag. See _record_stop.
+        self._stop_result: Optional[StopResult] = None
+        self._stop_lock = threading.Lock()
+        # Classification of the last fetch failure, so a stop caused by an
+        # exhausted retry / permanent auth failure carries the precise reason.
+        self._last_fetch_failure = None
         self.governor = ResourceGovernor(cfg, self.staging_dir)
 
     def _backup_writer(self, cls=LTOBackup):
@@ -158,9 +226,17 @@ class RemoteOrchestrator:
     # Public entry point
     # ------------------------------------------------------------------
 
-    def run(self):
+    def run(self, non_interactive=False, resume=False):
+        """Interactive menu entry, or a promptless headless entry.
+
+        Returns a :class:`StopResult`. Interactive callers may ignore it;
+        headless callers map ``result.exit_code`` to the process exit code.
+        ``non_interactive=True`` never prompts and never calls ``input()``.
+        """
         try:
             self._validate_config()
+            if non_interactive:
+                return self._run_non_interactive(resume=resume)
 
             existing = self.db.get_active_remote_session(self.remote_host, self.remote_session_path)
             if existing:
@@ -175,19 +251,74 @@ class RemoteOrchestrator:
                 print("0. Cancel")
                 choice = self.ui.prompt("Choose: ").strip()
                 if choice == '1':
-                    self._run_session(existing['session_id'])
-                    return
+                    return self._run_session(existing['session_id'])
                 elif choice == '2':
                     print("[REMOTE] Starting a fresh-session scan. The current session "
                           "will remain resumable until the replacement is approved.")
-                    self._start_new_session(replacing_session=existing)
-                    return
+                    return self._start_new_session(replacing_session=existing)
                 else:
-                    return
+                    return StopResult(
+                        exit_code=ExitCode.USER_STOP,
+                        reason=REASON_USER_REQUESTED_STOP, resumable=True,
+                        source="menu")
 
-            self._start_new_session()
+            return self._start_new_session()
+        except RuntimeError as e:
+            # _validate_config and similar operator-facing config errors.
+            get_logger().exception("remote orchestrator config error")
+            print(str(e))
+            return self._finalize(StopResult(
+                exit_code=ExitCode.FATAL_CONFIG, reason=REASON_BAD_CONFIG,
+                resumable=False, source="config", detailed_reason=str(e)),
+                phase="config")
         finally:
             self.skipped_tracker.print_summary(self.ui, self.cfg.backup_log_dir)
+
+    def _run_non_interactive(self, resume=False):
+        """Promptless dispatch for headless launches. Never calls input().
+
+        Dispatches strictly by active-session count so it can never block on a
+        prompt or guess which session to resume:
+
+          --resume, exactly one active session   -> resume it
+          --resume, zero active sessions          -> FATAL_CONFIG/no_active_session
+          --resume, >1 active sessions            -> SAFETY_BLOCK/ambiguous
+          without --resume                        -> FATAL_CONFIG/requires_resume
+
+        A fresh session needs a tape choice and a confirmation prompt, so a
+        promptless fresh start is out of scope until that workflow is defined.
+        """
+        if not resume:
+            msg = ("--non-interactive requires --resume: a fresh session needs "
+                   "interactive tape selection and confirmation.")
+            print(f"[REMOTE] {msg}")
+            return self._finalize(StopResult(
+                exit_code=ExitCode.FATAL_CONFIG,
+                reason=REASON_NONINTERACTIVE_REQUIRES_RESUME, resumable=False,
+                source="headless", detailed_reason=msg), phase="headless")
+
+        active = self.db.list_active_remote_sessions(
+            self.remote_host, self.remote_session_path)
+        if not active:
+            msg = "no active session to resume for this host/path."
+            print(f"[REMOTE] {msg}")
+            return self._finalize(StopResult(
+                exit_code=ExitCode.FATAL_CONFIG, reason=REASON_NO_ACTIVE_SESSION,
+                resumable=False, source="headless", detailed_reason=msg),
+                phase="headless")
+        if len(active) > 1:
+            labels = ", ".join(str(s.get('session_label')) for s in active)
+            msg = (f"{len(active)} active sessions match this host/path "
+                   f"({labels}); refusing to guess which to resume.")
+            print(f"[REMOTE] {msg}")
+            return self._finalize(StopResult(
+                exit_code=ExitCode.SAFETY_BLOCK,
+                reason=REASON_AMBIGUOUS_ACTIVE_SESSIONS, resumable=False,
+                source="headless", detailed_reason=msg), phase="headless")
+
+        session = active[0]
+        print(f"[REMOTE] Headless resume of session: {session.get('session_label')}")
+        return self._run_session(session['session_id'])
 
     # ------------------------------------------------------------------
     # Session lifecycle
@@ -236,9 +367,16 @@ class RemoteOrchestrator:
 
         tape_label = self._resolve_tape_label()
         if not tape_label:
-            return
+            return StopResult(
+                exit_code=ExitCode.USER_STOP, reason=REASON_USER_REQUESTED_STOP,
+                resumable=True, source="new-session",
+                detailed_reason="no tape label")
         if not _ensure_lto_drive_ready(self.cfg.lto_drive):
-            return
+            return self._finalize(StopResult(
+                exit_code=ExitCode.SAFETY_BLOCK,
+                reason=REASON_UNEXPECTED_TAPE_OR_DB_STATE, resumable=False,
+                source="new-session", detailed_reason="LTO drive not ready"),
+                phase="new-session")
 
         if self.db.tape_exists(tape_label) and \
                 self.db.count_tape_file_records(tape_label) > 0:
@@ -275,7 +413,10 @@ class RemoteOrchestrator:
                       f"{replacing_session['session_label']}")
             else:
                 print("[REMOTE] Cancelled before creating backup session.")
-            return
+            return StopResult(
+                exit_code=ExitCode.USER_STOP, reason=REASON_USER_REQUESTED_STOP,
+                resumable=True, source="new-session",
+                detailed_reason="not confirmed before write")
 
         session_id = self.db.create_remote_streaming_session(
             session_label=session_label,
@@ -292,7 +433,7 @@ class RemoteOrchestrator:
             )
             print(f"[REMOTE] Abandoned session: {replacing_session['session_label']}")
 
-        self._run_streaming_session(session_id)
+        return self._run_streaming_session(session_id)
 
     def _resolve_tape_label(self):
         detected = get_volume_label(self.cfg.lto_drive)
@@ -364,16 +505,29 @@ class RemoteOrchestrator:
     # ------------------------------------------------------------------
 
     def _run_streaming_session(self, session_id):
-        """Scan, persist, stage, and write chunks as one continuous pipeline."""
+        """Scan, persist, stage, and write chunks as one continuous pipeline.
+
+        Returns a :class:`StopResult` describing how the run ended."""
         session_row = self.db.get_remote_session(session_id)
         tape_label = session_row['tape_label']
         if not _ensure_lto_drive_ready(self.cfg.lto_drive):
-            return
+            return self._finalize(StopResult(
+                exit_code=ExitCode.SAFETY_BLOCK,
+                reason=REASON_UNEXPECTED_TAPE_OR_DB_STATE, resumable=False,
+                source="streaming", session_id=session_id,
+                detailed_reason="LTO drive not ready"))
 
         self._staged_bytes = 0
         self._producer_err = None
+        self._last_fetch_failure = None
         self._producer_chunk = None
         self._consumer_chunk = None
+
+        # Before any thread starts: a chunk left 'backing' by a prior run may
+        # already be on tape. Refuse to resume blindly rather than double-write.
+        prior_block = self._detect_prior_backing_chunks(session_id)
+        if prior_block is not None:
+            return self._finalize(prior_block, phase="resume-precheck")
 
         if self.fetch_cores:
             pin_current_process(self.fetch_cores, label='fetch/pack')
@@ -384,7 +538,11 @@ class RemoteOrchestrator:
         print(f"[WARNING] {LTFS_WRITE_WARNING}")
 
         if not self._validate_ltfs_sync_mode():
-            return False
+            return self._finalize(StopResult(
+                exit_code=ExitCode.SAFETY_BLOCK,
+                reason=REASON_LTFS_SYNC_MODE_NOT_TIME5, resumable=False,
+                source="streaming", session_id=session_id,
+                detailed_reason="LTFS mount is not time@5"))
 
         chunk_q = queue.Queue(maxsize=max(1, self.prefetch_ahead * 2))
         ready_q = queue.Queue(maxsize=self.prefetch_ahead)
@@ -396,11 +554,13 @@ class RemoteOrchestrator:
         # boundary while LTFS can still sync, rather than be killed mid-write.
         reboot_sentinel = RebootSentinel(
             stop_pipeline,
-            on_detect=lambda reasons: send_best_effort(
-                self.notifier,
-                "[PIPELINE] Windows staged a restart — stopping at the next "
-                "chunk boundary so the tape index is synced. Re-run option 6 "
-                "to resume after the host restarts.")).start()
+            on_detect=lambda reasons: (
+                self._record_reboot_stop(reasons),
+                send_best_effort(
+                    self.notifier,
+                    "[PIPELINE] Windows staged a restart — stopping at the next "
+                    "chunk boundary so the tape index is synced. Re-run option 6 "
+                    "to resume after the host restarts."))).start()
 
         tape_context = self._remote_tape_capacity_context(
             tape_label, session_id=session_id)
@@ -460,6 +620,11 @@ class RemoteOrchestrator:
                     state.scan_error = msg
                     self.db.mark_remote_scan_error(session_id, msg)
                     print(f"[TAPE] {msg}. Stopping before overfill.")
+                    self._record_stop(StopResult(
+                        exit_code=ExitCode.SAFETY_BLOCK,
+                        reason=REASON_UNEXPECTED_TAPE_OR_DB_STATE, resumable=False,
+                        source="scanner", session_id=session_id,
+                        detailed_reason=msg))
                     stop_pipeline.set()
                     return False
 
@@ -524,6 +689,11 @@ class RemoteOrchestrator:
                 state.scan_error = str(e)
                 self.db.mark_remote_scan_error(session_id, str(e))
                 self._producer_err = str(e)
+                self._record_stop(StopResult(
+                    exit_code=ExitCode.TRANSIENT_RESUMABLE,
+                    reason=REASON_STOPPED_AT_CHUNK_BOUNDARY, resumable=True,
+                    source="scanner", session_id=session_id,
+                    detailed_reason=f"scan failed: {e}"))
                 stop_pipeline.set()
             finally:
                 _force_put(chunk_q, SENTINEL)
@@ -557,6 +727,7 @@ class RemoteOrchestrator:
                         if not CANCEL.is_set():
                             self._producer_err = (
                                 f"chunk {ci + 1} could not be staged")
+                            self._record_fetch_failure_stop(session_id, ci)
                         stop_pipeline.set()
                         break
                     if not _queue_put(ready_q, desc):
@@ -565,6 +736,11 @@ class RemoteOrchestrator:
             except Exception as e:
                 get_logger().exception("chunk stager failed")
                 self._producer_err = str(e)
+                self._record_stop(StopResult(
+                    exit_code=ExitCode.TRANSIENT_RESUMABLE,
+                    reason=REASON_STOPPED_AT_CHUNK_BOUNDARY, resumable=True,
+                    source="stager", session_id=session_id,
+                    detailed_reason=str(e)))
                 stop_pipeline.set()
             finally:
                 _force_put(ready_q, SENTINEL)
@@ -579,43 +755,31 @@ class RemoteOrchestrator:
 
         completed = 0
         failed = False
-        blocked_by_reboot = False
+        stop_block = None
         try:
             while True:
                 desc = ready_q.get()
                 if desc is SENTINEL:
                     break
-                if CANCEL.is_set():
-                    # Keep the pack. It cost a full fetch+pack cycle and it is
-                    # exactly what a resume wants; deleting it here is why an
-                    # interrupted run used to re-fetch work it already had.
-                    self._preserve_desc(session_id, desc, "cancelled before write")
-                    break
-                # A stop asked for mid-write must end the pipeline at THIS
-                # boundary, not after the queue drains. The sentinel sets
-                # stop_pipeline precisely so the next write never starts.
-                if stop_pipeline.is_set():
-                    self._preserve_desc(session_id, desc, "stop requested before write")
-                    break
-                # Synchronous, current re-check. The sentinel's poll can be up
-                # to 60s stale, and on 2026-07-15 SCCM gave 60s of warning —
-                # a stale answer is not good enough at this boundary.
-                reasons, sccm = self._pre_tape_write_reboot_check(
-                    session_id, desc, tape_label)
-                if reasons:
-                    self._preserve_desc(session_id, desc, "blocked by pending restart")
-                    blocked_by_reboot = True
-                    stop_pipeline.set()
-                    break
-                if not self._write_chunk(
-                        session_id, desc, tape_label, eject_after=False):
-                    if not CANCEL.is_set():
+                # _write_chunk is the single authorization boundary: it runs the
+                # safety gate and starts the write atomically under the tape I/O
+                # lock. None => written; a StopResult => not written (its
+                # preserve_pack says whether to keep the staged pack for resume).
+                stop_block = self._write_chunk(
+                    session_id, desc, tape_label, False, stop_pipeline)
+                if stop_block is not None:
+                    if stop_block.preserve_pack:
+                        self._preserve_desc(session_id, desc, stop_block.reason)
+                    elif not CANCEL.is_set():
                         self._discard_desc(desc)
-                    failed = True
+                    failed = stop_block.exit_code != ExitCode.USER_STOP
                     stop_pipeline.set()
                     break
                 completed += 1
         finally:
+            # Shutdown-only: signal the producer threads to exit. Not a stop
+            # decision — the loop already recorded any stop reason (or completed
+            # cleanly), so this never leaves a reason to be inferred later.
             stop_pipeline.set()
             hb_stop.set()
             reboot_sentinel.stop()
@@ -641,10 +805,54 @@ class RemoteOrchestrator:
             if self.fetch_cores:
                 unpin_current_process()
 
+        # Authoritative completion: the scan finished AND every chunk is 'done'.
+        # An ambiguous ('backing') chunk keeps the session incomplete, so it is
+        # handled by the stop_block branch below (returns 20).
+        session_row = self.db.get_remote_session(session_id)
+        scan_done = bool(session_row and session_row.get('scan_complete'))
+        remaining = self.db.get_pending_chunks(session_id) if scan_done else [None]
+        if scan_done and not remaining:
+            # Everything is committed — nothing to resume. Mark the session
+            # complete NOW, even if the user cancelled during the final write.
+            self.db.update_remote_session(
+                session_id, status='completed',
+                completed_at=datetime.now().isoformat())
+            recorded = self._get_recorded_stop()
+            if recorded is not None and recorded.exit_code != ExitCode.COMPLETED:
+                # Cancel-during-final-write: session complete, this run exits with
+                # the recorded stop. Do NOT physically eject on a user cancel.
+                print("\n[REMOTE] Session complete (all streamed chunks "
+                      f"archived); this run was stopped by the user "
+                      f"({recorded.reason}).")
+                send_best_effort(
+                    self.notifier,
+                    "[PIPELINE] Session complete — all chunks archived; run "
+                    f"stopped by user ({recorded.reason}).")
+                return self._finalize(recorded, phase="streaming")
+            self._backup_writer(LTOBackup).eject_tape(self.cfg.lto_drive)
+            print("\n[REMOTE] Session complete. All streamed chunks archived.")
+            send_best_effort(
+                self.notifier,
+                f"[PIPELINE] Session complete - {completed} chunk(s) "
+                "written in this run.")
+            return self._finalize(StopResult(
+                exit_code=ExitCode.COMPLETED, reason=REASON_COMPLETED,
+                resumable=False, source="streaming", session_id=session_id),
+                phase="done")
+
+        if stop_block is not None:
+            # _write_chunk already recorded the specific reason (gate or write).
+            print(f"\n[REMOTE] Streaming pipeline stopped at a chunk boundary "
+                  f"({stop_block.reason}). Re-run option 6 to resume.")
+            return self._finalize(self._stop_result or stop_block,
+                                  phase="streaming")
         if CANCEL.is_set():
             print("\n[ABORTED] Stopped by user. Session saved - re-run option 6 "
                   "to resume from the interrupted chunk.")
-            return
+            return self._finalize(self._stop_result or StopResult(
+                exit_code=ExitCode.USER_STOP, reason=REASON_USER_REQUESTED_STOP,
+                resumable=True, source="streaming", session_id=session_id),
+                phase="streaming")
         if failed or self._producer_err or state.scan_error:
             msg = self._producer_err or state.scan_error or (
                 "a chunk failed during tape write")
@@ -653,25 +861,20 @@ class RemoteOrchestrator:
             send_best_effort(
                 self.notifier,
                 f"[PIPELINE] STOPPED: {msg}. Re-run to resume.")
-            return
-
-        session_row = self.db.get_remote_session(session_id)
-        if session_row and session_row.get('scan_complete'):
-            pending = self.db.get_pending_chunks(session_id)
-            if not pending:
-                self.db.update_remote_session(
-                    session_id, status='completed',
-                    completed_at=datetime.now().isoformat()
-                )
-                self._backup_writer(LTOBackup).eject_tape(self.cfg.lto_drive)
-                print("\n[REMOTE] Session complete. All streamed chunks archived.")
-                send_best_effort(
-                    self.notifier,
-                    f"[PIPELINE] Session complete - {completed} chunk(s) "
-                    "written in this run.")
-            else:
-                print(f"\n[REMOTE] Scan complete; {len(pending)} chunk(s) "
-                      "remain pending. Re-run to resume.")
+            return self._finalize(self._stop_result or StopResult(
+                exit_code=ExitCode.TRANSIENT_RESUMABLE,
+                reason=REASON_STOPPED_AT_CHUNK_BOUNDARY, resumable=True,
+                source="streaming", session_id=session_id, detailed_reason=msg),
+                phase="streaming")
+        if scan_done:
+            print(f"\n[REMOTE] Scan complete; {len(remaining)} chunk(s) "
+                  "remain pending. Re-run to resume.")
+        # Scan not complete or chunks remain: resumable, not an error.
+        return self._finalize(self._stop_result or StopResult(
+            exit_code=ExitCode.TRANSIENT_RESUMABLE,
+            reason=REASON_STOPPED_AT_CHUNK_BOUNDARY, resumable=True,
+            source="streaming", session_id=session_id,
+            detailed_reason="scan or chunks still pending"), phase="streaming")
 
     def _run_session(self, session_id):
         """Stream pending chunks to tape with a deep-prefetch pipeline.
@@ -684,8 +887,7 @@ class RemoteOrchestrator:
         session_row    = self.db.get_remote_session(session_id)
         tape_label     = session_row['tape_label']
         if not session_row.get('scan_complete', True):
-            self._run_streaming_session(session_id)
-            return
+            return self._run_streaming_session(session_id)
         pending_chunks = self.db.get_pending_chunks(session_id)
         total_chunks   = self.db.count_chunks(session_id)
         done_count     = total_chunks - len(pending_chunks)
@@ -699,7 +901,11 @@ class RemoteOrchestrator:
                 session_id, status='abandoned',
                 completed_at=datetime.now().isoformat()
             )
-            return
+            return self._finalize(StopResult(
+                exit_code=ExitCode.SAFETY_BLOCK,
+                reason=REASON_UNEXPECTED_TAPE_OR_DB_STATE, resumable=False,
+                source="resume", session_id=session_id,
+                detailed_reason="session has no planned chunks"), phase="resume")
 
         if not pending_chunks:
             print("[REMOTE] All chunks already completed.")
@@ -707,14 +913,28 @@ class RemoteOrchestrator:
                 session_id, status='completed',
                 completed_at=datetime.now().isoformat()
             )
-            return
+            return self._finalize(StopResult(
+                exit_code=ExitCode.COMPLETED, reason=REASON_COMPLETED,
+                resumable=False, source="resume", session_id=session_id),
+                phase="done")
 
         if not _ensure_lto_drive_ready(self.cfg.lto_drive):
-            return
+            return self._finalize(StopResult(
+                exit_code=ExitCode.SAFETY_BLOCK,
+                reason=REASON_UNEXPECTED_TAPE_OR_DB_STATE, resumable=False,
+                source="resume", session_id=session_id,
+                detailed_reason="LTO drive not ready"), phase="resume")
+
+        # Before any thread starts: a chunk left 'backing' by a prior run may
+        # already be on tape. Refuse to resume blindly rather than double-write.
+        prior_block = self._detect_prior_backing_chunks(session_id)
+        if prior_block is not None:
+            return self._finalize(prior_block, phase="resume-precheck")
 
         # --- per-session pipeline state ---
         self._staged_bytes   = 0
         self._producer_err   = None
+        self._last_fetch_failure = None
         self._producer_chunk = None
         self._consumer_chunk = None
         last_chunk = pending_chunks[-1]
@@ -747,11 +967,13 @@ class RemoteOrchestrator:
         # at the next chunk boundary so LTFS syncs its index while it still can.
         reboot_sentinel = RebootSentinel(
             stop_pipeline,
-            on_detect=lambda reasons: send_best_effort(
-                self.notifier,
-                "[PIPELINE] Windows staged a restart — stopping at the next "
-                "chunk boundary so the tape index is synced. Re-run option 6 "
-                "to resume after the host restarts.")).start()
+            on_detect=lambda reasons: (
+                self._record_reboot_stop(reasons),
+                send_best_effort(
+                    self.notifier,
+                    "[PIPELINE] Windows staged a restart — stopping at the next "
+                    "chunk boundary so the tape index is synced. Re-run option 6 "
+                    "to resume after the host restarts."))).start()
 
         def _producer():
             try:
@@ -768,6 +990,8 @@ class RemoteOrchestrator:
                     if desc is None:
                         if not CANCEL.is_set():
                             self._producer_err = f"chunk {ci + 1} could not be staged"
+                            self._record_fetch_failure_stop(session_id, ci)
+                            stop_pipeline.set()
                         break
                     # Enqueue, staying responsive to pipeline shutdown.
                     queued = False
@@ -784,6 +1008,12 @@ class RemoteOrchestrator:
             except Exception as e:
                 get_logger().exception("prefetch producer failed")
                 self._producer_err = str(e)
+                self._record_stop(StopResult(
+                    exit_code=ExitCode.TRANSIENT_RESUMABLE,
+                    reason=REASON_STOPPED_AT_CHUNK_BOUNDARY, resumable=True,
+                    source="producer", session_id=session_id,
+                    detailed_reason=str(e)))
+                stop_pipeline.set()
             finally:
                 ready_q.put(SENTINEL)
 
@@ -796,35 +1026,34 @@ class RemoteOrchestrator:
 
         completed = 0
         failed    = False
+        stop_block = None
         try:
             while True:
                 desc = ready_q.get()
                 if desc is SENTINEL:
                     break
-                if CANCEL.is_set():
-                    self._preserve_desc(session_id, desc, "cancelled before write")
-                    break
-                if stop_pipeline.is_set():
-                    self._preserve_desc(session_id, desc, "stop requested before write")
-                    break
                 ci          = desc.chunk_index
                 eject_after = (ci == last_chunk)
-                reasons, _sccm = self._pre_tape_write_reboot_check(
-                    session_id, desc, tape_label)
-                if reasons:
-                    self._preserve_desc(session_id, desc, "blocked by pending restart")
-                    stop_pipeline.set()
-                    break
-                if not self._write_chunk(session_id, desc, tape_label, eject_after):
-                    if not CANCEL.is_set():
-                        # A failed chunk is re-fetched and repacked on resume,
-                        # so its staged copy only wastes staging space — free
-                        # it now. On cancel, skip the rmtree so exit is quick.
+                # _write_chunk authorizes (safety gate) and writes atomically
+                # under the tape I/O lock — the same single boundary the
+                # streaming path uses. None => written; a StopResult => not
+                # written (preserve_pack decides keep-vs-discard of the pack).
+                stop_block = self._write_chunk(
+                    session_id, desc, tape_label, eject_after, stop_pipeline)
+                if stop_block is not None:
+                    if stop_block.preserve_pack:
+                        self._preserve_desc(session_id, desc, stop_block.reason)
+                    elif not CANCEL.is_set():
+                        # A re-fetchable failure: free its staged copy. On cancel
+                        # skip the rmtree so exit is quick.
                         self._discard_desc(desc)
-                    failed = True
+                    failed = stop_block.exit_code != ExitCode.USER_STOP
                     break
                 completed += 1
         finally:
+            # Shutdown-only: signal the producer threads to exit. Not a stop
+            # decision — the loop already recorded any stop reason (or completed
+            # cleanly), so this never leaves a reason to be inferred later.
             stop_pipeline.set()
             hb_stop.set()
             reboot_sentinel.stop()
@@ -842,15 +1071,50 @@ class RemoteOrchestrator:
             if self.fetch_cores:
                 unpin_current_process()
 
-        if reboot_sentinel.triggered:
-            print("\n[REMOTE] Stopped cleanly because Windows staged a "
-                  "restart. The tape index was synced and the session is "
-                  "resumable — re-run option 6 after the host restarts.")
-            return
+        # Authoritative completion from the DB: are ALL chunks committed 'done'?
+        # An ambiguous ('backing') chunk is NOT done, so it keeps the session
+        # incomplete and is handled by the stop_block branch below.
+        remaining = self.db.get_pending_chunks(session_id)
+        if not remaining:
+            # Everything is on tape and committed — nothing to resume. Mark the
+            # session complete NOW, even if the user cancelled during the final
+            # write (the data is complete; there is nothing left for a resume).
+            self.db.update_remote_session(
+                session_id, status='completed',
+                completed_at=datetime.now().isoformat())
+            recorded = self._get_recorded_stop()
+            if recorded is not None and recorded.exit_code != ExitCode.COMPLETED:
+                # Cancel-during-final-write: session complete, but THIS run exits
+                # with the recorded stop (e.g. 40/user_requested_stop).
+                print("\n[REMOTE] Session complete (all chunks archived); this "
+                      f"run was stopped by the user ({recorded.reason}).")
+                send_best_effort(
+                    self.notifier,
+                    "[PIPELINE] Session complete — all chunks archived; run "
+                    f"stopped by user ({recorded.reason}).")
+                return self._finalize(recorded, phase="resume")
+            print("\n[REMOTE] Session complete. All chunks archived to tape.")
+            send_best_effort(
+                self.notifier,
+                f"[PIPELINE] Session complete — all {total_chunks} chunk(s) "
+                "archived to tape.")
+            return self._finalize(StopResult(
+                exit_code=ExitCode.COMPLETED, reason=REASON_COMPLETED,
+                resumable=False, source="resume", session_id=session_id),
+                phase="done")
+
+        if stop_block is not None:
+            print(f"\n[REMOTE] Stopped at a chunk boundary "
+                  f"({stop_block.reason}). The tape index was synced and the "
+                  "session is resumable — re-run option 6 to resume.")
+            return self._finalize(self._stop_result or stop_block, phase="resume")
         if CANCEL.is_set():
             print("\n[ABORTED] Stopped by user. Session saved — "
                   "re-run option 6 to resume from the interrupted chunk.")
-            return
+            return self._finalize(self._stop_result or StopResult(
+                exit_code=ExitCode.USER_STOP, reason=REASON_USER_REQUESTED_STOP,
+                resumable=True, source="resume", session_id=session_id),
+                phase="resume")
         if failed or self._producer_err:
             msg = self._producer_err or "a chunk failed during tape write"
             print(f"\n[REMOTE] Pipeline stopped: {msg}. "
@@ -859,17 +1123,17 @@ class RemoteOrchestrator:
                 self.notifier,
                 f"[PIPELINE] STOPPED: {msg}. Re-run to resume from the "
                 "failed chunk.")
-            return
-        if completed == len(pending_chunks):
-            self.db.update_remote_session(
-                session_id, status='completed',
-                completed_at=datetime.now().isoformat()
-            )
-            print("\n[REMOTE] Session complete. All chunks archived to tape.")
-            send_best_effort(
-                self.notifier,
-                f"[PIPELINE] Session complete — all {total_chunks} chunk(s) "
-                "archived to tape.")
+            return self._finalize(self._stop_result or StopResult(
+                exit_code=ExitCode.TRANSIENT_RESUMABLE,
+                reason=REASON_STOPPED_AT_CHUNK_BOUNDARY, resumable=True,
+                source="resume", session_id=session_id, detailed_reason=msg),
+                phase="resume")
+        # Some chunks still pending (e.g. a partial run): resumable, not an error.
+        return self._finalize(self._stop_result or StopResult(
+            exit_code=ExitCode.TRANSIENT_RESUMABLE,
+            reason=REASON_STOPPED_AT_CHUNK_BOUNDARY, resumable=True,
+            source="resume", session_id=session_id,
+            detailed_reason="chunks still pending"), phase="resume")
 
     # ------------------------------------------------------------------
     # Producer: fetch + pack a chunk onto staging  (runs off the main thread)
@@ -1221,6 +1485,289 @@ class RemoteOrchestrator:
         send_best_effort(self.notifier, f"[PIPELINE] {msg}")
         return False
 
+    # ------------------------------------------------------------------
+    # Structured stop-result plumbing + the single pre-write safety gate
+    # ------------------------------------------------------------------
+
+    def _record_stop(self, result: StopResult, escalate=False) -> StopResult:
+        """Record the reason a stop was decided; the most specific one wins.
+
+        Called at the same point a component decides to stop, so the reason is
+        the specific one that component knows. A later, generic reason (only
+        ``stopped_at_chunk_boundary``) never overwrites a specific one already
+        recorded — that is how an SCCM/network stop keeps its precise reason even
+        though the bare ``stop_pipeline`` flag is what the writer loop observes.
+
+        ``escalate=True`` is the thread-safe SAFETY escalation: a physical
+        tape ambiguity (a write that failed after it started) must win over ANY
+        previously recorded reason — including a user stop — because the
+        ambiguous chunk needs human reconciliation regardless of why the run
+        ended. Returns the winning (recorded) result.
+        """
+        with self._stop_lock:
+            existing = self._stop_result
+            if (existing is None or escalate
+                    or (existing.is_generic and not result.is_generic)):
+                self._stop_result = result
+            return self._stop_result
+
+    def _get_recorded_stop(self):
+        """Thread-safe read of the recorded stop result, or None."""
+        with self._stop_lock:
+            return self._stop_result
+
+    def _write_status_snapshot(self, **fields):
+        """Best-effort status.json update. Never raises, never changes flow."""
+        try:
+            log_dir = getattr(self.cfg, "backup_log_dir", None)
+            write_status(log_dir, **fields)
+        except Exception:
+            get_logger().warning("status snapshot failed (ignored)",
+                                 exc_info=True)
+
+    def _finalize(self, result: StopResult, phase="pipeline") -> StopResult:
+        """Record the terminal result and persist the status/last-failure files.
+
+        The file writes are best-effort: a failure to write must not change the
+        exit code we return, must not raise, and must not hide the stop reason.
+        """
+        final = self._record_stop(result)
+        try:
+            log_dir = getattr(self.cfg, "backup_log_dir", None)
+            if final.exit_code == ExitCode.COMPLETED:
+                write_status(log_dir, session_id=final.session_id, phase="done",
+                             exit_code=int(final.exit_code), reason=final.reason,
+                             resumable=final.resumable)
+            else:
+                write_last_failure(log_dir, final, phase=phase)
+                write_status(
+                    log_dir, session_id=final.session_id,
+                    chunk_id=final.chunk_index, phase=phase,
+                    error_classification=final.error_classification,
+                    error_message=final.detailed_reason,
+                    resumable=final.resumable, exit_code=int(final.exit_code),
+                    reason=final.reason, detailed_reason=final.detailed_reason)
+        except Exception:
+            get_logger().warning("finalize status write failed (ignored)",
+                                 exc_info=True)
+        return final
+
+    def _verify_current_mount_time5(self):
+        """Gate check: verify the LIVE mount is time@5, bound to the running
+        LTFS process. Returns a blocking StopResult, or None when it is safe.
+
+        Unlike the lenient startup smoke-check ``_validate_ltfs_sync_mode`` (which
+        proceeds when the event log cannot be read), the gate fails **closed**:
+        an unverifiable current mount blocks the write, because approving a write
+        on a stale time@5 line from a previous mount is exactly the risk this
+        binding exists to remove. Read-only — never probes or remounts the drive.
+        """
+        status = ltfs_current_mount_status(expect_seconds=300)
+        if status.get("ok"):
+            get_logger().info(
+                "ltfs_current_mount_ok: type=%s seconds=%s at=%s proc=%s",
+                status.get("sync_type"), status.get("sync_seconds"),
+                status.get("declared_at"), status.get("mount_started_at"))
+            return None
+        if status.get("determinate") and status.get("reason") == "not_time5":
+            declared = f"{status.get('sync_type')}@{status.get('sync_seconds')}s"
+            msg = (f"LTFS current mount declared {declared}, expected time@300s. "
+                   "Refusing to start a tape write: under this mode a forced "
+                   "restart can lose every chunk written since the mount.")
+            print(f"\n[TAPE] {msg}")
+            get_logger().error("ltfs_sync_mode_blocked: declared=%s", declared)
+            send_best_effort(self.notifier, f"[PIPELINE] {msg}")
+            return StopResult(
+                exit_code=ExitCode.SAFETY_BLOCK,
+                reason=REASON_LTFS_SYNC_MODE_NOT_TIME5, resumable=False,
+                source="gate", detailed_reason=msg)
+        # Indeterminate: the live mount could not be verified / bound. Fail closed.
+        err = status.get("error") or "current LTFS mount could not be verified"
+        msg = (f"Cannot verify the live LTFS mount is time@5 ({err}). Refusing to "
+               "start a tape write: a write whose index sync cannot be trusted is "
+               "not recoverable after a forced restart.")
+        print(f"\n[TAPE] {msg}")
+        get_logger().error("ltfs_mount_unverifiable: %s", err)
+        send_best_effort(self.notifier, f"[PIPELINE] {msg}")
+        return StopResult(
+            exit_code=ExitCode.SAFETY_BLOCK,
+            reason=REASON_LTFS_MOUNT_UNVERIFIABLE, resumable=False,
+            source="gate", detailed_reason=msg)
+
+    @staticmethod
+    def _reboot_reason_slug(reasons, sccm):
+        """Map a pending-reboot block to (reason_slug). SCCM if the Configuration
+        Manager client is the cause (or is unreadable), else the Windows markers."""
+        sccm = sccm or {}
+        if (sccm.get("reboot_pending") or sccm.get("hard_reboot_pending")
+                or not sccm.get("determinate", True)):
+            return REASON_SCCM_REBOOT_PENDING
+        # Corroborate against the reason text in case the caller's sccm dict is
+        # sparse (e.g. the fallback path returns None for sccm).
+        if any("SCCM" in r or "Configuration Manager" in r for r in reasons):
+            return REASON_SCCM_REBOOT_PENDING
+        return REASON_WINDOWS_REBOOT_PENDING
+
+    def _record_reboot_stop(self, reasons, sccm=None):
+        """Record a StopResult for a staged restart detected by the sentinel.
+
+        The sentinel sets ``stop_pipeline`` in the background; recording here (as
+        its ``on_detect``) is what lets the pre-write gate return the specific
+        ``sccm_reboot_pending`` / ``windows_reboot_pending`` reason instead of the
+        generic ``stopped_at_chunk_boundary``."""
+        slug = self._reboot_reason_slug(reasons, sccm)
+        self._record_stop(StopResult(
+            exit_code=ExitCode.TRANSIENT_RESUMABLE, reason=slug, resumable=True,
+            source="reboot-sentinel", detailed_reason="; ".join(reasons)))
+
+    def _chunk_backing_from_prior_run(self, session_id, chunk_index):
+        """True if this chunk is in 'backing' at gate entry — i.e. a PRIOR run
+        left it mid-write. The current run only moves a chunk to 'backing' inside
+        ``_write_chunk`` AFTER this gate, so a 'backing' status now is never the
+        current run's own doing."""
+        try:
+            return chunk_index in self.db.get_chunks_with_status(
+                session_id, 'backing')
+        except Exception:
+            get_logger().warning(
+                "could not read chunk status for the ambiguity guard; "
+                "treating as clear", exc_info=True)
+            return False
+
+    def _detect_prior_backing_chunks(self, session_id):
+        """Before any producer/fetch/pack thread starts, refuse to resume a
+        session that has a chunk left in 'backing' by a prior run.
+
+        Such a chunk may already be on tape (the crash happened after the
+        physical write but before it was marked 'done'); re-fetching and
+        re-writing it blindly would double-write. Detect and stop — no
+        auto-reconcile, no status flip. Returns a StopResult to stop, else None.
+        """
+        try:
+            backing = self.db.get_chunks_with_status(session_id, 'backing')
+        except Exception:
+            get_logger().warning(
+                "could not scan for prior-run 'backing' chunks; proceeding",
+                exc_info=True)
+            return None
+        if not backing:
+            return None
+        ci = backing[0]
+        msg = (f"session {session_id}: chunk(s) {[c + 1 for c in backing]} were "
+               "left in 'backing' by a prior run — they may already be on tape. "
+               "Refusing to resume blindly; a human must reconcile the tape/DB "
+               "state before continuing.")
+        print(f"\n[REMOTE] {msg}")
+        get_logger().error("ambiguous_backing_chunk: %s", msg)
+        send_best_effort(self.notifier, f"[PIPELINE] SAFETY STOP: {msg}")
+        return StopResult(
+            exit_code=ExitCode.SAFETY_BLOCK, reason=REASON_AMBIGUOUS_BACKING_CHUNK,
+            resumable=False, source="resume-precheck", session_id=session_id,
+            chunk_index=ci, detailed_reason=msg)
+
+    def _record_fetch_failure_stop(self, session_id, chunk_index):
+        """Record the stop reason for a staging failure, using the precise fetch
+        classification captured by ``_note_fetch_failure`` when available.
+
+        Permanent auth/host-key/config → FATAL_CONFIG (no blind retry). An
+        exhausted transient (DNS/timeout/…) → TRANSIENT_RESUMABLE with the
+        generic ``network_retry_exhausted`` reason and the precise
+        ``error_classification``. Anything else stays a resumable generic stop.
+        """
+        info = getattr(self, "_last_fetch_failure", None) or {}
+        kind = info.get("kind")
+        detail = info.get("detail") or f"chunk {chunk_index + 1} could not be staged"
+        if kind == "permanent":
+            return self._record_stop(StopResult(
+                exit_code=ExitCode.FATAL_CONFIG,
+                reason=info.get("permanent_reason") or REASON_BAD_CONFIG,
+                resumable=False, source="fetch", session_id=session_id,
+                chunk_index=chunk_index, detailed_reason=detail))
+        if kind == "transient":
+            return self._record_stop(StopResult(
+                exit_code=ExitCode.TRANSIENT_RESUMABLE,
+                reason=REASON_NETWORK_RETRY_EXHAUSTED,
+                error_classification=info.get("classification"),
+                resumable=True, source="fetch", session_id=session_id,
+                chunk_index=chunk_index, detailed_reason=detail))
+        return self._record_stop(StopResult(
+            exit_code=ExitCode.TRANSIENT_RESUMABLE,
+            reason=REASON_STOPPED_AT_CHUNK_BOUNDARY, resumable=True,
+            source="fetch", session_id=session_id, chunk_index=chunk_index,
+            detailed_reason=detail))
+
+    def _pre_write_safety_gate(self, session_id, desc, tape_label, stop_pipeline):
+        """The single authority that permits or blocks the START of a tape write.
+
+        Both writer loops reach the tape only through ``_write_chunk``, and call
+        this gate immediately before it. The gate — and only the gate — checks
+        the stop flags, the live mount, a staged restart, and the ambiguity
+        guard, so no set flag can slip past into a new write and no two places
+        can disagree. It never interrupts a write already in progress; it only
+        blocks the start of the next one.
+
+        Returns None to permit the write, or a StopResult (already recorded as
+        the winning reason) to block it. On a block the caller preserves the
+        staged pack for resume.
+        """
+        ci = desc.chunk_index
+
+        # 1. An ALREADY-RECORDED stop wins, returned unchanged. This is the
+        #    required precedence: a later CANCEL must never replace an earlier
+        #    20/ltfs_mount_unverifiable or 10/network_retry_exhausted. Only when
+        #    nothing is recorded do the flag checks below create a new reason.
+        recorded = self._get_recorded_stop()
+        if recorded is not None:
+            return recorded
+
+        # 2. No prior stop: an operator cancel is the first stop source.
+        if CANCEL.is_set():
+            return self._record_stop(StopResult(
+                exit_code=ExitCode.USER_STOP, reason=REASON_USER_REQUESTED_STOP,
+                resumable=True, source="gate", session_id=session_id,
+                chunk_index=ci, detailed_reason="cancel requested before write"))
+
+        # 3. stop_pipeline set with nothing recorded — only now is the generic
+        #    boundary reason correct (no setter left a specific one).
+        if stop_pipeline.is_set():
+            return self._record_stop(StopResult(
+                exit_code=ExitCode.TRANSIENT_RESUMABLE,
+                reason=REASON_STOPPED_AT_CHUNK_BOUNDARY, resumable=True,
+                source="gate", session_id=session_id, chunk_index=ci))
+
+        # 4. The live mount must be time@5, bound to the running LTFS instance.
+        mount_block = self._verify_current_mount_time5()
+        if mount_block is not None:
+            mount_block.session_id = session_id
+            mount_block.chunk_index = ci
+            return self._record_stop(mount_block)
+
+        # 5. SCCM + Windows pending reboot (the synchronous, current re-check).
+        reasons, sccm = self._pre_tape_write_reboot_check(
+            session_id, desc, tape_label)
+        if reasons:
+            return self._record_stop(StopResult(
+                exit_code=ExitCode.TRANSIENT_RESUMABLE,
+                reason=self._reboot_reason_slug(reasons, sccm), resumable=True,
+                source="gate", session_id=session_id, chunk_index=ci,
+                detailed_reason="; ".join(reasons)))
+
+        # 6. Ambiguity guard: a 'backing' status now is a prior run's, never ours.
+        if self._chunk_backing_from_prior_run(session_id, ci):
+            msg = (f"chunk {ci + 1} is in 'backing' from a prior run — it may "
+                   "already be on tape; refusing to re-write it blindly.")
+            print(f"\n[REMOTE] {msg}")
+            get_logger().error("ambiguous_backing_chunk: %s", msg)
+            return self._record_stop(StopResult(
+                exit_code=ExitCode.SAFETY_BLOCK,
+                reason=REASON_AMBIGUOUS_BACKING_CHUNK, resumable=False,
+                source="gate", session_id=session_id, chunk_index=ci,
+                detailed_reason=msg))
+
+        # 7. All clear — permit the write. (Fit-to-tape stays inside
+        #    _write_chunk, which marks the chunk backup_failed on a miss.)
+        return None
+
     def _pack_inventory(self, pack_dir):
         """(name, size) for every file under pack_dir, sorted. The integrity basis."""
         items = []
@@ -1406,12 +1953,30 @@ class RemoteOrchestrator:
     # ------------------------------------------------------------------
 
     def _write_chunk(self, session_id, desc: StagedChunk, tape_label,
-                     eject_after):
+                     eject_after, stop_pipeline):
+        """Authorize and (if permitted) write one chunk to tape.
+
+        Returns None on success. Returns a :class:`StopResult` when the write did
+        not complete — a gate block (``preserve_pack=True``: the write never
+        started, keep the pack for a direct resume) or a mid-attempt failure
+        (``preserve_pack=False``: re-fetchable). This is the single boundary
+        where a tape write is authorized and started.
+
+        The authorization (recorded-stop check → safety gate → final
+        recorded-stop check → fits-tape → set 'backing' → launch the external
+        writer) all runs under ``_TAPE_IO_LOCK``, so no stop can slip in between
+        approving the write and starting it, and no other in-process tape op can
+        interleave. ``_TAPE_IO_LOCK`` is reentrant and this runs on the consumer
+        thread, so ``LTOBackup.run``'s own acquire nests correctly. The lock is
+        released *before* the 'done' commit, staging flush, and cleanup — it is
+        never held during status writes, fetch/pack, thread joins, or retries.
+        """
         chunk_index = desc.chunk_index
         self._consumer_chunk = chunk_index
         pack_dir = desc.pack_dir
 
         if desc.skip_tape:
+            # No tape I/O at all — nothing to serialize or authorize on the tape.
             log_path = _write_source_missing_only_log(
                 self.cfg.backup_log_dir,
                 session_id,
@@ -1429,27 +1994,79 @@ class RemoteOrchestrator:
                 print(f"[REMOTE] Source-missing CSV summary: {log_path}")
             if eject_after:
                 self._backup_writer().eject_tape(self.cfg.lto_drive)
-            return True
+            return None
 
-        # present_bytes excludes files marked source_missing during the fetch.
-        _, planned_bytes, _ = self.db.get_chunk_size_summary(
-            session_id, chunk_index).get(chunk_index, (0, 0, 0))
-        if not self._ensure_remote_chunk_fits_tape(
-                tape_label, planned_bytes, chunk_index):
-            self.db.update_chunk_status(session_id, chunk_index, 'backup_failed')
-            return False
-
-        self.db.update_chunk_status(session_id, chunk_index, 'backing')
-        # _NoEjectBackup keeps the tape mounted; eject only after the final chunk.
-        backup_cls = LTOBackup if eject_after else _NoEjectBackup
-        governor = getattr(self, 'governor', None)
-        tape_pending = (
-            governor.mark_tape_write_pending()
-            if governor else None
-        )
+        _acquire_tape_io_lock(f"authorize+write remote chunk {chunk_index + 1}")
         try:
-            if tape_pending:
-                with tape_pending:
+            # (a) An already-recorded stop wins outright.
+            recorded = self._get_recorded_stop()
+            if recorded is not None:
+                return recorded
+            # (b) The single authoritative safety gate.
+            gate_block = self._pre_write_safety_gate(
+                session_id, desc, tape_label, stop_pipeline)
+            if gate_block is not None:
+                return gate_block
+            # (c) Final recorded-stop re-check under the same lock: a stop may
+            #     have landed while the gate ran its mount/reboot subprocess
+            #     checks. This is the last authorization step before the tape.
+            recorded = self._get_recorded_stop()
+            if recorded is not None:
+                return recorded
+            if CANCEL.is_set():
+                return self._record_stop(StopResult(
+                    exit_code=ExitCode.USER_STOP,
+                    reason=REASON_USER_REQUESTED_STOP, resumable=True,
+                    source="write", session_id=session_id,
+                    chunk_index=chunk_index,
+                    detailed_reason="cancel requested before write"))
+
+            # (d) Fits-tape. A miss is re-fetchable — discard, do not preserve.
+            _, planned_bytes, _ = self.db.get_chunk_size_summary(
+                session_id, chunk_index).get(chunk_index, (0, 0, 0))
+            if not self._ensure_remote_chunk_fits_tape(
+                    tape_label, planned_bytes, chunk_index):
+                self.db.update_chunk_status(
+                    session_id, chunk_index, 'backup_failed')
+                return self._record_stop(StopResult(
+                    exit_code=ExitCode.SAFETY_BLOCK,
+                    reason=REASON_UNEXPECTED_TAPE_OR_DB_STATE, resumable=False,
+                    source="write", session_id=session_id,
+                    chunk_index=chunk_index, preserve_pack=False,
+                    detailed_reason="chunk does not fit the mounted tape"))
+
+            # (e) Launch the external writer. The chunk is moved to 'backing'
+            #     ONLY when the writer actually starts (via on_write_start), so
+            #     'backing' means exactly "the tape write has physically begun".
+            #     A failure BEFORE that (drive not ready, bad metadata) never set
+            #     'backing', so it is safely re-fetchable; a failure AT OR AFTER
+            #     it is physically ambiguous and must stay 'backing'.
+            backup_cls = LTOBackup if eject_after else _NoEjectBackup
+            governor = getattr(self, 'governor', None)
+            tape_pending = (
+                governor.mark_tape_write_pending() if governor else None)
+            write_started = {'v': False}
+
+            def _mark_write_started():
+                write_started['v'] = True
+                self.db.update_chunk_status(session_id, chunk_index, 'backing')
+
+            try:
+                if tape_pending:
+                    with tape_pending:
+                        self._backup_writer(backup_cls).run(
+                            source=pack_dir,
+                            tape_drive=self.cfg.lto_drive,
+                            tape_label=tape_label,
+                            packer_metadata=desc.metadata,
+                            stage_stats=desc,
+                            source_host=self.remote_host.split('.', 1)[0],
+                            skipped_tracker=self.skipped_tracker,
+                            remote_session_id=session_id,
+                            remote_chunk_index=chunk_index,
+                            on_write_start=_mark_write_started,
+                        )
+                else:
                     self._backup_writer(backup_cls).run(
                         source=pack_dir,
                         tape_drive=self.cfg.lto_drive,
@@ -1460,31 +2077,57 @@ class RemoteOrchestrator:
                         skipped_tracker=self.skipped_tracker,
                         remote_session_id=session_id,
                         remote_chunk_index=chunk_index,
+                        on_write_start=_mark_write_started,
                     )
-            else:
-                self._backup_writer(backup_cls).run(
-                    source=pack_dir,
-                    tape_drive=self.cfg.lto_drive,
-                    tape_label=tape_label,
-                    packer_metadata=desc.metadata,
-                    stage_stats=desc,
-                    source_host=self.remote_host.split('.', 1)[0],
-                    skipped_tracker=self.skipped_tracker,
-                    remote_session_id=session_id,
-                    remote_chunk_index=chunk_index,
-                )
-        except Exception as e:
-            if CANCEL.is_set():
-                # Robocopy was terminated by the stop request; leave the chunk
-                # non-'done' (resumable) and skip eject.
-                return False
-            print(f"[REMOTE] Backup error: {e}")
-            self.db.update_chunk_status(session_id, chunk_index, 'backup_failed')
-            return False
+            except Exception as e:
+                if write_started['v']:
+                    # ANY failure once the write has started — cancel or not,
+                    # exception, non-zero robocopy, killed subprocess, LTFS/I/O
+                    # error, DB-commit failure — is PHYSICALLY AMBIGUOUS: data
+                    # may be partly on tape. Leave the chunk 'backing' (never
+                    # done / backup_failed / pending). This is 20/ambiguous even
+                    # when CANCEL is set (a forced kill): physical ambiguity
+                    # ESCALATES over a user stop, so the recorded reason wins over
+                    # any 40/user_requested_stop. The resume precheck returns
+                    # 20/ambiguous_backing_chunk; staging is preserved.
+                    get_logger().warning(
+                        "tape write for chunk %s failed AFTER it started (%s); "
+                        "left 'backing' (ambiguous) for resume",
+                        chunk_index + 1, e)
+                    print(f"[REMOTE] Backup error after write started: {e}")
+                    return self._record_stop(StopResult(
+                        exit_code=ExitCode.SAFETY_BLOCK,
+                        reason=REASON_AMBIGUOUS_BACKING_CHUNK, resumable=False,
+                        source="write", session_id=session_id,
+                        chunk_index=chunk_index, preserve_pack=True,
+                        detailed_reason=f"tape write failed after starting: {e}"),
+                        escalate=True)
+                # Failure BEFORE the write started: nothing reached the tape, so
+                # the chunk is safely re-fetchable. 'backing' was never set.
+                if CANCEL.is_set():
+                    return self._record_stop(StopResult(
+                        exit_code=ExitCode.USER_STOP,
+                        reason=REASON_USER_REQUESTED_STOP, resumable=True,
+                        source="write", session_id=session_id,
+                        chunk_index=chunk_index, preserve_pack=True,
+                        detailed_reason="cancelled before the write started"))
+                print(f"[REMOTE] Backup error (before write started): {e}")
+                self.db.update_chunk_status(
+                    session_id, chunk_index, 'backup_failed')
+                return self._record_stop(StopResult(
+                    exit_code=ExitCode.TRANSIENT_RESUMABLE,
+                    reason=REASON_TAPE_WRITE_FAILED, resumable=True,
+                    source="write", session_id=session_id,
+                    chunk_index=chunk_index, preserve_pack=False,
+                    detailed_reason=str(e)))
+        finally:
+            _release_tape_io_lock()
 
-        if CANCEL.is_set():
-            return False
-
+        # --- The physical write completed; everything below is OFF the lock ---
+        # The write finished normally (a cooperative Ctrl+C lets the protected
+        # robocopy complete), so ALWAYS run the normal commit: mark the chunk
+        # 'done' and flush its staging. A cooperative cancel does NOT leave this
+        # chunk ambiguous — it is committed.
         self.db.update_chunk_status(session_id, chunk_index, 'done')
 
         # --- FLUSH staged files for this chunk ---
@@ -1493,7 +2136,20 @@ class RemoteOrchestrator:
         self._cleanup_dir(pack_dir)
         with self._staged_lock:
             self._staged_bytes = max(0, self._staged_bytes - desc.staged_bytes)
-        return True
+
+        # The chunk is committed. If a cooperative cancel is active, record the
+        # user-stop NOW — on the final chunk there is no next gate invocation to
+        # record it, and it must remain authoritative at process exit rather than
+        # letting the terminal fall through to 0/completed. We still return None
+        # so this chunk counts as done; the loop then stops before any next one.
+        if CANCEL.is_set():
+            self._record_stop(StopResult(
+                exit_code=ExitCode.USER_STOP, reason=REASON_USER_REQUESTED_STOP,
+                resumable=True, source="write", session_id=session_id,
+                chunk_index=chunk_index,
+                detailed_reason="cancel requested during the final write; "
+                                "chunk committed, stopping before any next"))
+        return None
 
     def _ensure_remote_chunk_fits_tape(self, tape_label, planned_bytes,
                                        chunk_index):
@@ -1832,11 +2488,23 @@ class RemoteOrchestrator:
                 fetch_cores=self.fetch_cores,
                 abort_evt=fetch_abort,
             )
-            if ok or attempt >= attempts or not _is_transient_fetch_error(err):
+            if ok:
+                return ok, err
+            # Permanent-first classification: an auth/host-key/config failure is
+            # never retried, however "network-ish" a co-occurring line looks.
+            if attempt >= attempts or not _is_transient_fetch_error(err):
+                self._note_fetch_failure(err)
                 return ok, err
             if CANCEL.is_set() or fetch_abort.is_set():
                 return False, "cancelled"
-            delay = min(60.0, base * (2 ** attempt))
+            delay = self._fetch_backoff_delay(attempt, base)
+            _cls = _classify_fetch_error(err)[1]
+            self._note_fetch_failure(err, retry_attempt=attempt + 1,
+                                     next_retry_delay=delay)
+            self._write_status_snapshot(
+                phase="fetch-retry", retry_attempt=attempt + 1,
+                error_classification=_cls, error_message=str(err).strip()[:300],
+                next_retry_delay=delay, resumable=True)
             msg = (f"transient fetch error (attempt {attempt + 1}/{attempts + 1}), "
                    f"retrying in {delay:.0f}s: {str(err).strip()[:160]}")
             get_logger().warning("fetch_transient_retry: %s", msg)
@@ -1844,7 +2512,35 @@ class RemoteOrchestrator:
             # Interruptible wait: a cancel/abort during backoff returns at once.
             if fetch_abort.wait(delay) or CANCEL.is_set():
                 return False, "cancelled"
+        self._note_fetch_failure(err)
         return False, "retries exhausted"
+
+    @staticmethod
+    def _fetch_backoff_delay(attempt, base):
+        """Exponential backoff with jitter, capped at 60s.
+
+        Jitter (``0.5 + random``) spreads retries so several streams that failed
+        on the same blip do not re-hammer the host in lockstep. The cap is
+        applied after jitter so a delay is always bounded and non-negative."""
+        raw = float(base) * (2 ** attempt)
+        jittered = raw * (0.5 + random.random())
+        return max(0.0, min(60.0, jittered))
+
+    def _note_fetch_failure(self, err, retry_attempt=None, next_retry_delay=None):
+        """Record the classification of a fetch failure for the terminal path.
+
+        The bubbled-up producer error is a generic "chunk N could not be staged";
+        this keeps the *precise* diagnosis (permanent auth vs transient DNS, etc.)
+        so the final StopResult carries the right exit code and reason."""
+        kind, classification, permanent_reason = _classify_fetch_error(err)
+        self._last_fetch_failure = {
+            "kind": kind,
+            "classification": classification,
+            "permanent_reason": permanent_reason,
+            "detail": str(err).strip()[:500],
+            "retry_attempt": retry_attempt,
+            "next_retry_delay": next_retry_delay,
+        }
 
     def _fetch_batches_parallel(self, work_items, fetch_dir, fetch_abort,
                                 session_id, streams):

@@ -326,6 +326,23 @@ class PgSessionMixin:
                 (remote_host, remote_path),
             ).fetchone())
 
+    def list_active_remote_sessions(self, remote_host, remote_path):
+        """All active sessions for this host+path, newest first.
+
+        The interactive path resumes the single newest active session, but the
+        non-interactive (headless) path must refuse to guess when more than one
+        exists — so it needs the full list, not just the newest.
+        """
+        rows = self._run_read(
+            lambda conn: conn.execute(
+                """SELECT * FROM remote_sessions
+                   WHERE remote_host=%s AND remote_path=%s AND status='active'
+                   ORDER BY session_id DESC""",
+                (remote_host, remote_path),
+            ).fetchall(),
+            f"list_active_remote_sessions({remote_host})")
+        return [_row(r) for r in rows]
+
     def get_remote_session(self, session_id):
         return self._run_read(
             lambda conn: _row(conn.execute(
@@ -775,6 +792,24 @@ class PgSessionMixin:
                 (session_id,),
             ).fetchone()["n"],
             f"count_chunks({session_id})")
+
+    def get_chunks_with_status(self, session_id, status):
+        """Chunk indices currently in ``status`` (e.g. 'backing'), ascending.
+
+        Used to detect a chunk a *prior* run left mid-write: the current run has
+        not written anything yet, so a 'backing' chunk at resume start is
+        unambiguously from an earlier, interrupted run and must not be blindly
+        re-written (it may already be on tape).
+        """
+        rows = self._run_read(
+            lambda conn: conn.execute(
+                """SELECT chunk_index FROM remote_chunks
+                   WHERE session_id=%s AND status=%s
+                   ORDER BY chunk_index""",
+                (session_id, status),
+            ).fetchall(),
+            f"get_chunks_with_status({session_id},{status})")
+        return [row["chunk_index"] for row in rows]
 
     def get_next_remote_chunk_index(self, session_id):
         value = self._run_read(
