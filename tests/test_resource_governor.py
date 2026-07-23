@@ -228,6 +228,82 @@ class TapeGateAsymmetryTests(unittest.TestCase):
         self.assertNotIn("tape_ram_reserve", pending_cont.reasons)
 
 
+class DbSyncPackDeadlockTests(unittest.TestCase):
+    """Regression coverage for the db_sync<->pack governor deadlock (0552a52).
+
+    A tape write's DB-catalog checkpoint calls wait_or_pause("db_sync",
+    "continue") while the next chunk's pack calls wait_or_pause("pack",
+    "continue"). Before the fix each held its own "active" flag and blocked on
+    the other's, a deadly embrace that hard-hung the pipeline (session 37,
+    chunk 37, 2026-07-23). A stage already in flight ("continue") must be
+    allowed to drain; only a new "start" is gated on the other stage.
+    """
+
+    def _relaxed_cfg(self, **overrides):
+        data = dict(
+            ram_hard_limit_pct=100,
+            ram_soft_limit_pct=100,
+            governor_fetch_min_free_floor_gb=0.5,
+            governor_fetch_target_free_ram_gb=0.5,
+            governor_tape_min_free_ram_gb=0.5,
+            governor_tape_exclusive_heavy_stages=False,
+        )
+        data.update(overrides)
+        return _cfg(**data)
+
+    def _gov(self, **overrides):
+        cfg = self._relaxed_cfg(**overrides)
+        gov = ResourceGovernor(cfg, staging_dir=".", sleep_seconds=0.01)
+        patches = [
+            mock.patch("src.resource_governor.psutil.virtual_memory",
+                       return_value=_vm()),
+            mock.patch("src.resource_governor.shutil.disk_usage",
+                       return_value=_disk()),
+        ]
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+        return gov
+
+    def test_mutual_continue_does_not_deadlock(self):
+        # The exact live pattern: both stages active, both at a "continue"
+        # checkpoint. Neither may be blocked by the other, or the pipeline
+        # hangs forever.
+        gov = self._gov()
+        gov.db_sync_active = True
+        gov.pack_active = True
+        db_cont = gov.decision("db_sync", "continue")
+        pack_cont = gov.decision("pack", "continue")
+        self.assertTrue(db_cont.allowed, db_cont.reasons)
+        self.assertTrue(pack_cont.allowed, pack_cont.reasons)
+        self.assertNotIn("pack_active", db_cont.reasons)
+        self.assertNotIn("db_sync_active", pack_cont.reasons)
+
+    def test_start_is_still_gated_on_the_other_stage(self):
+        # The "don't start two heavy stages at once" guard must survive: a
+        # brand-new start still yields to an already-active sibling.
+        gov = self._gov()
+        gov.pack_active = True
+        self.assertIn("pack_active",
+                      gov.decision("db_sync", "start").reasons)
+        gov.pack_active = False
+        gov.db_sync_active = True
+        self.assertIn("db_sync_active",
+                      gov.decision("pack", "start").reasons)
+        self.assertIn("db_sync_active",
+                      gov.decision("fetch", "start").reasons)
+
+    def test_tape_exclusivity_survives_the_fix(self):
+        # Relaxing the mutual continue gate must not let a drain stage run
+        # during an ACTIVE physical tape write.
+        gov = self._gov()
+        gov.tape_write_active = True
+        for stage in ("db_sync", "pack", "fetch"):
+            dec = gov.decision(stage, "continue")
+            self.assertIn("tape_active", dec.reasons,
+                          f"{stage} continue must yield to an active tape write")
+
+
 class _FakeDB:
     def tape_exists(self, tape_label):
         return True
