@@ -233,6 +233,7 @@ class FetchWatchdogTests(unittest.TestCase):
         orch.staging_dir = r"C:\stage"
         orch.staging_padding = 1.0
         orch.fetch_abort_factor = 2.0
+        orch.fetch_stall_timeout = 600
         orch.notifier = None
         return orch
 
@@ -266,6 +267,33 @@ class FetchWatchdogTests(unittest.TestCase):
         stop, abort = threading.Event(), threading.Event()
         plenty = SimpleNamespace(total=10**12, used=0, free=10**12)
         with mock.patch("src.remote_orchestrator._dir_tree_size", return_value=90), \
+             mock.patch("src.remote_orchestrator.shutil.disk_usage",
+                        return_value=plenty):
+            orch._start_fetch_monitor(stop, abort, r"C:\stage\_fetch", 100)
+            self.assertFalse(abort.wait(timeout=3))
+        stop.set()
+
+    def test_watchdog_aborts_a_stalled_stream(self):
+        # A connected-but-wedged stream: staging never grows and disk is fine.
+        # Overrun/disk-full never fire, so only the stall watchdog can save it.
+        orch = self._orchestrator()
+        orch.fetch_stall_timeout = 1
+        stop, abort = threading.Event(), threading.Event()
+        plenty = SimpleNamespace(total=10**12, used=0, free=10**12)
+        with mock.patch("src.remote_orchestrator._dir_tree_size", return_value=40), \
+             mock.patch("src.remote_orchestrator.shutil.disk_usage",
+                        return_value=plenty):
+            orch._start_fetch_monitor(stop, abort, r"C:\stage\_fetch", 100)
+            self.assertTrue(abort.wait(timeout=15),
+                            "watchdog did not abort a stalled (no-growth) stream")
+        stop.set()
+
+    def test_watchdog_stall_disabled_when_timeout_zero(self):
+        orch = self._orchestrator()
+        orch.fetch_stall_timeout = 0
+        stop, abort = threading.Event(), threading.Event()
+        plenty = SimpleNamespace(total=10**12, used=0, free=10**12)
+        with mock.patch("src.remote_orchestrator._dir_tree_size", return_value=40), \
              mock.patch("src.remote_orchestrator.shutil.disk_usage",
                         return_value=plenty):
             orch._start_fetch_monitor(stop, abort, r"C:\stage\_fetch", 100)

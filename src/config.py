@@ -534,6 +534,17 @@ class ConfigManager:
         return 0.0 if value <= 0 else max(1.0, value)
 
     @property
+    def fetch_stall_timeout_seconds(self):
+        """Abort a fetch whose staging dir has not grown by a single byte for
+        this many seconds (0 disables). Guards against a wedged SSH/tar stream
+        that stays connected but delivers no data — the abort is caught by the
+        fetch retry/backoff, so the chunk stays resumable. The default is
+        generous so a legitimately slow remote scan (tar stat-ing hundreds of
+        thousands of files before the first byte) is never aborted."""
+        return self._get_int('PERFORMANCE', 'fetch_stall_timeout_seconds',
+                             600, minimum=0)
+
+    @property
     def telegram_enabled(self):
         return self.config.get('TELEGRAM', 'enabled', fallback='false').strip().lower() in (
             '1', 'true', 'yes', 'on')
