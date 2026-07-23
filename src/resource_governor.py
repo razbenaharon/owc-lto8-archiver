@@ -241,7 +241,7 @@ class ResourceGovernor:
                 if not self._tape_allows("allow_fetch_during_tape_write",
                                          action):
                     dec.reasons.append("tape_active")
-                if self.db_sync_active:
+                if action == "start" and self.db_sync_active:
                     dec.reasons.append("db_sync_active")
                 if self.pack_active and not self._soft_memory_ok():
                     dec.reasons.append("pack_memory_pressure")
@@ -249,7 +249,7 @@ class ResourceGovernor:
                 if not self._tape_allows("allow_pack_during_tape_write",
                                          action):
                     dec.reasons.append("tape_active")
-                if self.db_sync_active:
+                if action == "start" and self.db_sync_active:
                     dec.reasons.append("db_sync_active")
                 if (self.fetch_active and
                         str(getattr(self.cfg, "allow_pack_during_fetch",
@@ -270,11 +270,20 @@ class ResourceGovernor:
                 if not self._tape_allows("allow_db_sync_during_tape_write",
                                          action):
                     dec.reasons.append("tape_active")
-                if not _bool_config(self.cfg, "allow_db_sync_during_fetch", False):
-                    if self.fetch_active:
-                        dec.reasons.append("fetch_active")
-                if self.pack_active:
-                    dec.reasons.append("pack_active")
+                # These "other producer/drain stage is active" gates prevent two
+                # heavy stages from STARTING at once. A stage already in flight
+                # ("continue") must be allowed to drain, or it deadlocks against
+                # the very stage it is waiting on: a db_sync checkpoint blocked on
+                # pack_active while that pack is blocked on db_sync_active is a
+                # deadly embrace (observed 2026-07-23, session 37 chunk 37). This
+                # mirrors ``_tape_blocks``'s "continue must drain" rule.
+                if action == "start":
+                    if not _bool_config(self.cfg, "allow_db_sync_during_fetch",
+                                        False):
+                        if self.fetch_active:
+                            dec.reasons.append("fetch_active")
+                    if self.pack_active:
+                        dec.reasons.append("pack_active")
             elif stage == "cleanup":
                 if self.tape_write_active or self.tape_write_pending:
                     dec.reasons.append("tape_active")
