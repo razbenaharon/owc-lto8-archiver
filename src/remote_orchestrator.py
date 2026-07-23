@@ -2737,9 +2737,11 @@ class RemoteOrchestrator:
             overrun_warned = False
             # Stall tracking: the last time the staging dir grew by a byte. A
             # wedged SSH/tar stream stays connected and delivers nothing, so
-            # ``cur`` never advances — communicate() would otherwise block
-            # forever (observed live 2026-07-23: three ssh streams idle ~27 min,
-            # 0 staged bytes, the whole pipeline starved behind fetch_active).
+            # ``cur`` never advances and tar's communicate() blocks forever
+            # (there is no idle timeout on the stream itself). The project has
+            # hit exactly this — a ~2.5h fetch/stage hang on 2026-07-15 — so the
+            # watchdog is the safety net that turns an infinite hang into a
+            # bounded, resumable retry.
             max_seen = 0
             last_growth_at = time.time()
             while not stop_evt.wait(interval):
