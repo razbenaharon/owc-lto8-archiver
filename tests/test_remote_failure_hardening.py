@@ -1243,5 +1243,79 @@ class SshNonInteractiveTests(unittest.TestCase):
         self.assertEqual(reason, REASON_MISSING_NONINTERACTIVE_CREDENTIAL)
 
 
+class FetchStallWatchdogTests(unittest.TestCase):
+    """The staging watchdog must abort a fetch that is connected but delivering
+    no data. A live 2026-07-23 hang left three ssh streams idle ~27 min with 0
+    staged bytes; tar's communicate() blocked forever and the whole pipeline
+    starved behind fetch_active. Only overrun (too many bytes) and disk-full
+    were previously detected — never a stall (no growth)."""
+
+    RESERVE = 50 * 1024**3
+
+    def _act(self, **kw):
+        base = dict(
+            cur=1 * 1024**3,
+            last_growth_at=0.0,
+            now=100.0,
+            total_bytes=10 * 1024**3,
+            abort_factor=2.0,
+            stall_timeout=600,
+            free_bytes=500 * 1024**3,
+            reserve_bytes=self.RESERVE,
+        )
+        base.update(kw)
+        return ro._fetch_watchdog_action(**base)
+
+    def test_healthy_progress_no_action(self):
+        # Growing recently, plenty of disk, under the overrun factor.
+        self.assertIsNone(self._act(now=100.0, last_growth_at=90.0))
+
+    def test_stall_fires_after_timeout(self):
+        # No growth for >= stall_timeout seconds.
+        self.assertEqual(
+            self._act(now=700.0, last_growth_at=0.0, stall_timeout=600),
+            'stall')
+
+    def test_stall_not_fired_before_timeout(self):
+        self.assertIsNone(
+            self._act(now=500.0, last_growth_at=0.0, stall_timeout=600))
+
+    def test_stall_timeout_zero_disables(self):
+        self.assertIsNone(
+            self._act(now=10**9, last_growth_at=0.0, stall_timeout=0))
+
+    def test_diskfull_takes_priority(self):
+        self.assertEqual(
+            self._act(free_bytes=self.RESERVE - 1, now=700.0,
+                      last_growth_at=0.0),
+            'diskfull')
+
+    def test_overrun_still_detected(self):
+        self.assertEqual(
+            self._act(cur=25 * 1024**3, total_bytes=10 * 1024**3,
+                      abort_factor=2.0),
+            'overrun')
+
+    def test_overrun_disabled_factor_zero(self):
+        self.assertIsNone(
+            self._act(cur=25 * 1024**3, total_bytes=10 * 1024**3,
+                      abort_factor=0.0, now=100.0, last_growth_at=90.0))
+
+
+class SshStreamKeepaliveTests(unittest.TestCase):
+    """A long streaming fetch must carry SSH keepalive so a dead/half-open TCP
+    peer is dropped instead of blocking the local tar forever."""
+
+    def test_keyauth_stream_has_keepalive(self):
+        from src import remote_transport as rtp
+        with mock.patch.object(rtp, "_has_command", return_value=True):
+            cmd, _env, err = rtp._ssh_stream_command(
+                "user", "host", "tar -cf - .", password="", cipher="")
+        self.assertIsNone(err)
+        self.assertIn("ServerAliveInterval=15", cmd)
+        self.assertIn("ServerAliveCountMax=4", cmd)
+        self.assertIn("ConnectTimeout=30", cmd)
+
+
 if __name__ == "__main__":
     unittest.main()

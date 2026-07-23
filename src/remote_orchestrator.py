@@ -63,6 +63,27 @@ from .ui import ConsoleUI
 # abort threshold is the configurable fetch_overrun_abort_factor.
 _FETCH_OVERRUN_WARN_FACTOR = 1.10
 
+
+def _fetch_watchdog_action(*, cur, last_growth_at, now, total_bytes,
+                           abort_factor, stall_timeout, free_bytes,
+                           reserve_bytes):
+    """Pure decision for the staging watchdog — returns a reason or ``None``.
+
+    Split out from the monitor thread so every abort branch is unit-testable
+    without spawning ssh/tar. Order is by urgency: a full staging disk wedges
+    everything, a hard overrun is a runaway file, and a stall is a stream that
+    stays connected but delivers no data (``cur`` has not grown for
+    ``stall_timeout`` seconds). Each reason maps to ``abort_evt.set()``; the
+    fetch retry/backoff then re-drives the chunk, which stays resumable.
+    """
+    if free_bytes is not None and free_bytes <= reserve_bytes:
+        return 'diskfull'
+    if total_bytes and abort_factor and cur > total_bytes * abort_factor:
+        return 'overrun'
+    if stall_timeout and (now - last_growth_at) >= stall_timeout:
+        return 'stall'
+    return None
+
 # Written inside a pack dir when a stop preserves it, and the only thing that
 # makes that pack reusable. Written last and atomically, so its presence means
 # the pack is complete — a pack interrupted mid-write simply has no marker.
@@ -180,6 +201,7 @@ class RemoteOrchestrator:
         self.prefetch_ahead    = cfg.prefetch_chunks_ahead
         self.staging_padding   = cfg.staging_padding_factor
         self.fetch_abort_factor = cfg.fetch_overrun_abort_factor
+        self.fetch_stall_timeout = cfg.fetch_stall_timeout_seconds
         self.fetch_transient_retries = cfg.fetch_transient_retries
         self.fetch_transient_retry_base = cfg.fetch_transient_retry_base_seconds
         self.chunk_max_files  = cfg.chunk_max_files
@@ -2702,6 +2724,7 @@ class RemoteOrchestrator:
         come from the scan, so a growing or sparse-expanded remote file shows
         up here first)."""
         abort_factor = self.fetch_abort_factor
+        stall_timeout = self.fetch_stall_timeout
 
         def _alarm(msg):
             print(f"\n[FETCH][ALERT] {msg}")
@@ -2712,6 +2735,13 @@ class RemoteOrchestrator:
             prev_time  = time.time()
             interval   = 2
             overrun_warned = False
+            # Stall tracking: the last time the staging dir grew by a byte. A
+            # wedged SSH/tar stream stays connected and delivers nothing, so
+            # ``cur`` never advances — communicate() would otherwise block
+            # forever (observed live 2026-07-23: three ssh streams idle ~27 min,
+            # 0 staged bytes, the whole pipeline starved behind fetch_active).
+            max_seen = 0
+            last_growth_at = time.time()
             while not stop_evt.wait(interval):
                 walk_start = time.time()
                 cur   = _dir_tree_size(fetch_dir)
@@ -2731,6 +2761,9 @@ class RemoteOrchestrator:
                 )
                 prev_bytes = cur
                 prev_time  = now
+                if cur > max_seen:
+                    max_seen = cur
+                    last_growth_at = now
 
                 if (total_bytes and not overrun_warned
                         and cur > total_bytes * _FETCH_OVERRUN_WARN_FACTOR):
@@ -2746,23 +2779,36 @@ class RemoteOrchestrator:
                     free = shutil.disk_usage(self.staging_dir).free
                 except OSError:
                     free = None
-                if free is not None and free <= LOCAL_STAGING_RESERVE_BYTES:
+                action = _fetch_watchdog_action(
+                    cur=cur, last_growth_at=last_growth_at, now=now,
+                    total_bytes=total_bytes, abort_factor=abort_factor,
+                    stall_timeout=stall_timeout, free_bytes=free,
+                    reserve_bytes=LOCAL_STAGING_RESERVE_BYTES)
+                if action == 'diskfull':
                     _alarm(
                         f"aborting fetch: staging free space is down to "
-                        f"{free / 1024**3:.1f} GB (reserve floor "
+                        f"{(free or 0) / 1024**3:.1f} GB (reserve floor "
                         f"{LOCAL_STAGING_RESERVE_BYTES / 1024**3:.0f} GB). "
                         "The chunk stays resumable."
                     )
                     abort_evt.set()
                     return
-                if (total_bytes and abort_factor
-                        and cur > total_bytes * abort_factor):
+                if action == 'overrun':
                     _alarm(
                         f"aborting fetch: {cur / 1024**3:.1f} GB fetched "
                         f"exceeds {abort_factor:.1f}x the planned "
                         f"{total_bytes / 1024**3:.1f} GB "
                         "(fetch_overrun_abort_factor). The chunk stays "
                         "resumable; re-scan so the plan matches the source."
+                    )
+                    abort_evt.set()
+                    return
+                if action == 'stall':
+                    _alarm(
+                        f"aborting fetch: staging has not grown "
+                        f"({cur / 1024**3:.1f} GB) for {stall_timeout}s — the "
+                        "remote stream is wedged (connected but delivering no "
+                        "data). The chunk stays resumable and will be retried."
                     )
                     abort_evt.set()
                     return

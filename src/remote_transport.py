@@ -35,6 +35,18 @@ def _hostkey_policy():
 
 SSH_HOSTKEY_POLICY = _hostkey_policy()
 
+# Keepalive for long streaming fetches: if the peer stops answering SSH-level
+# keepalives (a dead/half-open TCP connection), ssh gives up after
+# ~ServerAliveInterval * ServerAliveCountMax seconds instead of blocking the
+# local tar's communicate() forever. This only detects a dead *peer*; a peer
+# that answers keepalives while its tar/mbuffer delivers no data is caught
+# instead by the orchestrator's staging stall watchdog (fetch_stall_timeout).
+_SSH_STREAM_KEEPALIVE_OPTS = [
+    '-o', 'ServerAliveInterval=15',
+    '-o', 'ServerAliveCountMax=4',
+    '-o', 'ConnectTimeout=30',
+]
+
 
 _ASKPASS_HELPERS = set()
 _ASKPASS_HELPER_PATH = None
@@ -281,7 +293,7 @@ def _ssh_stream_command(remote_user, remote_host, command, password='', cipher='
             env['SSHPASS'] = password
             return [
                 'sshpass', '-e',
-                'ssh', *cipher_opts,
+                'ssh', *cipher_opts, *_SSH_STREAM_KEEPALIVE_OPTS,
                 '-o', 'BatchMode=no',
                 '-o', 'PubkeyAuthentication=no',
                 '-o', f'StrictHostKeyChecking={SSH_HOSTKEY_POLICY}',
@@ -290,7 +302,7 @@ def _ssh_stream_command(remote_user, remote_host, command, password='', cipher='
             ], env, None
         if _has_command('ssh'):
             return [
-                'ssh', *cipher_opts,
+                'ssh', *cipher_opts, *_SSH_STREAM_KEEPALIVE_OPTS,
                 '-o', 'BatchMode=no',
                 '-o', 'PubkeyAuthentication=no',
                 '-o', 'NumberOfPasswordPrompts=1',
@@ -308,7 +320,7 @@ def _ssh_stream_command(remote_user, remote_host, command, password='', cipher='
     if not _has_command('ssh'):
         return None, None, "ssh was not found on PATH."
     return [
-        'ssh', *cipher_opts,
+        'ssh', *cipher_opts, *_SSH_STREAM_KEEPALIVE_OPTS,
         '-o', 'BatchMode=yes',
         '-o', f'StrictHostKeyChecking={SSH_HOSTKEY_POLICY}',
         f'{remote_user}@{remote_host}',
