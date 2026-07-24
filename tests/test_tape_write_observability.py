@@ -37,6 +37,40 @@ _SUMMARY_ALL_SKIPPED = (
 )
 _ERROR_LINE = "2026/07/24 07:00:41 ERROR 32 (0x00000020) Copying File x.zip\n"
 
+# Realistic robocopy output ALWAYS contains an options header that echoes the
+# file filter as "Files : *.*" — this must not be mistaken for the summary.
+_REAL_SUCCESS = (
+    "-------------------------------------------------------------------\n"
+    "   ROBOCOPY     ::     Robust File Copy for Windows\n"
+    "-------------------------------------------------------------------\n"
+    "  Started : Fri Jul 24 10:16:36 2026\n"
+    "   Source : C:\\staging\\_pack_s0037_049\\\n"
+    "     Dest = Z:\\_pack_s0037_049\\\n"
+    "    Files : *.*\n"
+    "  Options : *.* /BYTES /S /E /J /R:3 /W:10\n"
+    "-------------------------------------------------------------------\n"
+    "   Dirs :         1         0         1         0         0         0\n"
+    "  Files :         6         6         0         0         0         0\n"
+    "  Bytes : 1731382179 1731382179 0 0 0 0\n"
+    "  Times :   0:00:15   0:00:15\n"
+)
+
+# Real write-protected tape capture (the 2026-07-24 root cause): exit 0, all
+# retries exhausted, a valid zero summary, plus the options "Files : *.*" echo.
+_REAL_WRITE_PROTECTED = (
+    "  Started : Fri Jul 24 10:16:36 2026\n"
+    "    Files : *.*\n"
+    "  Options : *.* /BYTES /S /E /J /R:3 /W:10\n"
+    "2026/07/24 10:16:36 ERROR 19 (0x00000013) Changing File Attributes "
+    "Z:\\_pack_s0037_049\\\n"
+    "The media is write protected.\n"
+    "Waiting 10 seconds... Retrying...\n"
+    "ERROR: RETRY LIMIT EXCEEDED.\n"
+    "   Dirs :         1         0         1         0         0         0\n"
+    "   Files :         0         0         0         0         0         0\n"
+    "   Bytes :         0         0         0         0         0         0\n"
+)
+
 
 # --- fakes --------------------------------------------------------------------
 
@@ -107,11 +141,26 @@ class SummaryParserTests(unittest.TestCase):
         self.assertEqual(p["files_failed"], 0)
 
     def test_malformed_summary_is_flagged(self):
-        # A "Files :" header present but its counters cannot be parsed
-        # (truncated/garbled — scenario 4).
+        # A numeric-leading "Files :" line present but its counters cannot be
+        # parsed (truncated/garbled — scenario 4).
         p = _parse_robocopy_summary("Files : 3 3 oops\n")
         self.assertFalse(p["summary_found"])
         self.assertTrue(p["summary_malformed"])
+
+    def test_options_echo_files_filter_is_not_a_summary(self):
+        # REGRESSION: robocopy's "Files : *.*" options echo must not be treated
+        # as a (malformed) summary, else every real run is rejected.
+        p = _parse_robocopy_summary(_REAL_SUCCESS)
+        self.assertTrue(p["summary_found"])
+        self.assertFalse(p["summary_malformed"])
+        self.assertEqual(p["files_copied"], 6)
+        self.assertEqual(p["bytes_copied"], 1731382179)
+
+    def test_real_write_protected_capture_parses_zero_summary(self):
+        p = _parse_robocopy_summary(_REAL_WRITE_PROTECTED)
+        self.assertTrue(p["summary_found"])       # "Files : 0 0 0 0 0 0" seen
+        self.assertFalse(p["summary_malformed"])  # options echo ignored
+        self.assertEqual(p["files_copied"], 0)
 
 
 # =============================================================================
@@ -128,6 +177,23 @@ class ClassifierTests(unittest.TestCase):
         v = self._classify(_SUMMARY_OK, 1)
         self.assertTrue(v.is_success)
         self.assertEqual(v.category, "success")
+
+    def test_realistic_success_output_with_options_header(self):
+        # REGRESSION: a real robocopy success (with the "Files : *.*" echo) must
+        # classify as success, not malformed_summary.
+        v = self._classify(_REAL_SUCCESS, 1, expected_files=6,
+                            expected_bytes=1731382179)
+        self.assertTrue(v.is_success, v.detail)
+        self.assertEqual(v.category, "success")
+
+    def test_real_write_protected_tape_is_retry_limit_failure(self):
+        # The 2026-07-24 root cause: media write protected -> retry limit -> 0
+        # copied at return code 0. Must never be trusted/committed.
+        v = self._classify(_REAL_WRITE_PROTECTED, 0, expected_files=6,
+                            expected_bytes=1731382179)
+        self.assertFalse(v.is_success)
+        self.assertEqual(v.category, "retry_limit_exceeded")
+        self.assertEqual(len(v.error_lines), 1)
 
     def test_all_skipped_resume_is_success(self):
         # A legitimate resume where everything is already on tape: copied==0 but

@@ -144,7 +144,13 @@ def _parse_robocopy_summary(output):
             continue
 
         # "Files :  5  5  0  0  0  0"  (Total Copied Skipped Mismatch Failed Extras)
-        if parts[0] == 'Files' and len(parts) >= 2 and parts[1] == ':':
+        # robocopy also echoes the file filter in its options header as
+        # "Files : *.*"; that is NOT the summary. Only a line whose first field
+        # is an integer counter is treated as a summary candidate, so the echo
+        # is ignored rather than mistaken for a corrupt summary (which would
+        # otherwise mark EVERY real run malformed and reject good writes).
+        if (parts[0] == 'Files' and len(parts) >= 2 and parts[1] == ':'
+                and len(parts) >= 3 and parts[2].lstrip('-').isdigit()):
             nums = parts[2:8]
             try:
                 if len(nums) < 6:
@@ -159,8 +165,9 @@ def _parse_robocopy_summary(output):
                 result['files_extras']   = extras
                 result['summary_found']  = True
             except (ValueError, IndexError):
-                # A "Files :" line that will not parse is a malformed summary,
-                # not an absent one: record it so the write is never trusted.
+                # A numeric-leading "Files :" line that will not fully parse is a
+                # malformed summary, not an absent one: record it so the write is
+                # never trusted.
                 result['summary_malformed'] = True
 
         # "Bytes :  4.52 g  4.52 g  0  0  0  0"
