@@ -343,6 +343,30 @@ class BackupRunClassificationTests(unittest.TestCase):
         self.assertIn("cut mid-flight", str(raised))
         self.assertEqual(db.file_commits, 0)
 
+    def test_remote_write_raw_log_is_labelled_with_session_and_chunk(self):
+        # Remote-pipeline writes pass remote_* ids (local_* are None); the raw
+        # log must still land under session_<id>/chunk_<idx>, not session_na.
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: _rmtree(tmp))
+        source = os.path.join(tmp, "source")
+        tape = os.path.join(tmp, "tape")
+        os.makedirs(source)
+        os.makedirs(tape)
+        with open(os.path.join(source, "bundle.bin"), "wb") as f:
+            f.write(b"x" * 1024)
+        db = _CommitTrackingDB()
+        backup = LTOBackup(db, "", governor=None, log_dir=tmp)
+        backup.eject_tape = lambda _drive: None
+        result = SimpleNamespace(stdout=_SUMMARY_OK, stderr="", returncode=1)
+        with mock.patch("src.backup._ensure_lto_drive_ready", return_value=True), \
+             mock.patch("src.backup._run_robocopy_tuned", return_value=result):
+            backup.run(source, tape, "Tape_02",
+                       remote_session_id=37, remote_chunk_index=49)
+        logdir = os.path.join(tmp, "tape_write", "session_37")
+        self.assertTrue(os.path.isdir(logdir), f"missing {logdir}")
+        logs = [f for f in os.listdir(logdir) if f.startswith("chunk_49_")]
+        self.assertTrue(logs, f"no chunk_49_* log in {logdir}: {os.listdir(logdir)}")
+
     def test_cancel_with_complete_summary_still_commits(self):
         # scenario 12: a protected write that COMPLETED under cancel still
         # commits (its data is on tape); skipping would create ambiguity.

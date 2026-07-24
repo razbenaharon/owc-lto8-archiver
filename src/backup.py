@@ -340,8 +340,14 @@ class LTOBackup:
         # line by line AS IT RUNS (never only after exit), so the complete
         # evidence survives a killed process, a detached-console closure, a
         # Ctrl+C, an exception, or a summary-less failure. Closed in the finally.
+        # Remote pipeline writes carry only remote_* ids (local_* are None), so
+        # fall back to them to keep the log identified as session_<id>/chunk_<n>.
+        log_session_id = (local_session_id if local_session_id is not None
+                          else remote_session_id)
+        log_chunk_index = (local_chunk_index if local_chunk_index is not None
+                           else remote_chunk_index)
         raw_log = TapeWriteRawLog(
-            self.log_dir or BACKUP_LOG_DIR, local_session_id, local_chunk_index,
+            self.log_dir or BACKUP_LOG_DIR, log_session_id, log_chunk_index,
             tape_label, source, tape_root, robocopy_cmd,
             expected_files=expected_files, expected_bytes=total_bytes)
         try:
