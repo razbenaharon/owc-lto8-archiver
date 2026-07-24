@@ -1,7 +1,6 @@
 """LTOBackup and _NoEjectBackup tape writers."""
 import contextlib
 import os
-import re
 import time
 import threading
 from datetime import datetime
@@ -18,19 +17,15 @@ from .logsetup import get_logger
 from .ltfs import _ensure_lto_drive_ready, eject_tape_drive
 from .ram_telemetry import RamStageSampler, TapeWriteProfiler
 from .reporting import append_backup_summary_row
-from .robocopy import _parse_robocopy_summary, _run_robocopy_tuned
+from .robocopy import (
+    _parse_robocopy_summary, _run_robocopy_tuned, classify_robocopy_result,
+    RobocopyVerdict)
 from .runtime import CANCEL, _acquire_tape_io_lock, _fmt_eta, _phase, _progress_done, _progress_line, _release_tape_io_lock
+from .tape_write_log import TapeWriteRawLog
 from .telegram_notify import notify_backup_summary
 
 if TYPE_CHECKING:
     from .pg_db import PgDatabaseManager
-
-
-# Robocopy error lines look like "2024/01/01 12:00:00 ERROR 32 (0x00000020)
-# Copying File ...". Matching the full shape (instead of the substring
-# "ERROR ") keeps a source path that merely contains the word from failing
-# the whole run.
-_ROBOCOPY_ERROR_RE = re.compile(r'ERROR \d+ \(0x[0-9A-Fa-f]{8}\)')
 
 
 def _tape_destination_root(source, tape_drive, tape_parent_dir=None):
@@ -268,16 +263,23 @@ class LTOBackup:
                                 chunk_index=local_chunk_index)
 
         if packer_metadata is not None:
-            # Bundle ZIPs aren't in loose_map; walk staging to size the progress bar.
+            # Bundle ZIPs aren't in loose_map; walk staging to size the progress
+            # bar and count the files robocopy is expected to move. This is the
+            # source-side accounting used to sanity-check robocopy's own reported
+            # statistics — it never reads the tape.
             total_bytes = 0
+            expected_files = 0
             for r, _, fs in os.walk(source):
                 for f in fs:
+                    expected_files += 1
                     try:
                         total_bytes += os.path.getsize(os.path.join(r, f))
                     except OSError:
                         pass
         else:
             total_bytes = sum(v['fsize'] for v in loose_map.values())
+            # Direct path: the loose files newly submitted to this write.
+            expected_files = len(loose_map)
 
         _progress_done()
         print(f"[BACKUP] {len(loose_map)} loose file(s) staged "
@@ -333,102 +335,129 @@ class LTOBackup:
             tape_guard = self.governor.mark_tape_write_active()
         else:
             tape_guard = contextlib.nullcontext()
+
+        # Durable per-write raw log: robocopy's stdout/stderr is streamed to disk
+        # line by line AS IT RUNS (never only after exit), so the complete
+        # evidence survives a killed process, a detached-console closure, a
+        # Ctrl+C, an exception, or a summary-less failure. Closed in the finally.
+        raw_log = TapeWriteRawLog(
+            self.log_dir or BACKUP_LOG_DIR, local_session_id, local_chunk_index,
+            tape_label, source, tape_root, robocopy_cmd,
+            expected_files=expected_files, expected_bytes=total_bytes)
         try:
-            with RamStageSampler("tape", _ram_interval()) as tape_sampler:
-                # Passive per-second profiler: reads only robocopy's own I/O
-                # counter (never the tape) to isolate open/stream/close/stalls.
-                with TapeWriteProfiler(interval_seconds=1.0) as tape_profiler:
-                    with tape_guard:
-                        # The write boundary: everything above (drive checks,
-                        # metadata, governor wait) is pre-write. From here the
-                        # tape may be touched, so signal the caller that the
-                        # write has STARTED — a failure past this point is
-                        # physically ambiguous (data may be partly on tape).
-                        if on_write_start is not None:
-                            on_write_start()
-                        rc = _run_robocopy_tuned(
-                            robocopy_cmd,
-                            priority=self.tape_priority,
-                            affinity=self.tape_affinity,
-                            on_start=tape_profiler.attach)
+            try:
+                with RamStageSampler("tape", _ram_interval()) as tape_sampler:
+                    # Passive per-second profiler: reads only robocopy's own I/O
+                    # counter (never the tape) to isolate open/stream/close/stalls.
+                    with TapeWriteProfiler(interval_seconds=1.0) as tape_profiler:
+                        with tape_guard:
+                            # The write boundary: everything above (drive checks,
+                            # metadata, governor wait) is pre-write. From here the
+                            # tape may be touched, so signal the caller that the
+                            # write has STARTED — a failure past this point is
+                            # physically ambiguous (data may be partly on tape).
+                            if on_write_start is not None:
+                                on_write_start()
+                            rc = _run_robocopy_tuned(
+                                robocopy_cmd,
+                                priority=self.tape_priority,
+                                affinity=self.tape_affinity,
+                                on_start=tape_profiler.attach,
+                                raw_sink=raw_log)
+            finally:
+                stop_evt.set()
+                mon.join(timeout=2)
+                _progress_done()
+
+            rc_sum = _parse_robocopy_summary(rc.stdout)
+            rc_output = (rc.stdout or '') + '\n' + (rc.stderr or '')
+
+            # A cooperative Ctrl+C no longer implies the write was cut: the tape
+            # write is protected, so robocopy runs to completion. Therefore a
+            # COMPLETED, successful write must still commit — its data is on tape
+            # and skipping the commit would itself create the ambiguity we avoid.
+            # Only an INCOMPLETE write under cancel (a forced kill: no robocopy
+            # summary) is skipped, and it stays ambiguous ('backing') for the
+            # caller. Semantics unchanged from before the raw-log/classifier work.
+            if CANCEL.is_set() and not rc_sum.get('summary_found'):
+                raw_log.write_footer(rc.returncode, rc_sum, RobocopyVerdict(
+                    False, 'interrupted',
+                    'tape write cut mid-flight before completion (cancelled)',
+                    []))
+                raise RuntimeError(
+                    "tape write cut mid-flight before completion (cancelled)")
+
+            # Single authoritative verdict from robocopy's OWN evidence (return
+            # code, complete output, parsed summary) plus source-side accounting.
+            # No tape is read. A missing/malformed summary or an unexpected
+            # zero-copy result is never success even when the return code is 0.
+            verdict = classify_robocopy_result(
+                rc.returncode, rc_sum, rc_output,
+                expected_files=expected_files, expected_bytes=total_bytes)
+            raw_log.write_footer(rc.returncode, rc_sum, verdict)
+
+            if not verdict.is_success:
+                copied_bytes = rc_sum.get('bytes_copied', 0)
+                new_used = self.db.recalculate_tape_used_space(tape_label)
+                log_path = self._write_backup_log(
+                    {
+                        'status': 'failed_critical',
+                        'started_at': started_at,
+                        'finished_at': datetime.now(),
+                        'source': source,
+                        'source_host': source_host,
+                        'tape_drive': tape_drive,
+                        'tape_label': tape_label,
+                        'tape_root': tape_root,
+                        'local_session_id': local_session_id,
+                        'local_chunk_index': local_chunk_index,
+                        'total_time_seconds': time.time() - total_start,
+                        'total_bytes': total_bytes,
+                        'copied_bytes': copied_bytes,
+                        'skipped': skipped,
+                        'new_used': new_used,
+                        'rc_sum': rc_sum,
+                        'record_counts': {},
+                        'source_missing_files':
+                            _stat('source_missing_files', []),
+                        'skipped_files_count':
+                            skipped_tracker.count() if skipped_tracker else '',
+                        'skipped_files_report':
+                            skipped_tracker.write_csv(self.log_dir or BACKUP_LOG_DIR)
+                            if skipped_tracker and skipped_tracker.has_items() else '',
+                        **_stage_ram_details(),
+                        **tape_sampler.as_details("tape"),
+                        **tape_profiler.as_details("tape"),
+                    },
+                    packer_metadata,
+                    loose_map,
+                    recovered_direct_existing,
+                    skipped_existing,
+                    robocopy_cmd,
+                    rc,
+                )
+                msg = (
+                    "Robocopy result is incomplete/untrustworthy: "
+                    f"{verdict.detail} (category={verdict.category}). "
+                    f"return_code={rc.returncode}. "
+                    "No file records were committed to the database. "
+                    f"Raw log: {raw_log.path}"
+                )
+                if log_path:
+                    msg += f" | CSV summary: {log_path}"
+                print(f"[ERROR] {msg}")
+                raise RuntimeError(msg)
+        except BaseException as exc:
+            # Any propagating failure/interrupt: annotate the durable log so the
+            # evidence is never lost, then re-raise unchanged. Classification
+            # failures already wrote a footer, so this only fires for unexpected
+            # exceptions (launch failure, interrupt, DB error building the log).
+            if not raw_log.footer_written:
+                raw_log.note(
+                    f"tape write aborted by {type(exc).__name__}: {exc}")
+            raise
         finally:
-            stop_evt.set()
-            mon.join(timeout=2)
-            _progress_done()
-
-        rc_sum = _parse_robocopy_summary(rc.stdout)
-        rc_output = (rc.stdout or '') + '\n' + (rc.stderr or '')
-
-        # A cooperative Ctrl+C no longer implies the write was cut: the tape
-        # write is protected, so robocopy runs to completion. Therefore a
-        # COMPLETED, successful write must still commit — its data is on tape and
-        # skipping the commit would itself create the ambiguity we avoid. Only an
-        # INCOMPLETE write under cancel (a forced kill: no robocopy summary) is
-        # skipped, and it stays ambiguous ('backing') for the caller.
-        if CANCEL.is_set() and not rc_sum.get('summary_found'):
-            raise RuntimeError(
-                "tape write cut mid-flight before completion (cancelled)")
-        # robocopy prints an ERROR line for EVERY failed attempt, including
-        # transient errors it then retried successfully (/R:3 /W:10). The final
-        # summary counters are the authoritative verdict, so the raw ERROR-line
-        # scan only applies when robocopy died before printing its summary;
-        # otherwise a single recovered transient would abort a healthy chunk.
-        critical_robocopy_failure = (
-            rc.returncode >= 8 or
-            rc_sum.get('files_failed', 0) > 0 or
-            'RETRY LIMIT EXCEEDED' in rc_output or
-            (not rc_sum.get('summary_found') and
-             _ROBOCOPY_ERROR_RE.search(rc_output) is not None)
-        )
-        if critical_robocopy_failure:
-            copied_bytes = rc_sum.get('bytes_copied', 0)
-            new_used = self.db.recalculate_tape_used_space(tape_label)
-            log_path = self._write_backup_log(
-                {
-                    'status': 'failed_critical',
-                    'started_at': started_at,
-                    'finished_at': datetime.now(),
-                    'source': source,
-                    'source_host': source_host,
-                    'tape_drive': tape_drive,
-                    'tape_label': tape_label,
-                    'tape_root': tape_root,
-                    'local_session_id': local_session_id,
-                    'local_chunk_index': local_chunk_index,
-                    'total_time_seconds': time.time() - total_start,
-                    'total_bytes': total_bytes,
-                    'copied_bytes': copied_bytes,
-                    'skipped': skipped,
-                    'new_used': new_used,
-                    'rc_sum': rc_sum,
-                    'record_counts': {},
-                    'source_missing_files':
-                        _stat('source_missing_files', []),
-                    'skipped_files_count':
-                        skipped_tracker.count() if skipped_tracker else '',
-                    'skipped_files_report':
-                        skipped_tracker.write_csv(self.log_dir or BACKUP_LOG_DIR)
-                        if skipped_tracker and skipped_tracker.has_items() else '',
-                    **_stage_ram_details(),
-                    **tape_sampler.as_details("tape"),
-                    **tape_profiler.as_details("tape"),
-                },
-                packer_metadata,
-                loose_map,
-                recovered_direct_existing,
-                skipped_existing,
-                robocopy_cmd,
-                rc,
-            )
-            msg = (
-                f"CRITICAL: robocopy failed with exit code {rc.returncode}; "
-                f"{rc_sum.get('files_failed', 0)} file(s) failed. "
-                "No file records were committed to the database."
-            )
-            if log_path:
-                msg += f" CSV summary: {log_path}"
-            print(f"[ERROR] {msg}")
-            raise RuntimeError(msg)
+            raw_log.close()
 
         # ---------------------------------------------------------------
         # Phase 3 - DB inserts (new/recovered files from this run)
