@@ -1,10 +1,28 @@
 """robocopy execution/parsing and Defender exclusion helpers."""
 import os
+import re
 import time
 import threading
 import subprocess
+from collections import namedtuple
 
 from .runtime import CANCEL, _apply_proc_tuning, _is_admin, _progress_done, _progress_line, register_proc, unregister_proc
+
+
+# Robocopy error lines look like "2024/01/01 12:00:00 ERROR 32 (0x00000020)
+# Copying File ...". Matching the full shape (instead of the substring
+# "ERROR ") keeps a source path that merely contains the word from failing
+# the whole run.
+_ROBOCOPY_ERROR_RE = re.compile(r'ERROR \d+ \(0x[0-9A-Fa-f]{8}\)')
+
+
+# Verdict returned by classify_robocopy_result. ``is_success`` is the single
+# authoritative gate the tape writer commits on; ``category`` names the failure
+# mode for logs/diagnostics; ``detail`` is a human sentence; ``error_lines`` are
+# the raw robocopy ERROR lines detected (kept even on success — a valid summary
+# with a recovered transient is still success, but the evidence is preserved).
+RobocopyVerdict = namedtuple(
+    'RobocopyVerdict', 'is_success category detail error_lines')
 
 
 def _robocopy_file(src, dst, display_name=None):
@@ -102,17 +120,22 @@ def _parse_robocopy_bytes(tokens, idx):
 def _parse_robocopy_summary(output):
     """
     Parse robocopy's captured stdout and return a dict with:
-      files_copied, files_skipped, files_failed,
-      bytes_copied, speed_mbs, elapsed, summary_found
+      files_total, files_copied, files_skipped, files_mismatch, files_failed,
+      files_extras, bytes_total, bytes_copied, speed_mbs, elapsed,
+      summary_found, summary_malformed
 
     ``summary_found`` records whether the final "Files :" summary line was
-    seen; when it is absent (robocopy died before printing its summary) the
-    zeroed counters must not be trusted as "no failures".
+    seen *and* fully parsed into its six integer counters; when it is absent
+    (robocopy died before printing its summary) the zeroed counters must not be
+    trusted as "no failures". ``summary_malformed`` is set when a "Files :"
+    header line IS present but its counters could not be parsed — a truncated or
+    garbled summary that must likewise never read as success.
     """
     result = {
-        'files_copied': 0, 'files_skipped': 0, 'files_failed': 0,
-        'bytes_copied': 0, 'speed_mbs': 0.0, 'elapsed': '',
-        'summary_found': False,
+        'files_total': 0, 'files_copied': 0, 'files_skipped': 0,
+        'files_mismatch': 0, 'files_failed': 0, 'files_extras': 0,
+        'bytes_total': 0, 'bytes_copied': 0, 'speed_mbs': 0.0, 'elapsed': '',
+        'summary_found': False, 'summary_malformed': False,
     }
     output = output or ''
     for line in output.splitlines():
@@ -121,20 +144,31 @@ def _parse_robocopy_summary(output):
             continue
 
         # "Files :  5  5  0  0  0  0"  (Total Copied Skipped Mismatch Failed Extras)
-        if parts[0] == 'Files' and len(parts) >= 7 and parts[1] == ':':
+        if parts[0] == 'Files' and len(parts) >= 2 and parts[1] == ':':
+            nums = parts[2:8]
             try:
-                result['files_copied']  = int(parts[3])
-                result['files_skipped'] = int(parts[4])
-                result['files_failed']  = int(parts[6])
-                result['summary_found'] = True
+                if len(nums) < 6:
+                    raise ValueError("incomplete Files summary")
+                total, copied, skipped, mismatch, failed, extras = (
+                    int(n) for n in nums)
+                result['files_total']    = total
+                result['files_copied']   = copied
+                result['files_skipped']  = skipped
+                result['files_mismatch'] = mismatch
+                result['files_failed']   = failed
+                result['files_extras']   = extras
+                result['summary_found']  = True
             except (ValueError, IndexError):
-                pass
+                # A "Files :" line that will not parse is a malformed summary,
+                # not an absent one: record it so the write is never trusted.
+                result['summary_malformed'] = True
 
         # "Bytes :  4.52 g  4.52 g  0  0  0  0"
 
         elif parts[0] == 'Bytes' and len(parts) >= 4 and parts[1] == ':':
-            _,          i = _parse_robocopy_bytes(parts, 2)  # total (skip)
-            bytes_copied, _ = _parse_robocopy_bytes(parts, i)
+            total_b,      i = _parse_robocopy_bytes(parts, 2)  # total
+            bytes_copied, _ = _parse_robocopy_bytes(parts, i)  # copied
+            result['bytes_total']  = total_b
             result['bytes_copied'] = bytes_copied
 
         # "Speed :  59993856 Bytes/Sec."
@@ -162,7 +196,8 @@ def _run_robocopy_capture(cmd):
     )
 
 
-def _run_robocopy_tuned(cmd, priority=None, affinity=None, on_start=None):
+def _run_robocopy_tuned(cmd, priority=None, affinity=None, on_start=None,
+                        raw_sink=None):
     """Run robocopy as a tracked, cancellable child with optional CPU priority
     and core affinity (the tape-write step). Returns a CompletedProcess with
     .stdout/.returncode so it is a drop-in for _run_robocopy_capture.
@@ -173,7 +208,15 @@ def _run_robocopy_tuned(cmd, priority=None, affinity=None, on_start=None):
     ``on_start`` (optional) is called once with the live Popen right after the
     process is created and tuned, so a passive profiler can read the robocopy
     process's own I/O counters. It must not block or touch the process; any
-    exception it raises is swallowed so it can never disturb the tape write."""
+    exception it raises is swallowed so it can never disturb the tape write.
+
+    ``raw_sink`` (optional) is any object with a ``.write(str)`` method. Every
+    stdout/stderr line is written to it *incrementally, as it arrives* (stderr
+    lines prefixed ``[stderr]``), so the complete robocopy output is durably
+    persisted even if this process is later killed, the console is detached, or
+    the summary is never printed. Sink errors are swallowed — logging must never
+    disturb the tape write. stdout/stderr are still accumulated and returned in
+    full on the CompletedProcess so parsing/classification are unchanged."""
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -181,6 +224,7 @@ def _run_robocopy_tuned(cmd, priority=None, affinity=None, on_start=None):
         text=True,
         encoding='utf-8',
         errors='replace',
+        bufsize=1,   # line-buffered so the sink sees each line as it is emitted
     )
     # Protected: a cooperative Ctrl+C must let the active tape write finish and
     # commit rather than cut it and leave the chunk ambiguously 'backing'. Only a
@@ -193,11 +237,129 @@ def _run_robocopy_tuned(cmd, priority=None, affinity=None, on_start=None):
             on_start(proc)
         except Exception:
             pass
+
+    out_chunks = []
+    err_chunks = []
+
+    def _pump(stream, buf, prefix):
+        # Read line by line and tee to the durable sink as each line arrives.
+        try:
+            for line in iter(stream.readline, ''):
+                buf.append(line)
+                if raw_sink is not None:
+                    try:
+                        raw_sink.write(prefix + line if prefix else line)
+                    except Exception:
+                        pass
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    t_out = threading.Thread(
+        target=_pump, args=(proc.stdout, out_chunks, ''), daemon=True)
+    t_err = threading.Thread(
+        target=_pump, args=(proc.stderr, err_chunks, '[stderr] '), daemon=True)
+    t_out.start()
+    t_err.start()
     try:
-        out, err = proc.communicate()
+        proc.wait()
     finally:
         unregister_proc(proc)
-    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+    # The readers exit once the pipes hit EOF (after the process ends).
+    t_out.join(timeout=30)
+    t_err.join(timeout=30)
+    return subprocess.CompletedProcess(
+        cmd, proc.returncode, ''.join(out_chunks), ''.join(err_chunks))
+
+
+def classify_robocopy_result(returncode, rc_sum, rc_output,
+                             expected_files=None, expected_bytes=None):
+    """Decide whether a robocopy tape write is trustworthy using ONLY the
+    robocopy process's own evidence (its return code, complete output, parsed
+    summary) plus locally-known source-side expectations. No tape is read.
+
+    Returns a :class:`RobocopyVerdict`. Conservative by construction: a missing
+    or malformed summary, or an unexpected zero-copy result, is NEVER success —
+    even when the process happened to return 0. The deliberate existing rule is
+    preserved: an ERROR line accompanied by a *complete* summary with zero failed
+    files is a transient robocopy retried successfully (/R /W) and stays success;
+    the summary counters are the authoritative verdict.
+
+    ``expected_files``/``expected_bytes`` are the source-side work submitted to
+    this write (counted locally before the copy). They gate the zero-copy sanity
+    check only — they are never compared against anything read back from tape.
+    """
+    output = rc_output or ''
+    error_lines = [ln.strip() for ln in output.splitlines()
+                   if _ROBOCOPY_ERROR_RE.search(ln)]
+    has_error = bool(error_lines)
+    summary_found = bool(rc_sum.get('summary_found'))
+    summary_malformed = bool(rc_sum.get('summary_malformed'))
+    files_failed = int(rc_sum.get('files_failed', 0) or 0)
+    files_copied = int(rc_sum.get('files_copied', 0) or 0)
+    files_skipped = int(rc_sum.get('files_skipped', 0) or 0)
+    bytes_copied = int(rc_sum.get('bytes_copied', 0) or 0)
+
+    # 1. The process never produced a usable return code (launch/interrupt).
+    if returncode is None:
+        return RobocopyVerdict(
+            False, 'interrupted',
+            'Robocopy did not complete (no return code)', error_lines)
+
+    # 2. Robocopy's own hard-failure signals.
+    if returncode >= 8:
+        return RobocopyVerdict(
+            False, 'nonzero_return_code',
+            f'Robocopy returned failure code {returncode} (>=8)', error_lines)
+    if 'RETRY LIMIT EXCEEDED' in output:
+        return RobocopyVerdict(
+            False, 'retry_limit_exceeded',
+            'Robocopy exhausted its retry limit', error_lines)
+
+    # 3. Summary integrity. A missing or malformed final summary is untrusted
+    #    regardless of the (possibly 0) return code — this is the exact gap that
+    #    let a summary-less exit-0 run masquerade as success.
+    if summary_malformed:
+        return RobocopyVerdict(
+            False, 'malformed_summary',
+            'Robocopy summary present but its counters could not be parsed',
+            error_lines)
+    if not summary_found:
+        detail = ('ERROR detected and final summary missing' if has_error
+                  else 'final Robocopy summary missing')
+        return RobocopyVerdict(False, 'missing_summary', detail, error_lines)
+
+    # 4. Explicit per-file failure inside an otherwise-complete summary.
+    if files_failed > 0:
+        return RobocopyVerdict(
+            False, 'files_failed',
+            f'{files_failed} file(s) failed to copy', error_lines)
+
+    # 5. Zero-work sanity vs. the source-side work we submitted. If we staged
+    #    files but robocopy neither copied nor skipped (already-on-tape) any,
+    #    the write did nothing though work was expected. Requiring BOTH
+    #    copied==0 and skipped==0 keeps a legitimate all-already-present resume
+    #    (skipped>0) classified as success.
+    if (expected_files and expected_files > 0
+            and files_copied == 0 and files_skipped == 0):
+        return RobocopyVerdict(
+            False, 'zero_copy_unexpected',
+            f'no files copied or skipped though {expected_files} were '
+            'expected from source', error_lines)
+    if (expected_bytes and expected_bytes > 0
+            and bytes_copied == 0 and files_skipped == 0):
+        return RobocopyVerdict(
+            False, 'zero_copy_unexpected',
+            f'no bytes copied though ~{expected_bytes} were expected from '
+            'source', error_lines)
+
+    # Success: complete summary, no failures, work is accounted for. Any ERROR
+    # lines here were transient and recovered — the summary is authoritative.
+    detail = ('complete summary, no failed files (recovered a transient ERROR)'
+              if has_error else 'complete summary, no failed files')
+    return RobocopyVerdict(True, 'success', detail, error_lines)
 
 
 def _run_powershell(ps_command):
