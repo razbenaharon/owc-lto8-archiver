@@ -28,6 +28,7 @@ from src.exit_codes import (ExitCode, StopResult, REASON_NETWORK_RETRY_EXHAUSTED
                             REASON_STOPPED_AT_CHUNK_BOUNDARY,
                             REASON_AMBIGUOUS_BACKING_CHUNK,
                             REASON_LTFS_SYNC_MODE_NOT_TIME5,
+                            REASON_LTFS_MEDIA_DEGRADED,
                             REASON_LTFS_MOUNT_UNVERIFIABLE,
                             REASON_AMBIGUOUS_ACTIVE_SESSIONS,
                             REASON_SSH_PERMISSION_DENIED,
@@ -202,15 +203,29 @@ class PreWriteSafetyGateTests(unittest.TestCase):
         ro.CANCEL.clear()
         self.addCleanup(ro.CANCEL.clear)
 
-    def _gate_orch(self, backing=(), mount_block=None,
+    def _gate_orch(self, backing=(), mount_block=None, media_block=None,
                    reboot=([], {"determinate": True})):
         orch = _orch()
         orch.db = SimpleNamespace(
             get_chunks_with_status=lambda sid, st: (
                 list(backing) if st == "backing" else []))
         orch._verify_current_mount_time5 = lambda: mount_block
+        # Neutralised like the mount check: these cases exercise the other gate
+        # steps and must not depend on this host's real LTFS drive health.
+        orch._verify_ltfs_media_health = lambda: media_block
         orch._pre_tape_write_reboot_check = lambda sid, desc, tape: reboot
         return orch
+
+    def test_degraded_drive_blocks_the_write(self):
+        """A failing drive must stop the write before it starts — the guard the
+        2026-07-24 cartridge freeze went four days without."""
+        block = StopResult(
+            exit_code=ExitCode.SAFETY_BLOCK, reason=REASON_LTFS_MEDIA_DEGRADED,
+            resumable=False, source="gate")
+        orch = self._gate_orch(media_block=block)
+        result = orch._pre_write_safety_gate(7, _desc(), "T", threading.Event())
+        self.assertIsNotNone(result)
+        self.assertEqual(result.reason, REASON_LTFS_MEDIA_DEGRADED)
 
     def test_clear_state_permits_the_write(self):
         orch = self._gate_orch()
@@ -608,6 +623,7 @@ class GatePrecedenceTests(unittest.TestCase):
         orch = _orch()
         orch.db = SimpleNamespace(get_chunks_with_status=lambda sid, st: [])
         orch._verify_current_mount_time5 = lambda: None
+        orch._verify_ltfs_media_health = lambda: None
         orch._pre_tape_write_reboot_check = lambda sid, desc, tape: ([], {})
         return orch
 
@@ -702,6 +718,7 @@ class WriteChunkRaceTests(unittest.TestCase):
             recalculate_tape_used_space=lambda label: 0,
             update_chunk_status=lambda sid, ci, st: statuses.append(st))
         orch._verify_current_mount_time5 = lambda: None
+        orch._verify_ltfs_media_health = lambda: None
         orch._pre_tape_write_reboot_check = lambda sid, desc, tape: ([], {})
         orch._backup_writer = lambda cls=None: writer
         orch._cleanup_dir = lambda p: None
@@ -777,6 +794,7 @@ class CooperativeCancelWriteTests(unittest.TestCase):
             recalculate_tape_used_space=lambda label: 0,
             update_chunk_status=lambda sid, ci, st: statuses.append(st))
         orch._verify_current_mount_time5 = lambda: None
+        orch._verify_ltfs_media_health = lambda: None
         orch._pre_tape_write_reboot_check = lambda sid, desc, tape: ([], {})
         orch._backup_writer = lambda cls=None: writer
         orch._cleanup_dir = lambda p: None

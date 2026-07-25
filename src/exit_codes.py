@@ -56,6 +56,7 @@ REASON_TAPE_WRITE_FAILED = "tape_write_failed"
 REASON_AMBIGUOUS_BACKING_CHUNK = "ambiguous_backing_chunk"
 REASON_LTFS_SYNC_MODE_NOT_TIME5 = "ltfs_sync_mode_not_time5"
 REASON_LTFS_MOUNT_UNVERIFIABLE = "ltfs_mount_unverifiable"
+REASON_LTFS_MEDIA_DEGRADED = "ltfs_media_degraded"
 REASON_UNEXPECTED_TAPE_OR_DB_STATE = "unexpected_tape_or_db_state"
 REASON_AMBIGUOUS_ACTIVE_SESSIONS = "ambiguous_active_sessions"
 # 30 — FATAL_CONFIG
