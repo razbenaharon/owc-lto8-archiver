@@ -22,6 +22,7 @@ from .exit_codes import (
     REASON_WINDOWS_REBOOT_PENDING, REASON_STOPPED_AT_CHUNK_BOUNDARY,
     REASON_TAPE_WRITE_FAILED,
     REASON_AMBIGUOUS_BACKING_CHUNK, REASON_LTFS_SYNC_MODE_NOT_TIME5,
+    REASON_LTFS_MEDIA_DEGRADED,
     REASON_LTFS_MOUNT_UNVERIFIABLE, REASON_UNEXPECTED_TAPE_OR_DB_STATE,
     REASON_AMBIGUOUS_ACTIVE_SESSIONS, REASON_SSH_AUTHENTICATION_FAILED,
     REASON_SSH_PERMISSION_DENIED, REASON_SSH_HOST_KEY_MISMATCH,
@@ -34,6 +35,7 @@ from .exit_codes import (
 from .logsetup import get_logger
 from .status_file import write_status, write_last_failure
 from .windows_update_guard import (RebootSentinel, ltfs_current_mount_status,
+                                   ltfs_media_health,
                                    ltfs_sync_mode_status,
                                    pending_reboot_reasons,
                                    reboot_block_reasons)
@@ -1616,6 +1618,85 @@ class RemoteOrchestrator:
             reason=REASON_LTFS_MOUNT_UNVERIFIABLE, resumable=False,
             source="gate", detailed_reason=msg)
 
+    def _verify_ltfs_media_health(self, mount_started_at=None):
+        """Gate check: refuse a write when the drive/medium is reporting faults.
+
+        Returns a blocking StopResult, or None when it is safe. Read-only — it
+        reads the LTFS event log and never touches the drive.
+
+        The 2026-07-24 loss of Tape_02 was preceded by four days of LOCATE
+        write-perm errors that LTFS masked and nobody read (roughly one per chunk
+        cycle, 45 in total) before the servo failed mid-write and froze the
+        cartridge permanently. Stopping on the *first* such event is the point:
+        a paused run costs hours, a frozen cartridge costs a trip to the drive
+        and a replacement.
+
+        Like the mount-mode gate this fails **closed** — an unreadable LTFS log
+        blocks the write, because "the drive might be dying and we cannot tell"
+        is not a state in which to start writing to tape.
+        """
+        if mount_started_at is None:
+            mount_started_at = (ltfs_current_mount_status()
+                                or {}).get("mount_started_at")
+        if not mount_started_at:
+            # Without the mount's start time the query would sweep the whole log
+            # and block forever on a previous cartridge's faults. Fail closed
+            # rather than bound the evidence wrongly.
+            msg = ("Cannot determine when the current LTFS mount started, so "
+                   "drive-health evidence cannot be scoped to this cartridge. "
+                   "Refusing to start a tape write.")
+            print(f"\n[TAPE] {msg}")
+            get_logger().error("ltfs_media_health_unscoped: no mount start time")
+            send_best_effort(self.notifier, f"[PIPELINE] {msg}")
+            return StopResult(
+                exit_code=ExitCode.SAFETY_BLOCK,
+                reason=REASON_LTFS_MEDIA_DEGRADED, resumable=False,
+                source="gate", detailed_reason=msg)
+
+        health = ltfs_media_health(since_iso=mount_started_at)
+
+        if not health.get("determinate"):
+            err = health.get("error") or "LTFS event log could not be read"
+            msg = (f"Cannot verify LTFS drive/medium health ({err}). Refusing to "
+                   "start a tape write: an unreadable drive log is exactly how "
+                   "the 2026-07-24 cartridge freeze went unnoticed for four days.")
+            print(f"\n[TAPE] {msg}")
+            get_logger().error("ltfs_media_health_unverifiable: %s", err)
+            send_best_effort(self.notifier, f"[PIPELINE] {msg}")
+            return StopResult(
+                exit_code=ExitCode.SAFETY_BLOCK,
+                reason=REASON_LTFS_MEDIA_DEGRADED, resumable=False,
+                source="gate", detailed_reason=msg)
+
+        if health.get("ok"):
+            get_logger().info("ltfs_media_health_ok: since=%s",
+                              health.get("since"))
+            return None
+
+        fatal = health.get("fatal") or []
+        degraded = health.get("degraded") or []
+        worst = fatal or degraded
+        kind = "FATAL" if fatal else "degradation"
+        first, last = worst[-1], worst[0]   # newest-first from Get-WinEvent
+        detail = (f"{len(fatal)} fatal + {len(degraded)} degradation event(s) "
+                  f"since the mount started; earliest {first['at']} "
+                  f"[{first['id']}] {first['meaning']}; latest {last['at']} "
+                  f"[{last['id']}] {last['meaning']}")
+        msg = (f"LTFS reports drive/medium {kind}. Refusing to start a tape "
+               f"write: {detail}. Writing into a failing drive is what froze "
+               "Tape_02 permanently. Investigate before resuming — see "
+               "docs/incidents/010-20260724-ltfs-write-perm-readonly.md.")
+        print(f"\n[TAPE] {msg}")
+        for ev in worst[:5]:
+            print(f"[TAPE]   {ev['at']}  [{ev['id']}]  {ev['message'][:140]}")
+        get_logger().error("ltfs_media_degraded: fatal=%d degraded=%d detail=%s",
+                           len(fatal), len(degraded), detail)
+        send_best_effort(self.notifier, f"[PIPELINE] {msg}")
+        return StopResult(
+            exit_code=ExitCode.SAFETY_BLOCK,
+            reason=REASON_LTFS_MEDIA_DEGRADED, resumable=False,
+            source="gate", detailed_reason=msg)
+
     @staticmethod
     def _reboot_reason_slug(reasons, sccm):
         """Map a pending-reboot block to (reason_slug). SCCM if the Configuration
@@ -1763,6 +1844,13 @@ class RemoteOrchestrator:
             mount_block.session_id = session_id
             mount_block.chunk_index = ci
             return self._record_stop(mount_block)
+
+        # 4b. The drive/medium must not be reporting faults on this mount.
+        media_block = self._verify_ltfs_media_health()
+        if media_block is not None:
+            media_block.session_id = session_id
+            media_block.chunk_index = ci
+            return self._record_stop(media_block)
 
         # 5. SCCM + Windows pending reboot (the synchronous, current re-check).
         reasons, sccm = self._pre_tape_write_reboot_check(

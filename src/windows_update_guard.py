@@ -38,8 +38,10 @@ paused after a crash is the fail-safe direction for the tape, but it is bad
 security hygiene to leave them paused indefinitely, so the next run always
 puts them back.
 """
+import csv
 import json
 import os
+import re
 import subprocess
 import threading
 from datetime import datetime, timedelta, timezone
@@ -672,6 +674,157 @@ def ltfs_current_mount_status(expect_seconds=300):
     info["ok"] = (info["sync_type"] == "time"
                   and info["sync_seconds"] == expect_seconds)
     info["reason"] = None if info["ok"] else "not_time5"
+    return info
+
+
+# ---------------------------------------------------------------------------
+# LTFS drive / medium health
+# ---------------------------------------------------------------------------
+# Why this exists: on 2026-07-24 Tape_02 was frozen by a permanent write error
+# and is read-only for good. It was not sudden. From 2026-07-20 the drive failed
+# 45 LOCATE operations with a write-perm error — roughly one per chunk cycle —
+# LTFS masked every one of them ("Replace a return code to -1201"), and the run
+# carried on for four days until the servo lost track following mid-write. The
+# archiver watched Windows Update, RAM, fetch stalls and robocopy, but nothing
+# watched the one log that predicted the failure. Stopping on the first of these
+# events is the difference between a paused run and a cartridge that only a
+# person standing at the drive can replace.
+
+# Errors that mean the volume is already compromised.
+_LTFS_FATAL_EVENTS = {
+    11083: "index write failed; the medium may be inconsistent",
+    11333: "cartridge already carries a permanent write error (mounts read-only)",
+    11343: "recovery index written to the index partition after a permanent write error",
+    11344: "cartridge frozen by a permanent write error",
+    12045: "LTFS dropped the volume to read-only after a failed block write",
+    17060: "XML writer could not write a block to the medium",
+}
+
+# Errors that mean the drive is failing operations LTFS is silently retrying —
+# the early warning that was missed.
+_LTFS_DEGRADED_EVENTS = {
+    17267: "drive returned a write-perm error on a LOCATE command",
+}
+
+# Event 62173 is Information level and carries benign mode-sense chatter
+# ("Not Ready to Ready Transition, Medium May Have Changed") as well as real
+# media faults, so it counts only when the message itself reports a failure.
+_LTFS_62173_FAULT_MARKERS = ("error on write", "error on read",
+                             "error on locate", "track following", "servo")
+
+_LTFS_HEALTH_EVENT_IDS = frozenset(
+    set(_LTFS_FATAL_EVENTS) | set(_LTFS_DEGRADED_EVENTS) | {62173})
+
+# The authoritative source is IBM's own CSV trace, NOT the Windows "LTFS" event
+# log. Verified 2026-07-25: the Windows log contains **no 17267 events at all**
+# — the single most valuable early warning — and it had already rotated away
+# everything before 07-23, while the CSV still held the full history back to
+# 07-16. Gating on the event log would have missed the very failure this guard
+# exists to catch.
+_LTFS_LOG_CSV_DEFAULT = r"C:\Program Files\IBM\LTFS\log\LogFile.csv"
+
+# "2026/07/24 07:07:41.022" — local time, no zone.
+_LTFS_CSV_TIME_FMT = "%Y/%m/%d %H:%M:%S.%f"
+
+
+def _parse_ltfs_csv_time(text):
+    """Parse an LTFS CSV timestamp to a naive local datetime, or None."""
+    try:
+        return datetime.strptime((text or "").strip(), _LTFS_CSV_TIME_FMT)
+    except (ValueError, TypeError):
+        return None
+
+
+def _classify_ltfs_health_rows(rows):
+    """Split normalised LTFS rows into (fatal, degraded). Pure — unit-testable.
+
+    Each row is ``{"id": int, "at": str, "message": str}``.
+    """
+    fatal, degraded = [], []
+    for row in rows:
+        try:
+            eid = int(row.get("id"))
+        except (TypeError, ValueError):
+            continue
+        entry = {"id": eid, "at": (row.get("at") or "").strip(),
+                 "message": (row.get("message") or "").strip()}
+        if eid in _LTFS_FATAL_EVENTS:
+            entry["meaning"] = _LTFS_FATAL_EVENTS[eid]
+            fatal.append(entry)
+        elif eid in _LTFS_DEGRADED_EVENTS:
+            entry["meaning"] = _LTFS_DEGRADED_EVENTS[eid]
+            degraded.append(entry)
+        elif eid == 62173:
+            low = entry["message"].lower()
+            if any(m in low for m in _LTFS_62173_FAULT_MARKERS):
+                entry["meaning"] = "drive reported a media/positioning fault"
+                degraded.append(entry)
+    return fatal, degraded
+
+
+def ltfs_media_health(since_iso=None, log_path=None):
+    """Report drive/medium faults the LTFS mount has logged.
+
+    Reads IBM's own ``LogFile.csv`` trace — read-only, and it never touches the
+    drive or moves tape. Pass ``since_iso`` (the mount's start time) so faults
+    from a previous cartridge cannot block the current one; the evidence then
+    resets naturally on every remount.
+
+    Returns a dict with ``determinate``, ``ok``, ``fatal``, ``degraded``,
+    ``since``, ``log_path`` and ``error``. ``ok`` is only meaningful when
+    ``determinate`` is True; callers that gate a tape write should fail closed on
+    an indeterminate result, as the mount-mode gate does.
+    """
+    path = log_path or _LTFS_LOG_CSV_DEFAULT
+    info = {"determinate": False, "ok": False, "fatal": [], "degraded": [],
+            "since": since_iso, "log_path": path, "error": None}
+
+    cutoff = None
+    if since_iso:
+        try:
+            parsed = datetime.fromisoformat(str(since_iso))
+            # CSV stamps are naive local time; normalise the bound to match.
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone().replace(tzinfo=None)
+            cutoff = parsed
+        except (ValueError, TypeError) as e:
+            info["error"] = f"unparsable since timestamp {since_iso!r}: {e}"
+            get_logger().warning("ltfs_media_health_bad_since: %s", info["error"])
+            return info
+
+    rows = []
+    try:
+        # LTFS holds the file open for append; read shared and tolerate the
+        # mixed encodings its messages occasionally carry.
+        with open(path, "r", encoding="utf-8", errors="replace",
+                  newline="") as fh:
+            for rec in csv.reader(fh):
+                # id, level, timestamp, pid, tid, drive, message
+                if len(rec) < 7:
+                    continue
+                try:
+                    eid = int(rec[0])
+                except (TypeError, ValueError):
+                    continue
+                if eid not in _LTFS_HEALTH_EVENT_IDS:
+                    continue
+                when = _parse_ltfs_csv_time(rec[2])
+                if when is None:
+                    continue
+                if cutoff is not None and when < cutoff:
+                    continue
+                rows.append({"id": eid, "at": rec[2].strip(),
+                             "message": rec[6].strip()})
+    except OSError as e:
+        info["error"] = f"cannot read {path}: {e}"
+        get_logger().warning("ltfs_media_health_check_failed: %s", info["error"])
+        return info
+
+    # Newest first, so callers can report the latest event without re-sorting.
+    rows.reverse()
+    info["fatal"], info["degraded"] = _classify_ltfs_health_rows(rows)
+    info["determinate"] = True
+    info["ok"] = not info["fatal"] and not info["degraded"]
     return info
 
 

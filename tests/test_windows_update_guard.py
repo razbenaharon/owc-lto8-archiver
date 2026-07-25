@@ -360,3 +360,77 @@ class CliWiringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LtfsMediaHealthTests(unittest.TestCase):
+    """The guard that would have caught the 2026-07-24 cartridge freeze.
+
+    Four days before Tape_02 was frozen permanently, the drive had already
+    failed 45 LOCATE operations with a write-perm error. LTFS masked every one
+    ("Replace a return code to -1201") and nothing read the log. These tests pin
+    the two properties that matter: the early warning is detected, and ordinary
+    mode-sense chatter does not cry wolf.
+    """
+
+    # id, level, timestamp, pid, tid, drive, message
+    ROWS = [
+        ('61259', 'Information', '2026/07/20 10:00:00.000', '1', '2', 'Z',
+         'Sync type is "time", Sync time is 300 sec'),
+        ('62173', 'Information', '2026/07/20 10:05:00.000', '1', '2', 'Z',
+         'Error on modesense: Not Ready to Ready Transition, Medium May Have '
+         'Changed (-20601) 0000000000.'),
+        ('17267', 'Error', '2026/07/20 19:42:11.557', '1', '2', 'Z',
+         'Locate command returns write-perm error (-20301). Replace a return '
+         'code to -1201.'),
+        ('62173', 'Information', '2026/07/24 07:07:41.022', '1', '2', 'Z',
+         'Error on write: Track Following Error (Servo) (-20301) 0000000000.'),
+        ('12045', 'Error', '2026/07/24 07:08:18.709', '1', '2', 'Z',
+         'Cannot write block: backend call failed (-20301). Dropping to '
+         'read-only mode.'),
+    ]
+
+    def _log(self, rows=None):
+        import csv as _csv
+        fd, path = tempfile.mkstemp(suffix=".csv")
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            _csv.writer(fh).writerows(rows if rows is not None else self.ROWS)
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def test_benign_mode_sense_is_not_a_fault(self):
+        """The one false positive that would make the guard untrustworthy."""
+        rows = [r for r in self.ROWS if r[2].startswith('2026/07/20 10:')]
+        health = wug.ltfs_media_health(log_path=self._log(rows))
+        self.assertTrue(health["determinate"])
+        self.assertTrue(health["ok"], health)
+        self.assertEqual(health["fatal"], [])
+        self.assertEqual(health["degraded"], [])
+
+    def test_locate_write_perm_is_caught_as_early_warning(self):
+        health = wug.ltfs_media_health(log_path=self._log())
+        self.assertTrue(health["determinate"])
+        self.assertFalse(health["ok"])
+        ids = {e["id"] for e in health["degraded"]}
+        self.assertIn(17267, ids)          # the masked LOCATE failure
+        self.assertIn(62173, ids)          # the servo error, by message
+        self.assertIn(12045, {e["id"] for e in health["fatal"]})
+
+    def test_since_scopes_evidence_to_the_current_mount(self):
+        """A previous cartridge's faults must not block the current one."""
+        health = wug.ltfs_media_health(
+            since_iso="2026-07-25T00:00:00", log_path=self._log())
+        self.assertTrue(health["determinate"])
+        self.assertTrue(health["ok"], health)
+
+    def test_newest_event_is_reported_first(self):
+        health = wug.ltfs_media_health(log_path=self._log())
+        self.assertEqual(health["fatal"][0]["id"], 12045)
+        self.assertTrue(
+            health["degraded"][0]["at"] > health["degraded"][-1]["at"])
+
+    def test_unreadable_log_is_indeterminate_so_callers_fail_closed(self):
+        health = wug.ltfs_media_health(log_path=os.path.join(
+            tempfile.gettempdir(), "definitely-not-here-ltfs.csv"))
+        self.assertFalse(health["determinate"])
+        self.assertFalse(health["ok"])
+        self.assertIn("cannot read", health["error"])
