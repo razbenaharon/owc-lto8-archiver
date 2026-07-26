@@ -171,7 +171,12 @@ The preserved local pack is intact and reusable — 6 files,
 **1,731,382,179 bytes**, matching the expected accounting exactly, plus the
 local-only `_resume_pack.json` marker.
 
-## Current state
+## Production state snapshot
+
+**As observed on `EXAMPLE-HOST` on 2026-07-25.** This table is not a live
+dashboard. Re-verify production processes, PostgreSQL, the current mount, and
+LTFS logs before acting; a synced repository clone cannot confirm or invalidate
+this state.
 
 | Item | State |
 | ------ | ------- |

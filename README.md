@@ -4,6 +4,15 @@ A Python CLI for archiving files to LTO tape using an OWC Mercury Pro LTO-8 driv
 
 Licensed under the [MIT License](LICENSE) — © 2026 Raz Ben Aharon. Free to use, modify, and distribute with attribution.
 
+## Documentation
+
+- [Documentation map](docs/README.md) — task routing and source-of-truth rules
+  for engineers and LLMs.
+- [Repository and safety guidance](AGENTS.md) — read before changing code or
+  operating a live tape run.
+- [Incident index and last documented production state](docs/incidents/README.md)
+  — read before recovery or troubleshooting.
+
 ## Features
 
 - **Smart packing** — small files (under a configurable threshold) are bundled into ZIP archives to minimize tape fragmentation; large files are copied directly

@@ -9,6 +9,37 @@ and **what prevents a repeat**. Written in English to match the rest of the repo
 Any incident whose recovery required someone to physically walk to the drive is
 tagged **PHYSICAL** and is treated as a design defect, not just an outage.
 
+## Last documented production state
+
+**Snapshot: `EXAMPLE-HOST`, as observed 2026-07-25. This is not live status.**
+Before acting, verify the production host directly with read-only process,
+PostgreSQL, current-mount, and LTFS-log checks. Do not infer production state
+from a synchronized clone on another computer.
+
+| Item | Last documented state |
+| --- | --- |
+| Production run | **Stopped; not resumed** |
+| Tape_02 | Last confirmed mounted as `Z:`, **read-only**, about 3.6 TB used |
+| Remote session 37 | Chunks 0–48 `done`; 49 `backing`; 50 stale `fetching`; 51–95 `pending` |
+| Preserved chunk 49 pack | Verified intact on the production host: 6 files, 1,731,382,179 bytes, with resume marker |
+| Remaining work | About 73 GB |
+| Data integrity in incident 010 | No loss found; chunk 49 was empty on tape and was not committed |
+
+Open decisions and risks:
+
+- Incident [010](010-20260724-ltfs-write-perm-readonly.md): diagnose the drive,
+  then explicitly choose repair or read-only retirement for Tape_02.
+- Incident [005](005-20260715-sccm-forced-restart-data-loss.md): an SCCM
+  maintenance window/deployment exemption remains the durable restart fix.
+- Incident [007](007-20260717-dns-blip-3-day-idle.md): external monitoring and
+  automatic relaunch remain unimplemented.
+- Incident [008](008-20260717-fetch-overrun-abort-trap.md): the documented
+  host-local config overrides still require re-verification/revert at session
+  37 completion.
+
+When production state changes, update this section's date and facts, then update
+the relevant open incident. Preserve older evidence inside the incident file.
+
 ## Summary table
 
 | # | Date | Incident | Root cause (one line) | Fix | Physical? |
@@ -33,3 +64,5 @@ tagged **PHYSICAL** and is treated as a design defect, not just an outage.
 - "Chunk N" always means `remote_chunks.chunk_index = N`, i.e. the (N+1)-th chunk.
 - Evidence paths (`backup_logs/…`, LTFS `LogFile.csv`) are quoted verbatim so the
   claim can be re-checked later.
+- "Current", "now", and "mounted" are valid only inside an explicitly dated,
+  host-named snapshot. Otherwise use "last documented" or historical wording.

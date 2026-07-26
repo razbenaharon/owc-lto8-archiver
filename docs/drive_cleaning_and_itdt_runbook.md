@@ -40,11 +40,14 @@ overwritten" — **cancel**.
 
 ## Facts you will need
 
+These are the last documented production facts from `EXAMPLE-HOST`, as observed
+2026-07-25; re-verify them at handover.
+
 | Item | Value |
 |---|---|
 | Drive | IBM ULTRIUM-HH8, serial **0000000000** |
 | Device ID | `SCSI\SEQUENTIAL&VEN_IBM&PROD_ULTRIUM-HH8\7&1EDBF2CE&0&000000` |
-| Cartridge | Tape_02, currently mounted read-only on `Z:` |
+| Cartridge | Tape_02, last confirmed mounted read-only on `Z:` |
 | ITDT | `C:\Program Files\IBM\ITDT Graphical Edition\itdt-ge.exe` |
 | LTFS log | `C:\Program Files\IBM\LTFS\log\LogFile.csv` |
 

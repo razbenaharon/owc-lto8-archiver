@@ -5,6 +5,22 @@ tapes. It fetches data from a remote host over SSH, packs many small files into 
 bundles, writes them to an LTFS-mounted tape via `robocopy`, and indexes every file
 in a PostgreSQL catalog (see `docker-compose.yml` and `scripts/sql/`).
 
+## Documentation Routing & Sources of Truth
+
+Start with `docs/README.md` for task routing and the source-of-truth hierarchy.
+Before live operation or recovery, read `docs/incidents/README.md` and the newest
+incident marked **OPEN**. Operational status in Markdown is always a dated
+snapshot: verify live state on production host `EXAMPLE-HOST`. A synced clone on
+another computer is not evidence of production process, DB, staging, or tape
+state.
+
+For conflicts: current code/tests define behavior; the production host's
+untracked `config.ini` defines active configuration; PostgreSQL defines
+session/chunk state; LTFS event 61259 defines the mounted sync mode; IBM
+`LogFile.csv` defines current-mount media health. A later explicit correction
+supersedes an older recommendation. Safety rules in this file and incident 000
+remain non-negotiable.
+
 ## Project Structure & Module Organization
 
 - `run.py` — root runner for the main CLI (chdir to the project root, then
@@ -110,16 +126,19 @@ perf work. In brief:
    (100-320 MB/s) but IBM LTFS default `sync_type=time@5` re-syncs the index
    every 5 min, and each sync seeks across a filling tape → *effective* per-chunk
    speed collapses to 8-46 MB/s and the collapse worsens as the cartridge fills.
-   Two fixes: `sync_type=unmount` in `ltfs.conf.local` (syncs once at the single
-   end-of-session eject; applies only on the next physical remount), and **bigger
-   chunks** (`chunk_max_files`) that amortise the fixed overhead — a 135 GB chunk
-   wrote at **208.6 MB/s effective**. After the remount, dial chunks back to
-   ~150-200k files (huge chunks then only add fetch latency / RAM / staging).
+   A historical `sync_type=unmount` experiment removed that overhead but is
+   **superseded and forbidden**: a forced restart then loses every index update
+   since mount, which caused incident 005. The required mode is `time@5`,
+   verified from the live mount. Amortise overhead only through bounded chunk
+   sizing; a 135 GB historical chunk wrote at **208.6 MB/s effective**, but
+   larger chunks increase restart exposure and recovery blast radius. Read
+   `docs/tape_transfer_size_analysis.md` before changing chunk size.
 3. **Fetch — single-stream small-file latency.** One SSH/tar stream over 100k
    tiny files is per-file-latency bound at ~15 MB/s. `[PERFORMANCE]
    fetch_parallel_streams` (default 1) runs N concurrent tar streams
    (`RemoteOrchestrator._fetch_batches_parallel`); 3 measured ~30 MB/s. Once the
-   tape is fast (unmount), fetch becomes the binding constraint.
+   tape overhead is amortised by a sufficiently large bounded chunk, fetch can
+   become the binding constraint.
 
 ## Storage Map & Analytics (`storage_map/`)
 
