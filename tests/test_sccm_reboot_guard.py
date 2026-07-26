@@ -18,6 +18,7 @@ import os
 import tempfile
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from src import windows_update_guard as wug
@@ -252,8 +253,14 @@ class PreTapeWriteGateTests(unittest.TestCase):
     """Scenarios 8-13: the gate runs before each write and never interrupts one."""
 
     def setUp(self):
+        # object.__new__ skips __init__, so every attribute the gate reads has
+        # to be supplied here by hand — including `cfg`, whose absence made all
+        # three tests raise AttributeError once the gate started consulting
+        # `[WINDOWS_UPDATE] block_on_pending_reboot`.
         self.orch = object.__new__(ro.RemoteOrchestrator)
         self.orch.notifier = None
+        self.orch.cfg = SimpleNamespace(
+            windows_update_block_on_pending_reboot=True)
         self.desc = StagedChunk(chunk_index=22, fetch_dir="f", pack_dir="p",
                                 metadata=[], staged_bytes=10)
 
@@ -272,6 +279,36 @@ class PreTapeWriteGateTests(unittest.TestCase):
             reasons, _ = self.orch._pre_tape_write_reboot_check(37, self.desc, "T")
         self.assertTrue(reasons)
         notify.assert_called_once()
+
+    def test_soft_marker_flag_follows_the_operator_config(self):
+        """The gate must honour ``[WINDOWS_UPDATE] block_on_pending_reboot``.
+
+        The flag is currently overridden to false on this host, so the gate
+        agreeing with the start gate is live behaviour, not a hypothetical:
+        if they disagree the run stops within 60s on the very soft marker the
+        operator overrode.
+        """
+        self.orch.cfg = SimpleNamespace(
+            windows_update_block_on_pending_reboot=False)
+        self.assertFalse(self.orch._block_on_soft_reboot_marker())
+
+        self.orch.cfg = SimpleNamespace(
+            windows_update_block_on_pending_reboot=True)
+        self.assertTrue(self.orch._block_on_soft_reboot_marker())
+
+        # An older config with the key absent must fail safe (block), never
+        # silently drop the soft marker.
+        self.orch.cfg = SimpleNamespace()
+        self.assertTrue(self.orch._block_on_soft_reboot_marker())
+
+    def test_soft_marker_flag_reaches_reboot_block_reasons(self):
+        # The flag is only useful if it is actually forwarded to the checker.
+        self.orch.cfg = SimpleNamespace(
+            windows_update_block_on_pending_reboot=False)
+        with mock.patch.object(ro, "reboot_block_reasons",
+                               return_value=([], {"determinate": True})) as chk:
+            self.orch._pre_tape_write_reboot_check(37, self.desc, "T")
+        self.assertIs(chk.call_args.kwargs["include_soft"], False)
 
     def test_gate_failure_falls_back_to_windows_markers(self):
         """The gate must never be the thing that takes the pipeline down."""
