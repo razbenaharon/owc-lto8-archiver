@@ -192,6 +192,15 @@ hardware/manual verification if relevant, and any database/config changes. For
   it is printed as a `[WARNING]` (`LTFS_WRITE_WARNING`, defined in
   `src/constants.py`) at the start of every tape-write run and at remote-pipeline
   start.
+- **Retiring a cartridge is a status, not a number.** `tapes.status='full'`
+  (migration `011`, set via Database Management → 7 or the inspector's
+  *Mark Full / Re-activate*) is the only durable way to take a tape out of the
+  write rotation: `recalculate_tape_used_space` rewrites `used_space` from the
+  catalog on every mount, so editing byte counters to fake "full" is silently
+  undone at the next run. A marked tape reports zero available bytes from
+  `tape_budget_bytes` and is refused by both orchestrators before a write
+  starts. Tape_02 is marked this way — read-only at ~5 TB of 12 TB after its
+  PWE bit latched ([incident 010](docs/incidents/010-20260724-ltfs-write-perm-readonly.md)).
 - **No Independent Write Verification.** Never add code that reads from the tape
   immediately after a write/copy operation just for verification purposes.
   Unnecessary reading right after writing causes wear and tear and damages the
