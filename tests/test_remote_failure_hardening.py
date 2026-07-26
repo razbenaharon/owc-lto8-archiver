@@ -52,6 +52,10 @@ def _orch(**attrs):
     orch._stop_result = None
     orch._last_fetch_failure = None
     orch.cfg = SimpleNamespace(backup_log_dir=None)
+    # Neutralised like the mount-mode and media-health checks: these cases
+    # exercise the other gate steps and must not read this host's real LTFS
+    # volume label. MountedCartridgeGuardTests covers the check itself.
+    orch._verify_mounted_cartridge = lambda _tape: None
     for key, value in attrs.items():
         setattr(orch, key, value)
     return orch

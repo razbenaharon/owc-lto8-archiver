@@ -553,6 +553,15 @@ class RemoteOrchestrator:
         if prior_block is not None:
             return self._finalize(prior_block, phase="resume-precheck")
 
+        # Also before any thread starts: the loaded cartridge must be this
+        # session's tape. The per-chunk gate enforces this too, but catching it
+        # here turns a ~40 min fetch+pack followed by a refusal into an
+        # immediate, obvious stop.
+        cartridge_block = self._verify_mounted_cartridge(tape_label)
+        if cartridge_block is not None:
+            cartridge_block.session_id = session_id
+            return self._finalize(cartridge_block, phase="resume-precheck")
+
         if self.fetch_cores:
             pin_current_process(self.fetch_cores, label='fetch/pack')
 
@@ -578,6 +587,7 @@ class RemoteOrchestrator:
         # boundary while LTFS can still sync, rather than be killed mid-write.
         reboot_sentinel = RebootSentinel(
             stop_pipeline,
+            include_soft=self._block_on_soft_reboot_marker(),
             on_detect=lambda reasons: (
                 self._record_reboot_stop(reasons),
                 send_best_effort(
@@ -955,6 +965,15 @@ class RemoteOrchestrator:
         if prior_block is not None:
             return self._finalize(prior_block, phase="resume-precheck")
 
+        # Also before any thread starts: the loaded cartridge must be this
+        # session's tape. The per-chunk gate enforces this too, but catching it
+        # here turns a ~40 min fetch+pack followed by a refusal into an
+        # immediate, obvious stop.
+        cartridge_block = self._verify_mounted_cartridge(tape_label)
+        if cartridge_block is not None:
+            cartridge_block.session_id = session_id
+            return self._finalize(cartridge_block, phase="resume-precheck")
+
         # --- per-session pipeline state ---
         self._staged_bytes   = 0
         self._producer_err   = None
@@ -991,6 +1010,7 @@ class RemoteOrchestrator:
         # at the next chunk boundary so LTFS syncs its index while it still can.
         reboot_sentinel = RebootSentinel(
             stop_pipeline,
+            include_soft=self._block_on_soft_reboot_marker(),
             on_detect=lambda reasons: (
                 self._record_reboot_stop(reasons),
                 send_best_effort(
@@ -1852,6 +1872,13 @@ class RemoteOrchestrator:
             media_block.chunk_index = ci
             return self._record_stop(media_block)
 
+        # 4c. The cartridge in the drive must be the one this session writes to.
+        cartridge_block = self._verify_mounted_cartridge(tape_label)
+        if cartridge_block is not None:
+            cartridge_block.session_id = session_id
+            cartridge_block.chunk_index = ci
+            return self._record_stop(cartridge_block)
+
         # 5. SCCM + Windows pending reboot (the synchronous, current re-check).
         reasons, sccm = self._pre_tape_write_reboot_check(
             session_id, desc, tape_label)
@@ -2017,6 +2044,81 @@ class RemoteOrchestrator:
               f"{payload.get('preserved_at')} — no re-fetch, no re-pack.")
         return desc
 
+    def _verify_mounted_cartridge(self, tape_label):
+        """Gate check: the mounted cartridge must be the session's tape.
+
+        Returns a blocking StopResult, or None when it is safe. Read-only — the
+        label comes from the already-mounted volume, never from the drive.
+
+        A resumed session takes its ``tape_label`` from the session row, and
+        until 2026-07-26 nothing compared that to the cartridge physically in
+        the drive. After the Tape_02 freeze the operator loaded Tape_03 and
+        resumed; the pipeline would have written the remaining chunks to
+        Tape_03 while cataloging every one of them under ``Tape_02``. Nothing
+        would have failed, and the catalog would have pointed a future restore
+        at the wrong cartridge — the read-only one that cannot be rewritten.
+
+        Fails **closed**: an unreadable label blocks the write, because "we
+        cannot tell which cartridge this is" is not a state in which to commit
+        files to a catalog keyed by cartridge.
+        """
+        try:
+            mounted = get_volume_label(self.cfg.lto_drive)
+        except Exception as e:
+            msg = (f"Cannot read the mounted volume label ({e}). Refusing to "
+                   "start a tape write: the catalog is keyed by cartridge and "
+                   "must not record a guess.")
+            print(f"\n[TAPE] {msg}")
+            get_logger().exception("mounted_cartridge_unreadable")
+            send_best_effort(self.notifier, f"[PIPELINE] {msg}")
+            return StopResult(
+                exit_code=ExitCode.SAFETY_BLOCK,
+                reason=REASON_UNEXPECTED_TAPE_OR_DB_STATE, resumable=False,
+                source="gate", detailed_reason=msg)
+
+        if not mounted:
+            msg = ("The mounted volume reports no label. Refusing to start a "
+                   f"tape write for session tape '{tape_label}'.")
+            print(f"\n[TAPE] {msg}")
+            get_logger().error("mounted_cartridge_unlabelled: expected=%s",
+                               tape_label)
+            send_best_effort(self.notifier, f"[PIPELINE] {msg}")
+            return StopResult(
+                exit_code=ExitCode.SAFETY_BLOCK,
+                reason=REASON_UNEXPECTED_TAPE_OR_DB_STATE, resumable=False,
+                source="gate", detailed_reason=msg)
+
+        if mounted != tape_label:
+            msg = (f"The mounted cartridge is '{mounted}' but this session "
+                   f"writes to '{tape_label}'. Refusing to write: the chunks "
+                   f"would land on '{mounted}' and be cataloged under "
+                   f"'{tape_label}', sending a future restore to the wrong "
+                   "cartridge. Load the right tape, or re-point the session.")
+            print(f"\n[TAPE] {msg}")
+            get_logger().error(
+                "mounted_cartridge_mismatch: mounted=%s session=%s",
+                mounted, tape_label)
+            send_best_effort(self.notifier, f"[PIPELINE] SAFETY STOP: {msg}")
+            return StopResult(
+                exit_code=ExitCode.SAFETY_BLOCK,
+                reason=REASON_UNEXPECTED_TAPE_OR_DB_STATE, resumable=False,
+                source="gate", detailed_reason=msg)
+
+        get_logger().info("mounted_cartridge_ok: %s", mounted)
+        return None
+
+    def _block_on_soft_reboot_marker(self):
+        """Whether PendingFileRenameOperations alone may stop the pipeline.
+
+        Follows the operator's ``[WINDOWS_UPDATE] block_on_pending_reboot``.
+        When that is false the start gate already proceeds past the marker, so
+        the sentinel and the pre-write gate must agree — otherwise the run stops
+        within 60s on the very signal the operator overrode. The hard markers
+        (CBS / Windows Update) and SCCM's intent are unaffected either way.
+        """
+        return bool(getattr(
+            self.cfg, "windows_update_block_on_pending_reboot", True))
+
     def _pre_tape_write_reboot_check(self, session_id, desc, tape_label):
         """Refuse a new tape write while a restart is staged. Returns reasons.
 
@@ -2031,14 +2133,16 @@ class RemoteOrchestrator:
         log.info("pre_tape_write_reboot_check: session=%s chunk=%s tape=%s "
                  "staging=%s", session_id, desc.chunk_index + 1, tape_label,
                  desc.pack_dir)
+        include_soft = self._block_on_soft_reboot_marker()
         try:
-            reasons, sccm = reboot_block_reasons(block_on_unknown=True)
+            reasons, sccm = reboot_block_reasons(
+                block_on_unknown=True, include_soft=include_soft)
         except Exception:
             # The gate itself must never take the pipeline down. Fall back to
             # the Windows markers alone rather than blocking forever.
             log.exception("pre_tape_write_reboot_check failed; "
                           "falling back to Windows markers")
-            return list(pending_reboot_reasons()), None
+            return list(pending_reboot_reasons(include_soft=include_soft)), None
 
         if reasons:
             detail = "; ".join(reasons)
