@@ -24,6 +24,7 @@ from src.config import ConfigManager
 from src.telegram_notify import TelegramNotifier
 from storage_map.lib import core
 from storage_map.lib import baseline as baseline_lib
+from storage_map.lib import deletions as deletions_lib
 from storage_map.lib.dashboard import _server_leaves
 from storage_map.webapp import coverage as cov
 from storage_map.webapp.jobs import JobBusy, JobManager
@@ -170,6 +171,28 @@ def create_app(cfg=None):
     @app.get('/api/coverage')
     def api_coverage():
         return _coverage_payload()
+
+    # Directories deleted from the servers after being archived. Read-only:
+    # the dashboard reports the ledger, it never performs a deletion.
+    @app.get('/api/deletions')
+    def api_deletions():
+        return deletions_lib.payload(smcfg)
+
+    @app.get('/api/deletions/inventory/{name}')
+    def api_deletion_inventory(name: str):
+        # Serve only a file the ledger itself references, matched on basename.
+        # Deriving the path from the ledger (never from the URL) keeps a
+        # crafted name from reaching outside the deletions directory.
+        wanted = os.path.basename(name)
+        known = {os.path.basename(r['inventory']): r['inventory']
+                 for r in deletions_lib.load_ledger(smcfg) if r.get('inventory')}
+        if wanted not in known:
+            raise HTTPException(status_code=404, detail='unknown inventory file')
+        path = os.path.join(smcfg.output_dir, known[wanted])
+        if not os.path.isfile(path):
+            raise HTTPException(status_code=404, detail='inventory file is missing')
+        return FileResponse(path, filename=wanted,
+                            media_type='application/gzip')
 
     @app.post('/api/export/html')
     def api_export_html(payload: dict = Body(default=None)):

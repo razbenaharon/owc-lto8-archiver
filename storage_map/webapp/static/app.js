@@ -258,6 +258,58 @@ function renderCoverage(report) {
     : 'Nothing to show yet.'}</div>`;
 }
 
+/* ----------------------------------------------------------- deletions -- */
+function delRow(rec) {
+  const v = rec.verification || {};
+  // A record only justifies itself if both counts matched at deletion time;
+  // anything else is flagged rather than quietly shown as a clean reclaim.
+  const verified = v.files_match && v.bytes_match;
+  const badge = verified
+    ? '<span class="badge full">verified on tape</span>'
+    : '<span class="badge none">unverified</span>';
+  const invName = (rec.inventory || '').split('/').pop();
+  const inv = invName
+    ? `<a href="/api/deletions/inventory/${encodeURIComponent(invName)}"
+         title="${esc(rec.inventory)}">inventory</a>`
+    : '<span class="muted">—</span>';
+  return `<tr>
+    <td class="dir" title="${esc(rec.path)}">${esc(rec.path)}</td>
+    <td>${esc(rec.server || '—')}</td>
+    <td>${esc(rec.owner || '—')}</td>
+    <td class="num">${esc(human(rec.bytes))}</td>
+    <td class="num">${Number(rec.files || 0).toLocaleString()}</td>
+    <td>${esc(rec.tape_label || '—')}</td>
+    <td class="num muted">${esc((rec.deleted_at || '').slice(0, 10))}</td>
+    <td>${badge}</td>
+    <td class="muted">${inv}</td>
+  </tr>`;
+}
+
+function renderDeletions(report) {
+  const records = (report && report.records) || [];
+  const panel = $('#deletions-panel');
+  // Nothing deleted yet is the normal state — keep the panel out of the way
+  // instead of showing an empty table on every dashboard.
+  if (!records.length) { panel.hidden = true; return; }
+  panel.hidden = false;
+
+  const t = report.totals || {};
+  $('#deletions-sub').textContent =
+    `${records.length} director${records.length === 1 ? 'y' : 'ies'} deleted ` +
+    `after their archive was verified on tape · ${human(t.bytes)} reclaimed · ` +
+    `${Number(t.files || 0).toLocaleString()} files · ` +
+    `${(t.servers || []).join(', ')}`;
+
+  $('#deletions').innerHTML = `<div class="cov-scroll"><table class="cov">
+      <thead><tr>
+        <th>Directory</th><th>Server</th><th>Owner</th>
+        <th class="num">Reclaimed</th><th class="num">Files</th>
+        <th>Tape</th><th class="num">Deleted</th><th>Evidence</th><th>Manifest</th>
+      </tr></thead>
+      <tbody>${records.map(delRow).join('')}</tbody>
+    </table></div>`;
+}
+
 function maybeAutoRefreshCoverage(report) {
   /* A snapshot older than DB_FRESH_HOURS silently hides everything archived
    * since, so re-aggregate once per page load instead of waiting for a manual
@@ -406,6 +458,15 @@ archivedOnlyBox.addEventListener('change', () => {
   if (lastCoverage) renderCoverage(lastCoverage);
 });
 
+async function loadDeletions() {
+  try {
+    renderDeletions(await getJSON('/api/deletions'));
+  } catch (err) {
+    $('#deletions-panel').hidden = true;
+  }
+}
+
 loadOverview();
 loadCoverage();
+loadDeletions();
 refreshJobs();

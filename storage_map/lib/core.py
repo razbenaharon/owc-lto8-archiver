@@ -32,6 +32,7 @@ This module sits at the very top of the package dependency graph (it imports
 so it stays fully decoupled from the tape pipeline.
 """
 import argparse
+import base64
 import json
 import os
 import posixpath
@@ -304,24 +305,69 @@ def _remote_launcher_script(server, depth):
     return '\n'.join(lines)
 
 
-def _remote_launch_command(server, depth):
-    """Full remote command: write run.sh then detach it from the SSH session."""
+# OpenSSH silently truncates an over-long remote command. Measured 2026-07-26
+# with OpenSSH_10.3p1: the command was cut at *exactly* 8192 bytes, which
+# amputated the closing heredoc terminator — so `cat > run.sh <<'__SM_EOF__'`
+# swallowed the rest of the command (chmod, setsid, `echo LAUNCHED`) into the
+# file, wrote a half-line script, and launched nothing. The only symptom was a
+# bash "here-document delimited by end-of-file" warning and a missing LAUNCHED.
+# Six mounts already produce a ~9.2 KB script, so the payload is uploaded in
+# chunks and its length verified rather than trusted.
+REMOTE_CMD_CHUNK_BYTES = 3000
+
+
+def _script_upload_commands(remote_dir, run_sh, script):
+    """Commands that rebuild ``script`` at ``run_sh``, each safely under the cap.
+
+    base64 sidesteps quoting, embedded newlines and any CR translation on the
+    way, and the final command reports the reconstructed byte count so the
+    caller can prove nothing was lost in transit.
+    """
     q = shlex.quote
-    script = _remote_launcher_script(server, depth)
-    run_sh = REMOTE_SCAN_DIR + '/run.sh'
-    # A *quoted* heredoc terminator stores the script literally, so $DIR / $PRE /
-    # $(date) are expanded when run.sh executes on the server, not now.
+    b64 = base64.b64encode(script.encode('utf-8')).decode('ascii')
+    staged = run_sh + '.b64'
+    cmds = [f'mkdir -p {q(remote_dir)} && : > {q(staged)}']
+    cmds += [f'printf %s {q(b64[i:i + REMOTE_CMD_CHUNK_BYTES])} >> {q(staged)}'
+             for i in range(0, len(b64), REMOTE_CMD_CHUNK_BYTES)]
+    cmds.append(
+        f'base64 -d {q(staged)} > {q(run_sh)} && rm -f {q(staged)} && '
+        f'chmod +x {q(run_sh)} && printf "UPLOADED:%s\\n" "$(wc -c < {q(run_sh)})"')
+    return cmds
+
+
+def _remote_detach_command(run_sh):
+    """Detach run.sh from the SSH session so it survives the disconnect."""
+    q = shlex.quote
     return (
-        f'mkdir -p {q(REMOTE_SCAN_DIR)} && '
-        f'cat > {q(run_sh)} <<\'__SM_EOF__\'\n'
-        f'{script}\n'
-        f'__SM_EOF__\n'
-        f'chmod +x {q(run_sh)}\n'
         f'if command -v setsid >/dev/null 2>&1; then '
         f'setsid sh {q(run_sh)} </dev/null >/dev/null 2>&1 & '
         f'else nohup sh {q(run_sh)} </dev/null >/dev/null 2>&1 & fi\n'
         f'echo LAUNCHED'
     )
+
+
+def launch_remote_script(server, remote_dir, run_sh, script, timeout=120):
+    """Upload ``script`` and start it detached. Returns ``(ok, error_text)``.
+
+    The upload is verified before anything runs: a truncated script must fail
+    loudly here rather than execute a half-written command on a lab server.
+    """
+    expected = len(script.encode('utf-8'))
+    for cmd in _script_upload_commands(remote_dir, run_sh, script):
+        res = _ssh_run(server.user, server.host, cmd,
+                       password=server.password, timeout=timeout)
+        if res.returncode != 0:
+            return False, (res.stderr or res.stdout or '').strip()
+        if 'UPLOADED:' in (res.stdout or ''):
+            got = (res.stdout.split('UPLOADED:')[1].split()[0] or '').strip()
+            if got != str(expected):
+                return False, (f'upload verification failed: server wrote '
+                               f'{got} bytes, expected {expected}')
+    res = _ssh_run(server.user, server.host, _remote_detach_command(run_sh),
+                   password=server.password, timeout=timeout)
+    if res.returncode != 0 or 'LAUNCHED' not in (res.stdout or ''):
+        return False, (res.stderr or res.stdout or '').strip()
+    return True, ''
 
 
 def scan(smcfg, servers, notifier=None):
@@ -334,13 +380,12 @@ def scan(smcfg, servers, notifier=None):
     for srv in servers:
         print(f"[SCAN] Launching background scan on {srv.name} ({srv.host}) "
               f"for {len(srv.mounts)} mount(s)...")
-        cmd = _remote_launch_command(srv, smcfg.depth)
-        result = _ssh_run(srv.user, srv.host, cmd,
-                          password=srv.password, timeout=120)
-        if result.returncode != 0 or 'LAUNCHED' not in (result.stdout or ''):
+        ok, err = launch_remote_script(
+            srv, REMOTE_SCAN_DIR, REMOTE_SCAN_DIR + '/run.sh',
+            _remote_launcher_script(srv, smcfg.depth))
+        if not ok:
             failures += 1
             failed.append(srv.name)
-            err = (result.stderr or '').strip() or (result.stdout or '').strip()
             print(f"[SCAN] FAILED to launch on {srv.name}: {err}")
             continue
         _write_manifest(smcfg, srv, started_at)

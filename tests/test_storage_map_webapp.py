@@ -1,7 +1,10 @@
 """Tests for the Storage Map web dashboard (coverage math + API routes)."""
+import base64
 import configparser
+import inspect
 import json
 import os
+import shlex
 import tempfile
 import threading
 import time
@@ -9,6 +12,8 @@ import unittest
 from unittest import mock
 
 from storage_map.lib import baseline as baseline_lib
+from storage_map.lib import core
+from storage_map.lib import deletions as deletions_lib
 from storage_map.lib.core import ServerConfig, parse_raw_log
 from storage_map.webapp import coverage as cov
 
@@ -649,6 +654,192 @@ class WebAppApiTests(unittest.TestCase):
             ]
         for body in bodies:
             self.assertNotIn("sekret-hunter2", body)
+
+
+class RemoteScriptUploadTests(unittest.TestCase):
+    """A remote command over ~8 KiB is silently truncated by OpenSSH, which on
+    2026-07-26 cut the heredoc terminator off the scan launcher and started
+    nothing. The upload must therefore stay chunked and be length-verified."""
+
+    def _script(self, size=9159):
+        return "x" * size
+
+    def test_no_upload_command_approaches_the_ssh_truncation_limit(self):
+        cmds = core._script_upload_commands(
+            ".storage_map/current", ".storage_map/current/run.sh",
+            self._script())
+        self.assertGreater(len(cmds), 3, "a 9 KB script must be split")
+        for cmd in cmds:
+            self.assertLess(len(cmd.encode()), 8192, cmd[:60])
+
+    def test_chunks_reassemble_to_the_original_script(self):
+        script = "printf 'hello\nworld'\n$PRE du -x /strg/D\n" * 300
+        cmds = core._script_upload_commands("d", "d/run.sh", script)
+        # shlex tokens are: printf %s <chunk> >> <staged>
+        blob = "".join(
+            shlex.split(c)[2] for c in cmds if c.startswith("printf %s "))
+        self.assertEqual(base64.b64decode(blob).decode(), script)
+
+    def test_upload_is_rejected_when_the_server_reports_a_short_write(self):
+        script = self._script()
+        srv = mock.Mock(user="u", host="h", password="")
+        # Every upload step succeeds, but the verification line reports fewer
+        # bytes than were sent — exactly the truncation signature.
+        short = mock.Mock(returncode=0, stdout="UPLOADED:8106\n", stderr="")
+        with mock.patch.object(core, "_ssh_run", return_value=short) as ssh:
+            ok, err = core.launch_remote_script(srv, "d", "d/run.sh", script)
+        self.assertFalse(ok)
+        self.assertIn("expected 9159", err)
+        # The detach must never run after a failed verification.
+        for call in ssh.call_args_list:
+            self.assertNotIn("setsid", call.args[2])
+
+    def test_successful_upload_verifies_length_then_detaches(self):
+        script = self._script()
+
+        def fake(user, host, cmd, password="", timeout=None):
+            if "wc -c" in cmd:
+                return mock.Mock(returncode=0, stdout=f"UPLOADED:{len(script)}\n",
+                                 stderr="")
+            if "setsid" in cmd:
+                return mock.Mock(returncode=0, stdout="LAUNCHED\n", stderr="")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        srv = mock.Mock(user="u", host="h", password="")
+        with mock.patch.object(core, "_ssh_run", side_effect=fake):
+            ok, err = core.launch_remote_script(srv, "d", "d/run.sh", script)
+        self.assertTrue(ok, err)
+
+    def test_baseline_launcher_uses_the_same_verified_upload(self):
+        # The baseline launcher had a byte-identical heredoc bug; it must not
+        # regrow its own oversized-command path.
+        src = inspect.getsource(baseline_lib)
+        self.assertNotIn("__SM_EOF__", src)
+        self.assertIn("launch_remote_script", src)
+
+
+class DeletionLedgerTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.smcfg = mock.Mock(output_dir=os.path.join(self._tmp.name, "logs"))
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _record(self, path="/strg/E/shared-data/x", **over):
+        rec = {"server": "so02", "path": path, "deleted_at": "2026-07-26T22:31:00",
+               "files": 10, "bytes": 1234, "tape_label": "Tape_01",
+               "verification": {"files_match": True, "bytes_match": True}}
+        rec.update(over)
+        return rec
+
+    def test_missing_ledger_reads_as_empty(self):
+        self.assertEqual(deletions_lib.load_ledger(self.smcfg), [])
+
+    def test_append_then_load_round_trips(self):
+        deletions_lib.append_record(self.smcfg, self._record())
+        loaded = deletions_lib.load_ledger(self.smcfg)
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0]["path"], "/strg/E/shared-data/x")
+
+    def test_record_without_required_field_is_rejected(self):
+        bad = self._record()
+        del bad["tape_label"]
+        with self.assertRaises(ValueError):
+            deletions_lib.append_record(self.smcfg, bad)
+        self.assertEqual(deletions_lib.load_ledger(self.smcfg), [])
+
+    def test_rerecording_same_path_replaces_rather_than_duplicates(self):
+        deletions_lib.append_record(self.smcfg, self._record(files=10))
+        deletions_lib.append_record(self.smcfg, self._record(files=99))
+        loaded = deletions_lib.load_ledger(self.smcfg)
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0]["files"], 99)
+
+    def test_records_are_newest_first(self):
+        deletions_lib.append_record(
+            self.smcfg, self._record("/a", deleted_at="2026-01-01T00:00:00"))
+        deletions_lib.append_record(
+            self.smcfg, self._record("/b", deleted_at="2026-07-26T00:00:00"))
+        self.assertEqual([r["path"] for r in deletions_lib.load_ledger(self.smcfg)],
+                         ["/b", "/a"])
+
+    def test_corrupt_ledger_reads_as_empty_rather_than_raising(self):
+        os.makedirs(deletions_lib.ledger_dir(self.smcfg), exist_ok=True)
+        with open(deletions_lib.ledger_path(self.smcfg), "w",
+                  encoding="utf-8") as fh:
+            fh.write("{not json")
+        self.assertEqual(deletions_lib.load_ledger(self.smcfg), [])
+
+    def test_totals_sum_files_and_bytes_across_servers(self):
+        deletions_lib.append_record(self.smcfg, self._record("/a", files=3, bytes=100))
+        deletions_lib.append_record(
+            self.smcfg, self._record("/b", files=4, bytes=200, server="so01"))
+        totals = deletions_lib.payload(self.smcfg)["totals"]
+        self.assertEqual(totals["count"], 2)
+        self.assertEqual(totals["files"], 7)
+        self.assertEqual(totals["bytes"], 300)
+        self.assertEqual(totals["servers"], ["so01", "so02"])
+
+
+class DeletionApiTests(unittest.TestCase):
+    def setUp(self):
+        try:
+            from fastapi.testclient import TestClient
+        except ImportError:
+            self.skipTest("fastapi is not installed "
+                          "(optional Storage Map dependency)")
+        from storage_map.webapp.app import create_app
+
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+        self.cfg = _FakeCfg(self.tmp)
+        os.makedirs(os.path.join(self.tmp, "logs"), exist_ok=True)
+        with open(os.path.join(self.tmp, "logs", "so01_latest.rawlog"),
+                  "w", encoding="utf-8") as fh:
+            fh.write(SAMPLE_RAWLOG_B1)
+        self.smcfg = mock.Mock(output_dir=os.path.join(self.tmp, "logs"))
+        self.client = TestClient(create_app(self.cfg))
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_empty_ledger_returns_empty_records(self):
+        data = self.client.get("/api/deletions").json()
+        self.assertEqual(data["records"], [])
+        self.assertEqual(data["totals"]["count"], 0)
+
+    def test_ledger_records_are_served(self):
+        deletions_lib.append_record(self.smcfg, {
+            "server": "so02", "path": "/strg/E/shared-data/demo_dir",
+            "deleted_at": "2026-07-26T22:31:00", "files": 40559,
+            "bytes": 18197167218, "tape_label": "Tape_01",
+            "verification": {"files_match": True, "bytes_match": True}})
+        data = self.client.get("/api/deletions").json()
+        self.assertEqual(len(data["records"]), 1)
+        self.assertEqual(data["totals"]["bytes"], 18197167218)
+
+    def test_inventory_download_serves_a_referenced_file(self):
+        name = "so02_demo_dir_20260726_inventory.tsv.gz"
+        os.makedirs(deletions_lib.ledger_dir(self.smcfg), exist_ok=True)
+        with open(os.path.join(deletions_lib.ledger_dir(self.smcfg), name),
+                  "wb") as fh:
+            fh.write(b"payload")
+        deletions_lib.append_record(self.smcfg, {
+            "server": "so02", "path": "/x", "deleted_at": "2026-07-26T00:00:00",
+            "files": 1, "bytes": 1, "tape_label": "Tape_01",
+            "verification": {"files_match": True, "bytes_match": True},
+            "inventory": f"deletions/{name}"})
+        resp = self.client.get(f"/api/deletions/inventory/{name}")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.content, b"payload")
+
+    def test_inventory_download_rejects_a_file_the_ledger_never_named(self):
+        # Path traversal and any unreferenced file must 404: the served path is
+        # derived from the ledger, never from the URL.
+        for probe in ("../../../../config.ini", "unknown.tsv.gz"):
+            resp = self.client.get(f"/api/deletions/inventory/{probe}")
+            self.assertEqual(resp.status_code, 404, probe)
 
 
 class RunAppTests(unittest.TestCase):

@@ -156,7 +156,14 @@ top-level Python entrypoint; internal code lives in `storage_map/lib/` and
   default 2 — never individual files) against the PostgreSQL catalog: one
   read-only aggregation of `files_index.original_path` prefixes
   (`webapp/coverage.py`), cached in `storage_map/logs/coverage_cache.json`
-  and refreshed only via the "Refresh DB coverage" button. Binds to
+  and refreshed only via the "Refresh DB coverage" button. It also serves a
+  **deletion ledger** (`storage_map/lib/deletions.py`, `GET /api/deletions`,
+  the "Reclaimed from servers" panel): the permanent record of server
+  directories deleted *after* their archive was verified on tape, each entry
+  carrying the verification numbers and a gzipped inventory of every removed
+  file. The module only records deletions — it never performs one. Rules,
+  permissions, and the deletion log live in
+  [docs/server_deletions.md](docs/server_deletions.md). Binds to
   `127.0.0.1:8765` (`web_port`/`match_depth`/`host_map`
   keys in `[STORAGE_MAP]`, all optional). The app is intentionally local-only
   and binds to `127.0.0.1`. `fastapi`/`uvicorn` are optional

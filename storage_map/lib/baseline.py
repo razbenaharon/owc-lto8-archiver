@@ -30,6 +30,7 @@ from .core import (
     TOP_LAYER_DEPTH,
     _shared_data_child,
     _safe_int,
+    launch_remote_script,
     path_segments,
 )
 
@@ -94,22 +95,8 @@ def _remote_baseline_script(server, depth):
     return '\n'.join(lines)
 
 
-def _remote_baseline_launch_command(server, depth):
-    """Write run.sh remotely then detach it from the SSH session."""
-    q = shlex.quote
-    script = _remote_baseline_script(server, depth)
-    run_sh = REMOTE_BASELINE_DIR + '/run.sh'
-    return (
-        f'mkdir -p {q(REMOTE_BASELINE_DIR)} && '
-        f'cat > {q(run_sh)} <<\'__SM_EOF__\'\n'
-        f'{script}\n'
-        f'__SM_EOF__\n'
-        f'chmod +x {q(run_sh)}\n'
-        f'if command -v setsid >/dev/null 2>&1; then '
-        f'setsid sh {q(run_sh)} </dev/null >/dev/null 2>&1 & '
-        f'else nohup sh {q(run_sh)} </dev/null >/dev/null 2>&1 & fi\n'
-        f'echo LAUNCHED'
-    )
+def _remote_baseline_run_sh():
+    return REMOTE_BASELINE_DIR + '/run.sh'
 
 
 def launch_baseline(smcfg, servers):
@@ -123,12 +110,13 @@ def launch_baseline(smcfg, servers):
     for srv in servers:
         print(f"[BASELINE] Launching exact find-count on {srv.name} "
               f"({srv.host})...")
-        cmd = _remote_baseline_launch_command(srv, smcfg.depth)
-        result = _ssh_run(srv.user, srv.host, cmd,
-                          password=srv.password, timeout=120)
-        if result.returncode != 0 or 'LAUNCHED' not in (result.stdout or ''):
+        # Chunked+verified upload: one oversized ssh command is silently
+        # truncated at 8 KiB (see core.launch_remote_script).
+        ok, err = launch_remote_script(
+            srv, REMOTE_BASELINE_DIR, _remote_baseline_run_sh(),
+            _remote_baseline_script(srv, smcfg.depth))
+        if not ok:
             failures += 1
-            err = (result.stderr or '').strip() or (result.stdout or '').strip()
             print(f"[BASELINE] FAILED to launch on {srv.name}: {err}")
             continue
         print(f"[BASELINE] {srv.name}: find running detached. Collect later.")
