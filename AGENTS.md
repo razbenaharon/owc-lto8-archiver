@@ -276,6 +276,36 @@ hardware/manual verification if relevant, and any database/config changes. For
   - **The `RebootData` registry key's existence proves nothing** — verified
     2026-07-17: present but empty while SCCM reported no pending restart. Read
     its *values* (`RebootBy`, `HardReboot`), never its presence.
+- **Swapping cartridges: re-point the session, and never trust `Test-Path`.**
+  The first swap (2026-07-26, Tape_02 → Tape_03) broke on three things at once;
+  full detail in [incident 011](docs/incidents/011-20260726-tape-swap-blockers.md).
+  The checklist that falls out of it:
+  - **`Test-Path Z:\` returning True does not mean the drive is alive.** If the
+    drive re-enumerates on the SAS bus (`esas4hba` PHY link down/up, LTFS
+    `Device ... has been removed`), `LtfsMain` keeps the old mount point alive
+    on a dead handle. The tell is `Device is not ready (-21702)` repeating in
+    `LogFile.csv`, and `\\.\tape0` no longer existing while the drive is now
+    `\\.\tape1`. Fix: restart the LTFS services and kill the wedged `LtfsMain`.
+    Safe only when the stale volume is read-only with its sync thread already
+    dead — otherwise you are discarding a live index.
+  - **A resumed session writes to whatever `remote_sessions.tape_label` says**,
+    not to whatever is loaded. After a swap, `UPDATE remote_sessions SET
+    tape_label=...`. `_verify_mounted_cartridge()` now refuses to write on a
+    mismatch (fails closed), but it will not fix the row for you. Already-written
+    chunks keep their old tape — attribution is per-bundle on
+    `archive_bundles.tape_label` — so re-pointing is non-destructive.
+  - **A fresh cartridge is the cheapest drive-vs-media test there is.** When a
+    cartridge latches read-only with a PWE bit, load a new one and see whether it
+    also latches. Tape_03 mounted `Volume Lock Status = 0x00` and wrote normally
+    on the same drive that was under suspicion — which answered the question for
+    free, without ITDT or a cleaning cartridge.
+- **`Set-MpPreference -DisableRemovableDriveScanning $true` can silently
+  no-op.** It is policy-managed on this host: the call succeeds and the value
+  still reads `False` — the same trap as the Windows Update pause. The
+  `ExclusionPath` entry for the LTFS drive is what actually takes. Always read
+  the value back. This matters because on 2026-07-26 a background scanner (with
+  no `python.exe` or `robocopy` running) read Bundle zips off the tape for nine
+  hours, each read costing a 49-minute LOCATE timeout on a damaged cartridge.
 - **Verify LTFS `sync_type` from the mount, not the config file.** The two drift
   silently: an MSI reinstall of IBM Storage Archive SDE on 2026-07-16 13:52 reset
   `ltfs.conf.local` to its packaged contents (which is why that file is dated

@@ -22,7 +22,8 @@ tagged **PHYSICAL** and is treated as a design defect, not just an outage.
 | [007](007-20260717-dns-blip-3-day-idle.md) | 2026-07-17 | Run stopped at chunk 25, sat idle ~3 days | Momentary Technion DNS failure (`could not resolve so01`); monitor ran on the host that lost the network; no auto-relaunch | `_fetch_one_batch` transient retry + backoff. Monitor placement & auto-relaunch still open | no |
 | [008](008-20260717-fetch-overrun-abort-trap.md) | 2026-07-17 | Run aborts: "fetched exceeds 2.0x the planned" | Partial resume plans only remaining bytes, but tar re-pulls whole batches | `fetch_overrun_abort_factor` override (**pending revert**); abort is self-healing — plain relaunch replans | no |
 | [009](009-20260724-robocopy-exit0-lie.md) | 2026-07-24 | Chunk 49 "succeeded" with 0 files copied | Robocopy returned exit 0 after `RETRY LIMIT EXCEEDED`, emitting no trustworthy summary | Durable raw logs + conservative classifier (`efda427`, `04dc841`, `19106f3`) | no |
-| [010](010-20260724-ltfs-write-perm-readonly.md) | 2026-07-24 → **OPEN** | All writes fail `ERROR 19 — media is write protected` | Drive/media WRITE-PERM error → LTFS latched the volume read-only; **not** the WP switch | Diagnosed 2026-07-25. Recovery not yet applied — see the file | **yes (so far)** |
+| [010](010-20260724-ltfs-write-perm-readonly.md) | 2026-07-24 | All writes fail `ERROR 19 — media is write protected` | Drive/media WRITE-PERM error → LTFS latched the volume read-only; **not** the WP switch | Resolved 2026-07-26 by retiring Tape_02 read-only and continuing on Tape_03 (option 2) | **yes** |
+| [011](011-20260726-tape-swap-blockers.md) | 2026-07-26 | Three blockers on the first cartridge swap | Dead mount passed `Test-Path`; health window anchored to a stale GUI process; a resumed session never checked which cartridge was loaded | Anchor on `LtfsMain`; `_verify_mounted_cartridge()` fails closed; `include_soft` reboot markers | no |
 
 ## Conventions
 

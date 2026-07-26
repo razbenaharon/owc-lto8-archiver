@@ -135,13 +135,26 @@ def _delete_value(root, path, name):
         pass
 
 
-def pending_reboot_reasons():
+def pending_reboot_reasons(include_soft=True):
     """Return a list of human-readable reasons Windows wants to restart now.
 
     A pending restart is the one state the pause cannot save us from: the
     update is already staged, and Windows will take the restart at its next
     opportunity regardless of the pause flag. The only safe move is to reboot
     before starting a multi-hour tape write, not during one.
+
+    The markers are not equally strong, and conflating them cost a run on
+    2026-07-26. ``RebootRequired`` and ``RebootPending`` are *hard* markers:
+    Windows has staged work that only a restart completes.
+    ``PendingFileRenameOperations`` is a *soft* one — it is a list of file
+    moves to apply **if** a restart happens, and it never causes one. Routine
+    Edge and Defender updates leave entries there for days, so treating it as
+    "a restart is staged" produces a permanent false positive that no amount of
+    waiting clears.
+
+    ``include_soft=False`` drops that marker. Callers use it only when the
+    operator has explicitly set ``block_on_pending_reboot = false``; the hard
+    markers and SCCM's own intent are never suppressed.
     """
     if winreg is None:
         return []
@@ -161,12 +174,13 @@ def pending_reboot_reasons():
         except OSError:
             pass
 
-    renames, _ = _read_value(
-        winreg.HKEY_LOCAL_MACHINE,
-        r"SYSTEM\CurrentControlSet\Control\Session Manager",
-        "PendingFileRenameOperations")
-    if renames:
-        reasons.append("Files are queued to be renamed on the next restart")
+    if include_soft:
+        renames, _ = _read_value(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager",
+            "PendingFileRenameOperations")
+        if renames:
+            reasons.append("Files are queued to be renamed on the next restart")
     return reasons
 
 
@@ -315,7 +329,7 @@ def sccm_reboot_status():
     return info
 
 
-def reboot_block_reasons(block_on_unknown=True):
+def reboot_block_reasons(block_on_unknown=True, include_soft=True):
     """Every reason a new tape write must not start right now.
 
     Unions the Windows pending-restart markers with the Configuration Manager
@@ -329,8 +343,12 @@ def reboot_block_reasons(block_on_unknown=True):
     being wrong is one deferred chunk. The background sentinel passes False,
     because there a transient WMI hiccup would stop a perfectly healthy run for
     no reason — it polls again in 60s, and the pre-write gate still backstops it.
+
+    ``include_soft`` is forwarded to :func:`pending_reboot_reasons`; see there
+    for why the file-rename marker is separable. SCCM's intent and the hard
+    Windows markers are never suppressed by it.
     """
-    reasons = list(pending_reboot_reasons())
+    reasons = list(pending_reboot_reasons(include_soft=include_soft))
     sccm = sccm_reboot_status()
 
     if sccm["reboot_pending"]:
@@ -439,10 +457,12 @@ class RebootSentinel:
     defended against.
     """
 
-    def __init__(self, stop_event, poll_seconds=60, on_detect=None):
+    def __init__(self, stop_event, poll_seconds=60, on_detect=None,
+                 include_soft=True):
         self.stop_event = stop_event
         self.poll_seconds = poll_seconds
         self.on_detect = on_detect
+        self.include_soft = include_soft
         self.triggered = False
         self._thread = None
         self._cancel = threading.Event()
@@ -451,7 +471,13 @@ class RebootSentinel:
         # block_on_unknown=False: a transient WMI failure must not stop a
         # healthy run. The pre-write gate refuses to start the next write while
         # the state is unknown, so nothing slips past on the path that matters.
-        reasons, _sccm = reboot_block_reasons(block_on_unknown=False)
+        #
+        # include_soft mirrors the operator's block_on_pending_reboot setting.
+        # Without it the sentinel would trip within 60s on a marker the start
+        # gate was explicitly told to ignore, making the override useless — the
+        # run would stop before writing a single chunk (observed 2026-07-26).
+        reasons, _sccm = reboot_block_reasons(
+            block_on_unknown=False, include_soft=self.include_soft)
         if not reasons:
             return False
         self.triggered = True
@@ -566,6 +592,23 @@ def ltfs_sync_mode_status(expect_seconds=300):
 # contains "ltfs" rather than pinning one spelling.
 _LTFS_PROCESS_MATCH = "ltfs"
 
+# ...but only ONE of those processes actually owns the mount: LtfsMain, which
+# performs the mount and emits the 61259 declaration. The others (LtfsManager,
+# LtfsMgmtSvc, LtfsAtMntSvc, LtfsGuiCancelShutdown) are services and GUI helpers
+# that outlive individual mounts.
+#
+# 2026-07-26: anchoring on the earliest *any* "ltfs" process broke a real run.
+# After a cartridge swap the LTFS services were restarted, but the GUI helper
+# LtfsGuiCancelShutdown survived from the previous day, so the mount window was
+# anchored ~28 h too early. The health check then swept in the OLD cartridge's
+# LOCATE faults and refused to write to a brand-new, provably clean tape.
+#
+# Preferring LtfsMain keeps the safety property intact: it starts before it
+# mounts the volume, so the anchor is still at or before the true mount, and the
+# evidence window can never be narrower than the mount itself. The broad match
+# stays as a fallback for SDE builds that name the mount process differently.
+_LTFS_MOUNT_PROCESS_MATCH = "ltfsmain"
+
 
 def ltfs_current_mount_status(expect_seconds=300):
     """Verify the *live* LTFS mount declared time@<expect_seconds>, and that the
@@ -599,6 +642,11 @@ def ltfs_current_mount_status(expect_seconds=300):
     # and the actual decision happen in Python so they are unit-testable.
     script = (
         "$ErrorActionPreference='Stop';"
+        "$m = Get-CimInstance Win32_Process "
+        f"-Filter \"Name LIKE '%{_LTFS_MOUNT_PROCESS_MATCH}%'\" "
+        "-ErrorAction SilentlyContinue |"
+        " Sort-Object CreationDate | Select-Object -First 1;"
+        "$mstart = if ($m) { $m.CreationDate.ToString('o') } else { '' };"
         "$p = Get-CimInstance Win32_Process "
         f"-Filter \"Name LIKE '%{_LTFS_PROCESS_MATCH}%'\" "
         "-ErrorAction SilentlyContinue |"
@@ -609,8 +657,8 @@ def ltfs_current_mount_status(expect_seconds=300):
         " Sort-Object TimeCreated -Descending | Select-Object -First 1;"
         "$etime = if ($e) { $e.TimeCreated.ToString('o') } else { '' };"
         "$emsg = if ($e) { ($e.Message -replace '\\s+',' ') } else { '' };"
-        "[pscustomobject]@{ProcStart=$pstart; EventTime=$etime; "
-        "EventMsg=$emsg} | ConvertTo-Json -Compress"
+        "[pscustomobject]@{MountProcStart=$mstart; ProcStart=$pstart; "
+        "EventTime=$etime; EventMsg=$emsg} | ConvertTo-Json -Compress"
     )
     try:
         proc = subprocess.run(
@@ -631,7 +679,10 @@ def ltfs_current_mount_status(expect_seconds=300):
         get_logger().warning("ltfs_current_mount_check_failed: %s", e)
         return info
 
-    proc_start = (data.get("ProcStart") or "").strip()
+    # Prefer the process that owns the mount; fall back to the broad match only
+    # when no LtfsMain-like process is running (differently-named SDE builds).
+    proc_start = ((data.get("MountProcStart") or "").strip()
+                  or (data.get("ProcStart") or "").strip())
     event_time = (data.get("EventTime") or "").strip()
     message = (data.get("EventMsg") or "").strip()
 

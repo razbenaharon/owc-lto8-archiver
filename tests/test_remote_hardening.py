@@ -117,6 +117,54 @@ class RemoteStagingSafetyTests(unittest.TestCase):
         self.assertEqual(orch.db.statuses, ["backup_failed"])
 
 
+class MountedCartridgeGuardTests(unittest.TestCase):
+    """The cartridge in the drive must be the one the session catalogs to.
+
+    2026-07-26: after Tape_02 was frozen read-only the operator loaded Tape_03
+    and resumed session 37. The session row still said ``Tape_02``, and nothing
+    compared it to the mounted volume — the run would have written the
+    remaining chunks to Tape_03 while recording every one of them under
+    Tape_02, pointing a future restore at the wrong (unwritable) cartridge.
+    """
+
+    def _orchestrator(self):
+        orch = RemoteOrchestrator.__new__(RemoteOrchestrator)
+        orch.cfg = SimpleNamespace(lto_drive="Z:\\")
+        orch.notifier = None
+        return orch
+
+    def test_matching_cartridge_passes(self):
+        orch = self._orchestrator()
+        with mock.patch("src.remote_orchestrator.get_volume_label",
+                        return_value="Tape_03"):
+            self.assertIsNone(orch._verify_mounted_cartridge("Tape_03"))
+
+    def test_wrong_cartridge_blocks(self):
+        orch = self._orchestrator()
+        with mock.patch("src.remote_orchestrator.get_volume_label",
+                        return_value="Tape_03"):
+            block = orch._verify_mounted_cartridge("Tape_02")
+        self.assertIsNotNone(block)
+        self.assertFalse(block.resumable)
+        self.assertIn("Tape_03", block.detailed_reason)
+        self.assertIn("Tape_02", block.detailed_reason)
+
+    def test_unlabelled_volume_fails_closed(self):
+        orch = self._orchestrator()
+        with mock.patch("src.remote_orchestrator.get_volume_label",
+                        return_value=""):
+            block = orch._verify_mounted_cartridge("Tape_03")
+        self.assertIsNotNone(block)
+
+    def test_unreadable_label_fails_closed(self):
+        """"We cannot tell which cartridge this is" must never mean "proceed"."""
+        orch = self._orchestrator()
+        with mock.patch("src.remote_orchestrator.get_volume_label",
+                        side_effect=OSError("drive busy")):
+            block = orch._verify_mounted_cartridge("Tape_03")
+        self.assertIsNotNone(block)
+
+
 class ChunkPlannerFootprintTests(unittest.TestCase):
     def test_small_files_round_up_to_allocation_clusters(self):
         # 20 one-byte files each allocate a full 4 KiB cluster, so a budget of
