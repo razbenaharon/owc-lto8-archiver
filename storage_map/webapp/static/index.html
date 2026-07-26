@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Storage Map</title>
-<link rel="stylesheet" href="/static/style.css?v=20260712-3">
+<link rel="stylesheet" href="/static/style.css?v=20260726-1">
 </head>
 <body>
 <div class="wrap">
@@ -37,8 +37,16 @@
     <div id="coverage"></div>
   </section>
 
+  <section class="panel" id="deletions-panel" hidden>
+    <div class="panel-head"><div>
+      <h2>Reclaimed from servers</h2>
+      <div class="panel-sub" id="deletions-sub">Directories deleted after their archive was verified on tape</div>
+    </div></div>
+    <div id="deletions"></div>
+  </section>
+
   <footer>Storage Map &amp; Analytics · interactive dashboard · data stays on this machine</footer>
 </div>
-<script src="/static/app.js?v=20260712-3"></script>
+<script src="/static/app.js?v=20260726-1"></script>
 </body>
 </html>
