@@ -29,9 +29,12 @@ constant.
 ### 2. An MSI reinstall reset the sync type
 
 The IBM Storage Archive SDE reinstall reset `ltfs.conf.local`, discarding the
-staged `sync_type` line. **`sync_type=unmount` was therefore never actually in
-effect** — do not cite it as active. The mount is proven `time@5` from LTFS event
-**61259** (`Sync type is "time", Sync time is 300 sec`).
+staged `sync_type` line. **After the 2026-07-16 reinstall,
+`sync_type=unmount` was not active** — do not cite it as the setting of that
+post-reinstall mount. This does not contradict incident 005: `unmount` was active
+on the mount interrupted on 2026-07-15 and amplified that restart into the
+~126 GB index loss. The later mount is proven `time@5` from LTFS event **61259**
+(`Sync type is "time", Sync time is 300 sec`).
 
 **Rule: verify `sync_type` from the mount (event 61259 in
 `C:\Program Files\IBM\LTFS\log\LogFile.csv`), never from the config file.** The

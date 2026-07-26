@@ -6,6 +6,11 @@
 > 37 to LTO-8. Every number here was measured live, not estimated. Companion to
 > `docs/pipeline_ram_context.md` (RAM deep-dive) and the memory files
 > `archive-pipeline-ram-phantom-cache` and `tape-write-speed-ltfs-sync`.
+>
+> **Current safety correction:** this document preserves historical experiments,
+> but `sync_type=unmount` is not a valid recommendation. The production pipeline
+> requires live-mount-verified `time@5`; see §3.4 and incident 005. Values below
+> describe the 2026-07-10 measurement snapshot unless explicitly updated.
 
 ---
 
@@ -20,10 +25,12 @@ deadlocks; (2) **tape write** — robocopy transfers at full LTO-8 speed
 IBM LTFS syncs its index every 5 min (`sync_type=time@5`) and each sync seeks
 across a filling 3.6 TB tape; (3) **fetch** — a single SSH/tar stream over 100k
 tiny files is per-file-latency bound at ~15 MB/s. The archiver process itself is
-never the memory hog (RSS 44-585 MB throughout). The two decisive fixes are
-`sync_type=unmount` (eliminates the tape overhead; needs a physical remount) and
-**bigger chunks** (amortise the overhead: a 135 GB chunk wrote at **208.6 MB/s
-effective**), plus parallel fetch (3 streams → ~30 MB/s).
+never the memory hog (RSS 44-585 MB throughout). The safe performance levers are
+bounded chunk sizing (a historical 135 GB chunk wrote at **208.6 MB/s
+effective**) and parallel fetch (3 streams → ~30 MB/s). A historical
+`sync_type=unmount` experiment eliminated periodic sync overhead, but it is
+**superseded and forbidden** because a forced restart can discard all index
+updates since mount.
 
 ---
 

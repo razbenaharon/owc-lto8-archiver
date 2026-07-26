@@ -1,8 +1,10 @@
 # CLAUDE.md
 
-AI-assistant guidance for this repository lives in **[AGENTS.md](AGENTS.md)** — read it
-first. It covers project structure, build/run commands, coding style, testing,
-logging/reports, performance characteristics, and security/operations.
+AI-assistant guidance for this repository lives in **[AGENTS.md](AGENTS.md)** —
+read it first. Use the **[documentation map](docs/README.md)** to route a task
+and identify the authoritative source. `AGENTS.md` covers project structure,
+build/run commands, coding style, testing, logging/reports, performance
+characteristics, and security/operations.
 
 This file is intentionally thin so the guidance has a single source of truth.
 
@@ -52,42 +54,18 @@ Hard rules that follow (full list, with rationale:
 
 ### Operational best practices (learned the hard way — read before touching a live run)
 
-- **A forced Windows Update restart mid-write destroys the LTFS index.** On
-  2026-07-15 one interrupted session 37 and silently lost chunks 18-91 (~126 GB)
-  from Tape_02 — the writes had been acknowledged and counted in
-  `tape_used_after`, but the cartridge came back with only chunks 0-17 and the
-  span had to be re-fetched. **This host cannot pause its way out of it**: it is
-  domain-joined to `iem.technion.ac.il`, served by WSUS
-  (`dds-wsus.iem.technion.ac.il`), and policy sets `SetDisablePauseUXAccess=1`
-  (pause is removed) plus `SetComplianceDeadline` +
-  `ConfigureDeadlineForQualityUpdates=2` — a 2-day deadline restart that
-  overrides **both** ActiveHours and `NoAutoRebootWithLoggedOnUsers` (which was
-  already `1` here and did not help). The pause registry writes still *succeed*,
-  which is the trap.
-  `src/windows_update_guard.py` therefore has two layers: `managed_update_policy()`
-  detects the above and refuses to print a false "paused" line, and
-  **`RebootSentinel` is the guard that actually works** — it polls for a staged
-  restart during the run and sets the pipeline's `stop_pipeline` event, stopping
-  at the next chunk boundary so LTFS syncs its index and the session stays
-  resumable. It never kills the writer itself. Configure via `[WINDOWS_UPDATE]`
-  in `config.ini`; needs Administrator for the pause layer only — the sentinel
-  works unelevated. **The durable fix is organizational: ask IT to exempt this
-  host from the update deadline policy.**
-  > **CORRECTION (2026-07-17, evidence-based — read before acting on the bullet
-  > above).** The 2026-07-15 restart was **not** a WSUS deadline restart. System
-  > log event 1074 names the initiator: `CcmExec.exe` (SCCM) — *"Your computer
-  > will restart at 15/07/2026 10:39:01 to complete the installation of
-  > applications and software updates"*, i.e. **60 seconds** of warning against a
-  > ~70 min chunk cycle. The WSUS/GPO settings above are real but were not the
-  > trigger, so **"exempt this host from the update deadline policy" targets the
-  > wrong system** — ask IT for an **SCCM maintenance window / deployment
-  > exemption**. The sentinel alone cannot win a 60 s race either; the guard that
-  > holds is `_pre_tape_write_reboot_check`, which refuses to *start* a write.
-  > And the ~126 GB loss mechanism was `sync_type=unmount` (LTFS writes the index
-  > only at unmount), **not** the restart itself: the last write ended 17 min
-  > before shutdown, so `time@5` would have lost nothing. The current mount is
-  > verified `time@5`. Evidence and specifics: **AGENTS.md → "Operating a live
-  > run"**.
+- **SCCM can force a restart with only 60 seconds of warning.** On 2026-07-15
+  `CcmExec.exe` interrupted session 37; because that mount used
+  `sync_type=unmount`, LTFS had not made chunks 18–91 durable in its index and
+  about 126 GB had to be re-fetched. The trigger was SCCM, not the host's
+  separate WSUS/GPO deadline policy. Pausing Windows Update therefore does not
+  control this risk. `_pre_tape_write_reboot_check` is the primary code guard:
+  it refuses to start a new write when SCCM reports a pending restart.
+  `RebootSentinel` is secondary and stops only at a chunk boundary; it cannot
+  reliably win a 60-second countdown. The required mount mode is `time@5`,
+  verified from event 61259 for the live mount. The durable organisational fix
+  remains an **SCCM maintenance window / deployment exemption**. Evidence:
+  [incident 005](docs/incidents/005-20260715-sccm-forced-restart-data-loss.md).
 - **Never eject the tape remotely.** `LtfsCmdEject` is physical; a cartridge
   ejected with nobody at the drive cannot be reloaded remotely (no software
   "load" for a tape out of the slot). LTFS `sync_type` changes need a physical
