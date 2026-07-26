@@ -1,4 +1,5 @@
 """Tape-registry method group: tapes table and label-wide maintenance."""
+from .constants import TAPE_STATUS_ACTIVE, TAPE_STATUSES
 from .db import _file_record_key
 from .pg_core import _now_utc, _row, _rows
 
@@ -228,6 +229,42 @@ class PgTapeMixin:
         self._transaction(operation, f"update tape capacity {volume_label}")
         print(f"[DB] Tape '{volume_label}' capacity set to {capacity_gb} GB.")
 
+    def set_tape_status(self, volume_label, status, reason=None):
+        """Mark a tape ``active`` or ``full`` (retired from writing).
+
+        ``full`` is the only durable way to retire a cartridge:
+        ``recalculate_tape_used_space`` rewrites ``used_space`` from the
+        catalog on every mount, so hand-edited byte counters do not survive.
+        """
+        status = str(status or "").strip().lower()
+        if status not in TAPE_STATUSES:
+            raise ValueError(
+                f"[DB] Invalid tape status '{status}'. "
+                f"Expected one of: {', '.join(TAPE_STATUSES)}.")
+
+        def operation(conn):
+            if not self._column_exists_conn(conn, "tapes", "status"):
+                raise RuntimeError(
+                    "[DB] tapes.status is missing on this database. Apply "
+                    "scripts/sql/011_postgres_tape_status.sql first.")
+            cur = conn.execute(
+                """UPDATE tapes
+                   SET status=%s, status_reason=%s, status_changed_at=%s
+                   WHERE volume_label=%s""",
+                (status, (reason or "").strip() or None, _now_utc(),
+                 volume_label),
+            )
+            self._require_updated(cur, f"[DB] Tape not found: {volume_label}")
+
+        self._transaction(operation, f"set tape status {volume_label}")
+        note = f" ({reason.strip()})" if (reason or "").strip() else ""
+        print(f"[DB] Tape '{volume_label}' marked {status.upper()}{note}.")
+
+    def get_tape_status(self, volume_label):
+        """Return ``tapes.status`` (``'active'`` when the column predates 011)."""
+        tape = self.get_tape(volume_label) or {}
+        return tape.get("status") or TAPE_STATUS_ACTIVE
+
     def recalculate_tape_used_space(self, volume_label):
         def operation(conn):
             new_used = self._calculate_tape_used_space_conn(conn, volume_label)
@@ -275,13 +312,28 @@ class PgTapeMixin:
                 ).fetchone():
                     return
                 raise RuntimeError(f"[DB] Tape not found: {old_label}")
-            conn.execute(
-                """INSERT INTO tapes
-                   (volume_label, date_formatted, total_capacity, used_space)
-                   VALUES (%s, %s, %s, %s)""",
-                (new_label, old["date_formatted"],
-                 old["total_capacity"], old["used_space"]),
-            )
+            # status/status_reason must be carried across: a relabel of a tape
+            # retired as 'full' would otherwise land on the column default
+            # ('active') and silently make a dead cartridge writable again.
+            if self._column_exists_conn(conn, "tapes", "status"):
+                conn.execute(
+                    """INSERT INTO tapes
+                       (volume_label, date_formatted, total_capacity,
+                        used_space, status, status_reason, status_changed_at)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                    (new_label, old["date_formatted"],
+                     old["total_capacity"], old["used_space"],
+                     old["status"], old["status_reason"],
+                     old["status_changed_at"]),
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO tapes
+                       (volume_label, date_formatted, total_capacity, used_space)
+                       VALUES (%s, %s, %s, %s)""",
+                    (new_label, old["date_formatted"],
+                     old["total_capacity"], old["used_space"]),
+                )
             conn.execute(
                 "UPDATE catalog_directories SET tape_label=%s WHERE tape_label=%s",
                 (new_label, old_label),

@@ -38,9 +38,31 @@ TAPE_BUDGET_LABEL = f"{LOCAL_TAPE_BUDGET_BYTES / 1000**4:.1f} TB"
 # Default registered capacity for a fresh LTO-8 cartridge (decimal-GB figure
 # used verbatim in prompts and stored in tapes.total_capacity).
 DEFAULT_TAPE_CAPACITY_GB = 12288
+# tapes.status values (migration 011). 'full' = retired from writing, whatever
+# the reason — genuinely out of space, or unwritable like Tape_02 after its PWE
+# bit latched (docs/incidents/010-20260724-ltfs-write-perm-readonly.md).
+TAPE_STATUS_ACTIVE = 'active'
+TAPE_STATUS_FULL = 'full'
+TAPE_STATUSES = (TAPE_STATUS_ACTIVE, TAPE_STATUS_FULL)
 
 
-def tape_budget_bytes(total_capacity_gb, used_bytes, reserved_bytes=0):
+def tape_is_full(status):
+    """True when a ``tapes.status`` value retires the tape from writing.
+
+    ``None`` (column absent on a pre-011 database, or an unregistered tape)
+    reads as active, so the guard is inert until a tape is marked.
+    """
+    return str(status or TAPE_STATUS_ACTIVE).strip().lower() == TAPE_STATUS_FULL
+
+
+def tape_status_reason_suffix(tape):
+    """Return ``" (reason)"`` for a tape row, or ``""`` when none is recorded."""
+    reason = ((tape or {}).get('status_reason') or '').strip()
+    return f" ({reason})" if reason else ''
+
+
+def tape_budget_bytes(total_capacity_gb, used_bytes, reserved_bytes=0,
+                      status=None):
     """Return ``(capacity_bytes, available_bytes)`` for a registered tape.
 
     ``total_capacity_gb`` is the ``tapes.total_capacity`` column — a
@@ -49,11 +71,18 @@ def tape_budget_bytes(total_capacity_gb, used_bytes, reserved_bytes=0):
     safety budget. Decimal GB replaces a previous GiB interpretation that
     overstated capacity by ~7%; the change can only ever reject MORE, never
     accept more than before.
+
+    ``status`` is ``tapes.status``: a tape marked ``full`` reports zero
+    available bytes regardless of its counters, which is the only
+    representation that survives ``recalculate_tape_used_space`` rewriting
+    ``used_space`` from the catalog on every mount.
     """
     capacity_bytes = LOCAL_TAPE_BUDGET_BYTES
     if total_capacity_gb:
         capacity_bytes = min(capacity_bytes,
                              int(float(total_capacity_gb) * 1000**3))
+    if tape_is_full(status):
+        return capacity_bytes, 0
     available_bytes = max(
         0, capacity_bytes - int(used_bytes) - int(reserved_bytes))
     return capacity_bytes, available_bytes

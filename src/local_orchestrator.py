@@ -8,7 +8,8 @@ from .backup import LTOBackup, _NoEjectBackup
 from .constants import (DEFAULT_TAPE_CAPACITY_GB, LOCAL_STAGING_RESERVE_BYTES,
                         LOCAL_TAPE_BUDGET_BYTES, ROOT_FILES_GROUP,
                         TAPE_BUDGET_LABEL, _auto_pack_decision,
-                        tape_budget_bytes)
+                        tape_budget_bytes, tape_is_full,
+                        tape_status_reason_suffix)
 from .ltfs import _ensure_lto_drive_ready, get_volume_label
 from .packer import LTOAnalyzer, LTOPacker, ensure_staging_space
 from .resource_governor import ResourceGovernor
@@ -125,10 +126,16 @@ class LocalOrchestrator:
 
         used_bytes = self.db.recalculate_tape_used_space(tape_label)
         _, available_bytes = tape_budget_bytes(
-            tape['total_capacity'], used_bytes)
+            tape['total_capacity'], used_bytes, status=tape.get('status'))
         print(f"[TAPE] Mounted '{tape_label}': DB occupied "
               f"{used_bytes / 1024**4:.2f} TiB; safe remaining "
               f"{available_bytes / 1024**4:.2f} TiB.")
+        if tape_is_full(tape.get('status')):
+            raise RuntimeError(
+                f"[TAPE] Mounted tape '{tape_label}' is marked FULL in the "
+                f"database{tape_status_reason_suffix(tape)}. Load a different "
+                "cartridge, or clear the mark from Database Management."
+            )
         if available_bytes <= 0:
             raise RuntimeError(
                 f"[TAPE] Mounted tape '{tape_label}' has no capacity remaining "
@@ -386,9 +393,14 @@ class LocalOrchestrator:
             print(f"[DB] Tape '{tape_label}' is not registered.")
             return False
 
+        if tape_is_full(tape.get('status')):
+            print(f"[TAPE] '{tape_label}' is marked FULL in the database"
+                  f"{tape_status_reason_suffix(tape)}; refusing to write.")
+            return False
+
         used_bytes = self.db.recalculate_tape_used_space(tape_label)
         _, available_bytes = tape_budget_bytes(
-            tape['total_capacity'], used_bytes)
+            tape['total_capacity'], used_bytes, status=tape.get('status'))
         if planned_bytes > available_bytes:
             print(f"[TAPE] '{tape_label}' does not have enough indexed "
                   f"capacity for this chunk ({planned_bytes / 1024**3:.2f} "

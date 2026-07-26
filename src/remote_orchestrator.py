@@ -14,7 +14,8 @@ from typing import Optional
 
 from .backup import LTOBackup, _NoEjectBackup
 from .constants import (DEFAULT_TAPE_CAPACITY_GB, LOCAL_STAGING_RESERVE_BYTES,
-                        LTFS_WRITE_WARNING, tape_budget_bytes)
+                        LTFS_WRITE_WARNING, tape_budget_bytes, tape_is_full,
+                        tape_status_reason_suffix)
 from .db import _apply_canonical_remote_paths
 from .exit_codes import (
     ExitCode, StopResult,
@@ -491,13 +492,23 @@ class RemoteOrchestrator:
         tape = self.db.get_tape(tape_label)
         if not tape:
             raise RuntimeError(f"[DB] Tape '{tape_label}' is not registered.")
+        # Refuse to *start* on a retired cartridge rather than discovering it
+        # mid-stream: this is the same "don't begin work that cannot finish"
+        # rule as _pre_tape_write_reboot_check.
+        if tape_is_full(tape.get('status')):
+            raise RuntimeError(
+                f"[TAPE] Tape '{tape_label}' is marked FULL in the database"
+                f"{tape_status_reason_suffix(tape)}. Load and select a "
+                "different cartridge before starting a write."
+            )
         used_bytes = self.db.recalculate_tape_used_space(tape_label)
         reserved_bytes = 0
         if session_id is not None and hasattr(
                 self.db, 'get_pending_remote_reserved_bytes'):
             reserved_bytes = self.db.get_pending_remote_reserved_bytes(session_id)
         capacity_bytes, available_bytes = tape_budget_bytes(
-            tape['total_capacity'], used_bytes, reserved_bytes)
+            tape['total_capacity'], used_bytes, reserved_bytes,
+            status=tape.get('status'))
         print(f"[TAPE] '{tape_label}': DB occupied "
               f"{used_bytes / 1024**3:.2f} GiB; "
               f"reserved pending {reserved_bytes / 1024**3:.2f} GiB; "
@@ -2371,9 +2382,14 @@ class RemoteOrchestrator:
         if not tape:
             print(f"[DB] Tape '{tape_label}' is not registered.")
             return False
+        if tape_is_full(tape.get('status')):
+            print(f"[TAPE] '{tape_label}' is marked FULL in the database"
+                  f"{tape_status_reason_suffix(tape)}; refusing to write "
+                  f"remote chunk {chunk_index + 1}.")
+            return False
         used_bytes = self.db.recalculate_tape_used_space(tape_label)
         _, available_bytes = tape_budget_bytes(
-            tape['total_capacity'], used_bytes)
+            tape['total_capacity'], used_bytes, status=tape.get('status'))
         if planned_bytes > available_bytes:
             print(f"[TAPE] Remote chunk {chunk_index + 1} does not fit on "
                   f"'{tape_label}' ({planned_bytes / 1024**3:.2f} GiB needed, "

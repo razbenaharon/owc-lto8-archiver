@@ -107,6 +107,7 @@ class PgConnectionCore:
             "008_postgres_remote_provenance.sql",
             "009_postgres_remote_session_fk.sql",
             "010_postgres_local_manifest_archive.sql",
+            "011_postgres_tape_status.sql",
         )
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
@@ -135,6 +136,16 @@ class PgConnectionCore:
                FROM information_schema.tables
                WHERE table_schema='public' AND table_name=%s""",
             (table_name,),
+        ).fetchone() is not None
+
+    @staticmethod
+    def _column_exists_conn(conn, table_name, column_name):
+        return conn.execute(
+            """SELECT 1
+               FROM information_schema.columns
+               WHERE table_schema='public'
+                 AND table_name=%s AND column_name=%s""",
+            (table_name, column_name),
         ).fetchone() is not None
 
     def directory_catalog_schema_installed(self):
