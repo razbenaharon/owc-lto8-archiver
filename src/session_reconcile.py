@@ -196,7 +196,7 @@ def _classify(session, chunk_states, idle_seconds, now):
         if pending or failed:
             return VERDICT_STALE_ABANDONED, (
                 f"scan never completed and {pending} chunk(s) are still "
-                f"pending, {sum(failed.values())} failed — unfinishable"), evidence
+                f"pending, {sum(failed.values())} failed - unfinishable"), evidence
         return VERDICT_AMBIGUOUS, (
             "scan never completed; every existing chunk is done but the plan "
             "membership is unknown, so completion cannot be proven"), evidence
@@ -371,14 +371,14 @@ def format_report(result):
         lines.append(
             f"  session {entry['session_id']} "
             f"({entry['session_label']}): active -> "
-            f"{entry['proposed_status']} — {entry['reason']}")
+            f"{entry['proposed_status']} - {entry['reason']}")
         lines.append(f"      chunks: {entry['evidence']['chunks_by_state']} "
                      f"idle={entry['evidence']['idle_seconds']}s")
         lines.append(f"      catalog rows: {entry['catalog_artifacts']}")
     for entry in result["left_alone"]:
         lines.append(
             f"  session {entry['session_id']} "
-            f"({entry['session_label']}): LEFT ACTIVE [{entry['verdict']}] — "
+            f"({entry['session_label']}): LEFT ACTIVE [{entry['verdict']}] - "
             f"{entry['reason']}")
     for entry in result["changed"]:
         verb = "updated" if entry["rows_updated"] else "already reconciled"
