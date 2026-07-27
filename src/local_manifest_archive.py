@@ -33,6 +33,7 @@ try:
 except ImportError:  # pragma: no cover
     zstd = None
 
+from .cli_errors import OperationalError
 from .pg_bulk import copy_rows, require_psycopg
 from .pg_core import PgConnectionCore
 
@@ -48,7 +49,7 @@ def active_archive_processes():
     try:
         import psutil
     except ImportError as exc:  # destructive safety check must not degrade
-        raise RuntimeError(
+        raise OperationalError(
             "[MANIFEST] psutil is required to prove no archive process is "
             "running before export/prune.") from exc
     current_pid = os.getpid()
@@ -140,7 +141,7 @@ def validate_archive_root(archive_root, protected_paths=()):
     """Require a permanent root that is not inside a staging/cleanup tree."""
     root = os.path.abspath(os.path.expanduser(str(archive_root or "")))
     if not archive_root:
-        raise RuntimeError("[MANIFEST] local archive root is not configured.")
+        raise OperationalError("[MANIFEST] local archive root is not configured.")
     for protected in protected_paths:
         if not protected:
             continue
@@ -151,7 +152,7 @@ def validate_archive_root(archive_root, protected_paths=()):
         except ValueError:
             continue  # different Windows volumes cannot contain one another
         if root_under or protected_under:
-            raise RuntimeError(
+            raise OperationalError(
                 "[MANIFEST] Archive root must be separate from staging and "
                 f"cleanup paths: {root} conflicts with {protected}")
     return root
@@ -401,10 +402,10 @@ def _segment_relpath(row):
 
 def _write_segment(root, relpath, rows):
     if zstd is None:
-        raise RuntimeError("[MANIFEST] zstandard is required.")
+        raise OperationalError("[MANIFEST] zstandard is required.")
     final_path = os.path.abspath(os.path.join(root, relpath))
     if os.path.commonpath([root, final_path]) != root:
-        raise RuntimeError("[MANIFEST] Refusing path outside archive root.")
+        raise OperationalError("[MANIFEST] Refusing path outside archive root.")
     os.makedirs(os.path.dirname(final_path), exist_ok=True)
     fd, temp_path = tempfile.mkstemp(
         prefix=".manifest_", suffix=".tmp", dir=os.path.dirname(final_path))
@@ -565,12 +566,12 @@ def execute_export(conninfo, archive_root, hot_backup_path, *,
                    threshold_bytes=SMALL_FILE_THRESHOLD_BYTES):
     """Snapshot eligible rows and write immutable local manifest segments."""
     if not hot_backup_path or not os.path.isfile(hot_backup_path):
-        raise RuntimeError("[MANIFEST] A verified hot backup path is required.")
+        raise OperationalError("[MANIFEST] A verified hot backup path is required.")
     root = os.path.abspath(archive_root)
     os.makedirs(root, exist_ok=True)
     with _connect(conninfo) as conn:
         if not _table_exists(conn, "local_manifest_exports"):
-            raise RuntimeError("[MANIFEST] Schema migration 010 is not applied.")
+            raise OperationalError("[MANIFEST] Schema migration 010 is not applied.")
         # Close the information_schema read transaction, then take the same
         # transaction-level lock used by prune before selecting any candidate.
         conn.commit()
@@ -580,7 +581,7 @@ def execute_export(conninfo, archive_root, hot_backup_path, *,
                WHERE status NOT IN ('pruned','failed','validation_failed')
                ORDER BY export_id DESC LIMIT 1""").fetchone()
         if open_export:
-            raise RuntimeError(
+            raise OperationalError(
                 "[MANIFEST] Finish or investigate export "
                 f"{open_export['export_id']} ({open_export['status']}) first.")
         cte = _classification_cte_for_connection(conn)
@@ -702,13 +703,13 @@ def execute_export(conninfo, archive_root, hot_backup_path, *,
 def validate_export(conninfo, export_id):
     """Re-hash/decompress every segment and compare exact file-id membership."""
     if zstd is None:
-        raise RuntimeError("[MANIFEST] zstandard is required.")
+        raise OperationalError("[MANIFEST] zstandard is required.")
     with _connect(conninfo) as conn:
         export = conn.execute(
             "SELECT * FROM local_manifest_exports WHERE export_id=%s",
             (export_id,)).fetchone()
         if not export:
-            raise RuntimeError(f"[MANIFEST] Export not found: {export_id}")
+            raise OperationalError(f"[MANIFEST] Export not found: {export_id}")
         segments = conn.execute(
             """SELECT * FROM local_manifest_segments WHERE export_id=%s
                ORDER BY manifest_relpath""", (export_id,)).fetchall()
@@ -822,7 +823,7 @@ def _acquire_prune_lock(conn):
         (PgConnectionCore.ARCHIVER_LOCK_KEY,),
     ).fetchone()["locked"]
     if not locked:
-        raise RuntimeError(
+        raise OperationalError(
             "[MANIFEST] Refusing prune while the archiver lock is held.")
 
 
@@ -900,20 +901,20 @@ def prune_export(conninfo, export_id, hot_backup_path, *, execute=False,
     """
     batch_size = int(batch_size or DEFAULT_PRUNE_BATCH_SIZE)
     if batch_size < 1:
-        raise RuntimeError("[MANIFEST] Prune batch size must be positive.")
+        raise OperationalError("[MANIFEST] Prune batch size must be positive.")
     validation = validate_export(conninfo, export_id)
     if not validation["passed"]:
-        raise RuntimeError("[MANIFEST] Export validation failed; refusing prune.")
+        raise OperationalError("[MANIFEST] Export validation failed; refusing prune.")
     with _connect(conninfo) as conn:
         export = conn.execute(
             "SELECT * FROM local_manifest_exports WHERE export_id=%s",
             (export_id,)).fetchone()
         if not export:
-            raise RuntimeError(f"[MANIFEST] Export not found: {export_id}")
+            raise OperationalError(f"[MANIFEST] Export not found: {export_id}")
         if (not hot_backup_path or
                 os.path.abspath(hot_backup_path) != export["hot_backup_path"] or
                 not os.path.isfile(hot_backup_path)):
-            raise RuntimeError(
+            raise OperationalError(
                 "[MANIFEST] The same verified pre-export hot backup is required.")
         skip_reasons = conn.execute(
             """SELECT skip_reason, COUNT(*) AS rows
@@ -964,14 +965,14 @@ def prune_export(conninfo, export_id, hot_backup_path, *, execute=False,
             while True:
                 processes = active_archive_processes()
                 if processes:
-                    raise RuntimeError(
+                    raise OperationalError(
                         "[MANIFEST] Archive/transfer process appeared before "
                         f"the next prune batch: {processes}")
                 with conn.transaction():
                     _acquire_prune_lock(conn)
                     processes = active_archive_processes()
                     if processes:
-                        raise RuntimeError(
+                        raise OperationalError(
                             "[MANIFEST] Archive/transfer process appeared after "
                             f"the prune lock was acquired: {processes}")
                     conn.execute(
@@ -1004,7 +1005,7 @@ def prune_export(conninfo, export_id, hot_backup_path, *, execute=False,
                         (int(export["threshold_bytes"]), export_id),
                     ).fetchone()["n"]
                     if no_longer_terminal:
-                        raise RuntimeError(
+                        raise OperationalError(
                             f"[MANIFEST] {no_longer_terminal} batch row(s) no "
                             "longer have terminal ownership/chunks.")
                     mismatch = conn.execute(
@@ -1020,7 +1021,7 @@ def prune_export(conninfo, export_id, hot_backup_path, *, execute=False,
                            WHERE f.file_id IS NULL""",
                         (export_id,)).fetchone()["n"]
                     if mismatch:
-                        raise RuntimeError(
+                        raise OperationalError(
                             f"[MANIFEST] {mismatch} batch row(s) changed or "
                             "disappeared; current batch rolled back.")
                     deleted = conn.execute(
@@ -1038,7 +1039,7 @@ def prune_export(conninfo, export_id, hot_backup_path, *, execute=False,
                              FROM gone""", (export_id,)).fetchone()
                     deleted_rows = int(deleted["rows"] or 0)
                     if deleted_rows != int(selected):
-                        raise RuntimeError(
+                        raise OperationalError(
                             "[MANIFEST] Batch delete count mismatch; current "
                             "batch rolled back.")
                     marked = conn.execute(
@@ -1050,7 +1051,7 @@ def prune_export(conninfo, export_id, hot_backup_path, *, execute=False,
                              AND er.pruned_at IS NULL""",
                         (export_id,)).rowcount
                     if int(marked or 0) != deleted_rows:
-                        raise RuntimeError(
+                        raise OperationalError(
                             "[MANIFEST] Batch progress marker mismatch; current "
                             "batch rolled back.")
                     progress = _prune_progress(conn, export_id)
@@ -1071,14 +1072,14 @@ def prune_export(conninfo, export_id, hot_backup_path, *, execute=False,
                 _acquire_prune_lock(conn)
                 processes = active_archive_processes()
                 if processes:
-                    raise RuntimeError(
+                    raise OperationalError(
                         "[MANIFEST] Archive/transfer process appeared before "
                         f"prune finalization: {processes}")
                 progress = _prune_progress(conn, export_id)
                 if (progress["pending_rows"] != 0
                         or progress["rows"] != int(export["eligible_rows"] or 0)
                         or progress["bytes"] != int(export["eligible_bytes"] or 0)):
-                    raise RuntimeError(
+                    raise OperationalError(
                         "[MANIFEST] Final prune progress does not match the "
                         "validated snapshot; finalization rolled back.")
                 remaining = conn.execute(
@@ -1088,7 +1089,7 @@ def prune_export(conninfo, export_id, hot_backup_path, *, execute=False,
                        WHERE er.export_id=%s AND er.eligible""",
                     (export_id,)).fetchone()["n"]
                 if remaining:
-                    raise RuntimeError(
+                    raise OperationalError(
                         f"[MANIFEST] {remaining} validated candidate row(s) "
                         "remain in files_index; finalization rolled back.")
                 conn.execute(
@@ -1099,7 +1100,7 @@ def prune_export(conninfo, export_id, hot_backup_path, *, execute=False,
                     "before": before_accounting, "after": after_accounting,
                     "passed": before_accounting == after_accounting}
                 if before_accounting != after_accounting:
-                    raise RuntimeError(
+                    raise OperationalError(
                         "[MANIFEST] Per-tape accounting changed; prune "
                         "finalization rolled back.")
                 snapshot_rows = conn.execute(
@@ -1169,7 +1170,7 @@ def export_legacy_cold_database(cold_conninfo, archive_root, cold_backup_path):
     if (not os.path.isfile(backup) or not os.path.getsize(backup)
             or not os.path.isfile(restore_list)
             or not os.path.getsize(restore_list)):
-        raise RuntimeError(
+        raise OperationalError(
             "[MANIFEST] A non-empty cold dump and verified .restore_list.txt "
             "are required before legacy cold export.")
     root = os.path.abspath(archive_root)
@@ -1178,7 +1179,7 @@ def export_legacy_cold_database(cold_conninfo, archive_root, cold_backup_path):
     relpath = "cold_db_export/small_file_manifest_cold.jsonl.zst"
     with _connect(cold_conninfo) as conn:
         if not _table_exists(conn, "small_file_manifest_cold"):
-            raise RuntimeError(
+            raise OperationalError(
                 "[MANIFEST] Legacy cold payload table does not exist.")
         expected = conn.execute(
             """SELECT COUNT(*) AS rows, COALESCE(SUM(size_bytes),0) AS bytes
@@ -1253,7 +1254,7 @@ def export_legacy_cold_database(cold_conninfo, archive_root, cold_backup_path):
             pass
         raise
     if not passed:
-        raise RuntimeError(
+        raise OperationalError(
             "[MANIFEST] Legacy cold export count/byte validation failed.")
     return report
 
@@ -1262,7 +1263,7 @@ def iter_manifest_records(archive_root, *, query=None, tape_label=None,
                           date_from=None, date_to=None, allowed_paths=None):
     """Stream local archive matches without requiring the retired cold DB."""
     if zstd is None:
-        raise RuntimeError("[MANIFEST] zstandard is required.")
+        raise OperationalError("[MANIFEST] zstandard is required.")
     root = os.path.abspath(archive_root)
     allowed = ({os.path.normcase(os.path.abspath(path))
                 for path in allowed_paths} if allowed_paths is not None else None)

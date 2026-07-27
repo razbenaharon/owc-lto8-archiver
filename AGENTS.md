@@ -208,6 +208,24 @@ hardware/manual verification if relevant, and any database/config changes. For
   `tape_budget_bytes` and is refused by both orchestrators before a write
   starts. Tape_02 is marked this way — read-only at ~5 TB of 12 TB after its
   PWE bit latched ([incident 010](docs/incidents/010-20260724-ltfs-write-perm-readonly.md)).
+- **A session row marked `active` is not proof that anything is running, and
+  the cleanup guard deliberately does not care.** `cleanup_unreferenced_remote_data`
+  refuses while *any* `remote_sessions.status='active'` row exists — a row is
+  treated as live until proven otherwise, so a crashed session blocks catalog
+  maintenance until a human resolves it. That refusal never softens. The way to
+  clear it is `inspect_db.py --reconcile-stale-sessions`
+  (`src/session_reconcile.py`), which proves staleness rather than assuming it:
+  it aborts entirely if any archiver lock holder or archiver process exists,
+  requires the session to have been silent for `--idle-seconds` (24h default),
+  refuses any session with a chunk left `fetching`/`packing`/`backing` (the
+  on-tape outcome is unknowable from the catalog), derives `completed` vs
+  `abandoned` from chunk state using the orchestrator's own rules, and updates
+  `WHERE status='active'` so a re-run is a no-op. Ambiguous cases are reported
+  and left alone. `--session-forensics` prints the same evidence read-only and
+  is safe during a live run.
+  Note `archiver_lock_status()` counts advisory locks **cluster-wide**, not per
+  database — deliberately conservative, but it means tests against a throwaway
+  DB must patch it or a live archiver on another database will block them.
 - **No Independent Write Verification.** Never add code that reads from the tape
   immediately after a write/copy operation just for verification purposes.
   Unnecessary reading right after writing causes wear and tear and damages the

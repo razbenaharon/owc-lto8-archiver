@@ -158,18 +158,47 @@ class InspectorRepository:
                 FROM local_sessions s ORDER BY s.session_id"""))
         if self._table_exists("remote_sessions"):
             if self._table_exists("remote_plan_files"):
+                # Aggregate per *plan*, once, then join the sessions onto it.
+                # The obvious correlated-subquery form re-runs the plan-file ->
+                # snapshot-file join once per session row, and because a plan
+                # matches millions of plan files the planner picks a sequential
+                # scan of remote_snapshot_files (10 GB here) for each one. Four
+                # sessions therefore cost four full scans — ~113 s on the live
+                # catalog — and the cost grows with every session ever created.
+                # Grouping first scans each table once, no matter how many
+                # sessions there are.
+                #
+                # The two aggregates stay separate on purpose: manifest_rows
+                # counts plan files *without* the join, so a plan file whose
+                # snapshot row is missing still counts, exactly as the
+                # correlated form did. Folding them into one join would quietly
+                # change that number.
                 rows.extend(dict(row) for row in self._execute("""
+                    WITH session_plans AS (
+                        SELECT DISTINCT plan_id FROM remote_sessions
+                        WHERE plan_id IS NOT NULL
+                    ), plan_rows AS (
+                        SELECT pf.plan_id, COUNT(*) AS manifest_rows
+                        FROM remote_plan_files pf
+                        WHERE pf.plan_id IN (SELECT plan_id FROM session_plans)
+                        GROUP BY pf.plan_id
+                    ), plan_bytes AS (
+                        SELECT pf.plan_id, SUM(sf.file_size_bytes) AS manifest_bytes
+                        FROM remote_plan_files pf
+                        JOIN remote_snapshot_files sf
+                          ON sf.snapshot_file_id=pf.snapshot_file_id
+                        WHERE pf.plan_id IN (SELECT plan_id FROM session_plans)
+                        GROUP BY pf.plan_id
+                    )
                     SELECT 'remote' AS kind,s.session_id,s.session_label,s.status,
                            '' AS mode,s.created_at,s.completed_at,s.chunk_count AS chunks,
-                           COALESCE((SELECT COUNT(*) FROM remote_plan_files pf
-                                     WHERE pf.plan_id=s.plan_id),0) AS manifest_rows,
-                           COALESCE((SELECT SUM(sf.file_size_bytes)
-                                     FROM remote_plan_files pf
-                                     JOIN remote_snapshot_files sf
-                                       ON sf.snapshot_file_id=pf.snapshot_file_id
-                                     WHERE pf.plan_id=s.plan_id),0) AS manifest_bytes,
+                           COALESCE(pr.manifest_rows,0) AS manifest_rows,
+                           COALESCE(pb.manifest_bytes,0) AS manifest_bytes,
                            0 AS file_records
-                    FROM remote_sessions s ORDER BY s.session_id"""))
+                    FROM remote_sessions s
+                    LEFT JOIN plan_rows pr ON pr.plan_id=s.plan_id
+                    LEFT JOIN plan_bytes pb ON pb.plan_id=s.plan_id
+                    ORDER BY s.session_id"""))
             elif self._table_exists("remote_manifest"):
                 rows.extend(dict(row) for row in self._execute("""
                     SELECT 'remote' AS kind,s.session_id,s.session_label,s.status,

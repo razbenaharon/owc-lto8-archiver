@@ -2,6 +2,7 @@
 import hashlib
 import os
 
+from .cli_errors import OperationalError
 from .pg_bulk import copy_rows
 from .pg_core import (_coerce_timestamp_kwargs, _now_utc, _row, _rows,
                       _valid_columns)
@@ -955,8 +956,10 @@ class PgSessionMixin:
     def cleanup_unreferenced_remote_data(self, compact=False):
         summary = self.get_unreferenced_remote_data_summary()
         if summary["active_sessions"]:
-            raise RuntimeError(
-                "[DB] Refusing cleanup while a remote session is active.")
+            raise OperationalError(
+                "[DB] Refusing cleanup while a remote session is active. "
+                "Run --reconcile-stale-sessions --dry-run to see whether the "
+                "active row is a live archiver or a stale crashed session.")
 
         def operation(conn):
             plan_files = conn.execute("""
