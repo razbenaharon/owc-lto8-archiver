@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.constants import PROJECT_ROOT
 os.chdir(PROJECT_ROOT)
 
+from src.cli_errors import OperationalError
 from src.config import ConfigManager
 from src.local_manifest_archive import (
     active_archive_processes,
@@ -37,6 +38,13 @@ from src.pg_backup import (
     verify_backup_file,
 )
 from src.pg_bulk import build_conninfo
+from src.session_reconcile import (
+    DEFAULT_IDLE_SECONDS,
+    format_report,
+    liveness_evidence,
+    reconcile_stale_remote_sessions,
+    session_forensics,
+)
 
 
 class _DbOverrideConfig:
@@ -102,11 +110,11 @@ def _open_db(cfg):
 def _require_maintenance_safe(cfg):
     holders = archiver_lock_status(_conninfo(cfg))
     if holders:
-        raise RuntimeError(
+        raise OperationalError(
             "[MANIFEST] Refusing maintenance while the archiver lock is held.")
     processes = active_archive_processes()
     if processes:
-        raise RuntimeError(
+        raise OperationalError(
             "[MANIFEST] Refusing maintenance while archive/transfer processes "
             f"are running: {processes}")
     return validate_archive_root(
@@ -123,16 +131,16 @@ def _verify_hot_backup(cfg, path):
 def _run_manifest_export(cfg, args):
     root = _require_maintenance_safe(cfg)
     if args.dry_run == args.execute:
-        raise RuntimeError(
+        raise OperationalError(
             "--export-small-file-manifests requires exactly one of --dry-run "
             "or --execute")
     if args.dry_run:
         _print_json(dry_run_export(_conninfo(cfg)))
         return 0
     if not args.yes:
-        raise RuntimeError("--execute requires --yes")
+        raise OperationalError("--execute requires --yes")
     if not args.hot_backup_path:
-        raise RuntimeError("--execute requires --hot-backup-path")
+        raise OperationalError("--execute requires --hot-backup-path")
     hot_backup = _verify_hot_backup(cfg, args.hot_backup_path)
     result = execute_export(
         _conninfo(cfg), root, args.hot_backup_path)
@@ -143,10 +151,10 @@ def _run_manifest_export(cfg, args):
 
 def _run_manifest_validate(cfg, args):
     if not args.heavy:
-        raise RuntimeError(
+        raise OperationalError(
             "--validate-local-manifest-export requires --heavy")
     if args.export_id is None:
-        raise RuntimeError("--export-id is required")
+        raise OperationalError("--export-id is required")
     _require_maintenance_safe(cfg)
     _print_json(validate_export(_conninfo(cfg), args.export_id))
     return 0
@@ -165,17 +173,17 @@ def _run_manifest_search(cfg, args):
 def _run_manifest_prune(cfg, args):
     _require_maintenance_safe(cfg)
     if args.export_id is None:
-        raise RuntimeError("--export-id is required")
+        raise OperationalError("--export-id is required")
     if args.dry_run == args.execute:
-        raise RuntimeError(
+        raise OperationalError(
             "--prune-exported-small-files requires exactly one of "
             "--dry-run or --execute")
     hot_backup = None
     if args.execute:
         if not args.yes:
-            raise RuntimeError("--execute requires --yes")
+            raise OperationalError("--execute requires --yes")
         if not args.hot_backup_path:
-            raise RuntimeError("--execute requires --hot-backup-path")
+            raise OperationalError("--execute requires --hot-backup-path")
         hot_backup = _verify_hot_backup(cfg, args.hot_backup_path)
     result = prune_export(
         _conninfo(cfg), args.export_id,
@@ -191,23 +199,34 @@ def _run_manifest_prune(cfg, args):
 def _run_legacy_cold_export(cfg, args):
     root = _require_maintenance_safe(cfg)
     if not args.execute or not args.yes:
-        raise RuntimeError(
+        raise OperationalError(
             "--export-legacy-cold-db requires --execute --yes")
     if not args.legacy_cold_dsn or not args.cold_backup_path:
-        raise RuntimeError(
+        raise OperationalError(
             "--legacy-cold-dsn and --cold-backup-path are required")
     _print_json(export_legacy_cold_database(
         args.legacy_cold_dsn, root, args.cold_backup_path))
     return 0
 
 
-def _cleanup_session_data(db, assume_yes):
+def _cleanup_session_data(db, assume_yes, cfg=None):
     try:
         summary = db.get_unreferenced_remote_data_summary()
         print("[DB] Unreferenced remote session data:")
         _print_json(summary)
         if summary['active_sessions']:
-            raise RuntimeError("Refusing cleanup while a remote session is active.")
+            # A row marked active is treated as live until proven otherwise —
+            # that refusal never softens. Print the liveness evidence beside it
+            # so the operator can tell a running archiver from a crashed
+            # session that nobody ever reaped.
+            if cfg is not None:
+                _print_json({"liveness": liveness_evidence(
+                    _conninfo(cfg), getattr(cfg, "backup_log_dir", None))})
+            raise OperationalError(
+                "[DB] Refusing cleanup while a remote session is active. "
+                "If nothing is running, --reconcile-stale-sessions --dry-run "
+                "shows whether those rows are stale and what they would "
+                "become.")
         if not summary['plans'] and not summary['snapshots']:
             print("[DB] Nothing to clean.")
             return 0
@@ -229,10 +248,10 @@ def _cleanup_session_data(db, assume_yes):
 def _run_backfill(db, args):
     try:
         if not args.dry_run and not args.execute:
-            raise RuntimeError(
+            raise OperationalError(
                 "--backfill-directory-catalog requires --dry-run or --execute")
         if args.dry_run and args.execute:
-            raise RuntimeError("Choose only one of --dry-run or --execute")
+            raise OperationalError("Choose only one of --dry-run or --execute")
         mode = "dry-run" if args.dry_run else "execute"
         print(f"[DB] Directory catalog backfill ({mode}) on target database...")
         result = db.backfill_directory_catalog_from_files_index(
@@ -308,12 +327,45 @@ def _build_parser():
                         help="Result limit for local-manifest search.")
     parser.add_argument("--prune-batch-size", type=int, default=100000,
                         help="Maximum files_index rows committed per prune batch.")
+    parser.add_argument("--session-forensics", action="store_true",
+                        help="Read-only evidence for every active session.")
+    parser.add_argument("--reconcile-stale-sessions", action="store_true",
+                        help="Move provably-dead active sessions to a "
+                             "terminal status (needs --dry-run or --execute).")
+    parser.add_argument("--session-id", type=int, action="append",
+                        help="Limit reconciliation to this session id "
+                             "(repeatable).")
+    parser.add_argument("--idle-seconds", type=int,
+                        default=DEFAULT_IDLE_SECONDS,
+                        help="Silence required before a session may be "
+                             "called stale.")
     return parser
 
 
-def main(argv=None):
-    parser = _build_parser()
-    args = parser.parse_args(argv)
+def _run_session_forensics(cfg, args):
+    _print_json(session_forensics(
+        _conninfo(cfg), idle_seconds=args.idle_seconds,
+        log_dir=getattr(cfg, "backup_log_dir", None)))
+    return 0
+
+
+def _run_reconcile_sessions(cfg, args):
+    if args.dry_run == args.execute:
+        raise OperationalError(
+            "--reconcile-stale-sessions requires exactly one of --dry-run "
+            "or --execute")
+    if args.execute and not args.yes:
+        raise OperationalError("--execute requires --yes")
+    result = reconcile_stale_remote_sessions(
+        _conninfo(cfg), execute=args.execute,
+        idle_seconds=args.idle_seconds, session_ids=args.session_id,
+        log_dir=getattr(cfg, "backup_log_dir", None))
+    print(format_report(result))
+    _print_json(result)
+    return 0
+
+
+def _dispatch(parser, args):
     cfg = _config(args)
 
     if args.print_db_target:
@@ -359,8 +411,14 @@ def main(argv=None):
         _print_json(compare_databases(source, target))
         return 0
 
+    if args.session_forensics:
+        return _run_session_forensics(cfg, args)
+
+    if args.reconcile_stale_sessions:
+        return _run_reconcile_sessions(cfg, args)
+
     if args.cleanup_session_data:
-        return _cleanup_session_data(_open_db(cfg), assume_yes=args.yes)
+        return _cleanup_session_data(_open_db(cfg), assume_yes=args.yes, cfg=cfg)
 
     if args.backfill_directory_catalog:
         return _run_backfill(_open_db(cfg), args)
@@ -390,6 +448,25 @@ def main(argv=None):
         return run_qt_inspector(db, cfg.db_dsn, display_ref=cfg.db_display_ref)
     finally:
         db.close()
+
+
+def main(argv=None):
+    """Dispatch, turning deliberate refusals into one readable line.
+
+    Only :class:`OperationalError` is caught, and only here. It is raised
+    exclusively where a command decides *not* to do something — a held archiver
+    lock, a running transfer, a missing required flag. Every other exception
+    propagates untouched so its traceback still reaches the operator: catching
+    ``Exception`` here would swallow the ``KeyError`` from a renamed column and
+    report it as if the tool had refused on purpose.
+    """
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return _dispatch(parser, args)
+    except OperationalError as exc:
+        print(f"{exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
