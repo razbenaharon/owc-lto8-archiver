@@ -35,7 +35,8 @@ from .exit_codes import (
     CLASS_NETWORK_UNREACHABLE, CLASS_TEMPORARY_TRANSPORT_FAILURE)
 from .logsetup import get_logger
 from .status_file import write_status, write_last_failure
-from .windows_update_guard import (RebootSentinel, ltfs_current_mount_status,
+from .windows_update_guard import (RebootSentinel, assess_reboot_state,
+                                   ltfs_current_mount_status,
                                    ltfs_media_health,
                                    ltfs_sync_mode_status,
                                    pending_reboot_reasons,
@@ -2119,13 +2120,14 @@ class RemoteOrchestrator:
         return None
 
     def _block_on_soft_reboot_marker(self):
-        """Whether PendingFileRenameOperations alone may stop the pipeline.
+        """Deprecated: severity now decides what blocks, not this flag.
 
-        Follows the operator's ``[WINDOWS_UPDATE] block_on_pending_reboot``.
-        When that is false the start gate already proceeds past the marker, so
-        the sentinel and the pre-write gate must agree — otherwise the run stops
-        within 60s on the very signal the operator overrode. The hard markers
-        (CBS / Windows Update) and SCCM's intent are unaffected either way.
+        ``PendingFileRenameOperations`` is classified warning-only in
+        ``windows_update_guard``, so it can never stop the pipeline on its own
+        regardless of what this returns. Kept because
+        ``[WINDOWS_UPDATE] block_on_pending_reboot`` still means "let a real,
+        critical pending restart block a write", and an absent key must fail
+        safe (block).
         """
         return bool(getattr(
             self.cfg, "windows_update_block_on_pending_reboot", True))
@@ -2144,16 +2146,35 @@ class RemoteOrchestrator:
         log.info("pre_tape_write_reboot_check: session=%s chunk=%s tape=%s "
                  "staging=%s", session_id, desc.chunk_index + 1, tape_label,
                  desc.pack_dir)
-        include_soft = self._block_on_soft_reboot_marker()
         try:
-            reasons, sccm = reboot_block_reasons(
-                block_on_unknown=True, include_soft=include_soft)
+            assessment = assess_reboot_state(block_on_unknown=True)
         except Exception:
             # The gate itself must never take the pipeline down. Fall back to
-            # the Windows markers alone rather than blocking forever.
+            # the critical Windows markers alone rather than blocking forever.
             log.exception("pre_tape_write_reboot_check failed; "
                           "falling back to Windows markers")
-            return list(pending_reboot_reasons(include_soft=include_soft)), None
+            return list(pending_reboot_reasons(include_soft=False)), None
+
+        sccm = assessment.sccm
+        # Warning-only indicators are never discarded: they are recorded here
+        # and on the console so a stale rename queue stays visible in
+        # diagnostics without stopping a tape write.
+        if assessment.warnings:
+            summary = assessment.warning_summary()
+            log.info("pre_tape_write_reboot_warning: session=%s chunk=%s %s",
+                     session_id, desc.chunk_index + 1, summary)
+            print(f"[WU] {summary}")
+
+        reasons = assessment.blocking_reasons
+        if reasons and not self._block_on_soft_reboot_marker():
+            # Explicit operator override of a real, critical pending restart.
+            log.warning(
+                "tape_write_reboot_block_overridden: session=%s chunk=%s "
+                "reasons=%s — [WINDOWS_UPDATE] block_on_pending_reboot=false",
+                session_id, desc.chunk_index + 1, "; ".join(reasons))
+            print("[WU] block_on_pending_reboot = false — proceeding despite: "
+                  + "; ".join(reasons))
+            return [], sccm
 
         if reasons:
             detail = "; ".join(reasons)

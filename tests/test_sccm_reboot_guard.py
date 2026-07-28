@@ -116,26 +116,35 @@ class SccmRebootStatusTests(unittest.TestCase):
         self.assertFalse(s["reboot_pending"])
 
 
+def _clear_sccm(**over):
+    base = dict(reboot_pending=False, hard_reboot_pending=False,
+                in_grace_period=False, deadline=None, error=None,
+                determinate=True, installed=True, registry_reboot_data=False)
+    base.update(over)
+    return base
+
+
+def _signal(code, severity, message="m", source="s"):
+    return wug.RebootSignal(code, severity, source, message)
+
+
 class RebootBlockReasonsTests(unittest.TestCase):
     """Scenario 7, plus the unknown-state asymmetry between the two callers."""
 
     def test_windows_marker_alone_blocks_without_sccm(self):
-        with mock.patch.object(wug, "pending_reboot_reasons",
-                               return_value=["CBS has a restart pending"]), \
+        with mock.patch.object(
+                wug, "pending_reboot_signals",
+                return_value=[_signal(wug.REBOOT_CBS_PENDING,
+                                      wug.SEVERITY_CRITICAL,
+                                      "CBS has a restart pending")]), \
              mock.patch.object(wug, "sccm_reboot_status",
-                               return_value=dict(reboot_pending=False,
-                                                 hard_reboot_pending=False,
-                                                 in_grace_period=False,
-                                                 deadline=None, error=None,
-                                                 determinate=True)):
+                               return_value=_clear_sccm()):
             reasons, _ = wug.reboot_block_reasons()
         self.assertEqual(len(reasons), 1)
 
     def test_unknown_sccm_blocks_a_write_but_not_the_sentinel(self):
-        unknown = dict(reboot_pending=False, hard_reboot_pending=False,
-                       in_grace_period=False, deadline=None,
-                       error="wmi down", determinate=False)
-        with mock.patch.object(wug, "pending_reboot_reasons", return_value=[]), \
+        unknown = _clear_sccm(error="wmi down", determinate=False)
+        with mock.patch.object(wug, "pending_reboot_signals", return_value=[]), \
              mock.patch.object(wug, "sccm_reboot_status", return_value=unknown):
             gate, _ = wug.reboot_block_reasons(block_on_unknown=True)
             sentinel, _ = wug.reboot_block_reasons(block_on_unknown=False)
@@ -144,6 +153,206 @@ class RebootBlockReasonsTests(unittest.TestCase):
         self.assertTrue(gate)
         # ...but a WMI hiccup must not stop a healthy run mid-flight.
         self.assertEqual(sentinel, [])
+
+
+class RebootSeverityClassificationTests(unittest.TestCase):
+    """2026-07-28: severity, not message text, decides whether a write blocks.
+
+    Root cause being locked down here: `PendingFileRenameOperations` is a list
+    of moves to apply *if* a restart happens — it never causes one. It used to
+    be indistinguishable from a real staged restart, so the only way to stop it
+    blocking every tape write was `block_on_pending_reboot = false`, which also
+    disabled blocking on SCCM, CBS and Windows Update. The guard that matters
+    was switched off to silence a stale rename queue.
+    """
+
+    # --- case 1: the false positive that caused the override ------------------
+
+    def test_file_rename_alone_is_warning_only_and_does_not_block(self):
+        rename = _signal(wug.REBOOT_FILE_RENAME, wug.SEVERITY_WARNING,
+                         "Files are queued to be renamed on the next restart")
+        with mock.patch.object(wug, "pending_reboot_signals",
+                               return_value=[rename]), \
+             mock.patch.object(wug, "sccm_reboot_status",
+                               return_value=_clear_sccm()):
+            a = wug.assess_reboot_state()
+            reasons, _ = wug.reboot_block_reasons()
+
+        self.assertFalse(a.blocking, "a stale rename queue must not block")
+        self.assertEqual(reasons, [])
+        # ...but it is NOT discarded: it stays visible in diagnostics.
+        self.assertEqual(len(a.warnings), 1)
+        self.assertIn(wug.REBOOT_FILE_RENAME, a.codes)
+        self.assertIn("non-blocking", a.warning_summary())
+        self.assertIn(wug.REBOOT_FILE_RENAME, a.warning_summary())
+
+    # --- case 2: SCCM ---------------------------------------------------------
+
+    def test_sccm_pending_is_critical_and_blocks(self):
+        with mock.patch.object(wug, "pending_reboot_signals", return_value=[]), \
+             mock.patch.object(wug, "sccm_reboot_status",
+                               return_value=_clear_sccm(reboot_pending=True)):
+            a = wug.assess_reboot_state()
+        self.assertTrue(a.blocking)
+        self.assertIn(wug.REBOOT_SCCM_PENDING, [s.code for s in a.critical])
+
+    def test_sccm_hard_reboot_is_critical_and_blocks(self):
+        with mock.patch.object(wug, "pending_reboot_signals", return_value=[]), \
+             mock.patch.object(
+                 wug, "sccm_reboot_status",
+                 return_value=_clear_sccm(reboot_pending=True,
+                                          hard_reboot_pending=True,
+                                          in_grace_period=True,
+                                          deadline="2026-07-29T10:00:00Z")):
+            a = wug.assess_reboot_state()
+        codes = [s.code for s in a.critical]
+        self.assertIn(wug.REBOOT_SCCM_HARD, codes)
+        self.assertTrue(a.blocking)
+        # The deadline and grace period must reach the operator-facing text.
+        joined = " ".join(a.blocking_reasons)
+        self.assertIn("2026-07-29T10:00:00Z", joined)
+        self.assertIn("grace period", joined)
+
+    # --- case 3: Windows Update / CBS ----------------------------------------
+
+    def test_windows_update_and_cbs_markers_are_critical(self):
+        for code in (wug.REBOOT_WU_REQUIRED, wug.REBOOT_CBS_PENDING,
+                     wug.REBOOT_CBS_IN_PROGRESS,
+                     wug.REBOOT_CBS_PACKAGES_PENDING,
+                     wug.REBOOT_WU_POST_REBOOT_REPORTING,
+                     wug.REBOOT_COMPUTER_RENAME, wug.REBOOT_DOMAIN_JOIN):
+            with self.subTest(code=code):
+                with mock.patch.object(
+                        wug, "pending_reboot_signals",
+                        return_value=[_signal(code, wug.SEVERITY_CRITICAL)]), \
+                     mock.patch.object(wug, "sccm_reboot_status",
+                                       return_value=_clear_sccm()):
+                    a = wug.assess_reboot_state()
+                self.assertTrue(a.blocking, f"{code} must block a tape write")
+
+    # --- case 4: critical always wins over warning ---------------------------
+
+    def test_critical_wins_when_mixed_with_a_warning(self):
+        signals = [
+            _signal(wug.REBOOT_FILE_RENAME, wug.SEVERITY_WARNING, "renames"),
+            _signal(wug.REBOOT_CBS_PENDING, wug.SEVERITY_CRITICAL, "cbs"),
+        ]
+        with mock.patch.object(wug, "pending_reboot_signals",
+                               return_value=signals), \
+             mock.patch.object(wug, "sccm_reboot_status",
+                               return_value=_clear_sccm()):
+            a = wug.assess_reboot_state()
+            reasons, _ = wug.reboot_block_reasons()
+
+        self.assertTrue(a.blocking)
+        self.assertEqual(a.blocking_reasons, ["cbs"])
+        self.assertEqual(reasons, ["cbs"])
+        # The warning survives alongside it rather than being swallowed.
+        self.assertEqual(a.warning_reasons, ["renames"])
+
+    # --- case 5: nothing at all ----------------------------------------------
+
+    def test_no_indicators_is_not_blocking(self):
+        with mock.patch.object(wug, "pending_reboot_signals", return_value=[]), \
+             mock.patch.object(wug, "sccm_reboot_status",
+                               return_value=_clear_sccm()):
+            a = wug.assess_reboot_state()
+        self.assertFalse(a.blocking)
+        self.assertEqual(a.signals, [])
+        self.assertEqual(a.warning_summary(), "")
+
+    # --- case 6: unknown must stay fail-closed -------------------------------
+
+    def test_indeterminate_sccm_still_fails_closed_at_the_write_boundary(self):
+        unknown = _clear_sccm(determinate=False, error="rpc unavailable")
+        with mock.patch.object(wug, "pending_reboot_signals", return_value=[]), \
+             mock.patch.object(wug, "sccm_reboot_status", return_value=unknown):
+            gate = wug.assess_reboot_state(block_on_unknown=True)
+            sentinel = wug.assess_reboot_state(block_on_unknown=False)
+
+        self.assertTrue(gate.blocking, "unknown must never read as safe")
+        self.assertIn(wug.REBOOT_SCCM_INDETERMINATE,
+                      [s.code for s in gate.critical])
+        # The sentinel's documented asymmetry is preserved untouched.
+        self.assertFalse(sentinel.blocking)
+
+    def test_severity_is_not_decided_by_message_text(self):
+        """A reworded message must not change the block/allow outcome."""
+        renamed = _signal(wug.REBOOT_FILE_RENAME, wug.SEVERITY_WARNING,
+                          "Completely different wording")
+        with mock.patch.object(wug, "pending_reboot_signals",
+                               return_value=[renamed]), \
+             mock.patch.object(wug, "sccm_reboot_status",
+                               return_value=_clear_sccm()):
+            self.assertFalse(wug.assess_reboot_state().blocking)
+
+
+class PendingRebootSignalRegistryTests(unittest.TestCase):
+    """The registry readers classify the real markers correctly."""
+
+    def _with_registry(self, existing_keys=(), values=None):
+        values = values or {}
+        return (
+            mock.patch.object(wug, "_key_exists",
+                              side_effect=lambda p: p in existing_keys),
+            mock.patch.object(
+                wug, "_read_value",
+                side_effect=lambda root, path, name: (
+                    values.get((path, name)), None)),
+        )
+
+    def setUp(self):
+        if wug.winreg is None:
+            self.skipTest("winreg unavailable on this platform")
+
+    def test_pending_file_rename_value_yields_a_warning_signal(self):
+        k, v = self._with_registry(
+            values={(wug._SESSION_MANAGER_PATH,
+                     "PendingFileRenameOperations"): ["a\0b"]})
+        with k, v:
+            signals = wug.pending_reboot_signals()
+        self.assertEqual([s.code for s in signals], [wug.REBOOT_FILE_RENAME])
+        self.assertEqual(signals[0].severity, wug.SEVERITY_WARNING)
+        # The source must point at the actual registry value, for traceability.
+        self.assertIn("PendingFileRenameOperations", signals[0].source)
+
+    def test_cbs_reboot_pending_key_yields_a_critical_signal(self):
+        cbs = [p for c, p, _m in wug._CRITICAL_KEY_MARKERS
+               if c == wug.REBOOT_CBS_PENDING][0]
+        k, v = self._with_registry(existing_keys={cbs})
+        with k, v:
+            signals = wug.pending_reboot_signals()
+        self.assertEqual([s.code for s in signals], [wug.REBOOT_CBS_PENDING])
+        self.assertEqual(signals[0].severity, wug.SEVERITY_CRITICAL)
+
+    def test_computer_rename_mismatch_is_critical(self):
+        k, v = self._with_registry(values={
+            (wug._COMPUTERNAME_ACTIVE, "ComputerName"): "LAB-HPLB-09",
+            (wug._COMPUTERNAME_PENDING, "ComputerName"): "LAB-HPLB-10",
+        })
+        with k, v:
+            signals = wug.pending_reboot_signals()
+        self.assertEqual([s.code for s in signals],
+                         [wug.REBOOT_COMPUTER_RENAME])
+
+    def test_matching_computer_name_is_not_a_signal(self):
+        k, v = self._with_registry(values={
+            (wug._COMPUTERNAME_ACTIVE, "ComputerName"): "LAB-HPLB-09",
+            (wug._COMPUTERNAME_PENDING, "ComputerName"): "LAB-HPLB-09",
+        })
+        with k, v:
+            self.assertEqual(wug.pending_reboot_signals(), [])
+
+    def test_legacy_pending_reboot_reasons_filters_by_severity(self):
+        signals = [
+            _signal(wug.REBOOT_CBS_PENDING, wug.SEVERITY_CRITICAL, "cbs"),
+            _signal(wug.REBOOT_FILE_RENAME, wug.SEVERITY_WARNING, "renames"),
+        ]
+        with mock.patch.object(wug, "pending_reboot_signals",
+                               return_value=signals):
+            self.assertEqual(wug.pending_reboot_reasons(), ["cbs", "renames"])
+            self.assertEqual(
+                wug.pending_reboot_reasons(include_soft=False), ["cbs"])
 
 
 class LtfsSyncModeTests(unittest.TestCase):
@@ -264,30 +473,65 @@ class PreTapeWriteGateTests(unittest.TestCase):
         self.desc = StagedChunk(chunk_index=22, fetch_dir="f", pack_dir="p",
                                 metadata=[], staged_bytes=10)
 
+    @staticmethod
+    def _assessment(signals=(), sccm=None):
+        return wug.RebootAssessment(list(signals),
+                                    sccm if sccm is not None
+                                    else _clear_sccm())
+
     def test_clear_state_allows_the_write(self):
-        with mock.patch.object(ro, "reboot_block_reasons",
-                               return_value=([], {"determinate": True})):
+        with mock.patch.object(ro, "assess_reboot_state",
+                               return_value=self._assessment()):
             reasons, _ = self.orch._pre_tape_write_reboot_check(37, self.desc, "T")
         self.assertEqual(reasons, [])
 
     def test_pending_restart_blocks_the_write(self):
+        crit = _signal(wug.REBOOT_SCCM_PENDING, wug.SEVERITY_CRITICAL,
+                       "SCCM has a restart pending")
         with mock.patch.object(
-                ro, "reboot_block_reasons",
-                return_value=(["SCCM has a restart pending"],
-                              {"reboot_pending": True})), \
+                ro, "assess_reboot_state",
+                return_value=self._assessment([crit])), \
              mock.patch.object(ro, "send_best_effort") as notify:
             reasons, _ = self.orch._pre_tape_write_reboot_check(37, self.desc, "T")
         self.assertTrue(reasons)
         notify.assert_called_once()
 
-    def test_soft_marker_flag_follows_the_operator_config(self):
-        """The gate must honour ``[WINDOWS_UPDATE] block_on_pending_reboot``.
+    def test_file_rename_warning_alone_allows_the_write(self):
+        """Case 1 at the gate: the exact state that forced the 07-26 override."""
+        warn = _signal(wug.REBOOT_FILE_RENAME, wug.SEVERITY_WARNING,
+                       "Files are queued to be renamed on the next restart")
+        with mock.patch.object(ro, "assess_reboot_state",
+                               return_value=self._assessment([warn])), \
+             mock.patch.object(ro, "send_best_effort") as notify:
+            reasons, _ = self.orch._pre_tape_write_reboot_check(37, self.desc, "T")
+        self.assertEqual(reasons, [], "a stale rename queue must not stop a write")
+        notify.assert_not_called()
 
-        The flag is currently overridden to false on this host, so the gate
-        agreeing with the start gate is live behaviour, not a hypothetical:
-        if they disagree the run stops within 60s on the very soft marker the
-        operator overrode.
-        """
+    def test_critical_beats_a_warning_at_the_gate(self):
+        """Case 4 at the gate: mixed signals must still block."""
+        signals = [
+            _signal(wug.REBOOT_FILE_RENAME, wug.SEVERITY_WARNING, "renames"),
+            _signal(wug.REBOOT_CBS_PENDING, wug.SEVERITY_CRITICAL, "cbs"),
+        ]
+        with mock.patch.object(ro, "assess_reboot_state",
+                               return_value=self._assessment(signals)), \
+             mock.patch.object(ro, "send_best_effort"):
+            reasons, _ = self.orch._pre_tape_write_reboot_check(37, self.desc, "T")
+        self.assertEqual(reasons, ["cbs"])
+
+    def test_indeterminate_state_blocks_the_write(self):
+        """Case 6 at the gate: unknown stays fail-closed."""
+        unknown = _signal(wug.REBOOT_SCCM_INDETERMINATE, wug.SEVERITY_CRITICAL,
+                          "SCCM restart state could not be determined")
+        with mock.patch.object(
+                ro, "assess_reboot_state",
+                return_value=self._assessment(
+                    [unknown], _clear_sccm(determinate=False))), \
+             mock.patch.object(ro, "send_best_effort"):
+            reasons, _ = self.orch._pre_tape_write_reboot_check(37, self.desc, "T")
+        self.assertTrue(reasons)
+
+    def test_block_flag_follows_the_operator_config(self):
         self.orch.cfg = SimpleNamespace(
             windows_update_block_on_pending_reboot=False)
         self.assertFalse(self.orch._block_on_soft_reboot_marker())
@@ -296,30 +540,62 @@ class PreTapeWriteGateTests(unittest.TestCase):
             windows_update_block_on_pending_reboot=True)
         self.assertTrue(self.orch._block_on_soft_reboot_marker())
 
-        # An older config with the key absent must fail safe (block), never
-        # silently drop the soft marker.
+        # An older config with the key absent must fail safe (block).
         self.orch.cfg = SimpleNamespace()
         self.assertTrue(self.orch._block_on_soft_reboot_marker())
 
-    def test_soft_marker_flag_reaches_reboot_block_reasons(self):
-        # The flag is only useful if it is actually forwarded to the checker.
+    def test_operator_override_can_still_proceed_past_a_critical_reason(self):
+        """block_on_pending_reboot=false remains a deliberate escape hatch."""
         self.orch.cfg = SimpleNamespace(
             windows_update_block_on_pending_reboot=False)
-        with mock.patch.object(ro, "reboot_block_reasons",
-                               return_value=([], {"determinate": True})) as chk:
-            self.orch._pre_tape_write_reboot_check(37, self.desc, "T")
-        self.assertIs(chk.call_args.kwargs["include_soft"], False)
+        crit = _signal(wug.REBOOT_SCCM_PENDING, wug.SEVERITY_CRITICAL, "sccm")
+        with mock.patch.object(ro, "assess_reboot_state",
+                               return_value=self._assessment([crit])):
+            reasons, _ = self.orch._pre_tape_write_reboot_check(37, self.desc, "T")
+        self.assertEqual(reasons, [])
 
-    def test_gate_failure_falls_back_to_windows_markers(self):
+    def test_gate_failure_falls_back_to_critical_windows_markers(self):
         """The gate must never be the thing that takes the pipeline down."""
-        with mock.patch.object(ro, "reboot_block_reasons",
+        with mock.patch.object(ro, "assess_reboot_state",
                                side_effect=RuntimeError("boom")), \
              mock.patch.object(ro, "pending_reboot_reasons",
-                               return_value=["CBS restart pending"]):
+                               return_value=["CBS restart pending"]) as legacy:
             reasons, sccm = self.orch._pre_tape_write_reboot_check(
                 37, self.desc, "T")
         self.assertEqual(reasons, ["CBS restart pending"])
         self.assertIsNone(sccm)
+        # The fallback must not resurrect the warning-only marker.
+        self.assertIs(legacy.call_args.kwargs["include_soft"], False)
+
+
+class RebootSentinelSeverityTests(unittest.TestCase):
+    """The sentinel must not trip on a warning-only indicator either.
+
+    Before the fix it did, within 60s, unless the operator disabled the guard —
+    which is what made the override necessary in the first place.
+    """
+
+    def test_warning_only_does_not_trigger_the_sentinel(self):
+        warn = _signal(wug.REBOOT_FILE_RENAME, wug.SEVERITY_WARNING, "renames")
+        stop = threading.Event()
+        sentinel = wug.RebootSentinel(stop)
+        with mock.patch.object(wug, "assess_reboot_state",
+                               return_value=wug.RebootAssessment([warn],
+                                                                 _clear_sccm())):
+            self.assertFalse(sentinel._check_once())
+        self.assertFalse(stop.is_set())
+        self.assertFalse(sentinel.triggered)
+
+    def test_critical_triggers_the_sentinel_and_sets_the_stop_event(self):
+        crit = _signal(wug.REBOOT_SCCM_PENDING, wug.SEVERITY_CRITICAL, "sccm")
+        stop = threading.Event()
+        sentinel = wug.RebootSentinel(stop)
+        with mock.patch.object(wug, "assess_reboot_state",
+                               return_value=wug.RebootAssessment([crit],
+                                                                 _clear_sccm())):
+            self.assertTrue(sentinel._check_once())
+        self.assertTrue(stop.is_set())
+        self.assertTrue(sentinel.triggered)
 
 
 class TransientFetchRetryTests(unittest.TestCase):
