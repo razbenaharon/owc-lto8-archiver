@@ -728,6 +728,57 @@ class WriteChunkRaceTests(unittest.TestCase):
         orch._cleanup_dir = lambda p: None
         return orch, statuses
 
+    def test_last_chunk_does_not_eject_by_default(self):
+        """2026-07-28: the remote orchestrator ejected after the final chunk.
+
+        `LtfsCmdEject` is mechanical and there is no software "load" for a tape
+        out of the slot, so a run finishing overnight stranded the drive until
+        somebody travelled to the lab — the exact outcome
+        docs/incidents/000-no-physical-intervention-policy.md forbids. It also
+        would have blocked the follow-up session for the roots plan 37 never
+        scanned. The default is now "leave the cartridge loaded".
+        """
+        writer = self._FakeWriter()
+        orch, _ = self._o(writer)
+        seen = {}
+        orch._backup_writer = lambda cls=None: (seen.__setitem__("cls", cls)
+                                                or writer)
+        # cfg has no eject_after_session key at all -> must fail SAFE.
+        self.assertFalse(orch._eject_after_session())
+        orch._write_chunk(7, _desc(0), "T", orch._eject_after_session(),
+                          threading.Event())
+        self.assertIs(seen["cls"], ro._NoEjectBackup,
+                      "the final chunk must use the no-eject writer by default")
+
+    def test_last_chunk_ejects_only_when_explicitly_enabled(self):
+        """The eject stays available for an operator standing at the drive."""
+        writer = self._FakeWriter()
+        orch, _ = self._o(writer)
+        orch.cfg.eject_after_session = True
+        seen = {}
+        orch._backup_writer = lambda cls=None: (seen.__setitem__("cls", cls)
+                                                or writer)
+        self.assertTrue(orch._eject_after_session())
+        orch._write_chunk(7, _desc(0), "T", orch._eject_after_session(),
+                          threading.Event())
+        self.assertIs(seen["cls"], ro.LTOBackup)
+
+    def test_eject_flag_is_explicitly_false_when_configured_false(self):
+        orch, _ = self._o(self._FakeWriter())
+        orch.cfg.eject_after_session = False
+        self.assertFalse(orch._eject_after_session())
+
+    def test_non_final_chunks_never_eject(self):
+        """Unchanged behaviour: mid-session chunks always keep the tape loaded."""
+        writer = self._FakeWriter()
+        orch, _ = self._o(writer)
+        orch.cfg.eject_after_session = True   # even with the eject opted in
+        seen = {}
+        orch._backup_writer = lambda cls=None: (seen.__setitem__("cls", cls)
+                                                or writer)
+        orch._write_chunk(7, _desc(0), "T", False, threading.Event())
+        self.assertIs(seen["cls"], ro._NoEjectBackup)
+
     def test_recorded_stop_before_write_prevents_the_writer(self):
         writer = self._FakeWriter()
         orch, statuses = self._o(writer)

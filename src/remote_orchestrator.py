@@ -236,6 +236,18 @@ class RemoteOrchestrator:
         self._last_fetch_failure = None
         self.governor = ResourceGovernor(cfg, self.staging_dir)
 
+    def _eject_after_session(self):
+        """Whether to physically eject once the session's last chunk is written.
+
+        Default False. `LtfsCmdEject` is mechanical and there is no software
+        "load" for a cartridge out of the slot, so an eject at the end of a run
+        that finishes unattended strands the drive until somebody travels to it
+        — exactly what the no-physical-intervention policy exists to prevent.
+        An absent config key must therefore fail SAFE (no eject), the opposite
+        of the reboot guard's fail-closed default.
+        """
+        return bool(getattr(self.cfg, "eject_after_session", False))
+
     def _backup_writer(self, cls=LTOBackup):
         return cls(
             self.db,
@@ -875,7 +887,11 @@ class RemoteOrchestrator:
                     "[PIPELINE] Session complete — all chunks archived; run "
                     f"stopped by user ({recorded.reason}).")
                 return self._finalize(recorded, phase="streaming")
-            self._backup_writer(LTOBackup).eject_tape(self.cfg.lto_drive)
+            if self._eject_after_session():
+                self._backup_writer(LTOBackup).eject_tape(self.cfg.lto_drive)
+            else:
+                print("[REMOTE] Leaving the cartridge loaded "
+                      "([HARDWARE] eject_after_session = false).")
             print("\n[REMOTE] Session complete. All streamed chunks archived.")
             send_best_effort(
                 self.notifier,
@@ -1089,7 +1105,7 @@ class RemoteOrchestrator:
                 if desc is SENTINEL:
                     break
                 ci          = desc.chunk_index
-                eject_after = (ci == last_chunk)
+                eject_after = (ci == last_chunk) and self._eject_after_session()
                 # _write_chunk authorizes (safety gate) and writes atomically
                 # under the tape I/O lock — the same single boundary the
                 # streaming path uses. None => written; a StopResult => not

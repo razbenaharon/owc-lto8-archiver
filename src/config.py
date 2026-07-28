@@ -253,6 +253,22 @@ class ConfigManager:
             'HARDWARE', 'ibm_eject_cmd',
             fallback=r'C:\Program Files\IBM\LTFS\LtfsCmdEject.exe'))
     @property
+    def eject_after_session(self):
+        """Whether a completed remote session physically ejects the cartridge.
+
+        Defaults to **False**, which is what the no-physical-intervention policy
+        has required all along: `LtfsCmdEject` is mechanical, and a cartridge
+        ejected with nobody at the drive cannot be reloaded remotely — there is
+        no software "load" for a tape sitting out of the slot. A run that
+        finishes overnight would strand the drive until someone travels to it.
+
+        The remote orchestrator ejected unconditionally after the last chunk,
+        which contradicted that policy; this flag makes the safe behaviour the
+        default and keeps the eject available for an operator who is standing
+        at the drive and wants the tape out.
+        """
+        return self._get_bool('HARDWARE', 'eject_after_session', False)
+    @property
     def zip_threshold_mb(self):
         return self._get_float('SETTINGS', 'zip_threshold_mb', 100)
     @property
