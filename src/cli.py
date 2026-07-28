@@ -18,7 +18,8 @@ from .retriever import LTORetriever
 from .robocopy import _prepare_robocopy_exclusion, _remove_robocopy_exclusion
 from .remote_transport import _cleanup_askpass_helpers
 from .runtime import _terminate_all_procs, install_cancel_handler, reset_cancel, uninstall_cancel_handler, unpin_current_process
-from .windows_update_guard import (managed_update_policy, pause_windows_updates,
+from .windows_update_guard import (assess_reboot_state, managed_update_policy,
+                                   pause_windows_updates,
                                    pending_reboot_reasons, print_guard_status,
                                    restore_stale_guard, resume_windows_updates)
 
@@ -39,11 +40,17 @@ def _start_windows_update_guard(cfg: ConfigManager):
     # Undo a pause a force-killed run left behind before installing a new one.
     restore_stale_guard()
 
-    reasons = pending_reboot_reasons()
-    if reasons:
+    # Severity decides. A warning-only indicator (a stale
+    # PendingFileRenameOperations queue) is reported but must not refuse to
+    # start the run — before 2026-07-28 it did, and silencing it meant turning
+    # the whole guard off.
+    assessment = assess_reboot_state(block_on_unknown=False)
+    if assessment.warnings:
+        print(f"\n[WU] {assessment.warning_summary()}")
+    if assessment.blocking:
         print("\n[WU] Windows has a restart pending:")
-        for reason in reasons:
-            print(f"  - {reason}")
+        for signal in assessment.critical:
+            print(f"  - {signal.message} [{signal.code}]")
         print("[WU] Pausing updates cannot cancel an already-staged restart. "
               "A restart during a tape write corrupts the LTFS index and "
               "loses every chunk written so far — this cost ~126 GB of "

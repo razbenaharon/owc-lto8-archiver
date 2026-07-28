@@ -239,11 +239,21 @@ class ManagedPolicyTests(_GuardTestCase):
 class RebootSentinelTests(_GuardTestCase):
     """The sentinel is the only real guard on an admin-managed host."""
 
+    @staticmethod
+    def _critical(message="update staged"):
+        return [wug.RebootSignal(wug.REBOOT_CBS_PENDING, wug.SEVERITY_CRITICAL,
+                                 "HKLM\\CBS", message)]
+
+    @staticmethod
+    def _warning(message="renames queued"):
+        return [wug.RebootSignal(wug.REBOOT_FILE_RENAME, wug.SEVERITY_WARNING,
+                                 "HKLM\\SessionManager", message)]
+
     def test_sentinel_sets_stop_event_when_restart_is_staged(self):
         stop = wug.threading.Event()
         s = wug.RebootSentinel(stop, poll_seconds=0.01)
-        with mock.patch.object(wug, "pending_reboot_reasons",
-                               lambda **_kw: ["update staged"]):
+        with mock.patch.object(wug, "pending_reboot_signals",
+                               lambda: self._critical()):
             s.start()
             self.assertTrue(stop.wait(timeout=3),
                             "sentinel must ask the pipeline to stop")
@@ -253,7 +263,7 @@ class RebootSentinelTests(_GuardTestCase):
     def test_sentinel_stays_quiet_on_a_clean_host(self):
         stop = wug.threading.Event()
         s = wug.RebootSentinel(stop, poll_seconds=0.01)
-        with mock.patch.object(wug, "pending_reboot_reasons", lambda **_kw: []):
+        with mock.patch.object(wug, "pending_reboot_signals", lambda: []):
             s.start()
             self.assertFalse(stop.wait(timeout=0.5))
         s.stop()
@@ -263,8 +273,8 @@ class RebootSentinelTests(_GuardTestCase):
         stop = wug.threading.Event()
         seen = []
         s = wug.RebootSentinel(stop, poll_seconds=0.01, on_detect=seen.append)
-        with mock.patch.object(wug, "pending_reboot_reasons",
-                               lambda **_kw: ["staged"]):
+        with mock.patch.object(wug, "pending_reboot_signals",
+                               lambda: self._critical("staged")):
             s.start()
             stop.wait(timeout=3)
         s.stop()
@@ -273,7 +283,7 @@ class RebootSentinelTests(_GuardTestCase):
     def test_registry_error_never_kills_the_pipeline(self):
         stop = wug.threading.Event()
         s = wug.RebootSentinel(stop, poll_seconds=0.01)
-        with mock.patch.object(wug, "pending_reboot_reasons",
+        with mock.patch.object(wug, "pending_reboot_signals",
                                mock.Mock(side_effect=OSError("hive gone"))):
             s.start()
             self.assertFalse(stop.wait(timeout=0.4),
@@ -288,28 +298,25 @@ class RebootSentinelTests(_GuardTestCase):
             raise RuntimeError("notifier down")
 
         s = wug.RebootSentinel(stop, poll_seconds=0.01, on_detect=boom)
-        with mock.patch.object(wug, "pending_reboot_reasons",
-                               lambda **_kw: ["staged"]):
+        with mock.patch.object(wug, "pending_reboot_signals",
+                               lambda: self._critical("staged")):
             s.start()
             self.assertTrue(stop.wait(timeout=3))
         s.stop()
 
-    def test_include_soft_is_forwarded_so_the_override_actually_holds(self):
+    def test_warning_only_marker_never_trips_the_sentinel(self):
         """2026-07-26: the sentinel tripped on a marker the start gate ignored.
 
         With block_on_pending_reboot=false the start gate proceeded, then the
-        sentinel stopped the run 60s later on the same PendingFileRenameOperations
-        entry — so the run could never write a chunk.
+        sentinel stopped the run 60s later on the same
+        PendingFileRenameOperations entry — so the run could never write a
+        chunk. Severity now settles it with no flag to keep in sync: the
+        marker is warning-only, so neither side blocks on it.
         """
-        seen = {}
-
-        def fake(include_soft=True):
-            seen["include_soft"] = include_soft
-            return []
-
         stop = wug.threading.Event()
-        s = wug.RebootSentinel(stop, poll_seconds=0.01, include_soft=False)
-        with mock.patch.object(wug, "pending_reboot_reasons", fake), \
+        s = wug.RebootSentinel(stop, poll_seconds=0.01)
+        with mock.patch.object(wug, "pending_reboot_signals",
+                               lambda: self._warning()), \
              mock.patch.object(wug, "sccm_reboot_status",
                                lambda: {"reboot_pending": False,
                                         "hard_reboot_pending": False,
@@ -319,7 +326,7 @@ class RebootSentinelTests(_GuardTestCase):
             s.start()
             self.assertFalse(stop.wait(timeout=0.5))
         s.stop()
-        self.assertIs(seen["include_soft"], False)
+        self.assertFalse(s.triggered)
 
 
 class SoftRebootMarkerTests(unittest.TestCase):
@@ -340,12 +347,19 @@ class SoftRebootMarkerTests(unittest.TestCase):
             raise OSError("key absent")
 
         self.renames = None
+
+        # Name-aware: a blanket "every value returns the rename list" stub would
+        # also make JoinDomain truthy and fabricate a domain-join signal.
+        def fake_read_value(_root, _path, name):
+            if name == "PendingFileRenameOperations":
+                return self.renames, REG_SZ
+            return None, None
+
         patches = [
             mock.patch.object(wug, "winreg", SimpleNamespace(
                 HKEY_LOCAL_MACHINE=0, REG_SZ=REG_SZ, REG_DWORD=REG_DWORD,
                 KEY_READ=0x20019, KEY_SET_VALUE=0x0002, OpenKey=fake_open)),
-            mock.patch.object(wug, "_read_value",
-                              lambda *_a, **_kw: (self.renames, REG_SZ)),
+            mock.patch.object(wug, "_read_value", fake_read_value),
             mock.patch.object(wug, "sccm_reboot_status", lambda: dict(
                 installed=False, reboot_pending=False,
                 hard_reboot_pending=False, in_grace_period=False,
@@ -368,13 +382,25 @@ class SoftRebootMarkerTests(unittest.TestCase):
         self.renames = ["\\??\\C:\\x"]
         self.assertEqual(wug.pending_reboot_reasons(include_soft=False), [])
 
+    def test_soft_marker_is_classified_warning_not_critical(self):
+        """The classification, not the caller's flag, is what makes it safe."""
+        self.renames = ["\\??\\C:\\x"]
+        signals = wug.pending_reboot_signals()
+        self.assertEqual([s.code for s in signals], [wug.REBOOT_FILE_RENAME])
+        self.assertEqual(signals[0].severity, wug.SEVERITY_WARNING)
+        self.assertFalse(wug.assess_reboot_state(block_on_unknown=False).blocking)
+
     def test_hard_marker_survives_the_exclusion(self):
-        """include_soft=False must not weaken the signals that matter."""
+        """A critical marker must never be weakened by the soft-marker path."""
         self.renames = ["\\??\\C:\\x"]
         self.hard_keys.add(self.CBS)
         reasons = wug.pending_reboot_reasons(include_soft=False)
         self.assertEqual(
             reasons, ["Component Based Servicing has a restart pending"])
+        # ...and the assessment blocks, with the warning still recorded.
+        a = wug.assess_reboot_state(block_on_unknown=False)
+        self.assertTrue(a.blocking)
+        self.assertEqual([s.code for s in a.warnings], [wug.REBOOT_FILE_RENAME])
 
     def test_sccm_intent_survives_the_exclusion(self):
         self.renames = ["\\??\\C:\\x"]
@@ -406,22 +432,54 @@ class CliWiringTests(unittest.TestCase):
         self.assertTrue(proceed)
         self.assertFalse(applied)
 
+    @staticmethod
+    def _assessment(*signals):
+        return wug.RebootAssessment(list(signals), dict(determinate=True))
+
+    @staticmethod
+    def _crit(message="update staged"):
+        return wug.RebootSignal(wug.REBOOT_CBS_PENDING, wug.SEVERITY_CRITICAL,
+                                "HKLM\\CBS", message)
+
+    @staticmethod
+    def _warn(message="renames queued"):
+        return wug.RebootSignal(wug.REBOOT_FILE_RENAME, wug.SEVERITY_WARNING,
+                                "HKLM\\SessionManager", message)
+
     def test_pending_reboot_blocks_the_run(self):
         from src import cli
         with mock.patch.object(cli, "restore_stale_guard", lambda: False), \
-             mock.patch.object(cli, "pending_reboot_reasons",
-                               lambda **_kw: ["update staged"]), \
+             mock.patch.object(cli, "assess_reboot_state",
+                               lambda **_kw: self._assessment(self._crit())), \
              mock.patch.object(cli, "pause_windows_updates") as pause:
             proceed, applied = cli._start_windows_update_guard(self._cfg())
         self.assertFalse(proceed)
         self.assertFalse(applied)
         pause.assert_not_called()
 
+    def test_warning_only_marker_does_not_block_the_run(self):
+        """The 2026-07-26 false positive, at the start gate.
+
+        A stale rename queue must not refuse to start the run even with
+        block_on_pending_reboot=true — that combination is what forced the
+        operator to disable the guard entirely.
+        """
+        from src import cli
+        with mock.patch.object(cli, "restore_stale_guard", lambda: False), \
+             mock.patch.object(cli, "assess_reboot_state",
+                               lambda **_kw: self._assessment(self._warn())), \
+             mock.patch.object(cli, "pause_windows_updates", lambda d: True), \
+             mock.patch.object(cli, "print_guard_status", lambda *a: None), \
+             mock.patch.object(cli, "managed_update_policy", lambda: {}):
+            proceed, applied = cli._start_windows_update_guard(self._cfg())
+        self.assertTrue(proceed, "a warning-only marker must not block the run")
+        self.assertTrue(applied)
+
     def test_pending_reboot_override_proceeds_and_pauses(self):
         from src import cli
         with mock.patch.object(cli, "restore_stale_guard", lambda: False), \
-             mock.patch.object(cli, "pending_reboot_reasons",
-                               lambda **_kw: ["update staged"]), \
+             mock.patch.object(cli, "assess_reboot_state",
+                               lambda **_kw: self._assessment(self._crit())), \
              mock.patch.object(cli, "pause_windows_updates", lambda d: True):
             proceed, applied = cli._start_windows_update_guard(
                 self._cfg(windows_update_block_on_pending_reboot=False))
