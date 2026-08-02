@@ -84,41 +84,11 @@ class PgTapeMixin:
 
     def replace_formatted_tape(self, volume_label, capacity_gb=None,
                                previous_labels=None):
-        labels = []
-        for label in list(previous_labels or []) + [volume_label]:
-            label = (label or "").strip()
-            if label and label not in labels:
-                labels.append(label)
-
-        def operation(conn):
-            removed = {}
-            for label in labels:
-                stats = self._delete_tape_records(conn, label)
-                cur = conn.execute(
-                    "DELETE FROM tapes WHERE volume_label=%s", (label,))
-                if cur.rowcount or any(stats.values()):
-                    removed[label] = stats
-            conn.execute(
-                """INSERT INTO tapes
-                   (volume_label, date_formatted, total_capacity, used_space)
-                   VALUES (%s, %s, %s, 0)""",
-                (volume_label, _now_utc(), capacity_gb),
-            )
-            return removed
-
-        removed = self._transaction(
-            operation, f"replace formatted tape {volume_label}")
-        if removed:
-            for label, stats in removed.items():
-                print(
-                    f"[DB] Cleared formatted tape '{label}': "
-                    f"{stats['file_records']} file record(s), "
-                    f"{stats['bundles']} bundle(s), {stats['runs']} run(s)."
-                )
-        else:
-            print("[DB] No existing tape records matched the formatted tape.")
-        print(f"[DB] Tape '{volume_label}' registered fresh with 0 used bytes.")
-        return True
+        raise RuntimeError(
+            "[DB] replace_formatted_tape is disabled: deleting/recreating a "
+            "tape row can erase sessions and chunks through foreign-key "
+            "cascades. Use the explicit `python run.py tape-reset --tape "
+            "<LABEL> --delete-catalog --yes ...` workflow instead.")
 
     def _delete_tape_records(self, conn, volume_label):
         stats = {}

@@ -108,6 +108,7 @@ class PgConnectionCore:
             "009_postgres_remote_session_fk.sql",
             "010_postgres_local_manifest_archive.sql",
             "011_postgres_tape_status.sql",
+            "013_postgres_tape_reset_safety.sql",
         )
         with self._pool.connection() as conn:
             with conn.cursor() as cur:

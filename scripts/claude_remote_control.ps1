@@ -53,6 +53,28 @@ param(
     [switch]$WhatIfOnly
 )
 
+# Task Scheduler and Windows Terminal can ignore -WindowStyle Hidden for
+# console applications. Hide the inherited console immediately while retaining
+# the TTY that Claude Remote Control requires.
+try {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class ClaudeRemoteConsoleWindow {
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetConsoleWindow();
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+}
+'@ -ErrorAction Stop
+    $consoleWindow = [ClaudeRemoteConsoleWindow]::GetConsoleWindow()
+    if ($consoleWindow -ne [IntPtr]::Zero) {
+        [void][ClaudeRemoteConsoleWindow]::ShowWindow($consoleWindow, 0)
+    }
+} catch { }
+
 $ErrorActionPreference = 'Stop'
 
 $ProjectRoot = Split-Path -Parent $PSScriptRoot

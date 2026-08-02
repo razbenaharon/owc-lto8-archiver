@@ -349,3 +349,72 @@ hardware/manual verification if relevant, and any database/config changes. For
   start tape writes under anything but `time@5` — under `sync_type=unmount` the
   index is written only at unmount, so a forced restart loses every chunk since
   the mount, which is exactly how chunks 18-91 (~126 GB) died.
+
+### Critical operating baseline for Session 37 and future code changes
+
+These rules are non-negotiable and apply to all future work on this repository.
+
+#### During IDLE, do not touch LTFS
+
+After a write group finishes and ownership is released, the application must
+perform zero tape operations until the next finite group is ready. During idle,
+do not call readiness, read the tape label, access `Z:\`, run `os.listdir()` or
+`os.path.isdir()` on the LTFS root, invoke IBM LTFS helpers, run `vol`,
+`Test-Path`, `Get-Volume`, `Get-PSDrive`, or similar tape probes, run robocopy
+against the tape, eject, remount, format, or run `ltfsck`. Only passive log and
+telemetry observation is allowed.
+
+#### Write only in finite groups
+
+The required sequence is:
+
+```text
+prepare several chunks locally
+-> select one finite group
+-> acquire Global LTFS ownership once
+-> run readiness once
+-> verify the cartridge once
+-> write all selected chunks consecutively
+-> release ownership
+```
+
+Do not check readiness or read the label between chunks. Do not release
+ownership between chunks, and do not wait for future chunks while ownership is
+held. Every chunk keeps its own authoritative status. If a later chunk fails,
+earlier completed chunks remain completed, and unstarted packs remain reusable.
+
+#### On a hard tape failure, stop immediately
+
+For read-only, write-protect, servo, SCSI timeout, ownership loss, cartridge
+mismatch, LTFS instability, or hard robocopy failure: stop; do not retry or
+start another group; do not eject, remount, format, or run `ltfsck`; preserve
+packs, logs, and dumps; record the last successful chunk; and classify the
+outcome conservatively. No automatic recovery is allowed after a hard tape
+failure.
+
+#### After code changes, do not resume production immediately
+
+Use this progression:
+
+```text
+code change
+-> full offline tests
+-> isolated PostgreSQL tests
+-> small synthetic hardware pilot
+-> one bounded production group
+-> review
+-> broader Session 37 resume
+```
+
+Do not combine major refactoring, database changes, scheduling changes, a
+hardware pilot, and a full production resume into one step.
+
+Current production assumptions as of 2026-08-02:
+
+- Authoritative catalog: `lto_archive_directory_catalog_20260710_103359`.
+- Chunks 0-48 are done on Tape_02.
+- Chunks 49-112 are pending for Tape_03; chunk 108 is pending.
+- Sealed batches and production observation remain disabled.
+- Tape_03 already contains the 24 GiB Phase 5E synthetic pilot data.
+- Do not resume Session 37 until code changes, tests, and a new bounded pilot
+  are reviewed.

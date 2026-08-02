@@ -140,16 +140,38 @@ _PREV_SIGBREAK = None
 _PERF_WARNED = False
 
 
-def _acquire_tape_io_lock(reason):
-    """Serialize in-process LTFS reads/writes so robocopy owns the tape alone."""
-    if _TAPE_IO_LOCK.acquire(blocking=False):
-        return
-    _status('TAPE', f"Waiting for exclusive tape access: {reason}")
-    _TAPE_IO_LOCK.acquire()
+def _acquire_tape_io_lock(reason, timeout=None):
+    """Take exclusive LTFS access: cross-process FIRST, then in-process.
+
+    ``_TAPE_IO_LOCK`` alone only serialises threads inside this interpreter; the
+    watchdog, helper scripts and a second ``run.py`` could all touch the tape
+    around it. The authoritative boundary is the Windows named mutex in
+    :mod:`src.ltfs_ownership`, so every existing call site is protected without
+    changing any of them.
+
+    Raises :class:`~src.ltfs_ownership.LtfsOwnershipError` when ownership cannot
+    be acquired — the caller must then perform no tape, mount, readiness or
+    robocopy operation. There is deliberately no fallback to the in-process
+    lock: a lock that does not stop other processes is not a safety boundary.
+    """
+    from .ltfs_ownership import OWNERSHIP     # late: avoids an import cycle
+
+    if not _TAPE_IO_LOCK.acquire(blocking=False):
+        _status('TAPE', f"Waiting for exclusive tape access: {reason}")
+        _TAPE_IO_LOCK.acquire()
+    try:
+        OWNERSHIP.acquire(reason, timeout=timeout)
+    except BaseException:
+        _TAPE_IO_LOCK.release()
+        raise
 
 
-def _release_tape_io_lock():
-    _TAPE_IO_LOCK.release()
+def _release_tape_io_lock(reason=None):
+    from .ltfs_ownership import OWNERSHIP     # late: avoids an import cycle
+    try:
+        OWNERSHIP.release(operation=reason)
+    finally:
+        _TAPE_IO_LOCK.release()
 
 
 def register_proc(proc, protected=False):

@@ -38,6 +38,27 @@ param(
     [switch]$WhatIfOnly
 )
 
+# Hide immediately even when Task Scheduler/Windows Terminal ignores the
+# action's -WindowStyle Hidden flag.
+try {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class ClaudeWatchdogConsoleWindow {
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetConsoleWindow();
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+}
+'@ -ErrorAction Stop
+    $consoleWindow = [ClaudeWatchdogConsoleWindow]::GetConsoleWindow()
+    if ($consoleWindow -ne [IntPtr]::Zero) {
+        [void][ClaudeWatchdogConsoleWindow]::ShowWindow($consoleWindow, 0)
+    }
+} catch { }
+
 $ErrorActionPreference = 'Stop'
 
 $StateDir  = Join-Path $env:LOCALAPPDATA 'ClaudeRemoteControl'

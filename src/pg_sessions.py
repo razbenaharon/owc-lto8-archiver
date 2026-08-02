@@ -202,13 +202,16 @@ class PgSessionMixin:
         return conn.execute(
             """INSERT INTO remote_sessions
                (session_label, remote_host, remote_user, remote_path,
-                tape_label, staging_dir, created_at, status)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, 'active')
+                tape_label, tape_generation, staging_dir, created_at, status)
+               VALUES (%s, %s, %s, %s, %s,
+                       (SELECT current_generation FROM tapes
+                        WHERE volume_label=%s),
+                       %s, %s, 'active')
                ON CONFLICT (session_label) DO UPDATE
                    SET session_label = EXCLUDED.session_label
                RETURNING session_id""",
             (session_label, remote_host, remote_user, remote_path,
-             tape_label, staging_dir, now),
+             tape_label, tape_label, staging_dir, now),
         ).fetchone()["session_id"]
 
     def create_remote_session(self, session_label, remote_host, remote_user,
