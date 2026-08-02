@@ -8,7 +8,8 @@ import queue
 import shutil
 import threading
 import posixpath
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 from collections import defaultdict
 from typing import Optional
 
@@ -25,6 +26,8 @@ from .exit_codes import (
     REASON_AMBIGUOUS_BACKING_CHUNK, REASON_LTFS_SYNC_MODE_NOT_TIME5,
     REASON_LTFS_MEDIA_DEGRADED,
     REASON_LTFS_MOUNT_UNVERIFIABLE, REASON_UNEXPECTED_TAPE_OR_DB_STATE,
+    REASON_LTFS_OWNERSHIP_UNAVAILABLE,
+    REASON_SEALED_BATCH_FEATURE_UNAVAILABLE,
     REASON_AMBIGUOUS_ACTIVE_SESSIONS, REASON_SSH_AUTHENTICATION_FAILED,
     REASON_SSH_PERMISSION_DENIED, REASON_SSH_HOST_KEY_MISMATCH,
     REASON_MISSING_NONINTERACTIVE_CREDENTIAL, REASON_BAD_CONFIG,
@@ -41,7 +44,10 @@ from .windows_update_guard import (RebootSentinel, assess_reboot_state,
                                    ltfs_sync_mode_status,
                                    pending_reboot_reasons,
                                    reboot_block_reasons)
-from .ltfs import _ensure_lto_drive_ready, get_volume_label
+from .ltfs import (_ensure_lto_drive_ready, get_volume_label,
+                   note_device_state_change)
+from .ltfs_ownership import (LtfsOwnershipError, OWNERSHIP,
+                             writer_timeout_seconds)
 from .packer import LTOPacker
 from .paths import (_LEGACY_PATH_LIMIT, _dir_tree_size,
                     _disambiguate_local_rel, _exceeds_legacy_path_limit,
@@ -50,6 +56,7 @@ from .paths import (_LEGACY_PATH_LIMIT, _dir_tree_size,
                     _winsafe_extracted_rel)
 from .pipeline_types import StagedChunk, StreamState
 from .planning import StreamingChunkBuilder
+from .ready_queue import ReadyItem, ReadyQueue
 from .ram_telemetry import RamStageSampler
 from .remote_transport import _remote_tar_fetch
 from .resource_governor import ResourceGovernor
@@ -182,6 +189,13 @@ class RemoteOrchestrator:
     interrupted run can be resumed from the last completed chunk.
     """
 
+    # Group/ownership metrics as CLASS defaults so they exist even on an
+    # instance built without __init__ (the test suite constructs partial
+    # orchestrators via __new__ to exercise the write path in isolation).
+    _ownership_acquisitions = 0
+    _readiness_checks = 0
+    _cartridge_verifications = 0
+
     def __init__(self, cfg, db, ui=None, skipped_tracker=None):
         self.cfg          = cfg
         self.db           = db
@@ -203,6 +217,25 @@ class RemoteOrchestrator:
         self.chunk_cap_bytes   = int(cfg.chunk_cap_gb * 1024**3)
         self.staging_max_bytes = int(cfg.staging_max_gb * 1024**3)
         self.prefetch_ahead    = cfg.prefetch_chunks_ahead
+        # Phase 4 byte-bounded ready queue (from [PIPELINE]). Phase 4.5 also
+        # validates the limits against the staging budget so the queue can never
+        # consume the space the producer needs for an active fetch+pack; on a
+        # conflict this returns the documented default set (or fails closed).
+        (self.ready_limits, self.ready_queue_reserve_bytes,
+         self.effective_staging_bytes, self.ready_limits_source) = (
+            cfg.validated_ready_queue_limits())
+        # Staging-pressure drain state (Phase 4.5). The single authoritative
+        # model is need-based: engage when the next chunk's fetch+pack footprint
+        # cannot fit under the staging cap, clear only once there is comfortable
+        # room again (hysteresis). See `_staging_pressure_decision`. Engaged and
+        # cleared purely from local staging figures — never from LTFS state.
+        self._staging_pressure_active = False
+        # Group/ownership metrics — proved after a pilot by comparing these to
+        # the number of chunks written: ownership and readiness must each be 1
+        # per group, not 1 per chunk.
+        self._ownership_acquisitions = 0
+        self._readiness_checks = 0
+        self._cartridge_verifications = 0
         self.staging_padding   = cfg.staging_padding_factor
         self.fetch_abort_factor = cfg.fetch_overrun_abort_factor
         self.fetch_stall_timeout = cfg.fetch_stall_timeout_seconds
@@ -552,12 +585,153 @@ class RemoteOrchestrator:
     # Pipeline execution
     # ------------------------------------------------------------------
 
+    def _assert_ownership_preflight(self, session_id, source):
+        """Cross-process ownership preflight, before ANY worker thread or device
+        access (Phase 3.5 / Phase 4.5-F).
+
+        Config-only: it validates ``ltfs_ownership_id``, the timeout
+        configuration and that the ``Global\\`` mutex can be created, so a host
+        that cannot guarantee cross-session ownership fails here rather than
+        part-way through a write. It performs no tape, mount, filesystem or IBM
+        helper operation. Returns a finalized :class:`StopResult` to abort on
+        failure, or ``None`` to proceed."""
+        try:
+            OWNERSHIP.assert_production_scope()
+            return None
+        except LtfsOwnershipError as e:
+            msg = f"LTFS ownership preflight failed ({e.kind}): {e}"
+            print(f"\n[TAPE] {msg}")
+            get_logger().error("ltfs_ownership_preflight_failed: %s", e)
+            return self._finalize(StopResult(
+                exit_code=ExitCode.SAFETY_BLOCK,
+                reason=REASON_LTFS_OWNERSHIP_UNAVAILABLE, resumable=False,
+                source=source, session_id=session_id,
+                detailed_reason=msg))
+
+    def _assert_feature_gate(self, session_id, source):
+        """Fail-closed sealed-batch feature gate (Phase 5B.5), before any worker.
+
+        When the flag is DISABLED (the default), this returns immediately without
+        constructing a repository, querying a batch table, running a schema
+        check, or otherwise changing behaviour or adding startup latency.
+
+        When the flag is ENABLED, it verifies the sealed-batch feature is ready
+        (schema applied, checksum valid, exact schema validation passes) and
+        fails closed BEFORE worker threads start — never falling back to legacy
+        behaviour after the operator explicitly opted in. Passing the gate does
+        NOT create or schedule any batch: Phase 5B.5 wires only the gate."""
+        # getattr default False: a config without the flag is treated as
+        # disabled (the fail-closed-safe direction), so the gate is a no-op.
+        if not getattr(self.cfg, "sealed_tape_write_batches_enabled", False):
+            return None
+        from .sealed_batch_repository import (SealedBatchRepository,
+                                              assert_feature_ready)
+        try:
+            repo = SealedBatchRepository(self.cfg.db_dsn)
+            assert_feature_ready(self.cfg, repo)
+            get_logger().info(
+                "sealed_batch_feature_ready: gate passed; no scheduling in 5B.5")
+            return None
+        except Exception as e:
+            msg = (f"sealed_tape_write_batches_enabled=true but the feature is "
+                   f"not ready: {e}")
+            print(f"\n[FEATURES] {msg}")
+            get_logger().error("sealed_batch_feature_gate_failed: %s", e)
+            return self._finalize(StopResult(
+                exit_code=ExitCode.SAFETY_BLOCK,
+                reason=REASON_SEALED_BATCH_FEATURE_UNAVAILABLE, resumable=False,
+                source=source, session_id=session_id, detailed_reason=msg))
+
+    # ------------------------------------------------------------------
+    # Phase 5D: non-authoritative asynchronous observation
+    # ------------------------------------------------------------------
+
+    def _build_observation_worker(self):
+        """Build the bounded observation worker, or None when observation mode
+        is disabled (the default). Never raises into the caller: an init failure
+        disables observation only and the writer continues normally."""
+        try:
+            from .sealed_batch_observation import maybe_build_observation_worker
+            return maybe_build_observation_worker(self.cfg, self.cfg.db_dsn)
+        except Exception:
+            get_logger().exception("observation_worker_build_failed")
+            return None
+
+    def _capture_write_group_snapshot(self, correlation_id, session_id, descs,
+                                      reason, tape_label, generation,
+                                      scan_complete, producer_state, safe_stop,
+                                      writer_path):
+        """Copy an IMMUTABLE snapshot at the finite-group boundary. In-memory
+        only: no DB query, no hashing, no JSON, no pack-content read (pack
+        identity is the dir BASENAME already in metadata)."""
+        from .sealed_batch_observation import WriteGroupSnapshot
+        chunk_ids = tuple(d.chunk_index for d in descs)
+        prepared = tuple(int(getattr(d, 'staged_bytes', 0) or 0) for d in descs)
+        packs = tuple(
+            (os.path.basename(getattr(d, 'pack_dir', '') or '') or None)
+            for d in descs)
+        return WriteGroupSnapshot(
+            correlation_id=correlation_id, session_id=session_id,
+            chunk_ids=chunk_ids, prepared_bytes=prepared,
+            total_prepared_bytes=sum(prepared), pack_identities=packs,
+            expected_tape=tape_label, selection_reason=reason,
+            ready_queue_generation=int(generation),
+            scan_complete=bool(scan_complete), producer_state=producer_state,
+            staging_pressure=bool(getattr(self, '_staging_pressure_active',
+                                          False)),
+            safe_stop=bool(safe_stop),
+            snapshot_ts_utc=datetime.now(timezone.utc).isoformat(),
+            writer_path=writer_path)
+
+    def _capture_group_outcome(self, correlation_id, session_id, descs,
+                               stop_block, counts_before, group_start,
+                               group_finish):
+        """Build the correlated actual-outcome event. Reads only in-memory
+        counters and the stop result; changes no writer or chunk state."""
+        from .sealed_batch_observation import WriteGroupOutcome
+        selected = tuple(d.chunk_index for d in descs)
+        if stop_block is None:
+            completed = selected
+            started = selected
+            failing = None
+            reason = None
+        else:
+            failing = stop_block.chunk_index
+            completed = tuple(d.chunk_index for d in descs
+                              if failing is not None and d.chunk_index < failing)
+            started = completed + ((failing,) if failing is not None else ())
+            reason = stop_block.reason
+        own0, rdy0, cart0 = counts_before
+        return WriteGroupOutcome(
+            correlation_id=correlation_id, session_id=session_id,
+            selected_chunk_ids=selected, started_chunk_ids=started,
+            completed_chunk_ids=completed, failing_chunk=failing,
+            stop_reason=reason, group_start_ts=group_start,
+            group_finish_ts=group_finish,
+            ownership_acquisitions=self._ownership_acquisitions - own0,
+            readiness_checks=self._readiness_checks - rdy0,
+            cartridge_verifications=self._cartridge_verifications - cart0,
+            writer_invocations=len(started))
+
     def _run_streaming_session(self, session_id):
         """Scan, persist, stage, and write chunks as one continuous pipeline.
 
         Returns a :class:`StopResult` describing how the run ended."""
+        # Ownership PREFLIGHT, before any worker thread or device access.
+        preflight_block = self._assert_ownership_preflight(session_id, "startup")
+        if preflight_block is not None:
+            return preflight_block
+
+        # Sealed-batch feature gate (disabled by default -> no-op, no DB).
+        feature_block = self._assert_feature_gate(session_id, "startup")
+        if feature_block is not None:
+            return feature_block
+
         session_row = self.db.get_remote_session(session_id)
         tape_label = session_row['tape_label']
+        generation_block = self._verify_session_tape_generation(session_row)
+        if generation_block is not None:
+            return self._finalize(generation_block, phase="resume-precheck")
         if not _ensure_lto_drive_ready(self.cfg.lto_drive):
             return self._finalize(StopResult(
                 exit_code=ExitCode.SAFETY_BLOCK,
@@ -570,6 +744,7 @@ class RemoteOrchestrator:
         self._last_fetch_failure = None
         self._producer_chunk = None
         self._consumer_chunk = None
+        self._staging_pressure_active = False
 
         # Before any thread starts: a chunk left 'backing' by a prior run may
         # already be on tape. Refuse to resume blindly rather than double-write.
@@ -602,7 +777,14 @@ class RemoteOrchestrator:
                 detailed_reason="LTFS mount is not time@5"))
 
         chunk_q = queue.Queue(maxsize=max(1, self.prefetch_ahead * 2))
-        ready_q = queue.Queue(maxsize=self.prefetch_ahead)
+        # Phase 4: byte-bounded ready queue. The producer keeps preparing while
+        # several chunks wait on NVMe; the writer then drains a finite group
+        # under one ownership period instead of one chunk per acquisition.
+        ready_q = ReadyQueue(self.ready_limits, name=f"session{session_id}")
+        print(f"  Ready queue: start >= {self.ready_limits.min_start_bytes / 1024**3:.0f} GiB, "
+              f"target {self.ready_limits.target_bytes / 1024**3:.0f} GiB, "
+              f"max {self.ready_limits.max_bytes / 1024**3:.0f} GiB / "
+              f"{self.ready_limits.max_chunks} chunks")
         stop_pipeline = threading.Event()
         hb_stop = threading.Event()
         SENTINEL = object()
@@ -776,7 +958,8 @@ class RemoteOrchestrator:
                     self._validate_chunk_file_limit(
                         session_id, ci, planned_files)
                     self._await_staging_capacity(
-                        planned_bytes, planned_files, stop_pipeline)
+                        planned_bytes, planned_files, stop_pipeline,
+                        ready_q=ready_q)
                     if CANCEL.is_set() or stop_pipeline.is_set():
                         break
                     desc = self._stage_chunk(
@@ -788,7 +971,19 @@ class RemoteOrchestrator:
                             self._record_fetch_failure_stop(session_id, ci)
                         stop_pipeline.set()
                         break
-                    if not _queue_put(ready_q, desc):
+                    # Byte-bounded enqueue. The prepared footprint is the packed
+                    # size on staging, NOT the remote logical size — those differ by
+                    # compression and per-file rounding.
+                    item = ReadyItem(
+                        chunk_index=ci,
+                        pack_dir=desc.pack_dir,
+                        prepared_bytes=int(getattr(desc, 'staged_bytes', 0) or 0),
+                        file_count=planned_files,
+                        desc=desc)
+                    # Blocks (without touching LTFS) while the queue is at its
+                    # byte or count ceiling; that backpressure is what keeps
+                    # staging bounded now that depth is no longer 1.
+                    if not ready_q.put(item, stop_event=stop_pipeline):
                         self._discard_desc(desc)
                         break
             except Exception as e:
@@ -801,7 +996,11 @@ class RemoteOrchestrator:
                     detailed_reason=str(e)))
                 stop_pipeline.set()
             finally:
-                _force_put(ready_q, SENTINEL)
+                # Producer done: translate WHY it exited into ready-queue
+                # completion state (normal completion drains a final partial
+                # group; a stop/failure preserves queued packs instead). A
+                # transient upstream pause never reaches here.
+                self._signal_producer_completion(ready_q, stop_pipeline)
 
         scanner_thread = threading.Thread(
             target=_scanner_planner, name='streaming-scanner', daemon=True)
@@ -810,30 +1009,102 @@ class RemoteOrchestrator:
         scanner_thread.start()
         stager_thread.start()
         self._start_pipeline_heartbeat(hb_stop, ready_q, "streaming")
+        # Non-authoritative observer (None unless observation mode is enabled).
+        obs_worker = self._build_observation_worker()
 
         completed = 0
         failed = False
         stop_block = None
         try:
             while True:
-                desc = ready_q.get()
-                if desc is SENTINEL:
+                if CANCEL.is_set() or stop_pipeline.is_set():
                     break
-                # _write_chunk is the single authorization boundary: it runs the
-                # safety gate and starts the write atomically under the tape I/O
-                # lock. None => written; a StopResult => not written (its
-                # preserve_pack says whether to keep the staged pack for resume).
-                stop_block = self._write_chunk(
-                    session_id, desc, tape_label, False, stop_pipeline)
-                if stop_block is not None:
-                    if stop_block.preserve_pack:
-                        self._preserve_desc(session_id, desc, stop_block.reason)
-                    elif not CANCEL.is_set():
-                        self._discard_desc(desc)
-                    failed = stop_block.exit_code != ExitCode.USER_STOP
-                    stop_pipeline.set()
-                    break
-                completed += 1
+                items, reason = ready_q.wait_for_group(stop_event=stop_pipeline)
+                if not items:
+                    if reason in ("producer_closed_empty", "stop_requested"):
+                        break
+                    continue
+                group_bytes = sum(i.prepared_bytes for i in items)
+                _status('TAPE', f"Write group: {len(items)} chunk(s), "
+                                f"{group_bytes / 1024**3:.2f} GiB ({reason})")
+                get_logger().info(
+                    "ready_group_selected: chunks=%d bytes=%d reason=%s "
+                    "ready_after=%d", len(items), group_bytes, reason,
+                    ready_q.ready_chunks)
+
+                # ONE ownership period, ONE gate, several chunks written
+                # consecutively. Per-chunk failure isolation is unchanged:
+                # earlier chunks that committed stay committed, and any chunk
+                # that never started keeps its pack.
+                written_before = completed
+
+                # Non-authoritative observation at the finite-group boundary:
+                # copy an immutable snapshot + one non-blocking enqueue, then go
+                # straight to writing. No DB/hash/JSON on this thread.
+                correlation_id = None
+                counts0 = group_start = None
+                if obs_worker is not None:
+                    correlation_id = uuid.uuid4().hex
+                    self._obs_correlation_id = correlation_id
+                    obs_worker.submit_snapshot(
+                        self._capture_write_group_snapshot(
+                            correlation_id, session_id, [i.desc for i in items],
+                            reason, tape_label, ready_q.groups_started,
+                            bool(session_row and session_row.get(
+                                'scan_complete')),
+                            ('failed' if self._producer_err else
+                             ('closed' if ready_q.closed else 'active')),
+                            CANCEL.is_set() or stop_pipeline.is_set(),
+                            'streaming'))
+                    counts0 = (self._ownership_acquisitions,
+                               self._readiness_checks,
+                               self._cartridge_verifications)
+                    group_start = time.time()
+
+                stop_block = self._write_chunk_group(
+                    session_id, [i.desc for i in items], tape_label, False,
+                    stop_pipeline)
+
+                if obs_worker is not None:
+                    obs_worker.submit_outcome(self._capture_group_outcome(
+                        correlation_id, session_id, [i.desc for i in items],
+                        stop_block, counts0, group_start, time.time()))
+
+                if stop_block is None:
+                    for item in items:
+                        ready_q.mark_written(item)
+                    completed += len(items)
+                    continue
+
+                # A stop ended the group. Everything up to the failing chunk is
+                # already committed by _write_chunk_group; classify the failing
+                # chunk with the existing rules and preserve the rest.
+                failing = stop_block.chunk_index
+                for item in items:
+                    if failing is not None and item.chunk_index < failing:
+                        ready_q.mark_written(item)
+                        completed += 1
+                    elif failing is not None and item.chunk_index == failing:
+                        ready_q.mark_failed(item)
+                        if stop_block.preserve_pack:
+                            self._preserve_desc(session_id, item.desc,
+                                                stop_block.reason)
+                        elif not CANCEL.is_set():
+                            self._discard_desc(item.desc)
+                    else:
+                        # Never started: its pack stays reusable, untouched.
+                        ready_q.mark_preserved(item)
+                        self._preserve_desc(session_id, item.desc,
+                                            "not started in aborted group")
+                get_logger().info(
+                    "ready_group_aborted: reason=%s failing_chunk=%s "
+                    "committed_in_group=%d",
+                    stop_block.reason,
+                    None if failing is None else failing + 1,
+                    completed - written_before)
+                failed = stop_block.exit_code != ExitCode.USER_STOP
+                stop_pipeline.set()
+                break
         finally:
             # Shutdown-only: signal the producer threads to exit. Not a stop
             # decision — the loop already recorded any stop reason (or completed
@@ -843,13 +1114,11 @@ class RemoteOrchestrator:
             reboot_sentinel.stop()
             # Anything still queued is a fully staged pack. Preserve it for the
             # resume instead of deleting it.
-            try:
-                while True:
-                    leftover = ready_q.get_nowait()
-                    if leftover is not SENTINEL:
-                        self._preserve_desc(session_id, leftover, "queued at shutdown")
-            except queue.Empty:
-                pass
+            for leftover in ready_q.drain_ready():
+                self._preserve_desc(session_id, leftover.desc,
+                                    "queued at shutdown")
+            get_logger().info("ready_queue_final_metrics: %s",
+                              ready_q.metrics())
             # Drain chunk_q too: the scanner's _force_put(SENTINEL) can spin
             # forever on a full queue once the stager has exited, leaking the
             # scanner thread past its join timeout.
@@ -860,6 +1129,8 @@ class RemoteOrchestrator:
                 pass
             scanner_thread.join(timeout=15)
             stager_thread.join(timeout=15)
+            if obs_worker is not None:
+                obs_worker.shutdown()          # bounded; never blocks shutdown
             if self.fetch_cores:
                 unpin_current_process()
 
@@ -950,6 +1221,25 @@ class RemoteOrchestrator:
         tape_label     = session_row['tape_label']
         if not session_row.get('scan_complete', True):
             return self._run_streaming_session(session_id)
+
+        # Ownership PREFLIGHT for the scan-complete resume path, before any
+        # worker thread or device access (the streaming path above runs its own).
+        # Config-only: validates ltfs_ownership_id and proves the Global\ mutex
+        # can be created, so a host that cannot guarantee cross-session ownership
+        # fails here instead of part-way through a write. No LTFS/mount/device op.
+        preflight_block = self._assert_ownership_preflight(session_id, "resume")
+        if preflight_block is not None:
+            return preflight_block
+
+        # Sealed-batch feature gate (disabled by default -> no-op, no DB).
+        feature_block = self._assert_feature_gate(session_id, "resume")
+        if feature_block is not None:
+            return feature_block
+
+        generation_block = self._verify_session_tape_generation(session_row)
+        if generation_block is not None:
+            return self._finalize(generation_block, phase="resume-precheck")
+
         pending_chunks = self.db.get_pending_chunks(session_id)
         total_chunks   = self.db.count_chunks(session_id)
         done_count     = total_chunks - len(pending_chunks)
@@ -1095,6 +1385,11 @@ class RemoteOrchestrator:
 
         hb_stop = threading.Event()
         self._start_pipeline_heartbeat(hb_stop, ready_q, total_chunks)
+        # Non-authoritative observer (None unless observation mode is enabled).
+        # The legacy resume path writes one chunk per ownership period, so each
+        # single-chunk write is observed as a group of one.
+        obs_worker = self._build_observation_worker()
+        obs_generation = 0
 
         completed = 0
         failed    = False
@@ -1106,12 +1401,36 @@ class RemoteOrchestrator:
                     break
                 ci          = desc.chunk_index
                 eject_after = (ci == last_chunk) and self._eject_after_session()
+
+                correlation_id = None
+                counts0 = group_start = None
+                if obs_worker is not None:
+                    obs_generation += 1
+                    correlation_id = uuid.uuid4().hex
+                    self._obs_correlation_id = correlation_id
+                    obs_worker.submit_snapshot(
+                        self._capture_write_group_snapshot(
+                            correlation_id, session_id, [desc], "legacy_resume",
+                            tape_label, obs_generation, True, 'active',
+                            CANCEL.is_set() or stop_pipeline.is_set(),
+                            'legacy'))
+                    counts0 = (self._ownership_acquisitions,
+                               self._readiness_checks,
+                               self._cartridge_verifications)
+                    group_start = time.time()
+
                 # _write_chunk authorizes (safety gate) and writes atomically
                 # under the tape I/O lock — the same single boundary the
                 # streaming path uses. None => written; a StopResult => not
                 # written (preserve_pack decides keep-vs-discard of the pack).
                 stop_block = self._write_chunk(
                     session_id, desc, tape_label, eject_after, stop_pipeline)
+
+                if obs_worker is not None:
+                    obs_worker.submit_outcome(self._capture_group_outcome(
+                        correlation_id, session_id, [desc], stop_block,
+                        counts0, group_start, time.time()))
+
                 if stop_block is not None:
                     if stop_block.preserve_pack:
                         self._preserve_desc(session_id, desc, stop_block.reason)
@@ -1140,6 +1459,8 @@ class RemoteOrchestrator:
             except queue.Empty:
                 pass
             prod.join(timeout=15)
+            if obs_worker is not None:
+                obs_worker.shutdown()          # bounded; never blocks shutdown
             if self.fetch_cores:
                 unpin_current_process()
 
@@ -1246,12 +1567,101 @@ class RemoteOrchestrator:
             self._validate_chunk_file_limit(
                 session_id, chunk_index, file_count)
 
-    def _await_staging_capacity(self, planned_bytes, planned_files, stop_evt):
+    # ------------------------------------------------------------------
+    # Staging-pressure drain (Phase 4.5)
+    # ------------------------------------------------------------------
+
+    def _staging_pressure_decision(self, resident, need):
+        """Pure hysteretic engage/clear decision from the SAME figures the
+        capacity gate uses (``resident`` = staged bytes on disk, ``need`` = the
+        next chunk's ~2x fetch+pack footprint).
+
+        Returns ``True`` to engage, ``False`` to clear, ``None`` to hold the
+        current state (the hysteresis band). Touches no LTFS state whatsoever.
+
+        * engage when the next chunk's footprint will not fit under the cap
+          (``resident + need > staging_max``) — the producer is about to block,
+          so the writer should drain a finite ready group even below the minimum;
+        * clear only once there is comfortable room for *two* more footprints
+          (``resident + 2*need <= staging_max``), so a value oscillating around
+          the exact boundary cannot flap the signal and start tiny groups;
+        * nothing staged (``resident <= 0``) is never pressure.
+        """
+        if self.staging_max_bytes <= 0 or resident <= 0:
+            return False
+        if resident + need > self.staging_max_bytes:
+            return True
+        if resident + 2 * need <= self.staging_max_bytes:
+            return False
+        return None
+
+    def _apply_staging_pressure(self, ready_q, resident, need):
+        """Engage/clear the ready queue's staging-pressure drain (Phase 4.5).
+
+        This is the production wiring: the orchestrator's own capacity gate calls
+        it with the authoritative resident-staging figure, and it is the only
+        place ``ReadyQueue.set_staging_pressure`` is toggled. Reads local staging
+        only; issues no device, mount or IBM-helper call."""
+        if ready_q is None or not hasattr(ready_q, 'set_staging_pressure'):
+            return
+        decision = self._staging_pressure_decision(resident, need)
+        if decision is True and not self._staging_pressure_active:
+            self._staging_pressure_active = True
+            ready_q.set_staging_pressure(True)
+            get_logger().info(
+                "staging_pressure_engaged: resident=%d need=%d staging_max=%d",
+                resident, need, self.staging_max_bytes)
+        elif decision is False and self._staging_pressure_active:
+            self._staging_pressure_active = False
+            ready_q.set_staging_pressure(False)
+            get_logger().info(
+                "staging_pressure_cleared: resident=%d need=%d staging_max=%d",
+                resident, need, self.staging_max_bytes)
+
+    def _signal_producer_completion(self, ready_q, stop_evt):
+        """Translate WHY the producer thread is exiting into ready-queue state.
+
+        Distinguishes the states the writer-start rules care about:
+
+        * **normal completion** — the scan finished and every planned chunk was
+          staged and enqueued, with no stop: ``close()`` so a final partial group
+          below the minimum threshold drains cleanly. This is the only path that
+          forces a sub-minimum tape write, and only because it is genuine
+          end-of-work, not a stop.
+        * **terminal producer failure** (``self._producer_err`` set): mark input
+          exhausted AND close. The stop is already recorded and ``stop_evt`` set,
+          so the consumer breaks *before* ``wait_for_group`` and the outer finally
+          preserves every queued pack — a failure never forces a final write.
+        * **safe stop / cancel**: close to release a possibly-waiting consumer;
+          the consumer breaks on ``stop_evt`` and queued packs are preserved.
+
+        A *temporary* upstream pause never reaches here: the stager keeps looping
+        on ``chunk_q.get()``, so transient emptiness never starts a tiny group.
+        """
+        if self._producer_err is not None:
+            ready_q.set_producer_exhausted(True)
+            ready_q.close("producer failed terminally; queued packs preserved "
+                          "for resume")
+        elif CANCEL.is_set() or stop_evt.is_set():
+            ready_q.close("producer stopped at a boundary; consumer preserves "
+                          "queued packs")
+        else:
+            ready_q.close("producer finished normally; a final partial group "
+                          "may drain")
+
+    def _await_staging_capacity(self, planned_bytes, planned_files, stop_evt,
+                                ready_q=None):
         """Block until there is room to stage another chunk without breaching the
         staging cap or starving the disk. Accounts for the ~2x transient
         footprint while a chunk is packed (fetch_dir + pack_dir coexist),
         sized on the estimated physical (allocated) footprint rather than
-        the plan's logical byte total."""
+        the plan's logical byte total.
+
+        When ``ready_q`` is a byte-bounded :class:`~src.ready_queue.ReadyQueue`
+        (the streaming path), staging pressure is engaged/cleared here from the
+        SAME ``resident``/``need`` figures used for the capacity decision, so the
+        writer can drain a finite group and free staging rather than deadlock the
+        producer against an unmet minimum."""
         # peak while fetch + pack dirs coexist
         need  = 2 * self._physical_estimate(planned_bytes, planned_files)
         floor = LOCAL_STAGING_RESERVE_BYTES
@@ -1259,6 +1669,9 @@ class RemoteOrchestrator:
         while not (CANCEL.is_set() or stop_evt.is_set()):
             with self._staged_lock:
                 resident = self._staged_bytes
+            # Local-only staging-pressure signal (no LTFS access). Engaged when
+            # this chunk's footprint will not fit; cleared with hysteresis.
+            self._apply_staging_pressure(ready_q, resident, need)
             try:
                 free = shutil.disk_usage(self.staging_dir).free
             except OSError:
@@ -1739,6 +2152,13 @@ class RemoteOrchestrator:
             print(f"[TAPE]   {ev['at']}  [{ev['id']}]  {ev['message'][:140]}")
         get_logger().error("ltfs_media_degraded: fatal=%d degraded=%d detail=%s",
                            len(fatal), len(degraded), detail)
+        # The drive/medium state this cartridge was verified under no longer
+        # holds, so the cached readiness must not be reused. Invalidated before
+        # returning the block, so no later readiness decision can see stale
+        # state. This discards cached state only — the StopResult below, and the
+        # stop policy it carries, are unchanged.
+        note_device_state_change(
+            f"ltfs_media_health fatal={len(fatal)} degraded={len(degraded)}")
         send_best_effort(self.notifier, f"[PIPELINE] {msg}")
         return StopResult(
             exit_code=ExitCode.SAFETY_BLOCK,
@@ -2072,6 +2492,37 @@ class RemoteOrchestrator:
               f"{payload.get('preserved_at')} — no re-fetch, no re-pack.")
         return desc
 
+    def _verify_session_tape_generation(self, session_row):
+        """Block an old session from silently crossing a physical format."""
+        # Unit-test/legacy injected rows may predate migration 013.  A real
+        # manager applies 013 at startup and makes this column NOT NULL, so the
+        # absence is not a production bypass.
+        if 'tape_generation' not in session_row:
+            return None
+        tape_label = session_row.get('tape_label')
+        tape = self.db.get_tape(tape_label)
+        session_generation = session_row.get('tape_generation')
+        current_generation = tape.get('current_generation') if tape else None
+        if tape and session_generation == current_generation:
+            return None
+        msg = (
+            f"Session {session_row.get('session_id')} targets {tape_label!r} "
+            f"generation {session_generation}, but the registered cartridge "
+            f"is generation {current_generation}. Refusing to resume an old "
+            "session onto newly formatted media. An operator must explicitly "
+            "re-point the session generation after reviewing its pending chunks.")
+        print(f"\n[TAPE] {msg}")
+        get_logger().error(
+            "session_tape_generation_mismatch: session=%s tape=%s "
+            "session_generation=%s current_generation=%s",
+            session_row.get('session_id'), tape_label, session_generation,
+            current_generation)
+        return StopResult(
+            exit_code=ExitCode.SAFETY_BLOCK,
+            reason=REASON_UNEXPECTED_TAPE_OR_DB_STATE, resumable=False,
+            source="gate", session_id=session_row.get('session_id'),
+            detailed_reason=msg)
+
     def _verify_mounted_cartridge(self, tape_label):
         """Gate check: the mounted cartridge must be the session's tape.
 
@@ -2233,56 +2684,141 @@ class RemoteOrchestrator:
         released *before* the 'done' commit, staging flush, and cleanup — it is
         never held during status writes, fetch/pack, thread joins, or retries.
         """
+        return self._write_chunk_group(
+            session_id, [desc], tape_label, eject_after, stop_pipeline)
+
+    def _write_chunk_group(self, session_id, descs, tape_label, eject_after,
+                           stop_pipeline):
+        """Write a FINITE group of prepared chunks under ONE ownership period.
+
+        Phase 4. Ownership and the safety gate run once for the whole group;
+        between chunks there is deliberately no readiness probe, no cartridge
+        read, no ``LtfsCmdDrives.exe`` and no filesystem access — the Phase 1
+        readiness cache stays valid precisely because Phase 3 ownership is never
+        released in between (a nested acquire/release does not invalidate).
+
+        The group is fixed at acquisition time. Chunks prepared later wait for
+        the next group: ownership is never held waiting for the producer.
+
+        Failure isolation is unchanged and per-chunk. An earlier chunk that
+        committed stays committed if a later one fails; a chunk that never
+        started keeps its pack and is returned to the caller as preserved.
+        """
+        descs = list(descs)
+        if not descs:
+            return None
+
+        # skip_tape chunks involve no tape at all — handle them outside
+        # ownership so an all-skip group never touches LTFS.
+        tape_descs = []
+        for desc in descs:
+            if desc.skip_tape:
+                block = self._write_skip_tape_chunk(
+                    session_id, desc, tape_label, eject_after)
+                if block is not None:
+                    return block
+            else:
+                tape_descs.append(desc)
+        if not tape_descs:
+            return None
+
+        group_started = time.time()
+        first = tape_descs[0]
+        group_bytes = sum(int(getattr(d, 'staged_bytes', 0) or 0)
+                          for d in tape_descs)
+        get_logger().info(
+            "tape_write_group_start: chunks=%d indices=%s bytes=%d "
+            "group_correlation_id=%s",
+            len(tape_descs), [d.chunk_index + 1 for d in tape_descs],
+            group_bytes, getattr(self, '_obs_correlation_id', None))
+
+        try:
+            _acquire_tape_io_lock(
+                f"authorize+write remote chunk group of {len(tape_descs)}",
+                timeout=writer_timeout_seconds())
+        except LtfsOwnershipError as e:
+            msg = (f"could not acquire exclusive LTFS ownership for a group of "
+                   f"{len(tape_descs)} chunk(s) ({e.kind}): {e}")
+            print(f"\n[TAPE] {msg}")
+            get_logger().error("ltfs_ownership_stop: kind=%s chunks=%s detail=%s",
+                               e.kind, [d.chunk_index + 1 for d in tape_descs], e)
+            send_best_effort(self.notifier, f"[PIPELINE] {msg}")
+            return self._record_stop(StopResult(
+                exit_code=ExitCode.SAFETY_BLOCK,
+                reason=REASON_LTFS_OWNERSHIP_UNAVAILABLE, resumable=True,
+                source="write", session_id=session_id,
+                chunk_index=first.chunk_index, preserve_pack=True,
+                detailed_reason=msg))
+
+        self._ownership_acquisitions += 1
+        try:
+            # ONE gate for the whole group: mount mode, media health, cartridge
+            # identity and pending-reboot. Nothing below re-runs it.
+            recorded = self._get_recorded_stop()
+            if recorded is not None:
+                return recorded
+            gate_block = self._pre_write_safety_gate(
+                session_id, first, tape_label, stop_pipeline)
+            if gate_block is not None:
+                return gate_block
+            self._readiness_checks += 1
+            self._cartridge_verifications += 1
+
+            for desc in tape_descs:
+                # Cheap, non-LTFS stop checks between chunks. A staged reboot,
+                # a recorded stop or a cancel must still end the group at a
+                # chunk boundary — but none of these touches the drive.
+                recorded = self._get_recorded_stop()
+                if recorded is not None:
+                    return recorded
+                if CANCEL.is_set() or stop_pipeline.is_set():
+                    return self._record_stop(StopResult(
+                        exit_code=ExitCode.USER_STOP,
+                        reason=REASON_USER_REQUESTED_STOP, resumable=True,
+                        source="write", session_id=session_id,
+                        chunk_index=desc.chunk_index, preserve_pack=True,
+                        detailed_reason="stop requested between group chunks"))
+                block = self._write_one_chunk_owned(
+                    session_id, desc, tape_label, eject_after)
+                if block is not None:
+                    return block
+            return None
+        finally:
+            _release_tape_io_lock()
+            get_logger().info(
+                "tape_write_group_end: chunks=%d bytes=%d duration_s=%.1f "
+                "group_correlation_id=%s",
+                len(tape_descs), group_bytes, time.time() - group_started,
+                getattr(self, '_obs_correlation_id', None))
+
+    def _write_skip_tape_chunk(self, session_id, desc, tape_label, eject_after):
+        """A chunk whose files were all source-missing: no tape I/O at all."""
+        chunk_index = desc.chunk_index
+        self._consumer_chunk = chunk_index
+        log_path = _write_source_missing_only_log(
+            self.cfg.backup_log_dir, session_id, chunk_index, tape_label,
+            desc.source_missing_files or [],
+            source_host=self.remote_host.split('.', 1)[0],
+            source_path=self.remote_session_path, notifier=self.notifier)
+        self.db.update_chunk_status(session_id, chunk_index, 'done')
+        self._cleanup_dir(desc.fetch_dir)
+        self._cleanup_dir(desc.pack_dir)
+        if log_path:
+            print(f"[REMOTE] Source-missing CSV summary: {log_path}")
+        if eject_after:
+            self._backup_writer().eject_tape(self.cfg.lto_drive)
+        return None
+
+    def _write_one_chunk_owned(self, session_id, desc, tape_label, eject_after):
+        """Write ONE chunk. Ownership is already held and the gate has passed."""
         chunk_index = desc.chunk_index
         self._consumer_chunk = chunk_index
         pack_dir = desc.pack_dir
 
-        if desc.skip_tape:
-            # No tape I/O at all — nothing to serialize or authorize on the tape.
-            log_path = _write_source_missing_only_log(
-                self.cfg.backup_log_dir,
-                session_id,
-                chunk_index,
-                tape_label,
-                desc.source_missing_files or [],
-                source_host=self.remote_host.split('.', 1)[0],
-                source_path=self.remote_session_path,
-                notifier=self.notifier,
-            )
-            self.db.update_chunk_status(session_id, chunk_index, 'done')
-            self._cleanup_dir(desc.fetch_dir)
-            self._cleanup_dir(pack_dir)
-            if log_path:
-                print(f"[REMOTE] Source-missing CSV summary: {log_path}")
-            if eject_after:
-                self._backup_writer().eject_tape(self.cfg.lto_drive)
-            return None
-
-        _acquire_tape_io_lock(f"authorize+write remote chunk {chunk_index + 1}")
+        # Ownership is already held by the group and the gate has already
+        # passed for this group: no readiness probe, cartridge read or
+        # LtfsCmdDrives call happens here or between chunks.
         try:
-            # (a) An already-recorded stop wins outright.
-            recorded = self._get_recorded_stop()
-            if recorded is not None:
-                return recorded
-            # (b) The single authoritative safety gate.
-            gate_block = self._pre_write_safety_gate(
-                session_id, desc, tape_label, stop_pipeline)
-            if gate_block is not None:
-                return gate_block
-            # (c) Final recorded-stop re-check under the same lock: a stop may
-            #     have landed while the gate ran its mount/reboot subprocess
-            #     checks. This is the last authorization step before the tape.
-            recorded = self._get_recorded_stop()
-            if recorded is not None:
-                return recorded
-            if CANCEL.is_set():
-                return self._record_stop(StopResult(
-                    exit_code=ExitCode.USER_STOP,
-                    reason=REASON_USER_REQUESTED_STOP, resumable=True,
-                    source="write", session_id=session_id,
-                    chunk_index=chunk_index,
-                    detailed_reason="cancel requested before write"))
-
             # (d) Fits-tape. A miss is re-fetchable — discard, do not preserve.
             _, planned_bytes, _ = self.db.get_chunk_size_summary(
                 session_id, chunk_index).get(chunk_index, (0, 0, 0))
@@ -2382,10 +2918,15 @@ class RemoteOrchestrator:
                     source="write", session_id=session_id,
                     chunk_index=chunk_index, preserve_pack=False,
                     detailed_reason=str(e)))
-        finally:
-            _release_tape_io_lock()
+        except BaseException:
+            raise
 
-        # --- The physical write completed; everything below is OFF the lock ---
+        # --- The physical write completed -----------------------------------
+        # Ownership stays held by the GROUP across this commit (Phase 4): the
+        # commit is PostgreSQL plus local staging cleanup and touches no tape,
+        # and releasing here would invalidate the readiness cache and force a
+        # re-verification before the next chunk — the exact per-chunk probe this
+        # phase removes.
         # The write finished normally (a cooperative Ctrl+C lets the protected
         # robocopy complete), so ALWAYS run the normal commit: mark the chunk
         # 'done' and flush its staging. A cooperative cancel does NOT leave this
@@ -2460,8 +3001,25 @@ class RemoteOrchestrator:
                           else self._producer_chunk + 1)
                 cons_c = ('-' if self._consumer_chunk is None
                           else self._consumer_chunk + 1)
+                # ReadyQueue (Phase 4) reports bytes as well as count; the old
+                # queue.Queue only had qsize(), which is why "queued=0/1" hid a
+                # 99.6%-empty pipeline for weeks.
+                if hasattr(ready_q, 'metrics'):
+                    m = ready_q.metrics()
+                    ready_desc = (
+                        f"ready={m['ready_chunks']}ch/"
+                        f"{m['ready_bytes'] / 1024**3:.1f}GiB "
+                        f"(start@{m['ready_target_bytes'] / 1024**3:.0f}"
+                        f"/max{m['ready_max_bytes'] / 1024**3:.0f}GiB) | "
+                        f"writing={m['writing_chunks']}ch | "
+                        f"groups={m['groups_started']} "
+                        f"own={self._ownership_acquisitions} "
+                        f"rdy={self._readiness_checks}"
+                    )
+                else:                                   # pragma: no cover
+                    ready_desc = f"queued={ready_q.qsize()}/{self.prefetch_ahead} | "
                 msg = (
-                    f"queued={ready_q.qsize()}/{self.prefetch_ahead} | "
+                    f"{ready_desc} | "
                     f"staging={staged_gb:.0f}/"
                     f"{self.staging_max_bytes / 1024**3:.0f} GB | "
                     f"producer chunk {prod_c}/{total_chunks} | "

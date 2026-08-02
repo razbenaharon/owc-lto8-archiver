@@ -178,11 +178,32 @@ def main(argv=None):
     baseline = _load_baseline()
     findings = []
 
-    _check_drive_letter(cfg, findings)
-    _check_cartridge(cfg, args.expect_label, findings)
-    mount_ok, mount = _check_mount(findings)
-    if mount_ok is not None:
-        _check_media_health(mount, baseline, findings)
+    # This helper reads the drive letter and the cartridge label, so it must
+    # hold the same authoritative cross-process LTFS ownership the archiver
+    # uses. Without it, a manual check could land in the middle of another
+    # process's tape operation. Fail safely with a clear message rather than
+    # probing anyway.
+    from src.ltfs_ownership import (LtfsOwnershipError, OWNERSHIP,
+                                    helper_timeout_seconds)
+    try:
+        OWNERSHIP.acquire("post-remount check",
+                          timeout=helper_timeout_seconds())
+    except LtfsOwnershipError as e:
+        print("\n=== post-remount check ===")
+        print(f"  [FAIL   ] LTFS ownership ({e.kind}): {e}")
+        print("\nNO-GO - LTFS ownership was not obtained. No device access was "
+              "performed. Wait for the owning process to finish (or stop it) "
+              "and re-run.")
+        return 2
+
+    try:
+        _check_drive_letter(cfg, findings)
+        _check_cartridge(cfg, args.expect_label, findings)
+        mount_ok, mount = _check_mount(findings)
+        if mount_ok is not None:
+            _check_media_health(mount, baseline, findings)
+    finally:
+        OWNERSHIP.release(operation="post-remount check")
 
     print("\n=== post-remount check ===")
     if baseline:

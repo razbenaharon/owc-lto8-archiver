@@ -581,38 +581,65 @@ class SingleGateStructureTests(unittest.TestCase):
         self.src = inspect.getsource(ro.RemoteOrchestrator._run_session)
         self.stream = inspect.getsource(
             ro.RemoteOrchestrator._run_streaming_session)
-        self.write = inspect.getsource(ro.RemoteOrchestrator._write_chunk)
+        # Phase 4: authorization moved from the per-chunk _write_chunk to the
+        # group boundary. _write_chunk is now a single-chunk wrapper over
+        # _write_chunk_group, which owns the lock and the gate; the per-chunk
+        # body lives in _write_one_chunk_owned.
+        self.write = inspect.getsource(ro.RemoteOrchestrator._write_chunk_group)
+        self.one = inspect.getsource(
+            ro.RemoteOrchestrator._write_one_chunk_owned)
 
     def test_every_write_goes_through_write_chunk(self):
         self.assertIn("_write_chunk(", self.src)
-        self.assertIn("_write_chunk(", self.stream)
+        self.assertIn("_write_chunk_group(", self.stream)
 
     def test_write_chunk_is_the_only_gate_caller_on_the_write_path(self):
-        # The loops must NOT call the gate directly — _write_chunk owns it.
+        # The loops must NOT call the gate directly — the group boundary owns it.
         self.assertNotIn("_pre_write_safety_gate", self.src)
         self.assertNotIn("_pre_write_safety_gate", self.stream)
         self.assertIn("_pre_write_safety_gate", self.write)
+        # And it must run exactly once per group, never per chunk.
+        self.assertNotIn("_pre_write_safety_gate", self.one)
+        self.assertEqual(self.write.count("_pre_write_safety_gate("), 1)
 
     def test_reboot_check_is_not_called_directly_in_the_loops(self):
         self.assertNotIn("_pre_tape_write_reboot_check", self.src)
         self.assertNotIn("_pre_tape_write_reboot_check", self.stream)
 
     def test_authorize_and_write_are_under_the_tape_lock(self):
-        # acquire -> gate -> writer launch -> release, all in _write_chunk.
+        # acquire -> gate -> per-chunk writer launch -> release, all in the
+        # group boundary. The writer itself launches inside
+        # _write_one_chunk_owned, which the group calls between gate and release.
         a = self.write.index("_acquire_tape_io_lock")
         g = self.write.index("_pre_write_safety_gate")
-        w = self.write.index(".run(")
-        r = self.write.index("_release_tape_io_lock")
+        w = self.write.index("_write_one_chunk_owned(")
+        r = self.write.rindex("_release_tape_io_lock")
         self.assertLess(a, g, "the tape lock must be held before authorizing")
         self.assertLess(g, w, "the gate must pass before the writer launches")
         self.assertLess(w, r, "the writer launches before the lock is released")
+        self.assertIn(".run(", self.one)
 
-    def test_status_flush_happens_after_the_lock_is_released(self):
-        # The 'done' commit + cleanup must be OUTSIDE the lock.
-        r = self.write.rindex("_release_tape_io_lock")
-        done = self.write.rindex("'done'")
-        self.assertLess(r, done,
-                        "the 'done' commit must happen after releasing the lock")
+    def test_per_chunk_body_never_acquires_or_releases_ownership(self):
+        """Phase 4: ownership spans the whole group, so the per-chunk body must
+        not touch the lock — that is what keeps readiness verified once."""
+        self.assertNotIn("_acquire_tape_io_lock", self.one)
+        self.assertNotIn("_release_tape_io_lock", self.one)
+
+    def test_done_commit_stays_inside_the_group_ownership_period(self):
+        """CHANGED IN PHASE 4, deliberately.
+
+        The 'done' commit + staging flush used to run after _write_chunk
+        released the lock. It now runs while the GROUP still owns LTFS: the
+        commit is PostgreSQL plus local staging cleanup and touches no tape,
+        and releasing between chunks would invalidate the readiness cache and
+        force the per-chunk probe this phase exists to remove. Ownership is
+        still released in the group's finally, before any wait for new work.
+        """
+        self.assertIn("'done'", self.one)
+        self.assertNotIn("_release_tape_io_lock", self.one)
+        # The group releases exactly once, in a finally.
+        self.assertEqual(self.write.count("_release_tape_io_lock()"), 1)
+        self.assertIn("finally:", self.write)
 
 
 class GatePrecedenceTests(unittest.TestCase):

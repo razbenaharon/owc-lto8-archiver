@@ -114,20 +114,37 @@ ORDER BY s.session_id DESC LIMIT 1;
         $refusals += "session $sessionId has $backing chunk(s) in 'backing' - on-tape outcome is unknowable; a human must reconcile"
     }
 
-    # --- 6/7. drive letter and the CARTRIDGE THAT IS ACTUALLY LOADED ----------
+    # --- 6/7. drive + cartridge: NO LTFS ACCESS FROM THE WATCHDOG -------------
+    # Until 2026-07-31 this block ran `Test-Path Z:\` and `cmd /c vol Z:` on
+    # every tick the archiver was down -- filesystem and volume access to a tape
+    # device from a process holding no lock at all. The archiver's in-process
+    # RLock could not serialise it, so those probes could land during another
+    # process's tape operation.
+    #
+    # The watchdog now decides from process/database/status-file state only.
+    # Cartridge identity is NOT checked here: it is verified by the archiver's
+    # own pre-write gate (_verify_mounted_cartridge), which runs while holding
+    # the authoritative cross-process LTFS mutex and fails closed on a mismatch.
+    # A restart with the wrong cartridge therefore stops safely at the gate
+    # instead of being pre-screened by an unsynchronised probe here.
     $drive = (Get-ConfigValue -Section 'HARDWARE' -Key 'lto_drive') -replace '\\\\', '\'
     if (-not $drive) { $refusals += 'could not read [HARDWARE] lto_drive' }
-    elseif (-not (Test-Path $drive)) { $refusals += "LTO drive $drive is not present" }
-    else {
-        $letter = $drive.TrimEnd('\', ':')
-        $volLine = (cmd /c "vol ${letter}:" 2>&1) -join ' '
-        if ($volLine -match 'Volume in drive \w+ is (\S+)') {
-            $loaded = $Matches[1]
-            if ($loaded -ne $tapeLabel) {
-                $refusals += "wrong cartridge: loaded='$loaded' but session $sessionId expects '$tapeLabel'"
+
+    # A recorded hard tape failure must not be auto-resumed into. This reads the
+    # archiver's own status file -- no device access.
+    $failurePath = Join-Path $PSScriptRoot '..\backup_logs\last_failure.json'
+    if (Test-Path $failurePath) {
+        try {
+            $failure = Get-Content $failurePath -Raw | ConvertFrom-Json
+            $hardReasons = @('ambiguous_backing_chunk', 'ltfs_media_degraded',
+                             'ltfs_sync_mode_not_time5', 'tape_write_failed',
+                             'unexpected_tape_or_db_state',
+                             'ltfs_ownership_unavailable')
+            if ($failure.reason -and ($hardReasons -contains $failure.reason)) {
+                $refusals += "last recorded failure '$($failure.reason)' is a hard tape fault - an operator must authorise resumption"
             }
-        } else {
-            $refusals += "could not read the volume label of $drive"
+        } catch {
+            $refusals += 'could not parse backup_logs/last_failure.json'
         }
     }
 

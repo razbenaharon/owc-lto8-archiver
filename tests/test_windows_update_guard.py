@@ -585,6 +585,88 @@ class LtfsMediaHealthTests(unittest.TestCase):
         self.assertFalse(health["ok"])
         self.assertIn("cannot read", health["error"])
 
+    def test_complete_format_sequence_resets_pre_format_faults(self):
+        rows = [
+            ('11333', 'Error', '2026/08/02 11:56:22.189', '1', '2', 'Z',
+             'A cartridge with write-perm error is detected on DP.'),
+            ('62173', 'Information', '2026/08/02 12:52:57.233', '2', '2', 'Z',
+             'Error on readattribute: Invalid Field in CDB (-20501).'),
+            ('15013', 'Information', '2026/08/02 12:53:07.366', '2', '2', 'Z',
+             'Volume UUID is: 55e10b7b-49a9-4f2d-a7c7-7586af1ec6a4.'),
+            ('15024', 'Information', '2026/08/02 12:53:26.316', '2', '2', 'Z',
+             'Medium formatted successfully.'),
+            ('17228', 'Information', '2026/08/02 12:53:41.678', '1', '2', 'Z',
+             'Tape attribute: Volume Lock Status = 0x00.'),
+            ('11031', 'Information', '2026/08/02 12:53:41.679', '1', '2', 'Z',
+             'Volume mounted successfully. NO_BARCODE : Gen = 1 / drive.'),
+        ]
+        health = wug.ltfs_media_health(
+            since_iso='2026-08-02T11:55:34', log_path=self._log(rows))
+        self.assertTrue(health["ok"], health)
+        self.assertIsNotNone(health["post_format_reset"])
+        self.assertEqual(health["fatal"], [])
+        self.assertEqual(health["degraded"], [])
+
+    def test_incomplete_format_evidence_does_not_reset_faults(self):
+        rows = [
+            ('11333', 'Error', '2026/08/02 11:56:22.189', '1', '2', 'Z',
+             'A cartridge with write-perm error is detected on DP.'),
+            # Missing the new UUID: a bare success/mount must not erase history.
+            ('15024', 'Information', '2026/08/02 12:53:26.316', '2', '2', 'Z',
+             'Medium formatted successfully.'),
+            ('17228', 'Information', '2026/08/02 12:53:41.678', '1', '2', 'Z',
+             'Tape attribute: Volume Lock Status = 0x00.'),
+            ('11031', 'Information', '2026/08/02 12:53:41.679', '1', '2', 'Z',
+             'Volume mounted successfully. NO_BARCODE : Gen = 1 / drive.'),
+        ]
+        health = wug.ltfs_media_health(
+            since_iso='2026-08-02T11:55:34', log_path=self._log(rows))
+        self.assertFalse(health["ok"])
+        self.assertIsNone(health["post_format_reset"])
+        self.assertIn(11333, {e["id"] for e in health["fatal"]})
+
+    def test_fault_after_verified_format_still_blocks(self):
+        rows = [
+            ('11333', 'Error', '2026/08/02 11:56:22.189', '1', '2', 'Z',
+             'A cartridge with write-perm error is detected on DP.'),
+            ('15013', 'Information', '2026/08/02 12:53:07.366', '2', '2', 'Z',
+             'Volume UUID is: new-uuid.'),
+            ('15024', 'Information', '2026/08/02 12:53:26.316', '2', '2', 'Z',
+             'Medium formatted successfully.'),
+            ('17228', 'Information', '2026/08/02 12:53:41.678', '1', '2', 'Z',
+             'Tape attribute: Volume Lock Status = 0x00.'),
+            ('11031', 'Information', '2026/08/02 12:53:41.679', '1', '2', 'Z',
+             'Volume mounted successfully. NO_BARCODE : Gen = 1 / drive.'),
+            ('17267', 'Error', '2026/08/02 13:00:00.000', '1', '2', 'Z',
+             'Locate command returns write-perm error (-20301).'),
+        ]
+        health = wug.ltfs_media_health(
+            since_iso='2026-08-02T11:55:34', log_path=self._log(rows))
+        self.assertFalse(health["ok"])
+        self.assertIsNotNone(health["post_format_reset"])
+        self.assertIn(17267, {e["id"] for e in health["degraded"]})
+
+    def test_read_only_between_format_and_mount_invalidates_reset(self):
+        rows = [
+            ('11333', 'Error', '2026/08/02 11:56:22.189', '1', '2', 'Z',
+             'A cartridge with write-perm error is detected on DP.'),
+            ('15013', 'Information', '2026/08/02 12:53:07.366', '2', '2', 'Z',
+             'Volume UUID is: new-uuid.'),
+            ('15024', 'Information', '2026/08/02 12:53:26.316', '2', '2', 'Z',
+             'Medium formatted successfully.'),
+            ('61223', 'Error', '2026/08/02 12:53:30.000', '1', '2', 'Z',
+             'Medium is write protected. Mounting medium as read-only.'),
+            ('17228', 'Information', '2026/08/02 12:53:41.678', '1', '2', 'Z',
+             'Tape attribute: Volume Lock Status = 0x00.'),
+            ('11031', 'Information', '2026/08/02 12:53:41.679', '1', '2', 'Z',
+             'Volume mounted successfully. NO_BARCODE : Gen = 1 / drive.'),
+        ]
+        health = wug.ltfs_media_health(
+            since_iso='2026-08-02T11:55:34', log_path=self._log(rows))
+        self.assertFalse(health["ok"])
+        self.assertIsNone(health["post_format_reset"])
+        self.assertIn(11333, {e["id"] for e in health["fatal"]})
+
 
 class LtfsMountAnchorTests(unittest.TestCase):
     """The mount window must be anchored to the process that owns the mount.

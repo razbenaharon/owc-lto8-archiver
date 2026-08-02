@@ -14,7 +14,7 @@ except ImportError:  # optional dependency; priority/affinity degrade gracefully
 
 from .constants import BACKUP_LOG_DIR, LTFS_WRITE_WARNING
 from .logsetup import get_logger
-from .ltfs import _ensure_lto_drive_ready, eject_tape_drive
+from .ltfs import _ensure_lto_drive_ready, eject_tape_drive, note_tape_io_error
 from .ram_telemetry import RamStageSampler, TapeWriteProfiler
 from .reporting import append_backup_summary_row
 from .robocopy import (
@@ -319,6 +319,41 @@ class LTOBackup:
             'robocopy', source, tape_root,
              '/E',     # recurse subdirectories including empty ones
              '/J',     # unbuffered I/O; optimised for large files / tape
+             # Data only. robocopy's DEFAULTS are /COPY:DAT and /DCOPY:DA, and
+             # they were never written in this source — they only showed up in
+             # the production logs' echoed Options header. Every A (attribute)
+             # and T (timestamp) element is a separate LTFS metadata write, and
+             # a directory-attribute write is literally the first thing robocopy
+             # attempts: chunk 108's failure was
+             #   "ERROR 19 ... Changing File Attributes Z:\_pack_s0037_108\".
+             # Archive provenance comes from the manifests and the PostgreSQL
+             # catalog (original_path, file_size_bytes, stored_path,
+             # directory_id, catalog_backup_date), never from LTFS file
+             # attributes, and the restore path uses /IS /IT so it copies
+             # regardless of destination timestamps. These two overrides must
+             # stay explicit — dropping them silently restores the defaults.
+             #
+             # KNOWN METADATA LIMITATION (2026-07-31, Phase 2):
+             #   * File and directory ATTRIBUTES are no longer copied to LTFS.
+             #   * Original MODIFICATION TIME was never stored authoritatively:
+             #     the packer writes "mtime": None into every manifest record
+             #     and files_index has no mtime column.
+             #   * For packed small files nothing is lost — a bundle's tape
+             #     timestamp was always the pack time, not any source file's.
+             #   * For LOOSE large files the original mtime used to survive
+             #     incidentally (tar -x preserves it, /COPY:T then propagated it
+             #     to tape). It no longer does: those files now carry the copy
+             #     time on tape.
+             #   * Restore correctness does NOT depend on either — the retriever
+             #     matches on path and size, and _robocopy_file uses /IS /IT so
+             #     it copies regardless of timestamps.
+             # FOLLOW-UP REQUIRED: persist original mtime (and any attributes a
+             # restore genuinely needs) in the manifest or catalog, rather than
+             # relying on LTFS filesystem metadata. Tracked as a required
+             # follow-up in the phased implementation plan; deliberately NOT
+             # done here — it is a manifest/schema change, out of Phase 2/2.5.
+             '/COPY:D',
+             '/DCOPY:D',
              '/R:3', '/W:10',
              '/NP',    # no per-file progress %
              '/NDL',   # no directory listing lines
@@ -403,6 +438,17 @@ class LTOBackup:
             raw_log.write_footer(rc.returncode, rc_sum, verdict)
 
             if not verdict.is_success:
+                # A classified tape-write failure invalidates the cached
+                # readiness verification FIRST — before the DB recalc, the
+                # failure log, the raise, or any later readiness decision.
+                # ERROR 19 on chunk 108 was returned by a volume LTFS had
+                # already dropped to read-only; a cached "ready" from before
+                # that transition must never be reused. This only discards
+                # cached state: it adds no retry and does not alter the stop
+                # policy or the classification above.
+                note_tape_io_error(
+                    f"robocopy verdict={verdict.category} rc={rc.returncode} "
+                    f"tape={tape_label}")
                 copied_bytes = rc_sum.get('bytes_copied', 0)
                 new_used = self.db.recalculate_tape_used_space(tape_label)
                 log_path = self._write_backup_log(

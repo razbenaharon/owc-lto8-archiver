@@ -982,6 +982,14 @@ _LTFS_62173_FAULT_MARKERS = ("error on write", "error on read",
 _LTFS_HEALTH_EVENT_IDS = frozenset(
     set(_LTFS_FATAL_EVENTS) | set(_LTFS_DEGRADED_EVENTS) | {62173})
 
+# A physical LTFS format can complete without restarting LtfsMain. In that
+# case the process-start bound still includes faults from the generation that
+# was just erased. A format resets the health window only when IBM's own CSV
+# proves the complete new-generation sequence. Anything less remains fail-
+# closed, and any fault at/after the new mount boundary is still classified.
+_LTFS_FORMAT_EVIDENCE_IDS = frozenset({15013, 15024, 17228, 11031, 61223})
+_LTFS_FORMAT_WINDOW_SECONDS = 10 * 60
+
 # The authoritative source is IBM's own CSV trace, NOT the Windows "LTFS" event
 # log. Verified 2026-07-25: the Windows log contains **no 17267 events at all**
 # — the single most valuable early warning — and it had already rotated away
@@ -1029,6 +1037,74 @@ def _classify_ltfs_health_rows(rows):
     return fatal, degraded
 
 
+def _latest_verified_format_boundary(rows):
+    """Return the latest proven post-format mount boundary, or ``None``.
+
+    ``rows`` are chronological normalised CSV rows with a private ``_when``
+    datetime. A reset requires, in order and within ten minutes:
+
+    * a newly reported volume UUID;
+    * ``Medium formatted successfully``;
+    * ``Volume Lock Status = 0x00``;
+    * ``Volume mounted successfully`` at fresh ``Gen = 1``.
+
+    A fatal/degraded health event or read-only declaration after the successful
+    format and before the mount invalidates that candidate. This deliberately
+    does not treat an ordinary remount, a bare Gen=1 line, or an incomplete
+    formatter attempt as a reset: those must continue to see the earlier fault.
+    """
+    latest_uuid = None
+    candidate = None
+    verified = None
+    for row in rows:
+        eid = row["id"]
+        when = row["_when"]
+        message = row["message"]
+        low = message.lower()
+
+        if eid == 15013 and "volume uuid is:" in low:
+            latest_uuid = when
+            continue
+
+        if eid == 15024 and "formatted successfully" in low:
+            uuid_recent = (latest_uuid is not None and
+                           0 <= (when - latest_uuid).total_seconds()
+                           <= _LTFS_FORMAT_WINDOW_SECONDS)
+            candidate = ({"uuid_at": latest_uuid, "formatted_at": when,
+                          "lock_at": None} if uuid_recent else None)
+            continue
+
+        if candidate is None:
+            continue
+        if (when - candidate["formatted_at"]).total_seconds() > \
+                _LTFS_FORMAT_WINDOW_SECONDS:
+            candidate = None
+            continue
+
+        fatal, degraded = _classify_ltfs_health_rows([row])
+        if fatal or degraded or (eid == 61223 and "read-only" in low):
+            candidate = None
+            continue
+
+        if eid == 17228 and "volume lock status" in low and "0x00" in low:
+            candidate["lock_at"] = when
+            continue
+
+        if (eid == 11031 and "volume mounted successfully" in low and
+                re.search(r"\bGen\s*=\s*1\b", message, re.I) and
+                candidate["lock_at"] is not None and
+                candidate["lock_at"] <= when):
+            verified = {
+                "uuid_at": candidate["uuid_at"],
+                "formatted_at": candidate["formatted_at"],
+                "lock_at": candidate["lock_at"],
+                "mounted_at": when,
+                "mounted_message": message,
+            }
+            candidate = None
+    return verified
+
+
 def ltfs_media_health(since_iso=None, log_path=None):
     """Report drive/medium faults the LTFS mount has logged.
 
@@ -1044,7 +1120,8 @@ def ltfs_media_health(since_iso=None, log_path=None):
     """
     path = log_path or _LTFS_LOG_CSV_DEFAULT
     info = {"determinate": False, "ok": False, "fatal": [], "degraded": [],
-            "since": since_iso, "log_path": path, "error": None}
+            "since": since_iso, "effective_since": since_iso,
+            "post_format_reset": None, "log_path": path, "error": None}
 
     cutoff = None
     if since_iso:
@@ -1073,7 +1150,8 @@ def ltfs_media_health(since_iso=None, log_path=None):
                     eid = int(rec[0])
                 except (TypeError, ValueError):
                     continue
-                if eid not in _LTFS_HEALTH_EVENT_IDS:
+                if eid not in (_LTFS_HEALTH_EVENT_IDS |
+                               _LTFS_FORMAT_EVIDENCE_IDS):
                     continue
                 when = _parse_ltfs_csv_time(rec[2])
                 if when is None:
@@ -1081,15 +1159,35 @@ def ltfs_media_health(since_iso=None, log_path=None):
                 if cutoff is not None and when < cutoff:
                     continue
                 rows.append({"id": eid, "at": rec[2].strip(),
-                             "message": rec[6].strip()})
+                             "message": rec[6].strip(), "_when": when})
     except OSError as e:
         info["error"] = f"cannot read {path}: {e}"
         get_logger().warning("ltfs_media_health_check_failed: %s", info["error"])
         return info
 
+    reset = _latest_verified_format_boundary(rows)
+    effective_cutoff = cutoff
+    if reset and (effective_cutoff is None or
+                  reset["mounted_at"] > effective_cutoff):
+        effective_cutoff = reset["mounted_at"]
+        info["effective_since"] = reset["mounted_at"].isoformat()
+        info["post_format_reset"] = {
+            key: (value.isoformat() if hasattr(value, "isoformat") else value)
+            for key, value in reset.items()
+        }
+        get_logger().info(
+            "ltfs_media_health_post_format_reset: requested_since=%s "
+            "effective_since=%s", since_iso, info["effective_since"])
+
+    health_rows = [
+        {"id": row["id"], "at": row["at"], "message": row["message"]}
+        for row in rows
+        if row["id"] in _LTFS_HEALTH_EVENT_IDS and
+        (effective_cutoff is None or row["_when"] >= effective_cutoff)
+    ]
     # Newest first, so callers can report the latest event without re-sorting.
-    rows.reverse()
-    info["fatal"], info["degraded"] = _classify_ltfs_health_rows(rows)
+    health_rows.reverse()
+    info["fatal"], info["degraded"] = _classify_ltfs_health_rows(health_rows)
     info["determinate"] = True
     info["ok"] = not info["fatal"] and not info["degraded"]
     return info

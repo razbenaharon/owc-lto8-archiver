@@ -27,6 +27,7 @@ storage_map_logs/
 storage_map/logs/
 storage_map/index.html
 db_backups/
+tape_reset_audits/
 lto_archive*.db
 
 # Local config — contains host/user/paths. Use config.example.ini as template.

@@ -1,9 +1,11 @@
 """ConfigManager and .env loading."""
 import os
 import configparser
+import tempfile
 from urllib.parse import quote
 
-from .constants import BACKUP_LOG_DIR, CONFIG_FILE, PROJECT_ROOT
+from .constants import (BACKUP_LOG_DIR, CONFIG_FILE, LOCAL_STAGING_RESERVE_BYTES,
+                        PROJECT_ROOT)
 from .paths import _clean_config_path, _clean_remote_path, _config_list
 
 
@@ -101,6 +103,21 @@ class ConfigManager:
             'directory_chunk_max_gb': '50',
             'directory_chunk_max_files': '100000',
         }
+        self.config['PIPELINE'] = {
+            # Byte-bounded ready queue (Phase 4). Values are BYTES and describe
+            # files already prepared on the staging disk, never memory.
+            'min_ready_bytes_before_writer_start': str(20 * 1024**3),
+            'target_ready_bytes':                  str(40 * 1024**3),
+            'max_ready_bytes':                     str(80 * 1024**3),
+            'max_ready_chunks':                    '48',
+            # Phase 4.5. Local staging the ready queue must NEVER consume, so an
+            # active fetch + active pack + temp pack output + manifests/resume
+            # metadata + the existing reserve always have room. 0 => auto
+            # (2x chunk_cap + LOCAL_STAGING_RESERVE_BYTES). Validated against
+            # staging_max_gb before a run; a conflict falls back atomically to
+            # the documented default limits (never a silent single-value clamp).
+            'ready_queue_staging_reserve_bytes':   '0',
+        }
         self.config['PERFORMANCE'] = {
             'pipeline_profile':      'tape_first_controlled',
             'chunk_cap_gb':          '50',
@@ -153,6 +170,32 @@ class ConfigManager:
             'guard': 'true',
             'pause_days': '7',
             'block_on_pending_reboot': 'true',
+        }
+        self.config['FEATURES'] = {
+            # Phase 5 sealed tape-write batches. FAIL-CLOSED: default false, and
+            # the production runtime queries/mutates no batch table while false.
+            # Enabling it without the applied 012 schema must fail at startup.
+            'sealed_tape_write_batches_enabled': 'false',
+            # Phase 5C observation mode. Default false: no observer is
+            # constructed. When true the observer only COMPUTES and logs a shadow
+            # comparison; it never influences the writer and its failures cannot
+            # block production. Enabling it does NOT enable sealed batches.
+            'sealed_tape_write_batches_observation_enabled': 'false',
+        }
+        self.config['OBSERVATION'] = {
+            # Phase 5D bounded async observation (only used when observation mode
+            # is enabled). The writer thread only copies a snapshot and does one
+            # non-blocking enqueue; this worker does the DB read + observer + log.
+            'sealed_batch_observation_queue_max': '100',
+            'sealed_batch_observation_shutdown_timeout_seconds': '5',
+            'sealed_batch_observation_statement_timeout_seconds': '5',
+            # Local diagnostic JSONL. MUST NOT be inside the repo, the LTFS mount,
+            # a pack/staging dir, or the evidence tree (validated at build time).
+            'sealed_batch_observation_log_path': os.path.join(
+                tempfile.gettempdir(), 'lto8_observations',
+                'sealed_batch_observations.jsonl'),
+            'sealed_batch_observation_log_max_bytes': str(10 * 1024 * 1024),
+            'sealed_batch_observation_log_backups': '5',
         }
         with open(self.config_path, 'w', encoding='utf-8') as f:
             self.config.write(f)
@@ -362,6 +405,105 @@ class ConfigManager:
     def chunk_max_files(self):
         return self._get_int('PERFORMANCE', 'chunk_max_files', 100000,
                              minimum=1)
+    # -- Phase 4 byte-bounded ready queue --------------------------------
+    _READY_QUEUE_DEFAULTS = {
+        'min_ready_bytes_before_writer_start': 20 * 1024**3,
+        'target_ready_bytes': 40 * 1024**3,
+        'max_ready_bytes': 80 * 1024**3,
+        'max_ready_chunks': 48,
+    }
+
+    def _ready_queue_raw(self, key):
+        return self._get_int('PIPELINE', key, self._READY_QUEUE_DEFAULTS[key],
+                             minimum=1)
+
+    @property
+    def ready_queue_limits(self):
+        """Validated :class:`~src.ready_queue.ReadyQueueLimits`.
+
+        Malformed individual values already degrade to the documented default
+        via ``_get_int``. If the *combination* is still inconsistent (e.g. min >
+        target), fall back to the full default set rather than running with an
+        ordering that would make the writer-start rules nonsensical — and say so
+        loudly, because a silently wrong threshold is how the drive ends up
+        idle again.
+        """
+        from .ready_queue import ReadyQueueLimits
+        values = {k: self._ready_queue_raw(k) for k in self._READY_QUEUE_DEFAULTS}
+        try:
+            return ReadyQueueLimits(
+                values['min_ready_bytes_before_writer_start'],
+                values['target_ready_bytes'],
+                values['max_ready_bytes'],
+                values['max_ready_chunks'])
+        except ValueError as e:
+            print(f"[CONFIG] Invalid [PIPELINE] ready-queue limits ({e}); "
+                  f"using defaults {self._READY_QUEUE_DEFAULTS}.")
+            d = self._READY_QUEUE_DEFAULTS
+            return ReadyQueueLimits(
+                d['min_ready_bytes_before_writer_start'],
+                d['target_ready_bytes'], d['max_ready_bytes'],
+                d['max_ready_chunks'])
+
+    @property
+    def ready_queue_staging_reserve_bytes(self):
+        """Local staging the ready queue must never consume (Phase 4.5).
+
+        ``0`` (the default) means *auto*: enough for one active fetch plus one
+        active pack (each up to ``chunk_cap``, which is the peak the capacity
+        gate already sizes on) plus the existing ``LOCAL_STAGING_RESERVE_BYTES``
+        headroom that also covers temp pack output, manifests and resume
+        metadata. This deliberately mirrors the ``need = 2 * physical_estimate``
+        figure in ``_await_staging_capacity`` so there is a single staging model,
+        not a second incompatible one."""
+        auto = 2 * int(self.chunk_cap_gb * 1024**3) + LOCAL_STAGING_RESERVE_BYTES
+        raw = self._get_int('PIPELINE', 'ready_queue_staging_reserve_bytes', 0,
+                            minimum=0)
+        return auto if raw == 0 else raw
+
+    def validated_ready_queue_limits(self):
+        """Ready-queue limits proven to leave room for fetch/pack (Phase 4.5).
+
+        The Phase-4 ``ready_queue_limits`` already validate internal ordering.
+        Here the *combination* with staging is checked: the queue's byte ceiling
+        plus the staging reserve must fit inside the effective staging budget, so
+        a large ``max_ready_bytes`` can never starve the producer's active
+        fetch+pack. On a conflict we fall back ATOMICALLY to the documented
+        default limit set (never clamp one value alone); if even the defaults
+        cannot fit, we fail closed so the run refuses to start rather than
+        deadlock the producer against the writer.
+
+        Returns ``(limits, reserve_bytes, effective_staging_bytes, source)``
+        where ``source`` is ``"configured"`` or ``"fallback_default"``.
+        """
+        from .ready_queue import ReadyQueueLimits
+        limits = self.ready_queue_limits
+        effective = int(self.staging_max_gb * 1024**3)
+        reserve = self.ready_queue_staging_reserve_bytes
+        if limits.max_bytes + reserve <= effective:
+            return limits, reserve, effective, "configured"
+
+        d = self._READY_QUEUE_DEFAULTS
+        defaults = ReadyQueueLimits(
+            d['min_ready_bytes_before_writer_start'], d['target_ready_bytes'],
+            d['max_ready_bytes'], d['max_ready_chunks'])
+        if defaults.max_bytes + reserve <= effective:
+            print(f"[CONFIG] [PIPELINE] max_ready_bytes "
+                  f"({limits.max_bytes / 1024**3:.0f} GiB) + staging reserve "
+                  f"({reserve / 1024**3:.0f} GiB) exceeds the effective staging "
+                  f"budget ({effective / 1024**3:.0f} GiB from staging_max_gb="
+                  f"{self.staging_max_gb:.0f}). Falling back atomically to the "
+                  f"documented default ready-queue limits.")
+            return defaults, reserve, effective, "fallback_default"
+
+        raise ValueError(
+            f"[PIPELINE] ready-queue limits cannot coexist with staging: even "
+            f"the default max_ready_bytes ({defaults.max_bytes / 1024**3:.0f} "
+            f"GiB) + reserve ({reserve / 1024**3:.0f} GiB) exceeds the effective "
+            f"staging budget ({effective / 1024**3:.0f} GiB). Increase "
+            f"staging_max_gb or reduce ready_queue_staging_reserve_bytes; "
+            f"refusing to run with a queue that would starve fetch/pack.")
+
     @property
     def prefetch_chunks_ahead(self):
         return max(1, int(self._get_float(
@@ -624,3 +766,60 @@ class ConfigManager:
     def windows_update_block_on_pending_reboot(self):
         return self._get_bool(
             'WINDOWS_UPDATE', 'block_on_pending_reboot', True)
+
+    @property
+    def sealed_tape_write_batches_enabled(self):
+        """Phase 5 sealed tape-write batches. Fail-closed default: False. While
+        False the production runtime touches no batch table. Enabling it without
+        the applied 012 schema must fail at startup (a later phase wires the
+        preflight; Phase 5B keeps the repository unused by production)."""
+        return self._get_bool(
+            'FEATURES', 'sealed_tape_write_batches_enabled', False)
+
+    @property
+    def sealed_tape_write_batches_observation_enabled(self):
+        """Phase 5C observation mode. Fail-closed default: False. When False no
+        observer is constructed. When True the observer only computes/logs a
+        shadow comparison and can never change production behaviour; an observer
+        failure never blocks the writer. Enabling it does not enable sealed
+        batches. Do not enable during Phase 5C."""
+        return self._get_bool(
+            'FEATURES', 'sealed_tape_write_batches_observation_enabled', False)
+
+    # --- [OBSERVATION] : Phase 5D bounded async observation -------------------
+    @property
+    def sealed_batch_observation_queue_max(self):
+        return self._get_int('OBSERVATION',
+                             'sealed_batch_observation_queue_max', 100,
+                             minimum=1)
+
+    @property
+    def sealed_batch_observation_shutdown_timeout_seconds(self):
+        return self._get_float(
+            'OBSERVATION',
+            'sealed_batch_observation_shutdown_timeout_seconds', 5.0)
+
+    @property
+    def sealed_batch_observation_statement_timeout_seconds(self):
+        return self._get_float(
+            'OBSERVATION',
+            'sealed_batch_observation_statement_timeout_seconds', 5.0)
+
+    @property
+    def sealed_batch_observation_log_path(self):
+        return _clean_config_path(self.config.get(
+            'OBSERVATION', 'sealed_batch_observation_log_path',
+            fallback=os.path.join(tempfile.gettempdir(), 'lto8_observations',
+                                  'sealed_batch_observations.jsonl')))
+
+    @property
+    def sealed_batch_observation_log_max_bytes(self):
+        return self._get_int('OBSERVATION',
+                             'sealed_batch_observation_log_max_bytes',
+                             10 * 1024 * 1024, minimum=4096)
+
+    @property
+    def sealed_batch_observation_log_backups(self):
+        return self._get_int('OBSERVATION',
+                             'sealed_batch_observation_log_backups', 5,
+                             minimum=0)
