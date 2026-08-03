@@ -7,8 +7,8 @@ Full evidence: [`plan1_completion_gate.md`](plan1_completion_gate.md).
 
 The remote pipeline was one 3,657-line file that did everything; it is now a
 small façade over four focused modules, the tape is touched from exactly one of
-them, and a faster "only scan what changed" scanner is built but **switched
-off**.
+them, and the faster "only scan what changed" scanner is **live** — it is the
+only scanner a production run can build.
 
 ## What an operator will actually notice on the next run
 
@@ -29,54 +29,94 @@ Nothing about how you start a run changes. Five behaviours differ:
 5. **`SUMMARY.csv` has 17 new `scan_*` columns**, appended at the end.
    Aggregates only — existing columns and their order are unchanged.
 
-## Production activation — what actually happened on 2026-08-03
+## Production activation — 2026-08-03
+
+Two passes. The first applied migration 014 and set the flag; the second made the
+flag mean something and migrated Session 37.
 
 | Step | Result |
 |---|---|
-| Plan 1 code on `origin/main` | **Done** (`3b810f1`) |
-| Verified production backup | **Done** — 647 MB dump + `pg_restore --list` verified |
-| Session 37 frontier report (read-only) | **`verdict: blocked`** |
-| Migration 014 on production | **Applied and finalized**, invariants validated |
-| Frontier bootstrap dry run | **`would_proceed: false`** |
-| Frontier bootstrap execution | **NOT RUN** — gate failed, executor refuses by design |
-| `incremental_scan = true` | **Set** (see the caveat below) |
-| Session 37 resumed | **No.** No run, no tape operation, no scan |
+| Plan 1 code on `origin/main` | **Done** |
+| Verified production backup | 647 MB dump + `pg_restore --list` verified |
+| Migration 014 on production | **Applied and finalized**; existing data unchanged |
+| All-session health report | 4 sessions audited — [`session_health_report.md`](session_health_report.md) |
+| Frontier wired into the runtime | **Done** — legacy scanner unreachable |
+| Session 37 conservative bootstrap | **done** — 65 scopes, 65 pending roots, nothing traversed |
+| `incremental_scan = true` | **Set, and now functional** |
+| Shadow rehearsal on a restored copy | **PASS** — 12/12 invariants unchanged |
+| Any session resumed | **No.** No run, no scan, no tape operation |
 
 Migration 014 changed no existing data: 113 chunks / 49 done / 64 pending /
-23,214,474 plan member rows were identical before and after, and all seven new
-tables are empty.
+23,214,474 plan member rows identical before and after.
 
-### Session 37 cannot be bootstrapped, and that is correct
+### Session 37: conservative bootstrap, and a serious finding
 
-Its scan never finished — `scan_complete = false`, killed by an SSH reset — so
-the plan's full membership is unknown and "all chunks done" cannot mean
-"finished". Both the read-only report and the bootstrap dry run block on
-exactly that one condition, and `FrontierBootstrap.execute()` re-runs the dry
-run and raises `BootstrapRefused` rather than proceeding. Nothing here is
-broken; the gate is doing its job.
+**The finding first, because it changes what a resume means.** Session 37 is
+bound to **Tape_03 generation 1**, which was *retired* on 2026-08-02 with the
+reason `physical contents intentionally destroyed by tape reset` — and retired
+again at generation 2. The active generation is **3**, and `tapes.used_space` for
+Tape_03 is `0`. So its 49 `done` chunks are done **in the catalog only**; the
+bytes are not on the cartridge. `_verify_session_tape_generation` blocks a
+resume before the drive is touched. Do not bypass that guard. Deciding what to do
+about those 49 chunks is an operator decision and is out of Plan 1 scope.
 
-To unblock it later, Session 37's scan has to complete first. That is a run,
-and a run is a separate operator decision.
+**What the bootstrap did.** The gate used to refuse any session whose scan had
+not finished — which is every session it exists for. That was wrong: an
+unfinished scan is the *expected input*, and `backing` chunks, mid-flight work,
+a shared plan or a live worker are what must actually block. The conservative
+bootstrap now creates the scope rows and queues each configured root as
+`pending`, and stops. It lists no directory, publishes no segment, imports no
+membership, finalizes nothing, and does not mark the scan complete.
 
-### `incremental_scan = true` is set — and is currently a no-op
+Nothing is skipped (every root starts `pending`, so the whole source is queued)
+and nothing is duplicated (when the next run lists a directory, its segment is
+reconciled once against the 23.2M existing rows and only genuinely new entries
+reach the chunk builder). Repeating it writes nothing new, and a completed
+bootstrap refuses a second one.
 
-Measured, not assumed. `decide_scan_mode()` does return `MODE_FRONTIER`, but
-**nothing consumes that decision**:
+### `incremental_scan = true` is now REAL
 
-- `RemoteOrchestrator._resolve_scan_mode()` sets `self._scan_mode`, and
-  `self._scan_mode` is never read anywhere.
-- The streaming path builds its scanner with `build_legacy_scanner_factory()`
-  unconditionally ([remote_orchestrator.py:1097](../src/remote_orchestrator.py#L1097)).
-- `build_frontier_scanner_factory()` has **zero callers** in `src/` or `tests/`.
-- `DirectoryFrontierCoordinator` is constructed in exactly one place —
-  `FrontierBootstrap.execute()` ([frontier_bootstrap.py:166](../src/frontier_bootstrap.py#L166)),
-  reachable only via `--bootstrap-frontier --execute`.
+The 2026-08-03 activation set the flag but it did nothing: `decide_scan_mode()`
+returned `MODE_FRONTIER` and no run consumed the decision. That is fixed. The
+production streaming path now builds
+[`FrontierScanCoordinator`](../src/scan_frontier.py), and the legacy whole-root
+scanner is no longer imported by any module under `src/`.
 
-So the flag is safe to leave true — it cannot hand a session to a scanner it
-was never bound to — but it does not yet deliver the speed-up either. **Wiring
-the run path to the scan-mode decision is remaining Plan 1 work**, and it is
-the next thing to do on this plan. The frontier machinery itself is built and
-tested; only the connection from decision to scanner is missing.
+**The new architecture, in one picture:**
+
+```text
+DirectoryFrontierScanner   lists ONE directory over SSH
+        |
+DirectoryFrontierCoordinator   claims a directory, writes its listing as a
+        |                      JSONL.zst segment, queues its children, commits
+        |                      -> a crash replays at most that one directory
+        |
+SegmentChunkPublisher      reads the segment artifact, reconciles it ONCE
+        |                  against the legacy snapshot (path AND size, one
+        |                  set-based query per segment), and passes ONLY the
+        |                  genuinely new entries to the chunk builder
+        |
+StreamingChunkBuilder      chooses chunk boundaries -- from survivors only
+        |
+sealed chunk -> stager -> ready queue -> finite write group (the only tape path)
+```
+
+The ordering is the point. The legacy scanner filtered already-planned files
+*after* they had moved the chunk boundary, so a resumed scan produced different
+boundaries from the original run for the same source. Now a known file never
+reaches the builder at all — there is no code path in which it can.
+
+**No runtime fallback, deliberately.** An unusable migration-014 schema stops the
+run (`SAFETY_BLOCK` / `scan_frontier_unavailable`) instead of quietly picking the
+old scanner. A fallback is exactly how two scanners end up running against one
+frontier. Git history and the verified PostgreSQL backup are the rollback path.
+
+**Scan finality now needs traversal evidence.** `remote_sessions.scan_complete`
+is set only when *every* scope reports final coverage, which requires each
+directory terminal, every descendant subtree final, and the mutation sweep
+finding nothing changed. A permission error or a partial directory leaves the
+session resumable — which is why the report can honestly say "the scan never
+completed" about session 37 rather than guessing from its 23M catalog rows.
 
 ## Two bugs this work found and fixed
 
