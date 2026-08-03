@@ -49,14 +49,15 @@ change is safe, this tells you which file to read:
 
 | module | owns | never does |
 | --- | --- | --- |
-| `scan_frontier.py` | which scanner may run; discovery; sealing chunks | touch the tape |
+| `scan_frontier.py` | the sole production scanner; discovery; sealing chunks | touch the tape |
 | `remote_staging.py` | SSH/tar fetch, retry classification, the staging watchdog, packing | touch the tape |
-| `remote_writer.py` | **the finite write group — the only path to the tape** | eject; retry into a failing drive; clear `backing` |
+| `remote_writer.py` | **the finite write group — the sole tape-writing entry path** | eject; retry into a failing drive; clear `backing` |
 | `remote_pipeline.py` | the single scheduling loop for BOTH session kinds | decide anything about the tape |
 
-**`remote_writer.py` is 351 lines and is the whole tape surface.** If you want
-to know whether the archiver can do something dangerous to a cartridge, that is
-the only file you have to read.
+**`remote_writer.py` is 351 lines and owns the complete finite write group.** It
+is the only place a remote pipeline copy enters the tape. Cartridge selection,
+announcement, and pre-run checks also exist in `remote_orchestrator.py`, so a
+review of all cartridge access must include both modules.
 
 Three rules the code now enforces rather than documents:
 
@@ -87,20 +88,27 @@ Current production state — verify, don't assume:
   a fallback is how two scanners end up on one frontier. Git history and the
   verified backup are the rollback path.
 - Migration 014 is **applied and finalized** on
-  `lto_archive_directory_catalog_20260710_103359`, and
-  `[REMOTE] incremental_scan = true` **now has a real runtime effect**.
-- **Known files are filtered before the chunk builder**, structurally: a segment
-  is reconciled once against the legacy snapshot (path AND size, one set-based
-  query per segment) and only genuinely new entries reach `builder.add()`. A
-  rediscovered file cannot move a chunk boundary.
+  `lto_archive_directory_catalog_20260710_103359`. The persistent frontier
+  scanner is the sole production scanner. There is no legacy scan mode and no
+  incremental-scan feature flag.
+- **Known files are filtered before the chunk builder**, structurally. A durable
+  `remote_frontier_bootstraps` row identifies a migrated session; each of its
+  segments is reconciled once against the legacy snapshot (path AND size, one
+  set-based query per segment) and only genuinely new entries reach
+  `builder.add()`. Without a bootstrap row, only a definite empty snapshot is
+  treated as frontier-born; existing membership or any missing, exceptional, or
+  indeterminate probe fails toward reconciliation. A rediscovered file cannot
+  move a chunk boundary.
 - **Scan finality needs traversal evidence.** `scan_complete` is written only
   when every scope reports final coverage. Catalog rows never establish it.
 - **Session 37** has a conservative frontier: 65 scopes and 65 roots queued
   `pending`, nothing traversed, nothing marked complete (shadow-rehearsed
   first, 12/12 invariants unchanged). Its 49 `done` chunks are on
   **Tape_02** generation 1 (still active) — all 9 of its archive runs wrote
-  there and Tape_03 has never been written to. Its `tape_label = Tape_03` is
-  the NEXT target, and that generation was reformatted twice, so
+  there, zero archive runs reference Tape_03, and `files_index` has zero rows
+  for Tape_03. Its `tape_label = Tape_03` is the NEXT target, not evidence of
+  where completed work resides. Tape_03 was reformatted twice and separately
+  received the 24 GiB Phase 5E synthetic pilot, so
   `_verify_session_tape_generation` blocks a resume; do not bypass it.
 - **Session 36** is partial and **superseded by 37** (its chunks 1–10 are 100%
   covered by plan 37; its `done` chunk 0 is unique and must be preserved). It
@@ -138,8 +146,9 @@ small staged dataset before a full remote archive run.
 ### PostgreSQL tests need an explicit disposable server
 
 `python -m pytest -q` on its own is safe and complete except for the PostgreSQL
-suites, which **skip** (1259 passed, 149 skipped) because they refuse to guess a
-server. They used to fall back to `build_conninfo`'s defaults — `localhost:5432`,
+suites, which **skip** (1312 passed, 149 skipped, 12 subtests passed; 2 warnings)
+because they refuse to guess a server. They used to fall back to
+`build_conninfo`'s defaults — `localhost:5432`,
 which is exactly where the **production** `lto_pg` container listens.
 `tests/pg_test_guard.py` now forbids that, fail-closed: no implicit defaults, no
 port 5432, no non-loopback host, and no server hosting `lto_archive`. A DSN that
@@ -152,7 +161,7 @@ docker run -d --name lto_pg_test -e POSTGRES_DB=postgres -e POSTGRES_USER=lto `
 
 $env:LTO_TEST_PG_DSN = "postgresql://lto:<pw>@127.0.0.1:15432/postgres"
 $env:LTO_PG_SEALED_BATCH_IT = "1"
-python -m pytest tests/ -q            # 1408 passed, 0 skipped
+python -m pytest tests/ -q            # 1461 passed, 0 skipped; 12 subtests passed
 
 docker rm -f lto_pg_test              # tmpfs: the server vanishes with it
 ```
@@ -430,9 +439,10 @@ hardware/manual verification if relevant, and any database/config changes. For
     `archive_bundles.tape_label` — so re-pointing is non-destructive.
   - **A fresh cartridge is the cheapest drive-vs-media test there is.** When a
     cartridge latches read-only with a PWE bit, load a new one and see whether it
-    also latches. Tape_03 mounted `Volume Lock Status = 0x00` and wrote normally
-    on the same drive that was under suspicion — which answered the question for
-    free, without ITDT or a cleaning cartridge.
+    also latches. Tape_03 mounted `Volume Lock Status = 0x00` and the separate
+    24 GiB Phase 5E synthetic pilot wrote normally on the same drive that was
+    under suspicion — which answered the question for free, without ITDT or a
+    cleaning cartridge. No Session 37 archive work was written to Tape_03.
 - **`Set-MpPreference -DisableRemovableDriveScanning $true` can silently
   no-op.** It is policy-managed on this host: the call succeeds and the value
   still reads `False` — the same trap as the Windows Update pause. The
@@ -509,11 +519,12 @@ code change
 Do not combine major refactoring, database changes, scheduling changes, a
 hardware pilot, and a full production resume into one step.
 
-Current production assumptions as of 2026-08-02:
+Current production assumptions as of 2026-08-03:
 
 - Authoritative catalog: `lto_archive_directory_catalog_20260710_103359`.
 - Chunks 0-48 are done on Tape_02.
-- Chunks 49-112 are pending for Tape_03; chunk 108 is pending.
+- Chunks 49-112 are pending. `remote_sessions.tape_label = Tape_03` names their
+  next write target; it does not attribute any completed Session 37 work there.
 - Sealed batches and production observation remain disabled.
 - Tape_03 already contains the 24 GiB Phase 5E synthetic pilot data.
 - Do not resume Session 37 until code changes, tests, and a new bounded pilot

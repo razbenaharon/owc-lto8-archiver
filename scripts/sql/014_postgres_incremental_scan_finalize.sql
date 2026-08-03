@@ -126,8 +126,8 @@ ALTER TABLE remote_scan_segments
 -- 4. Marker
 -- ===========================================================================
 -- PgConnectionCore.incremental_scan_schema_finalized() checks for this comment
--- plus the unique index above.  Both halves must be present before
--- [REMOTE] incremental_scan can activate.
+-- plus the unique index above.  Both halves must be present before the sole
+-- production frontier may scan.
 COMMENT ON INDEX uq_remote_plan_files_chunk_ordinal IS
     'Plan 1 migration 014 (finalize): duplicate chunk membership is '
     'structurally impossible. Audited before creation; never auto-resequenced.';

@@ -337,36 +337,19 @@ class FiniteGroupRehearsalTests(unittest.TestCase):
 
 
 # =============================================================================
-# D. The production feature is still off
+# D. The frontier is the fixed production scanner
 # =============================================================================
 class ProductionGateTests(unittest.TestCase):
-    def test_incremental_scan_is_disabled_in_the_shipped_config(self):
+    def test_shipped_config_has_no_incremental_scan_feature_flag(self):
         import configparser
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         parser = configparser.ConfigParser()
         parser.read(os.path.join(root, "config.example.ini"), encoding="utf-8")
-        self.assertEqual(
-            parser.get("REMOTE", "incremental_scan").strip().lower(), "false")
+        self.assertFalse(parser.has_option("REMOTE", "incremental_scan"))
 
-    def test_the_default_config_object_reports_it_disabled(self):
-        """The CODE default, not whatever the live config.ini currently says.
-
-        ``ConfigManager()`` reads the host's real ``config.ini``, so this used
-        to assert the operator's current production setting — and broke when
-        the flag was legitimately enabled in production on 2026-08-03. The
-        default is the fallback in ``src/config.py``; that is what must stay
-        false, so that a config which never mentions the setting cannot end up
-        with the frontier active. The shipped default is covered separately by
-        ``test_incremental_scan_is_disabled_in_the_shipped_config``.
-        """
-        import tempfile
+    def test_config_manager_exposes_no_incremental_scan_feature_flag(self):
         from src.config import ConfigManager
-        handle = tempfile.NamedTemporaryFile(
-            "w", suffix=".ini", delete=False, encoding="utf-8")
-        handle.write("[REMOTE]\nremote_host = example\n")
-        handle.close()
-        self.assertFalse(
-            ConfigManager(config_path=handle.name).incremental_scan_enabled)
+        self.assertFalse(hasattr(ConfigManager, "incremental_scan_enabled"))
 
     def test_migration_014_is_not_applied_at_startup(self):
         import inspect

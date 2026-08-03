@@ -1,53 +1,27 @@
-"""Plan 1 / Task 0.3 — the incremental-scan activation gate.
+"""The fail-closed schema gate for the sole production frontier scanner.
 
-``decide_scan_mode`` is the single place the frontier can be turned on. The
-properties asserted here are the ones that keep a live session safe:
+There is no runtime scan-mode selection and no incremental-scan feature flag.
+The properties asserted here keep the fixed production path safe:
 
-* default OFF, and any unrecognised config value also means OFF;
-* the flag alone never activates anything — migration 014 must be installed
-  **and** finalized;
+* migration 014 must be installed **and** finalized;
 * a database that cannot answer is "not ready", never "ready";
-* a session already bound to frontier state is **blocked**, not quietly handed
-  back to whole-root replay, so two scanners can never run against one frontier;
-* nothing in this gate migrates, backfills or writes anything.
+* the orchestrator stops before worker or device work when it is not ready;
+* probing readiness never migrates, backfills or writes anything.
 """
 import configparser
 import os
+import tempfile
 import unittest
+import warnings
 from types import SimpleNamespace
 from unittest import mock
 
 from src import remote_orchestrator as ro
 from src.config import ConfigManager
 from src.exit_codes import ExitCode, REASON_SCAN_FRONTIER_UNAVAILABLE
-from src.scan_frontier import (MODE_BLOCKED, MODE_FRONTIER, MODE_LEGACY,
-                               decide_scan_mode,
-                               incremental_scan_schema_ready)
+from src.scan_frontier import incremental_scan_schema_ready
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-class _DB:
-    """Database double whose schema answers are set per test."""
-
-    def __init__(self, installed=None, finalized=None, raises=False):
-        self._installed = installed
-        self._finalized = finalized
-        self._raises = raises
-        if installed is None:
-            del self.incremental_scan_schema_installed
-        if finalized is None:
-            del self.incremental_scan_schema_finalized
-
-    def incremental_scan_schema_installed(self):
-        if self._raises:
-            raise RuntimeError("connection lost")
-        return self._installed
-
-    def incremental_scan_schema_finalized(self):
-        if self._raises:
-            raise RuntimeError("connection lost")
-        return self._finalized
 
 
 def _db(installed=True, finalized=True, raises=False):
@@ -64,61 +38,44 @@ def _db(installed=True, finalized=True, raises=False):
     return obj
 
 
-def _cfg(enabled):
-    return SimpleNamespace(incremental_scan_enabled=enabled)
-
-
 # =============================================================================
-# A. Configuration
+# A. Configuration surface
 # =============================================================================
-def _config_without_the_key():
-    """A ConfigManager over a config.ini that does not mention the setting.
+class ConfigurationSurfaceTests(unittest.TestCase):
+    def test_config_manager_exposes_no_incremental_scan_feature_flag(self):
+        self.assertFalse(hasattr(ConfigManager, "incremental_scan_enabled"))
 
-    Deliberately NOT ``ConfigManager()``: that reads the live ``config.ini`` on
-    whatever host the suite runs on, so it asserts the operator's current
-    production setting rather than the code's default. That made this test fail
-    the moment the flag was legitimately enabled in production on 2026-08-03 —
-    it was measuring the wrong thing. Pointing it at a config that omits the key
-    tests the fallback in ``src/config.py``, which is what "default" means and
-    is the thing a regression would actually break.
-    """
-    import tempfile
-    handle = tempfile.NamedTemporaryFile(
-        "w", suffix=".ini", delete=False, encoding="utf-8")
-    handle.write("[REMOTE]\nremote_host = example\n")
-    handle.close()
-    return ConfigManager(config_path=handle.name)
-
-
-class ConfigFlagTests(unittest.TestCase):
-    def test_default_is_off(self):
-        self.assertFalse(_config_without_the_key().incremental_scan_enabled)
-
-    def test_malformed_values_fall_back_to_off(self):
-        cfg = ConfigManager()
-        for raw in ("maybe", "", "0", "off", "TRUEISH", "  ", "2"):
-            with mock.patch.object(cfg.config, "get", return_value=raw):
-                self.assertFalse(cfg.incremental_scan_enabled, raw)
-
-    def test_explicit_truthy_values_are_accepted(self):
-        cfg = ConfigManager()
-        for raw in ("true", "TRUE", " yes ", "on", "1"):
-            with mock.patch.object(cfg.config, "get", return_value=raw):
-                self.assertTrue(cfg.incremental_scan_enabled, raw)
-
-    def test_example_config_ships_the_flag_disabled(self):
+    def test_example_config_has_no_incremental_scan_feature_flag(self):
         parser = configparser.ConfigParser()
         parser.read(os.path.join(PROJECT_ROOT, "config.example.ini"),
                     encoding="utf-8")
-        self.assertEqual(
-            parser.get("REMOTE", "incremental_scan").strip().lower(), "false")
+        self.assertFalse(parser.has_option("REMOTE", "incremental_scan"))
 
-    def test_example_config_documents_the_migration_precondition(self):
+    def test_example_config_documents_the_fixed_frontier_path(self):
         with open(os.path.join(PROJECT_ROOT, "config.example.ini"),
                   encoding="utf-8") as handle:
             text = handle.read()
-        self.assertIn("incremental_scan", text)
-        self.assertIn("migration 014", text)
+        self.assertIn("sole production scanner", text)
+        self.assertIn("no incremental-scan feature flag", text)
+        self.assertIn("migration 014", text.lower())
+
+    def test_retired_key_is_warned_once_and_ignored(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "old.ini")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("[REMOTE]\nincremental_scan = true\n")
+            with mock.patch("src.config._incremental_scan_warning_emitted",
+                            False), mock.patch(
+                                "src.config._load_env_file", return_value={}
+                            ), warnings.catch_warnings(record=True) as seen:
+                warnings.simplefilter("always")
+                first = ConfigManager(config_path=path)
+                ConfigManager(config_path=path)
+
+        matching = [item for item in seen
+                    if "deprecated and ignored" in str(item.message)]
+        self.assertEqual(len(matching), 1)
+        self.assertFalse(hasattr(first, "incremental_scan_enabled"))
 
 
 # =============================================================================
@@ -153,65 +110,15 @@ class SchemaReadinessTests(unittest.TestCase):
 
 
 # =============================================================================
-# C. The gate
+# C. The production gate
 # =============================================================================
-class DecideScanModeTests(unittest.TestCase):
-    def test_disabled_flag_keeps_the_legacy_scanner(self):
-        decision = decide_scan_mode(_cfg(False), _db())
-        self.assertEqual(decision.mode, MODE_LEGACY)
-        self.assertEqual(decision.reason, "disabled_by_config")
-        self.assertFalse(decision.frontier_enabled)
-        self.assertFalse(decision.blocked)
-
-    def test_a_config_without_the_attribute_is_treated_as_disabled(self):
-        decision = decide_scan_mode(SimpleNamespace(), _db())
-        self.assertEqual(decision.mode, MODE_LEGACY)
-
-    def test_enabled_but_unmigrated_keeps_the_legacy_scanner_and_says_why(self):
-        decision = decide_scan_mode(_cfg(True), _db(installed=False))
-        self.assertEqual(decision.mode, MODE_LEGACY)
-        self.assertEqual(decision.reason, "migration_014_not_installed")
-        self.assertIn("nothing was migrated", decision.detail)
-
-    def test_enabled_but_unfinalized_keeps_the_legacy_scanner(self):
-        decision = decide_scan_mode(_cfg(True), _db(finalized=False))
-        self.assertEqual(decision.mode, MODE_LEGACY)
-        self.assertEqual(decision.reason, "migration_014_not_finalized")
-
-    def test_indeterminate_schema_keeps_the_legacy_scanner(self):
-        decision = decide_scan_mode(_cfg(True), _db(raises=True))
-        self.assertEqual(decision.mode, MODE_LEGACY)
-        self.assertEqual(decision.reason, "schema_state_indeterminate")
-
-    def test_explicit_activation_requires_flag_and_finalized_schema(self):
-        decision = decide_scan_mode(_cfg(True), _db())
-        self.assertEqual(decision.mode, MODE_FRONTIER)
-        self.assertTrue(decision.frontier_enabled)
-        self.assertEqual(decision.reason, "enabled_and_schema_ready")
-
-    def test_a_frontier_bound_session_is_blocked_not_returned_to_replay(self):
-        for cfg, db in ((_cfg(False), _db()),
-                        (_cfg(True), _db(installed=False)),
-                        (_cfg(True), _db(raises=True))):
-            decision = decide_scan_mode(cfg, db,
-                                        session_bound_to_frontier=True)
-            self.assertEqual(decision.mode, MODE_BLOCKED)
-            self.assertTrue(decision.blocked)
-            self.assertFalse(decision.frontier_enabled)
-            self.assertIn("cannot fall back to whole-root replay",
-                          decision.detail)
-
-    def test_a_frontier_bound_session_with_a_ready_schema_runs_the_frontier(self):
-        decision = decide_scan_mode(_cfg(True), _db(),
-                                    session_bound_to_frontier=True)
-        self.assertEqual(decision.mode, MODE_FRONTIER)
-
-    def test_the_gate_writes_nothing(self):
+class SchemaProbePurityTests(unittest.TestCase):
+    def test_the_schema_probe_writes_nothing(self):
         db = mock.MagicMock(spec=["incremental_scan_schema_installed",
                                   "incremental_scan_schema_finalized"])
         db.incremental_scan_schema_installed.return_value = True
         db.incremental_scan_schema_finalized.return_value = True
-        decide_scan_mode(_cfg(True), db)
+        incremental_scan_schema_ready(db)
         # Only the two read-only probes were ever called.
         self.assertEqual(db.method_calls and
                          {c[0] for c in db.method_calls},
@@ -238,7 +145,7 @@ class OrchestratorFrontierGateTests(unittest.TestCase):
 
     def _orchestrator(self, db):
         orch = ro.RemoteOrchestrator.__new__(ro.RemoteOrchestrator)
-        orch.cfg = _cfg(True)
+        orch.cfg = SimpleNamespace()
         orch.db = db
         orch.notifier = None
         return orch
@@ -284,16 +191,41 @@ class OrchestratorFrontierGateTests(unittest.TestCase):
         self.assertNotIn("MODE_LEGACY", source)
         self.assertIn("SAFETY_BLOCK", source)
 
+    def test_the_run_path_has_no_mode_or_feature_flag_branch(self):
+        import inspect
+        source = inspect.getsource(
+            ro.RemoteOrchestrator._run_streaming_session)
+        self.assertIn("_require_frontier_schema", source)
+        self.assertNotIn("decide_scan_mode", source)
+        self.assertNotIn("incremental_scan_enabled", source)
+
     # -- legacy reconciliation decision ---------------------------------
-    def test_a_session_without_frontier_state_needs_reconciling(self):
+    def test_bootstrap_row_marks_a_migrated_session_after_scopes_exist(self):
         db = _db(installed=True, finalized=True)
-        db.session_has_frontier_state = lambda session_id: False
+        db.get_frontier_bootstrap = lambda session_id: {
+            "session_id": session_id, "state": "running"}
+        db.session_has_frontier_state = lambda _session_id: (_ for _ in ()).throw(
+            AssertionError("frontier scope presence is not an origin signal"))
         self.assertTrue(self._orchestrator(db)._session_predates_frontier(37))
 
-    def test_a_frontier_born_session_needs_no_reconciling(self):
+    def test_no_bootstrap_requires_proof_that_snapshot_membership_is_empty(self):
         db = _db(installed=True, finalized=True)
-        db.session_has_frontier_state = lambda session_id: True
+        db.get_frontier_bootstrap = lambda _session_id: None
+        db.session_has_snapshot_membership = lambda _session_id: False
+        db.session_has_frontier_state = lambda _session_id: (_ for _ in ()).throw(
+            AssertionError("frontier scope presence must not be probed"))
         self.assertFalse(self._orchestrator(db)._session_predates_frontier(37))
+
+        db.session_has_snapshot_membership = lambda _session_id: True
+        self.assertTrue(self._orchestrator(db)._session_predates_frontier(37))
+
+        db.session_has_snapshot_membership = lambda _session_id: None
+        self.assertTrue(self._orchestrator(db)._session_predates_frontier(37))
+
+        def boom(_session_id):
+            raise RuntimeError("membership unavailable")
+        db.session_has_snapshot_membership = boom
+        self.assertTrue(self._orchestrator(db)._session_predates_frontier(37))
 
     def test_an_unreadable_probe_fails_towards_reconciling(self):
         """Reconciling a session that did not need it costs one set-based query
@@ -303,19 +235,22 @@ class OrchestratorFrontierGateTests(unittest.TestCase):
 
         def boom(session_id):
             raise RuntimeError("connection lost")
-        db.session_has_frontier_state = boom
+        db.get_frontier_bootstrap = boom
         self.assertTrue(self._orchestrator(db)._session_predates_frontier(37))
 
     def test_a_missing_probe_fails_towards_reconciling(self):
         db = _db(installed=True, finalized=True)
-        if hasattr(db, "session_has_frontier_state"):
-            del db.session_has_frontier_state
+        self.assertTrue(self._orchestrator(db)._session_predates_frontier(37))
+
+    def test_an_indeterminate_probe_result_fails_towards_reconciling(self):
+        db = _db(installed=True, finalized=True)
+        db.get_frontier_bootstrap = lambda _session_id: False
         self.assertTrue(self._orchestrator(db)._session_predates_frontier(37))
 
     # -- the run stops at the gate --------------------------------------
     def test_streaming_session_stops_before_any_device_or_thread_work(self):
         orch = ro.RemoteOrchestrator.__new__(ro.RemoteOrchestrator)
-        orch.cfg = _cfg(True)
+        orch.cfg = SimpleNamespace()
         orch.db = mock.MagicMock()
         orch.db.get_remote_session.return_value = {
             "tape_label": "Tape_TEST", "scan_complete": False}

@@ -224,18 +224,16 @@ def main(argv=None):
                     "claim": claim, "sql": " ".join(sql.split()),
                     "expected": expected, "actual": value, "ok": ok})
 
-        # The feature must stay inert while the flag is off.
-        from types import SimpleNamespace
-        from src.scan_frontier import MODE_LEGACY, decide_scan_mode
-        decision = decide_scan_mode(
-            SimpleNamespace(incremental_scan_enabled=False), db)
-        inert = decision.mode == MODE_LEGACY
-        all_ok &= inert
+        # Production has one scanner, so migration readiness is a hard
+        # prerequisite rather than a feature-selection decision.
+        from src.scan_frontier import incremental_scan_schema_ready
+        schema_ready, schema_reason = incremental_scan_schema_ready(db)
+        all_ok &= schema_ready
         print()
-        print(f"  [{'ok  ' if inert else 'FAIL'}] the legacy scanner stays "
-              f"selected while incremental_scan=false "
-              f"(mode={decision.mode}, reason={decision.reason})")
-        report["scan_mode_with_flag_off"] = decision.mode
+        print(f"  [{'ok  ' if schema_ready else 'FAIL'}] the persistent "
+              f"frontier schema is usable (reason={schema_reason})")
+        report["frontier_schema_ready"] = schema_ready
+        report["frontier_schema_reason"] = schema_reason
 
         # And the frontier has enough state to restart once bootstrapped.
         db.create_scan_scopes(session_id, ["/vault/a"])

@@ -196,9 +196,13 @@ local-only `_resume_pack.json` marker.
 
 ## Outcome (2026-07-26)
 
-Option 2 was taken: Tape_02 is retired read-only and work continues on Tape_03
-(session 37). The retirement is now recorded in the catalog rather than kept in
-the operator's head — `tapes.status = 'full'` with
+Option 2 was initiated: Tape_02 was retired read-only and Session 37's next
+target was changed to Tape_03. No Session 37 archive work was ultimately written
+there: all 9 Session 37 `archive_runs` name Tape_02, zero `archive_runs` reference
+Tape_03, and `files_index` has zero Tape_03 rows. Tape_03 did receive the separate
+24 GiB Phase 5E synthetic pilot and was reformatted twice. The Tape_02 retirement
+is recorded in the catalog rather than kept in the operator's head —
+`tapes.status = 'full'` with
 `status_reason = 'read-only: PWE bit latched 2026-07-24 (incident 010); retired
 2026-07-26'` (schema: `scripts/sql/011_postgres_tape_status.sql`).
 

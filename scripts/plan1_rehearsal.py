@@ -32,7 +32,7 @@ sys.path.insert(0, PROJECT_ROOT)
 PLAN1_SUITES = [
     ("characterization", "tests/test_pipeline_characterization.py"),
     ("scan telemetry", "tests/test_scan_metrics.py"),
-    ("scan-mode gate", "tests/test_scan_mode_gate.py"),
+    ("frontier schema gate", "tests/test_scan_mode_gate.py"),
     ("scan coordinator", "tests/test_scan_frontier.py"),
     ("lifecycle transitions", "tests/test_lifecycle_transitions.py"),
     ("finite-group tape path", "tests/test_finite_group_only_tape_path.py"),
@@ -128,7 +128,6 @@ HARDWARE_PRECONDITIONS = [
     "directory NAME appears in any of them.",
     "Confirm backup_logs/tape_write/ holds the durable raw robocopy log "
     "(incident 009).",
-    "Keep [REMOTE] incremental_scan = false. Plan 3 owns the rollout.",
 ]
 
 #: Neither offline work nor the tape run establishes these. Recorded so they
@@ -139,8 +138,8 @@ REMAINS_UNVERIFIED = [
     "only — deliberately.",
     "Behaviour at production scale (~82M files, multi-day sessions). The "
     "frontier is measured on synthetic data and a shadow database only.",
-    "The incremental frontier in production: migration 014 is validated on a "
-    "shadow database and has never been applied to the production catalog.",
+    "Production-scale frontier traversal. Migration 014 is active, but Session "
+    "37 has only received the conservative structure-only bootstrap.",
 ]
 
 
@@ -261,7 +260,8 @@ def main(argv=None):
         verdict = "PASSED"
     print(f"  Stages 1-2: {verdict}")
     print("  Stage 3   : awaiting the operator's pilot")
-    print("  Production: [REMOTE] incremental_scan stays FALSE until Plan 3")
+    print("  Production: the persistent frontier is the sole scanner; there is "
+          "no incremental-scan feature flag")
     print("=" * 78)
 
     if args.json:

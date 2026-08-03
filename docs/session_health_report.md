@@ -68,7 +68,7 @@ state, no shared plan.
 **Intervention: NONE, deliberately.** Session 36 gets no conservative bootstrap
 and no metadata correction, because:
 
-* it has no outstanding work the new scanner needs to reach — session 37 covers
+* it has no outstanding work the persistent frontier needs to reach — session 37 covers
   all of it, so bootstrapping 36 would queue a second exploration of the same
   source;
 * the `fetch_failed` chunk must **not** be reset. It is superseded, and clearing
@@ -98,14 +98,17 @@ Measured:
 | Check | Result |
 |---|---|
 | `archive_runs` where `remote_session_id = 37` | **9 runs, every one `Tape_02`** (2026-07-10 → 2026-07-24) |
-| Any archive run ever on Tape_03 | **none** |
+| `archive_runs` rows referencing Tape_03 | **0** |
 | `files_index` rows from session-37 runs | **2,036 stored objects, 710 GB, all on Tape_02** (2,018 ZIP containers, the rest loose) |
 | `files_index` rows on Tape_03 | **0** |
 | `tapes.used_space` for Tape_03 | **0** |
+| Separate non-archive use of Tape_03 | **24 GiB Phase 5E synthetic pilot; cartridge reformatted twice** |
 
 So session 37's completed work is on **Tape_02, generation 1, which is still
 active**. It was never reset and nothing of session 37's was destroyed.
-**Nothing was ever written to Tape_03.**
+**No Session 37 archive work was written to Tape_03.** The separate synthetic
+pilot means the cartridge itself was written; it simply produced no Session 37
+`archive_runs` or `files_index` attribution.
 
 ### What the generation mismatch actually means
 
@@ -118,7 +121,7 @@ retired_reason: "physical contents intentionally destroyed by tape reset"
 
 `remote_sessions.tape_label = Tape_03` is the session's **next write target**,
 not where its finished work lives. It was re-pointed at Tape_03 when Tape_02
-filled, but no write to Tape_03 ever completed.
+filled, but no Session 37 archive run on Tape_03 ever completed.
 
 The mismatch (session holds generation 1, active is 3) is real and still blocks
 `--resume` via `_verify_session_tape_generation` — correctly, and for the

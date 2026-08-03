@@ -1,11 +1,9 @@
-"""The frontier is THE production scanner, and the legacy one is gone.
+"""The frontier is the sole production scanner; legacy replay is unreachable.
 
-Plan 1 completion. The previous review shipped `incremental_scan = true` while
-the runtime still built the legacy scanner unconditionally — the flag changed a
-recorded decision and one log line and nothing else. The reason that survived
-1408 passing tests is visible in what those tests asserted: they exercised
-``decide_scan_mode`` **in isolation**, and not one of them asked what a run
-actually constructs. Every test here asks exactly that.
+Plan 1 completion exposed that the retired ``incremental_scan`` key and
+``decide_scan_mode`` helper never controlled the runtime: it still built the
+legacy scanner unconditionally. Those tests exercised a dead decision helper
+instead of asking what a run constructs. Every test here asks exactly that.
 
 The rule these lock in: a production streaming run builds
 :class:`~src.scan_frontier.FrontierScanCoordinator`, and the legacy whole-root
@@ -96,39 +94,65 @@ class KnownFilesNeverReachTheChunkBuilderTests(unittest.TestCase):
     dropped. The frontier filters first, structurally.
     """
 
-    class _Publisher(sf.SegmentChunkPublisher):
-        """A publisher whose artifact reading and DB are stubbed out."""
-
-        def __init__(self, entries, classification, **kwargs):
-            super().__init__(**kwargs)
-            self._entries = entries
-            self._classification = classification
-
-        def entries_for_segment(self, segment):
-            return self._classification
-
     @staticmethod
     def _builder_factory(max_files=None, budget=10_000):
         return lambda: StreamingChunkBuilder(budget, max_files=max_files)
 
     def test_rediscovered_files_do_not_shift_chunk_boundaries(self):
         """Same NEW files, with and without known files interleaved, must
-        produce byte-identical chunk membership."""
+        produce identical chunk membership through the real publisher."""
+        known = [(f"/s/known{i}", 100) for i in range(6)]
         new_only = [(f"/s/new{i}", 100) for i in range(6)]
-        # The same six new files, but rediscovered known files sit between
-        # them. If the filter ran after the builder these would move the split.
+        interleaved = [entry for pair in zip(known, new_only) for entry in pair]
+
+        db = mock.Mock()
+        segment = {"locator": "mixed", "scan_segment_id": 7}
+        db.get_ready_segments.return_value = [segment]
+        db.import_legacy_scan_segment.return_value = {
+            "covered": known, "new": new_only,
+            "source_changed": [], "already_imported": False}
+
+        published = []
+
+        def append_chunk(_session_id, chunk_index, rows):
+            members = [(row[1], row[3]) for row in rows]
+            published.append((chunk_index, members))
+            return {
+                "inserted_files": len(members),
+                "inserted_bytes": sum(size for _path, size in members),
+            }
+
+        db.append_remote_streaming_chunk.side_effect = append_chunk
+        db.consume_segment_range.side_effect = (
+            lambda _segment_id, _session_id, _chunk_index, count: (0, count - 1))
+
+        publisher = sf.SegmentChunkPublisher(
+            db=db, session_id=1, archive_root="/root",
+            builder_factory=self._builder_factory(budget=250),
+            legacy_session=True)
+        artifact_entries = [
+            {"path": path, "size": size}
+            for path, size in interleaved
+        ]
+        with mock.patch.object(
+                sf, "parse_jsonl_zst_artifact",
+                return_value=({}, artifact_entries, {})):
+            publisher.publish_ready_segments(next_chunk_index=0)
+
+        # Independent new-only baseline. If known entries reached add(), the
+        # 250-byte threshold would split these boundaries differently.
         builder = StreamingChunkBuilder(250, max_files=None)
         chunks_without = []
         for path, size in new_only:
             chunks_without.extend(builder.add(path, size))
         chunks_without.extend(builder.flush())
+        chunks_with = [members for _index, members in published]
 
-        builder2 = StreamingChunkBuilder(250, max_files=None)
-        chunks_with = []
-        for path, size in new_only:          # filter already removed the known
-            chunks_with.extend(builder2.add(path, size))
-        chunks_with.extend(builder2.flush())
-        self.assertEqual(chunks_without, chunks_with)
+        db.import_legacy_scan_segment.assert_called_once_with(
+            1, 7, interleaved)
+        self.assertEqual(chunks_with, chunks_without)
+        self.assertTrue(set(known).isdisjoint(
+            entry for chunk in chunks_with for entry in chunk))
 
     def test_only_new_entries_are_returned_for_a_legacy_session(self):
         db = mock.Mock()

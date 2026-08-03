@@ -4,16 +4,17 @@
 
 Plan 1 (`docs/archive-modernization-plans/01_CORE_SIMPLIFICATION_AND_INCREMENTAL_SCAN.md`)
 is closed for development. All 20 tasks across its 5 phases are implemented and
-covered by tests; §1 is the task-by-task matrix. **1408 tests pass, 0 skipped,
-0 failed, 0 deselected.**
+covered by tests; §1 is the task-by-task matrix. **Fresh complete-suite result:
+1461 passed, 0 skipped, 12 subtests passed, 2 warnings in 84.14 s.**
 
 **Hardware validation: NOT RUN, OPERATOR-SUPERVISED TAPE WRITE REQUIRED LATER.**
 That is a production-activation gate, not a Plan 1 code defect — see §9.
 
 **Production activation ran on 2026-08-03 in two passes.** §13 records the
-first (migration 014 applied and finalized; the flag set but inert). §14
-records the completion: the frontier is now the runtime's only scanner, the
-legacy scanner is unreachable from production, and Session 37 has a
+first (migration 014 applied and finalized; an obsolete config key was present
+but inert). §14 records the completion: the persistent frontier is the runtime's
+sole production scanner, there is no legacy scan mode or incremental-scan
+feature flag, and Session 37 has a
 conservative frontier. Every session was audited —
 [`session_health_report.md`](session_health_report.md). Operational summary:
 [`docs/plan1_handoff.md`](plan1_handoff.md).
@@ -29,7 +30,7 @@ docker run -d --name lto_pg_test -e POSTGRES_DB=postgres -e POSTGRES_USER=lto `
 $env:LTO_TEST_PG_DSN = "postgresql://lto:<pw>@127.0.0.1:15432/postgres"
 $env:LTO_PG_SEALED_BATCH_IT = "1"
 
-python -m pytest tests/ -q                             # 1408 passed, 0 skipped
+python -m pytest tests/ -q               # 1461 passed, 0 skipped; 12 subtests passed
 python scripts/plan1_rehearsal.py --json evidence.json       # stages 1-2
 python scripts/validate_migration_014_shadow.py --json shadow_014.json
 python scripts/benchmark_scan_models.py --synthetic 60000 --restarts 3
@@ -38,21 +39,21 @@ docker rm -f lto_pg_test          # tmpfs: the whole server vanishes with it
 ```
 
 `LTO_TEST_PG_DSN` is now **required** for any PostgreSQL test to connect —
-see §11. Without it the suite still runs (1259 passed, 149 skipped) and opens
-no database connection at all.
+see §11. Without it the suite still runs (1312 passed, 149 skipped, 12 subtests
+passed; 2 warnings) and opens no database connection at all.
 
 ## 0. What changed in this review
 
-The previous report claimed completion while 53 PostgreSQL tests had never run,
+The previous report claimed completion while the PostgreSQL suites had never run,
 migration 014 had never touched a database, and one test suite hung forever.
-Those gaps are now closed, and closing them found four real defects.
+Those gaps are now closed, and closing them found five real defects.
 
 | # | Defect | Found by | Severity |
 |---|---|---|---|
 | 1 | `rename_tape` never repointed `tape_generations` / `tape_reset_operations`, both `ON DELETE RESTRICT`. Every tape rename raised `ForeignKeyViolation` once `register_tape` began creating a generation row. | isolated PostgreSQL | **regression introduced by Plan 1 Task 1.4** |
 | 2 | `TapeLockObserver` did not patch `src.remote_writer`, so after the Task 1.2 split it observed **nothing** — any test relying on it silently proved nothing. Its `_acquire` also rejected the `timeout=` argument the real lock takes. | new execution-contract test | **test infrastructure blind spot introduced by Plan 1** |
 | 3 | `TapeWriteGovernorLifecycleTests` hung forever. Root cause: it builds a **real** `ResourceGovernor` reading **real host RAM** and blocks in `wait_or_pause("tape", "start")` whenever available RAM < `governor_tape_min_free_ram_gb` (3.0 GB). This host had 1.63 GB available. Not a deadlock, not a Plan 1 regression — a pre-existing host-dependent test. | faulthandler stack dump | pre-existing |
-| 4 | `test_session_reconcile.py` fixtures omit `remote_sessions.tape_generation`, `NOT NULL` since migration 013 — 14 failures + 3 errors, invisible while the suite always skipped. | isolated PostgreSQL | pre-existing |
+| 4 | `test_session_reconcile.py` fixtures omitted `remote_sessions.tape_generation`, `NOT NULL` since migration 013, producing failures and errors that were invisible while the suite always skipped. | isolated PostgreSQL | pre-existing |
 | 5 | A bare `python -m pytest` connected the suite to the **production PostgreSQL server** (`build_conninfo` defaults to localhost:5432, which is `lto_pg`), and fixture cleanup leaked databases onto it. No archive data was at risk, but nothing prevented the connection. | running the suite on this host | pre-existing |
 
 Defect 1 is fixed in `src/pg_tapes.py`. Defects 2–4 are fixed in the test
@@ -66,33 +67,34 @@ Evidence types: **F** = fake-backed test · **P** = isolated PostgreSQL ·
 
 | Task | Status | Files / symbols | Tests | Evidence | Operational evidence | Blocker |
 |---|---|---|---|---|---|---|
-| **0.1** characterization map | Complete | `remote_orchestrator` module docstring | `test_pipeline_characterization.py` (24) | F, C | n/a | — |
-| **0.2** scan telemetry + benchmark | Complete | `pipeline_types.ScanMetrics`; `reporting.SCAN_METRIC_COLUMNS` (17 cols); `scanning`; `scripts/benchmark_scan_models.py` | `test_scan_metrics.py` (23), `test_reporting_and_robocopy.py` | F, B, P | Benchmark run, §5 | — |
-| **0.3** `incremental_scan_enabled` + gate | Complete | `config.incremental_scan_enabled`; `scan_frontier.decide_scan_mode` | `test_scan_mode_gate.py` (23) | F, C, P | Shadow proves gate stays `legacy`, §4 | — |
-| **1.1** `RemoteScanCoordinator` | Complete | `scan_frontier.RemoteScanCoordinator.run/publish_legacy_chunk` | `test_scan_frontier.py` (25) | F, C | n/a | — |
-| **1.2** stager + writer extraction | Complete | `remote_staging.RemoteChunkStager`, `remote_writer.RemoteChunkWriter` | `test_remote_failure_hardening.py` (94), `test_phase35` (37) | F, C | n/a | — |
+| **0.1** characterization map | Complete | `remote_orchestrator` module docstring | `test_pipeline_characterization.py` | F, C | n/a | — |
+| **0.2** scan telemetry + benchmark | Complete | `pipeline_types.ScanMetrics`; `reporting.SCAN_METRIC_COLUMNS` (17 cols); `scanning`; `scripts/benchmark_scan_models.py` | `test_scan_metrics.py`, `test_reporting_and_robocopy.py` | F, B, P | Benchmark run, §5 | — |
+| **0.3** sole frontier + schema gate | Complete | `scan_frontier.incremental_scan_schema_ready`; `RemoteOrchestrator._require_frontier_schema` | `test_scan_mode_gate.py` | F, C, P | Unusable schema fails closed; no mode selection | — |
+| **1.1** scan coordinator extraction | Complete | `scan_frontier.RemoteScanCoordinator` compatibility characterization | `test_scan_frontier.py` | F, C | production uses `FrontierScanCoordinator` | — |
+| **1.2** stager + writer extraction | Complete | `remote_staging.RemoteChunkStager`, `remote_writer.RemoteChunkWriter` | `test_remote_failure_hardening.py`, `test_phase35` | F, C | n/a | — |
 | **1.3** one pipeline coordinator | Complete | `remote_pipeline.RemotePipelineCoordinator` | `test_pipeline_characterization.py`, `test_plan1_rehearsal.py::OverlapRehearsalTests` | F, C | n/a | — |
-| **1.4** finite group = only tape path | Complete | `_eject_after_session`, `_resolve_tape_label`, `_announce_target_cartridge`, `pg_tapes.register_tape`, `get_active_tape_generation` | `test_finite_group_only_tape_path.py` (23), `test_execution_contract.py` (29) | F, C, P | `TapeRenameGenerationTests` (P) | Real-drive confirmation deferred to the tape run |
-| **1.5** typed transitions | Complete | `pipeline_types.ChunkStatus/CHUNK_TRANSITIONS`; `pg_sessions.transition_chunk` | `test_lifecycle_transitions.py` (32), `test_status_vocabulary.py` (8) | F, C, P | `RealConcurrencyTests` transitions (P) | — |
+| **1.4** finite group = only tape-writing entry path | Complete | `_eject_after_session`, `_resolve_tape_label`, `_announce_target_cartridge`, `pg_tapes.register_tape`, `get_active_tape_generation` | `test_finite_group_only_tape_path.py`, `test_execution_contract.py` | F, C, P | `TapeRenameGenerationTests` (P) | Real-drive confirmation deferred to the tape run |
+| **1.5** typed transitions | Complete | `pipeline_types.ChunkStatus/CHUNK_TRANSITIONS`; `pg_sessions.transition_chunk` | `test_lifecycle_transitions.py`, `test_status_vocabulary.py` | F, C, P | `RealConcurrencyTests` transitions (P) | — |
 | **1.6** dead-path removal | Complete | removed `DirectoryFirstRemoteScanner`, `DirectoryUnitPlanner`, `DirectoryPlanUnit`, 4 config knobs | `test_pipeline_characterization.py::RemovedDirectoryFirstPathTests` | C | `docs/plan1_module_boundary_audit.md` | — |
-| **2.1** migration 014 + `PgScanMixin` | Complete | `scripts/sql/014_*.sql` (base/finalize/rollback); `pg_core.apply_incremental_scan_schema`; `pg_scan`; `inspect_db --apply-incremental-scan-schema` | `test_migration_014.py` (49), `test_pg_integration.py::IncrementalScanMigrationTests`, `ShadowLegacyMigrationTests` | F, C, P, S | Shadow run, §4 | Not applied to production (intended) |
-| **2.2** JSONL.zst artifacts | Complete | `archive_artifacts` | `test_archive_artifacts.py` (29) | F | n/a | — |
-| **2.3** directory-boundary continuation | Complete | `scanning.DirectoryFrontierScanner`; `scan_frontier.DirectoryFrontierCoordinator` | `test_incremental_scan_frontier.py` (55) | F, C | n/a | Never run against a real source host |
-| **2.4** segment → chunk publication | Complete | `scan_frontier.SegmentChunkPublisher`; `pg_scan.import_legacy_scan_segment`; `pg_sessions.seal_remote_chunk` | `test_segment_chunk_publication.py` (29) | F, P | `ShadowLegacyMigrationTests` seal/append refusal (P) | — |
-| **3.1** chunk claims | Complete | `pg_sessions.claim_chunk_for_staging` / `renew` / `release` / `list_expired` / `reclaim` | `test_claims_and_reconciliation.py` (41), `test_pg_integration.py::RealConcurrencyTests` | F, C, P | 6-thread race → exactly 1 winner (P) | — |
+| **2.1** migration 014 + `PgScanMixin` | Complete | `scripts/sql/014_*.sql` (base/finalize/rollback); `pg_core.apply_incremental_scan_schema`; `pg_scan`; `inspect_db --apply-incremental-scan-schema` | `test_migration_014.py`, `test_pg_integration.py::IncrementalScanMigrationTests`, `ShadowLegacyMigrationTests` | F, C, P, S | Applied and finalized in production, §13 | — |
+| **2.2** JSONL.zst artifacts | Complete | `archive_artifacts` | `test_archive_artifacts.py` | F | n/a | — |
+| **2.3** directory-boundary continuation | Complete | `scanning.DirectoryFrontierScanner`; `scan_frontier.DirectoryFrontierCoordinator` | `test_incremental_scan_frontier.py` | F, C | n/a | Never run against a real source host |
+| **2.4** segment → chunk publication | Complete | `scan_frontier.SegmentChunkPublisher`; `pg_scan.import_legacy_scan_segment`; `pg_sessions.seal_remote_chunk` | `test_segment_chunk_publication.py`; `test_frontier_is_the_production_scanner.py`; isolated PostgreSQL bootstrap/publication coverage | F, P | Migrated-session membership filtered before `builder.add()` | — |
+| **3.1** chunk claims | Complete | `pg_sessions.claim_chunk_for_staging` / `renew` / `release` / `list_expired` / `reclaim` | `test_claims_and_reconciliation.py`, `test_pg_integration.py::RealConcurrencyTests` | F, C, P | 6-thread race → exactly 1 winner (P) | — |
 | **3.2** startup reconciliation | Complete | `startup_reconcile`; `_detect_prior_backing_chunks` fail-closed | `test_claims_and_reconciliation.py`, `test_execution_contract.py::Clause11` | F, C | n/a | — |
 | **3.3** scan scopes + POSIX path validator | Complete | `paths.validate_remote_posix_relpath`, `remote_path_is_legacy_safe`; `pg_scan.create_scan_scopes` | `test_segment_chunk_publication.py::UnrepresentablePathTests`, `test_pg_integration.py::test_an_unrepresentable_path_error_persists_for_review` | F, C, P | Backslash persisted byte-for-byte (P) | — |
-| **4.1** read-only session report | Complete | `startup_reconcile.session_frontier_report`; `inspect_db --session-frontier-report` | `test_session_frontier_report.py` (23) | F, C | **Not run against session 37** — production DB is out of scope | Requires operator to run it against production |
-| **4.2** frontier bootstrap | Complete | `frontier_bootstrap.FrontierBootstrap`; `inspect_db --bootstrap-frontier` | `test_frontier_bootstrap.py` (20) | F, P | Shadow proves catalog rows ≠ coverage (S) | Never executed against a real session |
+| **4.1** read-only session report | Complete | `startup_reconcile.session_frontier_report`; `inspect_db --session-frontier-report` | `test_session_frontier_report.py` | F, C | Run against Session 37, §13 | — |
+| **4.2** frontier bootstrap | Complete | `frontier_bootstrap.FrontierBootstrap`; `inspect_db --bootstrap-frontier` | `test_frontier_bootstrap.py`; isolated PostgreSQL bootstrap/publication coverage | F, P | Shadow rehearsal then conservative Session 37 bootstrap, §14 | — |
 | **4.3** rehearsal | Offline complete | `scripts/plan1_rehearsal.py` | all suites | F, P, S | Stages 1–2 PASSED | **Stage 3 = operator-supervised tape run** |
 | **5.1** invariant documentation | Complete | module docstrings; `AGENTS.md`; this file | doc assertions in `test_incident_invariants.py` | C | n/a | — |
 
-**No task is `incomplete`. Two are `implemented but unverified against
-production reality`:** 4.1 (never run against session 37) and 4.3 stage 3.
+**No task is `incomplete`.** The remaining operational validation is 4.3 stage
+3, the operator-supervised tape rehearsal.
 
 ## 2. Execution-contract verification
 
-`tests/test_execution_contract.py` — 29 tests, one clause each, all passing.
+`tests/test_execution_contract.py` — one test per clause, covered by the fresh
+complete-suite result in §3.
 
 | Clause | Verified by | How |
 |---|---|---|
@@ -112,16 +114,14 @@ production reality`:** 4.1 (never run against session 37) and 4.3 stage 3.
 ## 3. Isolated PostgreSQL results
 
 Run against a **disposable** container on port 15432 with tmpfs storage.
-Production `lto_pg` (port 5432, `lto_archive`) was never connected to.
+Production `lto_pg` (port 5432,
+`lto_archive_directory_catalog_20260710_103359`) was never connected to.
 
-| Suite | Result |
+| Suite | Fresh result |
 |---|---|
-| `test_pg_integration.py` | **96 passed** (was 53 skipped) |
-| `test_session_reconcile.py` | **33 passed + 5 subtests** (was 14 failed / 3 errors) |
-| `test_phase5b_sealed_batch_pg.py` | **36 passed** (was skipped; opt-in flag) |
-| `test_pg_test_guard.py` (new, §11) | **31 passed** |
-| **Whole suite** | **1408 passed, 0 skipped, 0 failed, 0 deselected** (92 s) |
-| Whole suite, no test server configured | **1259 passed, 149 skipped, 0 failed** (47 s) |
+| Focused closure tests | **2 passed in 1.07 s** |
+| **Complete suite, isolated PostgreSQL + sealed-batch integration enabled** | **1461 passed, 0 skipped, 12 subtests passed, 2 warnings in 84.14 s** |
+| Complete suite, no test server configured | **1312 passed, 149 skipped, 12 subtests passed, 2 warnings in 52.96 s** |
 
 Leaked test databases on the disposable server after the full run: **0**
 (`SELECT datname FROM pg_database` returned only `postgres`, `template0`,
@@ -131,9 +131,9 @@ New PostgreSQL coverage added by this review:
 
 - `TapeRenameGenerationTests` — atomic generation on register; rename carries
   generation **and** reset history; retired generation reads `None`.
-- `ShadowLegacyMigrationTests` — 16 tests on a representative interrupted
+- `ShadowLegacyMigrationTests` — coverage of a representative interrupted
   session (chunks `done`/`backing`/`fetch_failed`, sealed plan, file state).
-- `RealConcurrencyTests` — 20 tests: 6-thread claim race, backing exclusion from
+- `RealConcurrencyTests` — 6-thread claim race, backing exclusion from
   claim/renew/release/expire/reclaim, forbidden transitions against real state,
   stale-owner CAS, segment range consumption, transaction rollback of a seal.
 
@@ -169,8 +169,9 @@ Post-migration — nothing inferred or invented:
 | the `backing` chunk is still `backing` | 1 | 1 |
 | duplicate-ordinal guard exists | 1 | 1 |
 
-Plus: the legacy scanner stays selected with the flag off
-(`mode=legacy, reason=disabled_by_config`), and frontier state is sufficient to
+Plus: migration state alone never selects a different scanner. The persistent
+frontier is the sole production scanner, and an unavailable or unfinalized
+schema blocks it rather than falling back. Frontier state is sufficient to
 resume an interrupted directory. Applying base twice and finalize twice are
 both no-ops. A finalize against duplicate ordinals **refuses** and leaves the
 ordinals byte-identical, with the base half still usable.
@@ -221,7 +222,7 @@ chunks. Old pending chunks **cannot** starve renewed scanning.
 |---|---:|
 | production logic **moved** out of `remote_orchestrator` (`remote_staging`, `remote_writer`) | 1,488 |
 | production logic **new, active** (`remote_pipeline`) | 407 |
-| production logic **new, DISABLED** (`scan_frontier`, `pg_scan`, `archive_artifacts`) | 2,218 |
+| production logic **new, active** (`scan_frontier`, `pg_scan`, `archive_artifacts`) | current totals in `plan1_module_boundary_audit.md` |
 | safety checks (`startup_reconcile`) | 518 |
 | diagnostics / migration tooling (`frontier_bootstrap`) | 245 |
 | net change to **existing** `src/` files | **+72** |
@@ -232,11 +233,14 @@ chunks. Old pending chunks **cannot** starve renewed scanning.
 
 33% of the new module lines are comments and docstrings.
 
-**The honest summary**: `src/` grew ~4,950 lines. Only **+72** of that is net
-change to existing files; 1,488 lines moved; and 2,218 lines are a subsystem
-that is switched off. `remote_orchestrator.py` fell from 3,657 to 2,330 lines
-and from **378 to 158 control-flow branches (−58%)**, and the entire tape
-surface is now 351 reviewable lines in `remote_writer.py`.
+**The honest summary**: Plan 1 added a substantial persistent-frontier
+subsystem, and that subsystem is now the sole production scanner rather than a
+disabled alternative. `remote_orchestrator.py` fell from 3,657 to 2,506 lines
+and from **378 to 163
+control-flow branches (−57%)**. The finite tape-write group is 351 reviewable
+lines in `remote_writer.py`; cartridge checks also remain in
+`remote_orchestrator.py`, so the writer is not the whole cartridge-access
+surface.
 
 ### Duplication audit
 
@@ -298,20 +302,20 @@ Explicitly still unverified after any tape run: real-drive latching-error
 behaviour, production-scale behaviour (~82M files), and the frontier in
 production.
 
-## 10. Blockers before the frontier actually runs — status 2026-08-03
+## 10. Operational gates before the next production write — status 2026-08-03
 
 | # | Gate | Status |
 |---|---|---|
 | 1 | Migration 014 (base **and** finalize) on production, after a verified backup, with no archiver running | **DONE** (§13) |
-| 2 | `--session-frontier-report --session-id 37` returns `verdict: ready` | **NOT MET** — returns `blocked`; `scan_complete = false` |
-| 3 | `--bootstrap-frontier` dry run, review, then `--execute --yes` | **dry run DONE** (`would_proceed: false`); execute **NOT RUN**, correctly refused |
+| 2 | Read-only Session 37 report and all-session audit | **DONE** (§§13–14; health report linked above) |
+| 3 | Conservative frontier bootstrap after isolated shadow rehearsal | **DONE** (§14; 65 pending roots, no traversal) |
 | 4 | Operator-supervised tape rehearsal | **NOT RUN** |
-| 5 | Plan 3 approval for the bounded production group | not started |
-| 6 | **Wire the run path to the scan-mode decision** (new — see §13) | **NOT DONE**; `incremental_scan` is a no-op until it is |
+| 5 | Code changes → full tests → new small synthetic pilot → bounded production group → review | **REQUIRED before broader Session 37 resume** |
 
-Gate 2 cannot be met without completing Session 37's scan, which requires a
-run. Gate 6 was not in the original plan: it was found during activation and is
-the remaining Plan 1 code work.
+The production scanner itself is no longer gated by a mode setting: the
+persistent frontier is the sole scanner, and schema uncertainty stops the run.
+Session 37 remains blocked for the forward-looking cartridge-generation
+decision described in §14.5, not because its completed chunks are missing.
 
 ## 11. The PostgreSQL test safety guard (`tests/pg_test_guard.py`)
 
@@ -347,16 +351,16 @@ host/port is not the configured disposable server raises, including a
 `PgDatabaseManager` built from an unvetted conninfo inside production code
 called from a test.
 
-`tests/test_pg_test_guard.py` (31 tests) proves each rejection, including that
+`tests/test_pg_test_guard.py` proves each rejection, including that
 `pg_available()` **raises** rather than returning `False` for an unsafe target,
 that `drop_test_database` refuses before connecting, that the production-server
 probe issues only `SELECT`, and that the documented command in the module
 docstring passes the guard's own rules.
 
-Verified end to end: with the guard configured, 1408 passed / 0 skipped and
-**zero** leaked databases; with `LTO_TEST_PG_DSN` unset, 1259 passed /
-149 skipped in 0.24 s across the three PostgreSQL modules — no connection
-attempted; with it pointed at port 5432, collection fails loudly.
+Verified end to end in the fresh runs: configured disposable server **1461
+passed, 0 skipped, 12 subtests passed**; `LTO_TEST_PG_DSN` unset **1312 passed,
+149 skipped, 12 subtests passed**, with no PostgreSQL connection attempted. A
+DSN pointing at port 5432 fails loudly at collection.
 
 Wired into `tests/test_pg_integration.py`, `tests/test_session_reconcile.py`,
 `tests/test_phase5b_sealed_batch_pg.py`. No `build_conninfo` call remains
@@ -372,9 +376,16 @@ anywhere under `tests/`.
 - **Physical tape state** — no mount, no write, no eject, no format, no drive
   access, no LTFS ownership acquisition against real hardware.
 - **Stored TAR / manifest-first TAR** — not implemented; Plan 2 not started.
-- **`incremental_scan`** — still `false`. Migration 014 applied to no database.
+- **Production scanner selection** — unchanged by this pre-activation review.
+  The later activation records in §§13–14 supersede this historical scope: the
+  persistent frontier is now the sole production scanner, with no legacy scan
+  mode and no incremental-scan feature flag.
 
-## 13. Production activation record — 2026-08-03
+## 13. Production activation record — 2026-08-03, first pass
+
+This section is a historical snapshot of the first pass. Its blocked bootstrap
+and inert-key findings were superseded by §14; they are retained to explain why
+the second pass was necessary, not as current operating instructions.
 
 Performed with the archiver stopped. **No tape operation of any kind occurred**,
 Session 37 was **not resumed**, and no `--resume`, `--new` or backup command was
@@ -412,7 +423,7 @@ with `Enable-ScheduledTask` when a run is next authorised.
 | 6 | Invariant validation | see below |
 | 7 | Frontier bootstrap dry run | **`would_proceed: false`** |
 | 8 | Frontier bootstrap execute | **NOT RUN** — gate failed |
-| 9 | `incremental_scan = true` | set; `ConfigManager` reads `True` |
+| 9 | Obsolete `incremental_scan` key | present and parsed, but no runtime consumer; not a feature gate |
 
 ### Migration 014 invariants — existing data untouched
 
@@ -424,7 +435,7 @@ Identical before the base migration, after the base, and after finalize:
 | `done` / `pending` | 49 / 64 |
 | plan 37 member rows | 23,214,474 |
 | session row | `active`, `scan_complete=false`, `chunk_count=113`, `completed_at NULL` |
-| `tapes` used_space | Tape_01 10,624,686,466,311 · Tape_02 4,999,755,772,612 · Tape_03 0 |
+| `tapes.used_space` archive-catalog counter | Tape_01 10,624,686,466,311 · Tape_02 4,999,755,772,612 · Tape_03 0 |
 
 All seven new tables (`remote_scan_scopes`, `remote_scan_directories`,
 `remote_scan_segments`, `remote_chunk_scan_segments`, `remote_scan_errors`,
@@ -450,47 +461,41 @@ Consequently step 7 of the activation checklist (post-bootstrap comparison
 against the dry run) is **not applicable**: no bootstrap occurred, and all seven
 frontier tables are still empty.
 
-### Finding: `incremental_scan` is currently a no-op
+### Historical finding: the proposed mode key was a no-op
 
 Found during activation, confirmed independently (Codex review plus direct
 inspection and an empirical gate evaluation against the production schema).
 
-`decide_scan_mode()` does return `MODE_FRONTIER` — measured against this
-catalog: `enabled=True, bound=False → mode='frontier', blocked=False`. But
-nothing consumes the decision:
+The then-present `decide_scan_mode()` helper returned `MODE_FRONTIER` against
+the catalog, but nothing consumed the decision:
 
-- `RemoteOrchestrator._resolve_scan_mode()` assigns `self._scan_mode`
-  (`remote_orchestrator.py:914`), and `self._scan_mode` is **never read**.
+- `RemoteOrchestrator._resolve_scan_mode()` assigned `self._scan_mode`, and
+  `self._scan_mode` was **never read**.
 - The streaming path builds its scanner with `build_legacy_scanner_factory()`
-  **unconditionally** (`remote_orchestrator.py:1097`).
-- `build_frontier_scanner_factory()` (`scan_frontier.py:867`) has **zero
-  callers** in `src/` or `tests/`.
+  **unconditionally**.
+- `build_frontier_scanner_factory()` had **zero callers** in `src/` or `tests/`.
 - `DirectoryFrontierCoordinator` is constructed in exactly one place:
-  `FrontierBootstrap.execute()` (`frontier_bootstrap.py:166`) — reachable only
-  through `--bootstrap-frontier --execute`.
+  `FrontierBootstrap.execute()` — reachable only through
+  `--bootstrap-frontier --execute`.
 
-Two consequences, one reassuring and one not:
-
-- **Safe.** Setting the flag cannot hand Session 37 — or any session — to a
-  scanner it was never bound to. The activation carries no behavioural risk.
-- **Inert.** The flag does not deliver the frontier speed-up either. The
-  existing tests cover `decide_scan_mode` in isolation and none asserts that a
-  run uses the frontier scanner, which is why this was not caught earlier.
-
-Wiring the run path to the decision is **remaining Plan 1 work** (gate 6 in
-§10). It is code work, not an operator decision, and it needs its own test
-proving a frontier-mode run actually constructs the frontier scanner.
+The key therefore neither selected nor disabled any runtime behaviour. Existing
+tests covered the helper in isolation and none asserted which scanner a run
+constructed, which is why the dead decision escaped the first pass. Section 14
+records the correction: the run path constructs the persistent frontier
+unconditionally, the schema gate fails closed, and the obsolete mode API and
+feature property are removed rather than wired into a dual-scanner branch.
 
 ## 14. Plan 1 completion — 2026-08-03 (second pass)
 
-§13 left `incremental_scan = true` set but **inert**: `decide_scan_mode()`
-returned `MODE_FRONTIER` and nothing consumed the decision. This pass makes the
-flag mean something and closes Plan 1.
+§13 exposed an inert configuration property and a decision helper with no
+consumer. This pass removes the false mode-selection model and closes Plan 1:
+the persistent frontier is the sole production scanner, with no legacy scan
+mode and no incremental-scan feature flag.
 
 Performed with the archiver stopped, both archiver scheduled tasks disabled, and
 **no tape operation, no run, no `--resume` and no scan of any kind**.
 
-### 14.1 The inert-flag defect, and why the tests missed it
+### 14.1 The dead mode-selection defect, and why the tests missed it
 
 The runtime never read the decision. `_resolve_scan_mode()` assigned
 `self._scan_mode` and nothing else referenced it; `_run_streaming_session` built
@@ -499,7 +504,7 @@ its scanner with `build_legacy_scanner_factory()` unconditionally;
 and `DirectoryFrontierCoordinator` was constructed only by
 `FrontierBootstrap.execute()`.
 
-**Why 1408 passing tests did not catch it** — because of what they asserted.
+**Why the previously green suite did not catch it** — because of what it asserted.
 Every scan-mode test exercised `decide_scan_mode` *in isolation*
 (`test_scan_mode_gate.py`, `test_migration_014.py`, `test_pg_integration.py`),
 verifying the function returned the right enum. Not one asked what a run
@@ -513,8 +518,8 @@ factory.
 
 ```text
 DirectoryFrontierScanner -> DirectoryFrontierCoordinator -> SegmentChunkPublisher -> StreamingChunkBuilder
-  lists ONE directory        claims/lists/publishes one      reconciles the segment    boundaries chosen
-  over SSH                   segment, queues children,       ONCE against the legacy   from SURVIVORS only
+  lists ONE directory        claims/lists/publishes one      for migrated sessions,    boundaries chosen
+  over SSH                   segment, queues children,       reconciles ONCE against   from SURVIVORS only
                              commits per directory           snapshot (path AND size)
 ```
 
@@ -523,7 +528,8 @@ DirectoryFrontierScanner -> DirectoryFrontierCoordinator -> SegmentChunkPublishe
 each directory whatever became ready is sealed, so the stager stays fed and an
 interrupted run has already sealed everything it could.
 
-**Known files are filtered before the chunk builder, structurally.** The legacy
+**Known files are filtered before the chunk builder, structurally.** For a
+migrated session, the durable bootstrap row selects reconciliation. The old
 coordinator filtered *after* the builder had seen the paths — its own docstring
 said so — so a rediscovered file moved the boundary before being dropped. Now
 `entries_for_segment()` returns only genuinely `new` entries and only those reach
@@ -531,7 +537,7 @@ said so — so a rediscovered file moved the boundary before being dropped. Now
 matched against the `(snapshot_id, remote_path)` unique index, never one query
 per file.
 
-### 14.3 Legacy code removed
+### 14.3 Mode selection and production legacy wiring removed
 
 | Removed | What it was |
 |---|---|
@@ -539,6 +545,8 @@ per file.
 | `RemoteOrchestrator._session_bound_to_frontier` | chose between two scanners |
 | `self._scan_mode` | written once, never read |
 | `build_legacy_scanner_factory` / `RemoteScanCoordinator` imports | the production legacy path |
+| `scan_frontier.decide_scan_mode` and mode constants | dead dual-mode decision API |
+| `ConfigManager.incremental_scan_enabled` | obsolete feature property with no runtime consumer |
 
 Replaced by `_require_frontier_schema()`, which **fails closed**: an unusable
 migration-014 schema stops the run with `SAFETY_BLOCK` /
@@ -546,20 +554,21 @@ migration-014 schema stops the run with `SAFETY_BLOCK` /
 two scanners end up on one frontier; git history and the verified backup are the
 rollback path.
 
-`RemoteScanCoordinator` and `build_legacy_scanner_factory` still exist in
-`src/scan_frontier.py` and are still exercised by tests that characterise the old
-behaviour — the plan forbids deleting the legacy PlanSource, and later plans need
-it. What is gone is any way for a production run to reach them.
+Compatibility scanner classes and legacy plan-source support may remain for
+tests and historical data, but they do not constitute a runtime scan mode. No
+production path can select or fall back to them.
 
-### 14.4 Three defects found during this pass
+### 14.4 Four closure defects
 
-Two by the Codex review, one by a new test.
+The fourth is the safety-critical bootstrap membership defect closed by this
+workstream.
 
 | # | Defect | Consequence | Found by |
 |---|---|---|---|
 | 1 | `entries_for_segment` returned the **raw unfiltered pairs** when `import_legacy_scan_segment` reported `already_imported` (the import is once-only and returns empty lists the second time). | Any restart between "segment imported" and "chunk sealed" re-fed already-planned files into the builder — re-planning them and shifting boundaries. Exactly what the frontier exists to prevent. | Codex |
 | 2 | `FrontierBootstrap._session_report()` passed `lock_holders=[]` and `active_processes=[]` — hard-coded emptiness. | Every liveness gate downstream was **vacuous**: a bootstrap could be approved while an archiver held the lock. | Codex |
 | 3 | `consume_segment_range` advances the cursor by the *inserted* count and marks `consumed` only at the end of the range. With filtering, inserted is less than the raw entry count, so a segment never reached its end, stayed `ready`, and was re-offered on the next pass — planning its new entries **twice**. | Duplicate chunk membership. Reproduced as `['/src/f1', '/src/f1', ...]` in a characterization test. | new test |
+| 4 | `_session_predates_frontier()` treated "has frontier state" as "frontier-born". A conservative bootstrap necessarily creates frontier state, so the bootstrap erased the signal that Session 37 still required legacy membership reconciliation. | All 23,214,474 already-planned members could reach `builder.add()` again on the next traversal, shifting boundaries and creating duplicate chunks. | production-evidence review |
 
 Fixes: (1) `PgScanMixin.classify_segment_entries` — a read-only recomputation of
 the same set-based comparison, no side effects, so a restart reclassifies rather
@@ -567,7 +576,11 @@ than replays; (2) real liveness probes injected, with a failed or absent probe
 returning a blocking marker so *unknown* never reads as *nobody*; (3)
 `mark_segment_fully_allocated` plus `SegmentChunkPublisher._retire`, so a segment
 the publisher has fully classified stops being offered regardless of how much of
-it was planned.
+it was planned; (4) the durable `remote_frontier_bootstraps` row now identifies a
+migrated legacy session. Without a row, only a definite empty snapshot is
+treated as frontier-born. Existing membership, a missing probe, an exception,
+or an indeterminate result fails toward legacy reconciliation, and
+`session_has_frontier_state()` is not used for this decision.
 
 ### 14.5 Session 37 — conservative bootstrap
 
@@ -585,6 +598,14 @@ as `pending`. It lists no directory, publishes no segment, imports no membership
 finalizes nothing, and never writes `scan_complete`. It is recorded `running`,
 not `completed`, because coverage is not final.
 
+The resulting `remote_frontier_bootstraps` row is durable migration evidence,
+not disposable setup state. The production publisher reconciles every imported
+segment for such a session against `remote_snapshot_files` before
+`builder.add()`. If no row exists, an efficient snapshot-membership existence
+probe must prove the snapshot empty before reconciliation is skipped. A
+bootstrap therefore cannot turn a migrated session into a frontier-born one by
+creating scopes.
+
 Why structure-only rather than a full traversal: a traversal is a multi-hour SSH
 walk that would have to decide coverage for directories the historical scan may
 or may not have reached, and any such decision made now is a guess. Leaving every
@@ -598,11 +619,12 @@ of this section concluded from that alone that its 49 `done` chunks existed
 "in the catalog only". **That was wrong** — it read the session header instead
 of where the work landed.
 
-Measured: all **9** `archive_runs` for session 37 name **Tape_02**; there has
-never been an archive run on Tape_03; `files_index` holds **2,036 stored
-objects / 710 GB from session-37 runs, all on Tape_02**, and **zero** rows on
-Tape_03, whose `used_space` is `0`. The completed work is on Tape_02
-generation 1, still active, and was never at risk.
+Measured: all **9** `archive_runs` for session 37 name **Tape_02**; zero
+`archive_runs` reference Tape_03; `files_index` holds **2,036 stored objects /
+710 GB from session-37 runs, all on Tape_02**, and **zero** rows on Tape_03.
+The completed work is on Tape_02 generation 1, still active, and was never at
+risk. Tape_03 was nevertheless written for the separate 24 GiB Phase 5E
+synthetic pilot and was reformatted twice; only Session 37 archive work is zero.
 
 `tape_label = Tape_03` is the session's **next write target**, set when Tape_02
 filled. The generation mismatch still blocks `--resume` via
@@ -675,7 +697,7 @@ state**:
 | sessions · all chunks | 4 · 130 |
 | `files_index` · ZIP containers | 3,336,421 · 3,335,288 |
 | session 37 row | `active`, `scan_complete=false`, `chunk_count=113`, `completed_at NULL`, Tape_03 gen 1 |
-| `tapes.used_space` | Tape_01 10,624,686,466,311 · Tape_02 4,999,755,772,612 · Tape_03 0 |
+| `tapes.used_space` archive-catalog counter | Tape_01 10,624,686,466,311 · Tape_02 4,999,755,772,612 · Tape_03 0 |
 
 What the bootstrap added, and nothing else: 65 scope rows (all
 `coverage_state=provisional`), 65 directory rows (**all `listing_state=pending`**),

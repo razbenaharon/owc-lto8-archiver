@@ -13,10 +13,10 @@ with ``PGPASSWORD=change_me_local``.
 """
 import os
 import tempfile
+import threading
 import unittest
 import uuid
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, TYPE_CHECKING, cast
 from unittest import mock
 
@@ -923,6 +923,157 @@ class IncrementalScanMigrationTests(unittest.TestCase):
         scopes = self.db.get_scan_scopes(session_id)
         return session_id, scopes
 
+    def test_conservative_bootstrap_keeps_legacy_members_out_of_the_builder(self):
+        """The migration record must survive the scopes the bootstrap creates.
+
+        This follows the production construction path far enough to create the
+        real ``SegmentChunkPublisher`` owned by ``FrontierScanCoordinator``.
+        The recording builder is intentional: PostgreSQL also rejects duplicate
+        snapshot paths while appending, which could otherwise hide a filter that
+        ran too late.
+        """
+        from types import SimpleNamespace
+
+        from src.archive_artifacts import (JsonlZstArtifactWriter,
+                                           resolve_locator, segment_locator)
+        from src.frontier_bootstrap import FrontierBootstrap
+        from src.pipeline_types import ScanMetrics
+        from src.planning import StreamingChunkBuilder
+        from src.remote_orchestrator import RemoteOrchestrator
+        from src.scan_frontier import FrontierScanCoordinator
+
+        known = [(f"/vault/known{i}", 100) for i in range(6)]
+        new_only = [(f"/vault/new{i}", 100) for i in range(6)]
+        mixed = [entry for pair in zip(known, new_only) for entry in pair]
+
+        session_id = self._session(label="LEGACY_BOOTSTRAP")
+        self.assertFalse(self.db.session_has_snapshot_membership(session_id))
+        self.db.append_remote_streaming_chunk(
+            session_id, 0,
+            [(0, path, f"known{i}", size)
+             for i, (path, size) in enumerate(known)])
+        self.assertTrue(self.db.session_has_snapshot_membership(session_id))
+        self._exec(
+            """UPDATE remote_chunks SET status='done'
+               WHERE session_id=%s AND chunk_index=0""", (session_id,))
+        self.db.apply_incremental_scan_schema(finalize=True)
+
+        existing_chunk_before = self._query(
+            """SELECT * FROM remote_chunks
+               WHERE session_id=%s AND chunk_index=0""", (session_id,))
+        existing_members_before = self._query(
+            """SELECT pf.*, sf.remote_path, sf.file_size_bytes
+               FROM remote_sessions s
+               JOIN remote_plan_files pf ON pf.plan_id=s.plan_id
+               JOIN remote_snapshot_files sf
+                    ON sf.snapshot_file_id=pf.snapshot_file_id
+               WHERE s.session_id=%s AND pf.chunk_index=0
+               ORDER BY pf.ordinal""", (session_id,))
+
+        with tempfile.TemporaryDirectory() as archive_root:
+            bootstrap = FrontierBootstrap(
+                db=self.db, session_id=session_id, scan_paths=["/strg"],
+                archive_root=archive_root,
+                scanner_factory=lambda _metrics: mock.Mock(),
+                stop_event=threading.Event(),
+                active_processes_probe=lambda: [],
+                lock_holders_probe=lambda: [])
+            result = bootstrap.execute(approved=True, conservative=True)
+            self.assertEqual(result["mode"], "conservative")
+            self.assertIsNotNone(self.db.get_frontier_bootstrap(session_id))
+            self.assertTrue(self.db.session_has_frontier_state(session_id))
+
+            scope = self.db.get_scan_scopes(session_id)[0]
+            directory_id = self._query(
+                """SELECT scan_directory_id FROM remote_scan_directories
+                   WHERE scan_scope_id=%s AND canonical_path='/strg'""",
+                (scope["scan_scope_id"],))[0]["scan_directory_id"]
+            locator = segment_locator(session_id, directory_id, 0)
+            with JsonlZstArtifactWriter(
+                    archive_root, locator, scope="/strg",
+                    scan_directory_id=directory_id,
+                    session_id=session_id) as writer:
+                for ordinal, (path, size) in enumerate(mixed):
+                    writer.add(path=path, size=size, ordinal=ordinal)
+            segment = self.db.publish_scan_segment(
+                directory_id, first_scan_ordinal=0,
+                last_scan_ordinal=len(mixed) - 1, locator=locator,
+                file_count=writer.file_count, byte_count=writer.byte_count,
+                artifact_size_bytes=os.path.getsize(
+                    resolve_locator(archive_root, locator)),
+                first_canonical_path=mixed[0][0],
+                last_canonical_path=mixed[-1][0])
+
+            added = []
+
+            class RecordingBuilder(StreamingChunkBuilder):
+                def add(self, remote_path, size):
+                    added.append((remote_path, size))
+                    return super().add(remote_path, size)
+
+            state = SimpleNamespace(
+                metrics=ScanMetrics(), remaining_bytes=10 ** 9,
+                next_chunk_index=1, chunks=0, files=0, bytes=0,
+                scan_error=None)
+            legacy_session = RemoteOrchestrator._session_predates_frontier(
+                SimpleNamespace(db=self.db), session_id)
+            self.assertTrue(legacy_session)
+            coordinator = FrontierScanCoordinator(
+                db=self.db, session_id=session_id, scan_paths=["/strg"],
+                archive_root=archive_root, state=state,
+                remaining_lock=threading.Lock(), stop_event=threading.Event(),
+                scanner_factory=lambda _metrics: mock.Mock(),
+                builder_factory=lambda: RecordingBuilder(250),
+                legacy_session=legacy_session)
+
+            sealed = coordinator.publisher.publish_ready_segments(
+                next_chunk_index=1)
+
+        baseline_builder = StreamingChunkBuilder(250)
+        expected_chunks = []
+        for path, size in new_only:
+            expected_chunks.extend(baseline_builder.add(path, size))
+        expected_chunks.extend(baseline_builder.flush())
+
+        planned_rows = self._query(
+            """SELECT pf.chunk_index, pf.ordinal, sf.remote_path,
+                      sf.file_size_bytes
+               FROM remote_sessions s
+               JOIN remote_plan_files pf ON pf.plan_id=s.plan_id
+               JOIN remote_snapshot_files sf
+                    ON sf.snapshot_file_id=pf.snapshot_file_id
+               WHERE s.session_id=%s AND pf.chunk_index > 0
+               ORDER BY pf.chunk_index, pf.ordinal""", (session_id,))
+        actual_by_chunk = {}
+        for row in planned_rows:
+            actual_by_chunk.setdefault(row["chunk_index"], []).append(
+                (row["remote_path"], row["file_size_bytes"]))
+
+        self.assertEqual(added, new_only,
+                         "known membership reached StreamingChunkBuilder.add")
+        self.assertEqual(sealed, [1, 2, 3])
+        self.assertEqual(list(actual_by_chunk.values()), expected_chunks)
+        self.assertEqual(
+            self._query(
+                """SELECT * FROM remote_chunks
+                   WHERE session_id=%s AND chunk_index=0""", (session_id,)),
+            existing_chunk_before)
+        self.assertEqual(
+            self._query(
+                """SELECT pf.*, sf.remote_path, sf.file_size_bytes
+                   FROM remote_sessions s
+                   JOIN remote_plan_files pf ON pf.plan_id=s.plan_id
+                   JOIN remote_snapshot_files sf
+                        ON sf.snapshot_file_id=pf.snapshot_file_id
+                   WHERE s.session_id=%s AND pf.chunk_index=0
+                   ORDER BY pf.ordinal""", (session_id,)),
+            existing_members_before)
+        import_state = self._query(
+            """SELECT legacy_import_state FROM remote_scan_segments
+               WHERE scan_segment_id=%s""",
+            (segment["scan_segment_id"],))[0]["legacy_import_state"]
+        self.assertEqual(import_state, "imported")
+
     def test_scopes_are_persisted_in_order_and_are_idempotent(self):
         session_id, scopes = self._frontier_session()
         self.assertEqual([s["source_root"] for s in scopes],
@@ -1499,29 +1650,25 @@ class ShadowLegacyMigrationTests(unittest.TestCase):
         self.assertEqual(self._query("SELECT * FROM remote_scan_scopes"), [])
         self.assertFalse(self.db.session_has_frontier_state(self.session_id))
 
-    def test_the_legacy_scanner_stays_selected_while_the_flag_is_off(self):
-        from src.scan_frontier import MODE_LEGACY, decide_scan_mode
-        self.db.apply_incremental_scan_schema(finalize=True)
-        cfg = SimpleNamespace(incremental_scan_enabled=False)
-        decision = decide_scan_mode(self.db, self.db) if False else \
-            decide_scan_mode(cfg, self.db)
-        self.assertEqual(decision.mode, MODE_LEGACY)
-        self.assertEqual(decision.reason, "disabled_by_config")
-
-    def test_the_frontier_activates_only_with_both_halves_and_the_flag(self):
-        from src.scan_frontier import (MODE_FRONTIER, MODE_LEGACY,
-                                       decide_scan_mode)
-        cfg = SimpleNamespace(incremental_scan_enabled=True)
+    def test_the_frontier_schema_gate_requires_both_migration_halves(self):
+        from src.scan_frontier import incremental_scan_schema_ready
         # Nothing applied.
-        self.assertEqual(decide_scan_mode(cfg, self.db).mode, MODE_LEGACY)
+        self.assertEqual(
+            incremental_scan_schema_ready(self.db),
+            (False, "migration_014_not_installed"),
+        )
         # Base only.
         self.db.apply_incremental_scan_schema()
-        decision = decide_scan_mode(cfg, self.db)
-        self.assertEqual(decision.mode, MODE_LEGACY)
-        self.assertEqual(decision.reason, "migration_014_not_finalized")
+        self.assertEqual(
+            incremental_scan_schema_ready(self.db),
+            (False, "migration_014_not_finalized"),
+        )
         # Finalized.
         self.db.apply_incremental_scan_schema(finalize=True)
-        self.assertEqual(decide_scan_mode(cfg, self.db).mode, MODE_FRONTIER)
+        self.assertEqual(
+            incremental_scan_schema_ready(self.db),
+            (True, "schema_ready"),
+        )
 
     # -- the finalize audit on real duplicate data ------------------------
     def test_finalize_refuses_and_leaves_the_ordinals_untouched(self):

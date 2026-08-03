@@ -2,11 +2,30 @@
 import os
 import configparser
 import tempfile
+import warnings
 from urllib.parse import quote
 
 from .constants import (BACKUP_LOG_DIR, CONFIG_FILE, LOCAL_STAGING_RESERVE_BYTES,
                         PROJECT_ROOT)
 from .paths import _clean_config_path, _clean_remote_path, _config_list
+
+
+_incremental_scan_warning_emitted = False
+
+
+def _warn_ignored_incremental_scan(config):
+    """Warn once because the retired key must never imply runtime control."""
+    global _incremental_scan_warning_emitted
+    if (_incremental_scan_warning_emitted
+            or not config.has_option('REMOTE', 'incremental_scan')):
+        return
+    _incremental_scan_warning_emitted = True
+    warnings.warn(
+        "[REMOTE] incremental_scan is deprecated and ignored; the persistent "
+        "frontier scanner is the sole production scanner. Remove this key.",
+        UserWarning,
+        stacklevel=3,
+    )
 
 
 def _strip_quotes(value):
@@ -53,6 +72,7 @@ class ConfigManager:
             print("[CONFIG] Please review and edit it before running operations.")
 
         self.config.read(config_path, encoding='utf-8')
+        _warn_ignored_incremental_scan(self.config)
 
         # Secrets live in a gitignored .env next to the app, never in config.ini.
         self.env = _load_env_file(os.path.join(PROJECT_ROOT, '.env'))
@@ -99,7 +119,6 @@ class ConfigManager:
             'tape_label': '',
             'staging_fill_pct': '0.80',
             'large_file_min_mb': '10',
-            'incremental_scan': 'false',
         }
         self.config['PIPELINE'] = {
             # Byte-bounded ready queue (Phase 4). Values are BYTES and describe
@@ -405,28 +424,6 @@ class ConfigManager:
         already planned against a cartridge.
         """
         return (self.config.get('REMOTE', 'tape_label', fallback='') or '').strip()
-
-    @property
-    def incremental_scan_enabled(self):
-        """Opt-in for the persistent incremental directory frontier (Plan 1).
-
-        **Default false**, and false is also what any malformed value means,
-        so a configuration that never mentions the setting cannot end up with
-        the frontier active.
-
-        UPDATED AT PLAN 1 COMPLETION. This used to say the legacy
-        ``StreamingRemoteScanner`` stayed the production scanner until an
-        operator opted in. That is no longer true: the frontier is the only
-        scanner a production run can build, and there is no runtime fallback.
-        What this flag now gates is whether the *incremental* frontier state is
-        used at all; an unusable migration-014 schema **stops the run**
-        (``SAFETY_BLOCK`` / ``scan_frontier_unavailable``) rather than
-        downgrading, because a downgrade is how two scanners end up running
-        against one frontier.
-        """
-        return self.config.get(
-            'REMOTE', 'incremental_scan',
-            fallback='false').strip().lower() in ('1', 'true', 'yes', 'on')
 
     # --- [PERFORMANCE] : continuous-streaming pipeline tuning -----------------
     @property

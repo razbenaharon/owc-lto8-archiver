@@ -1,10 +1,11 @@
 -- 014_postgres_incremental_scan_rollback.sql  —  REVIEWED rollback only
 --
--- Plan 1, Task 2.1.  This is NOT a general undo.  The supported rollback for
--- the incremental scan is to DISABLE the feature ([REMOTE] incremental_scan =
--- false) and leave every table, column and artifact in place: they are
--- additive, they cost nothing while unused, and they are the only record of
--- what a frontier-publishing session already covered.
+-- Plan 1, Task 2.1.  This is NOT a general runtime undo.  The persistent
+-- frontier is the sole production scanner, with no feature flag or legacy scan
+-- mode.  Production rollback therefore means restoring the verified database
+-- backup and matching code from Git history.  Leaving these additive objects
+-- in place preserves the only record of what a frontier-publishing session
+-- already covered.
 --
 -- What this file may safely drop, after review:
 --   * the FINALIZED unique index, if it is not being relied on;
@@ -47,8 +48,9 @@ BEGIN
             'REFUSING to roll back migration 014: these tables hold data (%). '
             'They are the record of what a frontier-publishing session already '
             'covered, and dropping them would make that coverage unknowable. '
-            'Disable [REMOTE] incremental_scan instead and reconcile the '
-            'session explicitly (Plan 1 Task 4.2).', populated;
+            'There is no feature flag that makes this loss safe; restore the '
+            'verified backup and matching code, or reconcile the session '
+            'explicitly (Plan 1 Task 4.2).', populated;
     END IF;
 END $$;
 

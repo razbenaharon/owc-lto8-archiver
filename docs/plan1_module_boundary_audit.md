@@ -13,10 +13,10 @@ Repository-wide search over `*.py`, `*.ini` and `*.md` (excluding
 
 | Symbol | Production caller | Verdict |
 |---|---|---|
-| `scanning.StreamingRemoteScanner` | **Yes** — `scan_frontier.build_legacy_scanner_factory` builds it for every remote session | Retained. It is still *the* production scanner; Task 2.3's frontier replaces it only after the schema and rehearsal gates pass. |
-| `scanning.RemoteScanner` | **Yes, indirectly** — base class of `StreamingRemoteScanner`; owns `_record_find_warnings` and the record-validation rules both scanners rely on | Retained. Its own `scan()`/`_scan_one()` batch entry has no production caller but is exercised by `RemoteScannerTests`, which is where the find-warning and truncated-record parsing is proved. Documented compatibility purpose. |
+| `scanning.StreamingRemoteScanner` | **No production caller** | Retained only for compatibility characterization. The persistent frontier is the sole production scanner; this class is not a legacy scan mode. |
+| `scanning.RemoteScanner` | **No production scanner caller** | Retained for parsing compatibility tests. Its `scan()`/`_scan_one()` batch entry has no production caller but is exercised by `RemoteScannerTests`, which proves the historical find-warning and truncated-record parsing rules. |
 | `planning.ChunkPlanner` | **Yes** — `StreamingChunkBuilder` composes it for `footprint()` | Retained. |
-| `planning.StreamingChunkBuilder` | **Yes** — `RemoteScanCoordinator.run()` | Retained. |
+| `planning.StreamingChunkBuilder` | **Yes** — the production frontier publisher receives it from `RemoteOrchestrator` and calls `builder.add()` only for reconciled survivors | Retained. |
 | `scanning.DirectoryFirstRemoteScanner` | **No** | **Removed.** |
 | `planning.DirectoryUnitPlanner` | **No** | **Removed.** |
 | `planning.DirectoryPlanUnit` | **No** (only `DirectoryFirstRemoteScanner.stat_directory` constructed it) | **Removed.** |
@@ -25,9 +25,11 @@ Repository-wide search over `*.py`, `*.ini` and `*.md` (excluding
 | `config.directory_chunk_max_gb` | **No reader** | **Removed.** |
 | `config.directory_chunk_max_files` | **No reader** | **Removed.** |
 | `config.large_file_min_mb` | **No reader** today | **Retained** — it is a real archival policy figure (loose vs packed), defaults from `index_min_file_mb`, and Plans 2–3 size stored-TAR/loose behaviour on it. Documented as currently unread. |
+| `config.incremental_scan` | **No runtime mode exists** | **Removed** as a feature property/example key. An old live key is deprecated and ignored; it cannot change scanner behaviour. |
 
-An existing `config.ini` may still contain the removed keys. `configparser`
-ignores keys nothing asks for, so no operator action is required.
+An existing `config.ini` may still contain removed directory-first keys, which
+`configparser` ignores. The obsolete `incremental_scan` key is also ignored but
+emits one deprecation warning per process; remove that line from the live config.
 
 ### Why the directory-first code was not revived instead
 
@@ -62,37 +64,40 @@ proxy for control-flow density.
 | module | lines | defs | branches |
 |---|---:|---:|---:|
 | `remote_orchestrator.py` **before Plan 1** | 3657 | 78 | 378 |
-| `remote_orchestrator.py` after | 2330 | 74 | 158 |
-| `scan_frontier.py` | 347 | 13 | 29 |
+| `remote_orchestrator.py` after | 2506 | 77 | 163 |
+| `scan_frontier.py` | 1111 | 42 | 123 |
 | `remote_staging.py` | 1137 | 21 | 128 |
 | `remote_writer.py` | 351 | 6 | 30 |
 | `remote_pipeline.py` | 407 | 16 | 40 |
-| `scanning.py` | 340 | 12 | 53 |
+| `scanning.py` | 543 | 20 | 74 |
 | `planning.py` | 86 | 6 | 8 |
 
 **Control flow, not just line count, is what moved.** `remote_orchestrator.py`
-lost **58% of its branches** (378 → 158) while losing 36% of its lines: what
+lost **57% of its branches** (378 → 163) while materially reducing its lines: what
 left is decision-making, not boilerplate. Its remaining `def` count barely
 changed because Task 1.2 deliberately kept the façade's public API — the
 delegating one-liners are the API surface, not the behaviour.
 
-The five-module total (4572) exceeds the original 3657 because each new module
+The five-module total exceeds the original 3657 because each new module
 carries its own imports and a docstring explaining the invariant it protects.
 That is the intended trade: the number that matters operationally is that the
-single largest file dropped from 3657 to 2330, and that the code deciding
-whether a tape write may start is now 351 reviewable lines in one place.
+single largest file dropped from 3657 to 2506,
+and that the finite tape-write group is now 351 reviewable lines in one place.
+Cartridge checks remain in `remote_orchestrator.py`, so those 351 lines are the
+sole write-group entry path, not the whole cartridge-access surface.
 
 ## 3. No duplicate scheduling implementation
 
-- **One scan/publication implementation**: `scan_frontier.RemoteScanCoordinator`.
-  `remote_orchestrator.py` contains no `StreamingChunkBuilder`, no `iter_scan`,
-  no `_append_chunk` and no `_scanner_planner`
-  (`tests/test_scan_frontier.py::OrchestratorIsWiringTests`).
+- **One production scan/publication implementation**:
+  `scan_frontier.FrontierScanCoordinator`.
+  `remote_orchestrator.py` constructs the builder factory but contains no
+  `iter_scan`, `_append_chunk`, or `_scanner_planner`; the frontier coordinator
+  owns traversal and publication.
 - **One scheduling loop**: `remote_pipeline.RemotePipelineCoordinator`, used by
   *both* `_run_streaming_session` and `_run_session`. The scan-complete resume
   path's group-of-one bypass is gone
   (`tests/test_remote_failure_hardening.py::SingleGateStructureTests`).
-- **One tape path**: `remote_writer.RemoteChunkWriter._write_chunk_group`, which
+- **One finite tape-write path**: `remote_writer.RemoteChunkWriter._write_chunk_group`, which
   is the only caller of `_pre_write_safety_gate`
   (`tests/test_finite_group_only_tape_path.py`).
 
@@ -102,7 +107,7 @@ Each new module owns behaviour rather than forwarding:
 
 | module | owns |
 |---|---|
-| `scan_frontier` | the scan-mode activation gate, discovery, chunk sealing/publication, the publication gate |
+| `scan_frontier` | the sole production frontier, schema readiness, discovery, chunk sealing/publication, and the publication gate |
 | `remote_staging` | SSH/tar fetch, retry classification, the staging watchdog, packing, preserve/discard/resume-pack rules |
 | `remote_writer` | ownership acquisition, the single safety gate, per-chunk failure isolation, the `backing` transition |
 | `remote_pipeline` | authoritative work selection, backlog fairness, producer/writer lifecycle, group settlement |

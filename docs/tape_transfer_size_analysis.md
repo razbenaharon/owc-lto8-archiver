@@ -3,6 +3,12 @@
 **Question (operator, 2026-07-25):** the tape writes look like small ~1 GB
 transfers; wouldn't one big ~500 GB transfer per write be better?
 
+> **Historical measurement:** the 96-chunk / 73-GB-remaining figures below are
+> the 2026-07-25 snapshot, not current Session 37 state. The corrected current
+> baseline is 113 chunks: 0–48 done on Tape_02 and 49–112 pending. Tape_03 is the
+> next target in the session row, but no Session 37 archive work was written
+> there.
+
 **Short answer:** the *instinct* is sound — tape rewards long sequential writes —
 but the premise is inaccurate for this system, and 500 GB is the wrong number by
 a wide margin. **Recommendation: do not change chunk sizing.** The measured

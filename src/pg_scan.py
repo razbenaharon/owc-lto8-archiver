@@ -125,9 +125,10 @@ class PgScanMixin:
     def session_has_frontier_state(self, session_id):
         """Has this session published ANY frontier state?
 
-        Used by the scan-mode gate: a session that has published cannot be
-        handed back to whole-root replay. Returns False only on a definite
-        "nothing here"; a database without the schema has definitively nothing.
+        This is useful for reports and bootstrap idempotence, but it is not a
+        session-origin signal: a conservative legacy bootstrap creates scopes
+        by design. Migration origin comes from ``remote_frontier_bootstraps``.
+        A database without the schema has definitively published nothing.
         """
         if not self.incremental_scan_schema_installed():
             return False
