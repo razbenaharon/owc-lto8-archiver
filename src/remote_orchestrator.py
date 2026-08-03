@@ -149,6 +149,8 @@ from .ram_telemetry import RamStageSampler
 from .remote_transport import _remote_tar_fetch
 from .resource_governor import ResourceGovernor
 from .reporting import _write_source_missing_only_log
+from .cli_errors import OperationalError
+from .local_manifest_archive import validate_archive_root
 from .planning import StreamingChunkBuilder
 from .scan_frontier import (FrontierScanCoordinator,
                             build_frontier_scanner_factory,
@@ -906,8 +908,32 @@ class RemoteOrchestrator:
             return True
 
     def _scan_artifact_root(self):
-        """Where scan-segment artifacts live. Never staging, never LTFS."""
-        return self.cfg.local_manifest_archive_root
+        """Where scan-segment artifacts live — proven, not assumed.
+
+        The frontier writes a segment artifact per directory *during scanning*.
+        If that root ever resolved onto the LTFS mount, scanning would be
+        writing to tape outside a finite write group — the one thing the whole
+        ownership design exists to prevent — and onto a medium that cannot take
+        small random writes. If it resolved inside staging, archive cleanup
+        would delete the frontier's evidence underneath it.
+
+        So the containment is checked here rather than trusted from config.
+        Raising is correct: the caller has not started a scan, claimed a
+        directory or touched the drive at this point, so a misconfigured root
+        stops the run with nothing to undo.
+        """
+        root = validate_archive_root(
+            self.cfg.local_manifest_archive_root,
+            (self.staging_dir, getattr(self.cfg, "lto_drive", None)))
+        drive = os.path.splitdrive(os.path.abspath(root))[0].rstrip(":").upper()
+        lto = os.path.splitdrive(
+            str(getattr(self.cfg, "lto_drive", "") or ""))[0]
+        if drive and lto and drive == lto.rstrip(":").upper():
+            raise OperationalError(
+                f"[SCAN] The scan-artifact root {root} is on the LTFS drive "
+                f"{lto}. Scan segments are written during traversal, outside "
+                "any write group; they must live on local storage.")
+        return root
 
     def _require_frontier_schema(self, session_id):
         """Refuse to scan unless the frontier schema is usable. Fail closed.
