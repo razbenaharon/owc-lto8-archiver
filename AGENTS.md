@@ -97,10 +97,10 @@ Current production state — verify, don't assume:
   when every scope reports final coverage. Catalog rows never establish it.
 - **Session 37** has a conservative frontier: 65 scopes and 65 roots queued
   `pending`, nothing traversed, nothing marked complete (shadow-rehearsed
-  first, 12/12 invariants unchanged). **It is bound to
-  Tape_03 generation 1, which was RETIRED with "physical contents intentionally
-  destroyed by tape reset"** — the active generation is 3 and `used_space` is 0,
-  so its 49 `done` chunks are done in the catalog only.
+  first, 12/12 invariants unchanged). Its 49 `done` chunks are on
+  **Tape_02** generation 1 (still active) — all 9 of its archive runs wrote
+  there and Tape_03 has never been written to. Its `tape_label = Tape_03` is
+  the NEXT target, and that generation was reformatted twice, so
   `_verify_session_tape_generation` blocks a resume; do not bypass it.
 - **Session 36** is partial and **superseded by 37** (its chunks 1–10 are 100%
   covered by plan 37; its `done` chunk 0 is unique and must be preserved). It

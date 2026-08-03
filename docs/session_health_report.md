@@ -15,7 +15,7 @@ memory.
 | 34 | **terminal** | completed | complete | 6 done | Tape_02 (1, active) | none |
 | 35 | **terminal** | abandoned | never ran | none | Tape_02 (1, active) | none |
 | 36 | **blocked** | active | incomplete | 1 done · 1 fetch_failed · 9 pending | Tape_02 (1, active) | **defer** — see below |
-| 37 | **blocked** | active | incomplete | 49 done · 64 pending | Tape_03 (**1, RETIRED**) | conservative bootstrap **done**; generation decision outstanding |
+| 37 | **blocked** | active | incomplete | 49 done (**on Tape_02**) · 64 pending | targets Tape_03 (**gen 1, reformatted**) | conservative bootstrap **done**; next-cartridge decision outstanding |
 
 Classification vocabulary, and the distinction that drives it:
 
@@ -84,10 +84,30 @@ session-selection logic that matches on host/path could see it. It has never
 collided in practice because its selection differs from 37's, but a future
 Plan 3/4 task should retire it explicitly rather than leave two active sessions.
 
-## Session 37 — blocked: its tape generation was destroyed
+## Session 37 — blocked: it targets a cartridge that was reformatted
 
-This is the most serious finding in the catalog, and it was **not** previously
-recorded anywhere.
+### CORRECTION (2026-08-03, evidence-based — read this before the rest)
+
+An earlier revision of this report claimed session 37's 49 `done` chunks existed
+"in the catalog only" because the session is bound to Tape_03 generation 1,
+which was retired as *destroyed*. **That was wrong**, and the inference was made
+from the session header rather than from where the work actually landed.
+
+Measured:
+
+| Check | Result |
+|---|---|
+| `archive_runs` where `remote_session_id = 37` | **9 runs, every one `Tape_02`** (2026-07-10 → 2026-07-24) |
+| Any archive run ever on Tape_03 | **none** |
+| `files_index` rows from session-37 runs | **2,036 stored objects, 710 GB, all on Tape_02** (2,018 ZIP containers, the rest loose) |
+| `files_index` rows on Tape_03 | **0** |
+| `tapes.used_space` for Tape_03 | **0** |
+
+So session 37's completed work is on **Tape_02, generation 1, which is still
+active**. It was never reset and nothing of session 37's was destroyed.
+**Nothing was ever written to Tape_03.**
+
+### What the generation mismatch actually means
 
 ```
 Tape_03 generation 1  formatted 2026-06-28  RETIRED 2026-08-02 09:56
@@ -96,20 +116,19 @@ Tape_03 generation 3  formatted 2026-08-02  ACTIVE
 retired_reason: "physical contents intentionally destroyed by tape reset"
 ```
 
-Session 37 is bound to **generation 1**. Its 49 `done` chunks therefore describe
-data on a medium that was deliberately wiped — twice — and `tapes.used_space`
-for Tape_03 is `0`, which corroborates it exactly.
+`remote_sessions.tape_label = Tape_03` is the session's **next write target**,
+not where its finished work lives. It was re-pointed at Tape_03 when Tape_02
+filled, but no write to Tape_03 ever completed.
 
-**Consequences an operator must accept before any resume:**
+The mismatch (session holds generation 1, active is 3) is real and still blocks
+`--resume` via `_verify_session_tape_generation` — correctly, and for the
+forward-looking reason: the session is planned to continue writing onto a
+cartridge that has been reformatted twice since. It is **not** evidence of loss.
 
-* The 49 `done` chunks are done *in the catalog only*. Their bytes are not on the
-  cartridge.
-* `_verify_session_tape_generation` compares the session's persisted generation
-  against the catalog's active one and blocks the run, so a `--resume` stops
-  before touching the drive. That guard is working; do not bypass it.
-* Deciding what to do about those 49 chunks — re-plan, abandon, or accept the
-  loss — is an operator decision, and a large one. It is explicitly **out of
-  Plan 1 scope**: Plan 1 must not change chunk membership.
+**What an operator still has to decide:** whether the remaining 64 pending
+chunks should target the current Tape_03 generation 3, a different cartridge, or
+be re-planned. That is a capacity and lifecycle decision, out of Plan 1 scope.
+The 49 `done` chunks need no decision — they are on Tape_02 and restorable.
 
 **Intervention: the conservative frontier bootstrap, and nothing else.** It
 creates scope rows and queues each configured root as `pending`. It changes no

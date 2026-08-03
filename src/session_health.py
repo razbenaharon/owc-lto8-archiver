@@ -46,6 +46,13 @@ FAILED_STATES = ("fetch_failed", "backup_failed")
 TERMINAL_SESSION_STATES = ("completed", "abandoned")
 
 
+def label_differs(next_target, written_targets):
+    """True when finished work lives somewhere other than the next target."""
+    if not next_target or not written_targets:
+        return False
+    return written_targets != {next_target}
+
+
 def _safe(report, name, call, default=None):
     """Run one probe; a failure becomes a recorded finding, never an exception.
 
@@ -78,6 +85,7 @@ def session_health(db, session_id, *, active_processes=None,
         "leases": {"expired": 0, "held": 0},
         "file_state": {},
         "tape": {},
+        "written_to": [],
         "shared_plan_sessions": [],
         "supersession": {},
     }
@@ -172,6 +180,24 @@ def session_health(db, session_id, *, active_processes=None,
     if boot:
         report["frontier"]["bootstrap"] = {
             k: boot.get(k) for k in ("bootstrap_id", "state", "coverage_final")}
+
+    # -- where the completed work PHYSICALLY is --------------------------
+    # `remote_sessions.tape_label` is the session's NEXT write target, not
+    # where its finished chunks live. Reading it as the latter produced a wrong
+    # and alarming conclusion about session 37 (its label pointed at a
+    # reformatted cartridge, while every one of its archive runs had written to
+    # a different, intact one). The two facts are separate and both are now
+    # reported, so nobody has to infer one from the other again.
+    report["written_to"] = _safe(
+        report, "archive runs",
+        lambda: db.session_tape_footprint(session_id), []) or []
+    targets = {row["tape_label"] for row in report["written_to"]}
+    if targets and label_differs(session.get("tape_label"), targets):
+        note(PARTIAL,
+             f"finished work is on {sorted(targets)}, but the session's next "
+             f"write target is {session.get('tape_label')!r}. That is normal "
+             "after a cartridge change — it is NOT evidence that the completed "
+             "chunks are gone.")
 
     # -- tape and generation -------------------------------------------
     label = session.get("tape_label")

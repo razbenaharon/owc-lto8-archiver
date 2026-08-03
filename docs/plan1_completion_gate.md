@@ -591,13 +591,25 @@ or may not have reached, and any such decision made now is a guess. Leaving ever
 root `pending` means the next approved run simply scans, and the frontier's own
 rules decide coverage from real evidence.
 
-**Serious finding, recorded because it changes what a resume means.** Session 37
-is bound to Tape_03 **generation 1**, retired 2026-08-02 with
-`physical contents intentionally destroyed by tape reset`; generation 2 was also
-retired; generation 3 is active and `tapes.used_space` is `0`. Its 49 `done`
-chunks are done in the catalog only. `_verify_session_tape_generation` blocks a
-resume before the drive is touched. What to do about those chunks is an operator
-decision and is explicitly out of Plan 1 scope.
+**Finding, and a CORRECTION to how it was first written up.** Session 37 is
+bound to Tape_03 **generation 1**, retired 2026-08-02 as *destroyed*;
+generation 2 was retired too and generation 3 is active. An earlier revision
+of this section concluded from that alone that its 49 `done` chunks existed
+"in the catalog only". **That was wrong** — it read the session header instead
+of where the work landed.
+
+Measured: all **9** `archive_runs` for session 37 name **Tape_02**; there has
+never been an archive run on Tape_03; `files_index` holds **2,036 stored
+objects / 710 GB from session-37 runs, all on Tape_02**, and **zero** rows on
+Tape_03, whose `used_space` is `0`. The completed work is on Tape_02
+generation 1, still active, and was never at risk.
+
+`tape_label = Tape_03` is the session's **next write target**, set when Tape_02
+filled. The generation mismatch still blocks `--resume` via
+`_verify_session_tape_generation`, correctly and for the forward-looking
+reason: the session would continue writing onto a cartridge reformatted twice
+since it was planned. It is not evidence of loss. What remains an operator
+decision is where the 64 pending chunks should go — out of Plan 1 scope.
 
 ### 14.6 Session 36 and the all-session audit
 
