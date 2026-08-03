@@ -22,6 +22,7 @@ from unittest import mock
 
 from src.archive_artifacts import JsonlZstArtifactWriter, segment_locator
 from src.planning import StreamingChunkBuilder
+from src import scan_frontier as sf
 from src.scan_frontier import SegmentChunkPublisher
 
 
@@ -44,6 +45,9 @@ class PublisherDB:
         row = {"scan_segment_id": segment_id, "locator": locator,
                "first_scan_ordinal": first, "last_scan_ordinal": last,
                "next_unconsumed_ordinal": first,
+               # The REAL column is `state`, not `readiness_state`. The fake
+               # must use the migration's name or it hides a schema typo.
+               "state": "ready",
                "legacy_import_state": "not_imported"}
         self.segments.append(row)
         return row
@@ -77,6 +81,35 @@ class PublisherDB:
         segment["legacy_import_state"] = "blocked" if changed else "imported"
         return {"covered": covered, "new": fresh, "source_changed": changed,
                 "already_imported": False}
+
+    def classify_segment_entries(self, session_id, entries):
+        """Read-only reclassification, used after an import already committed.
+
+        The import is once-only and returns EMPTY lists the second time, so a
+        restart between "segment imported" and "chunk sealed" had nothing to
+        filter with and used to replay the raw entries. This recomputes the
+        same answer without touching state — note it does NOT bump
+        ``membership_queries``-style import bookkeeping, because it is not an
+        import.
+        """
+        covered, fresh, changed = [], [], []
+        for path, size in entries:
+            known = self.snapshot.get(path)
+            if known is None:
+                fresh.append((path, size))
+            elif known == size:
+                covered.append((path, size))
+            else:
+                changed.append((path, known, size))
+        return {"covered": covered, "new": fresh, "source_changed": changed}
+
+    def mark_segment_fully_allocated(self, scan_segment_id):
+        for segment in self.segments:
+            if segment["scan_segment_id"] == scan_segment_id:
+                if segment["state"] in ("ready", "partially_consumed"):
+                    segment["state"] = "consumed"
+                    return True
+        return False
 
     def consume_segment_range(self, segment_id, session_id, chunk_index,
                               count):
@@ -425,3 +458,84 @@ class RemotePosixPathValidatorTests(unittest.TestCase):
         self.assertTrue(remote_path_is_legacy_safe("/vault/a/normal"))
         self.assertFalse(
             remote_path_is_legacy_safe(f"/vault/a/back{self.BACKSLASH}slash"))
+
+
+class SegmentRetirementTests(unittest.TestCase):
+    """When a segment may be marked finished — and when it must not be.
+
+    ``consume_segment_range`` advances the cursor by the number of entries that
+    became membership and marks ``consumed`` only at the end of the range. Once
+    filtering removes some entries, inserted < raw, so the cursor never reaches
+    the end: the segment stays ready, is re-offered on the next pass, and its
+    new entries are planned a second time. An explicit retirement marker fixes
+    that — but retiring at the wrong moment loses data instead.
+    """
+
+    def _publisher(self, db, **kwargs):
+        from src.planning import StreamingChunkBuilder
+        kwargs.setdefault("builder_factory",
+                          lambda: StreamingChunkBuilder(10 ** 9))
+        return SegmentChunkPublisher(
+            db=db, session_id=1, archive_root="/root", **kwargs)
+
+    def test_a_fully_planned_segment_is_retired(self):
+        db = PublisherDB()
+        segment = db.add_segment(1, "a.jsonl.zst", first=0, last=1)
+        pub = self._publisher(db)
+        with mock.patch.object(sf, "parse_jsonl_zst_artifact",
+                               return_value=({}, [{"path": "/s/a", "size": 1},
+                                                  {"path": "/s/b", "size": 1}],
+                                             {})):
+            pub.publish_ready_segments(0)
+        self.assertEqual(segment["state"], "consumed")
+
+    def test_a_segment_whose_entries_were_ALL_already_planned_is_retired(self):
+        """Otherwise it stays ready for ever and, with the LIMIT on ready
+        segments, starves every later segment that does hold new files."""
+        db = PublisherDB(snapshot={"/s/a": 1, "/s/b": 1})
+        segment = db.add_segment(1, "a.jsonl.zst", first=0, last=1)
+        pub = self._publisher(db, legacy_session=True)
+        with mock.patch.object(sf, "parse_jsonl_zst_artifact",
+                               return_value=({}, [{"path": "/s/a", "size": 1},
+                                                  {"path": "/s/b", "size": 1}],
+                                             {})):
+            pub.publish_ready_segments(0)
+        self.assertEqual(db.appended, [], "nothing new to plan")
+        self.assertEqual(segment["state"], "consumed")
+
+    def test_a_BLOCKED_segment_is_never_retired(self):
+        """A source change needs an operator. Retiring it would hide it."""
+        db = PublisherDB(snapshot={"/s/a": 999})
+        segment = db.add_segment(1, "a.jsonl.zst", first=0, last=0)
+        pub = self._publisher(db, legacy_session=True)
+        with mock.patch.object(sf, "parse_jsonl_zst_artifact",
+                               return_value=({}, [{"path": "/s/a", "size": 1}],
+                                             {})):
+            pub.publish_ready_segments(0)
+        self.assertNotEqual(segment["state"], "consumed")
+        self.assertIn(1, pub.blocked_segments)
+
+    def test_nothing_is_retired_when_publication_halts_with_a_buffered_tail(self):
+        """THE data-loss case.
+
+        The builder only emits a chunk at a boundary, so a segment's last
+        entries can sit unsealed in memory. If the gate stops publication at
+        that moment and the segment had already been retired, those entries are
+        gone: never planned, and never offered again.
+        """
+        db = PublisherDB()
+        segment = db.add_segment(1, "a.jsonl.zst", first=0, last=1)
+        gate = {"open": True}
+        pub = self._publisher(
+            db, publication_gate=lambda: gate["open"])
+        gate["open"] = False               # refuse the very first seal
+        with mock.patch.object(sf, "parse_jsonl_zst_artifact",
+                               return_value=({}, [{"path": "/s/a", "size": 1},
+                                                  {"path": "/s/b", "size": 1}],
+                                             {})):
+            pub.publish_ready_segments(0)
+        self.assertTrue(pub.halted)
+        self.assertEqual(db.appended, [])
+        self.assertNotEqual(
+            segment["state"], "consumed",
+            "a segment whose entries were never sealed must stay offerable")

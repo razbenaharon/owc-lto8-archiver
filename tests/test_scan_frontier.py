@@ -386,13 +386,22 @@ class LegacyScannerFactoryTests(_Silent):
 # =============================================================================
 class OrchestratorIsWiringTests(unittest.TestCase):
     def test_the_streaming_session_no_longer_implements_a_scanner(self):
+        """The orchestrator delegates discovery; it does not perform it.
+
+        Updated at Plan 1 completion: the coordinator it delegates to is now
+        :class:`FrontierScanCoordinator`, not ``RemoteScanCoordinator``. The
+        point of the test is unchanged — the orchestrator must not have kept a
+        private copy of the scanning logic — so the "left behind" list still
+        applies, minus the builder factory the coordinator now legitimately
+        receives from it.
+        """
         import inspect
         from src.remote_orchestrator import RemoteOrchestrator
         source = inspect.getsource(RemoteOrchestrator._run_streaming_session)
-        self.assertIn("RemoteScanCoordinator", source)
-        # The moved logic is gone from the orchestrator, not duplicated.
+        self.assertIn("FrontierScanCoordinator", source)
+        self.assertNotIn("RemoteScanCoordinator", source)
         for gone in ("_scanner_planner", "_append_chunk", "_chunk_rows",
-                     "StreamingChunkBuilder(", "iter_scan("):
+                     "iter_scan("):
             self.assertNotIn(gone, source, f"{gone} was left behind")
 
     def test_the_coordinator_owns_publication_and_discovery(self):

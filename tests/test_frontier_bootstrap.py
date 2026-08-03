@@ -133,6 +133,13 @@ class _Bootstrap(unittest.TestCase):
         self.stop = threading.Event()
 
     def _bootstrap(self, db, source, scan_paths=("/vault/a",), **kwargs):
+        # The liveness probes are injected EXPLICITLY. They used to default to
+        # hard-coded emptiness inside the bootstrap, which told the quiescence
+        # gate "nothing is running" without anything having looked; the real
+        # class now treats an absent probe as *unknown* and blocks. A test that
+        # wants a quiet host must say so, which is what these two lambdas do.
+        kwargs.setdefault("active_processes_probe", lambda: [])
+        kwargs.setdefault("lock_holders_probe", lambda: [])
         return FrontierBootstrap(
             db=db, session_id=37, scan_paths=list(scan_paths),
             archive_root=self.root,

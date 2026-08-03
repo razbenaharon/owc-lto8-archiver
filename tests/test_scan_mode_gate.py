@@ -222,63 +222,113 @@ class DecideScanModeTests(unittest.TestCase):
 # =============================================================================
 # D. Orchestrator wiring
 # =============================================================================
-class OrchestratorScanModeTests(unittest.TestCase):
-    def _orchestrator(self, cfg_enabled, db):
+class OrchestratorFrontierGateTests(unittest.TestCase):
+    """The orchestrator side of the gate, after Plan 1 completion.
+
+    The old ``_resolve_scan_mode``/``_session_bound_to_frontier`` pair chose
+    between two scanners and fell back to the legacy one on uncertainty. There
+    is no second scanner to fall back to any more, so the orchestrator's job
+    changed shape: it must **refuse to scan at all** when the frontier schema
+    is unusable, and it must decide whether an imported segment needs
+    reconciling against a pre-frontier snapshot.
+
+    A downgrade is not an option here, and that is deliberate: a fallback is
+    exactly how two scanners end up running against one frontier.
+    """
+
+    def _orchestrator(self, db):
         orch = ro.RemoteOrchestrator.__new__(ro.RemoteOrchestrator)
-        orch.cfg = _cfg(cfg_enabled)
+        orch.cfg = _cfg(True)
         orch.db = db
         orch.notifier = None
         return orch
 
-    def test_legacy_default_flow_does_not_block(self):
-        orch = self._orchestrator(False, _db(installed=False))
-        with mock.patch("builtins.print"):
-            self.assertIsNone(orch._resolve_scan_mode(37))
-        self.assertEqual(orch._scan_mode.mode, MODE_LEGACY)
+    # -- the schema gate ------------------------------------------------
+    def test_a_ready_schema_lets_the_run_proceed(self):
+        orch = self._orchestrator(_db(installed=True, finalized=True))
+        self.assertIsNone(orch._require_frontier_schema(37))
 
-    def test_a_blocked_decision_stops_the_run_before_any_device_work(self):
-        db = _db(installed=False)
-        db.session_has_frontier_state = lambda session_id: True
-        orch = self._orchestrator(False, db)
-        with mock.patch("builtins.print"), \
-                mock.patch.object(ro, "send_best_effort", lambda *a, **k: None):
-            block = orch._resolve_scan_mode(37)
+    def test_an_uninstalled_schema_stops_the_run(self):
+        orch = self._orchestrator(_db(installed=False))
+        with mock.patch("builtins.print"),                 mock.patch.object(ro, "send_best_effort", lambda *a, **k: None):
+            block = orch._require_frontier_schema(37)
         self.assertIsNotNone(block)
         self.assertEqual(block.exit_code, ExitCode.SAFETY_BLOCK)
         self.assertEqual(block.reason, REASON_SCAN_FRONTIER_UNAVAILABLE)
         self.assertFalse(block.resumable)
 
-    def test_an_unreadable_frontier_probe_is_treated_as_bound(self):
-        db = _db(installed=False)
+    def test_an_unfinalized_schema_stops_the_run(self):
+        """Both halves of migration 014 are required. The finalized half is
+        what makes the unique ordinal constraint real."""
+        orch = self._orchestrator(_db(installed=True, finalized=False))
+        with mock.patch("builtins.print"),                 mock.patch.object(ro, "send_best_effort", lambda *a, **k: None):
+            block = orch._require_frontier_schema(37)
+        self.assertIsNotNone(block)
+        self.assertEqual(block.reason, REASON_SCAN_FRONTIER_UNAVAILABLE)
+
+    def test_an_indeterminate_schema_stops_the_run(self):
+        """A database that cannot answer is never treated as ready."""
+        orch = self._orchestrator(_db(installed=True, finalized=True,
+                                      raises=True))
+        with mock.patch("builtins.print"),                 mock.patch.object(ro, "send_best_effort", lambda *a, **k: None):
+            block = orch._require_frontier_schema(37)
+        self.assertIsNotNone(block)
+        self.assertEqual(block.reason, REASON_SCAN_FRONTIER_UNAVAILABLE)
+
+    def test_the_gate_never_offers_a_legacy_fallback(self):
+        """Structural: the refusal path must not mention a downgrade."""
+        import inspect
+        source = inspect.getsource(
+            ro.RemoteOrchestrator._require_frontier_schema)
+        self.assertNotIn("build_legacy_scanner_factory", source)
+        self.assertNotIn("MODE_LEGACY", source)
+        self.assertIn("SAFETY_BLOCK", source)
+
+    # -- legacy reconciliation decision ---------------------------------
+    def test_a_session_without_frontier_state_needs_reconciling(self):
+        db = _db(installed=True, finalized=True)
+        db.session_has_frontier_state = lambda session_id: False
+        self.assertTrue(self._orchestrator(db)._session_predates_frontier(37))
+
+    def test_a_frontier_born_session_needs_no_reconciling(self):
+        db = _db(installed=True, finalized=True)
+        db.session_has_frontier_state = lambda session_id: True
+        self.assertFalse(self._orchestrator(db)._session_predates_frontier(37))
+
+    def test_an_unreadable_probe_fails_towards_reconciling(self):
+        """Reconciling a session that did not need it costs one set-based query
+        per segment. Skipping it for one that did would re-plan files that are
+        already on tape, so the uncertain answer is the expensive one."""
+        db = _db(installed=True, finalized=True)
 
         def boom(session_id):
             raise RuntimeError("connection lost")
         db.session_has_frontier_state = boom
-        orch = self._orchestrator(False, db)
-        self.assertTrue(orch._session_bound_to_frontier(37))
+        self.assertTrue(self._orchestrator(db)._session_predates_frontier(37))
 
-    def test_no_probe_means_no_frontier_state(self):
-        orch = self._orchestrator(False, _db(installed=False))
-        self.assertFalse(orch._session_bound_to_frontier(37))
+    def test_a_missing_probe_fails_towards_reconciling(self):
+        db = _db(installed=True, finalized=True)
+        if hasattr(db, "session_has_frontier_state"):
+            del db.session_has_frontier_state
+        self.assertTrue(self._orchestrator(db)._session_predates_frontier(37))
 
-    def test_streaming_session_stops_at_the_scan_mode_gate(self):
+    # -- the run stops at the gate --------------------------------------
+    def test_streaming_session_stops_before_any_device_or_thread_work(self):
         orch = ro.RemoteOrchestrator.__new__(ro.RemoteOrchestrator)
-        orch.cfg = _cfg(False)
+        orch.cfg = _cfg(True)
         orch.db = mock.MagicMock()
         orch.db.get_remote_session.return_value = {
             "tape_label": "Tape_TEST", "scan_complete": False}
-        orch.db.session_has_frontier_state.return_value = True
+        orch.db.incremental_scan_schema_installed.return_value = False
         orch.notifier = None
         orch._assert_ownership_preflight = lambda *a, **k: None
         orch._assert_feature_gate = lambda *a, **k: None
         orch._finalize = lambda result, phase="pipeline": result
-        with mock.patch("builtins.print"), \
-                mock.patch.object(ro, "send_best_effort", lambda *a, **k: None), \
-                mock.patch.object(ro, "threading") as fake_threading:
+        with mock.patch("builtins.print"),                 mock.patch.object(ro, "send_best_effort", lambda *a, **k: None),                 mock.patch.object(ro, "threading") as fake_threading:
             result = orch._run_streaming_session(37)
         self.assertEqual(result.reason, REASON_SCAN_FRONTIER_UNAVAILABLE)
-        # It stopped before any worker thread and before the tape generation
-        # check, the drive-ready probe or the cartridge read.
+        # Stopped before any worker thread, the tape generation check, the
+        # drive-ready probe and the cartridge read.
         self.assertEqual(fake_threading.Thread.call_count, 0)
         orch.db.get_tape.assert_not_called()
 

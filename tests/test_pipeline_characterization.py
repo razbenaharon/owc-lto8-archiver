@@ -12,6 +12,7 @@ the writer and the database are all fakes, and every blocking wait is bounded.
 import inspect
 import os
 import re
+import tempfile
 import threading
 import time
 import unittest
@@ -31,14 +32,24 @@ TIMEOUT = 20            # every blocking assertion in this module is bounded
 # =============================================================================
 # Fakes
 # =============================================================================
-class FakeStreamingDB:
+from lto_fakes import FakeFrontierCatalog
+
+
+class FakeStreamingDB(FakeFrontierCatalog):
     """In-memory stand-in for the PostgreSQL session/chunk API.
 
     Only the calls ``_run_streaming_session`` makes are implemented, and each
     one records itself so ordering can be asserted.
+
+    Since Plan 1 completion the streaming session drives the DIRECTORY
+    FRONTIER rather than a whole-root scan, so this inherits
+    :class:`~tests.lto_fakes.FakeFrontierCatalog` for the migration-014 half
+    of the API: schema readiness, scopes, the directory queue, ready segments
+    and segment-range consumption.
     """
 
     def __init__(self, pending=(), tape_label="Tape_TEST", scan_complete=False):
+        super().__init__()
         self.calls = []                     # ordered method-name log
         self.pending = list(pending)
         self.tape_label = tape_label
@@ -89,7 +100,7 @@ class FakeStreamingDB:
         return {chunk_index: (1024, 1024, 1)}
 
     def get_chunk_files(self, session_id, chunk_index):
-        return [{"remote_path": f"/vault/f{chunk_index}", "file_size_bytes": 1024}]
+        return [{"remote_path": f"/src/f{chunk_index}", "file_size_bytes": 1024}]
 
     def get_chunks_with_status(self, session_id, status):
         return [ci for ci, st in self.statuses.items() if st == status]
@@ -182,7 +193,12 @@ def build_streaming_orchestrator(db, *, prefetch_ahead=1, chunk_budget=4096,
     orch.cfg = SimpleNamespace(
         lto_drive="X:\\", backup_log_dir=None, ibm_eject_cmd="",
         eject_after_session=False, allow_resume_oversized_chunks=False,
-        windows_update_block_on_pending_reboot=False)
+        windows_update_block_on_pending_reboot=False,
+        # Where scan-segment artifacts go. A temp dir, never staging and
+        # never the LTFS mount (the autouse conftest guard would block a
+        # real drive letter anyway).
+        local_manifest_archive_root=tempfile.mkdtemp(
+            prefix="char_artifacts_"))
     orch.ui = mock.MagicMock()
     orch.notifier = None
     orch.skipped_tracker = mock.MagicMock()
@@ -251,6 +267,73 @@ def build_streaming_orchestrator(db, *, prefetch_ahead=1, chunk_budget=4096,
     return orch
 
 
+def _shout(msg, *a, **k):
+    import traceback; traceback.print_exc()
+
+
+class FakeDirectoryScanner:
+    """A directory scanner over the flat record list these tests supply.
+
+    Since Plan 1 completion the streaming session drives the DIRECTORY frontier,
+    so the collaborator to fake is ``DirectoryFrontierScanner.list_directory``
+    rather than the whole-root ``iter_scan``.
+
+    The records are modelled as **one file per subdirectory** rather than as a
+    single flat listing. That matters: publication happens after each directory,
+    so a one-directory tree would finish the whole scan before the writer saw
+    anything, and the interleaving these tests exist to observe would be
+    invisible. A tree of N leaf directories reproduces the real shape — traverse
+    a little, publish a little, while staging and writing run behind.
+    """
+
+    instances = []
+    records = ()
+    on_start = None
+    per_record = None
+    listed = []
+
+    def __init__(self, *args, **kwargs):
+        FakeDirectoryScanner.instances.append(self)
+        self.metrics = kwargs.get("metrics")
+
+    @staticmethod
+    def _child(index):
+        return f"/src/_d{index}"
+
+    def list_directory(self, path):
+        from src.scanning import DirectoryListing
+
+        if FakeDirectoryScanner.on_start is not None:
+            FakeDirectoryScanner.on_start()
+        FakeDirectoryScanner.listed.append(path)
+        records = FakeDirectoryScanner.records
+
+        # A directory already listed once has nothing new: re-listing must not
+        # re-emit entries (that would be replay, which the frontier forbids).
+        if FakeDirectoryScanner.listed.count(path) > 1:
+            return DirectoryListing(path, [], [], [], "obs:1", 0)
+
+        for index, record in enumerate(records):
+            if path == self._child(index):
+                if FakeDirectoryScanner.per_record is not None:
+                    FakeDirectoryScanner.per_record(*record)
+                return DirectoryListing(
+                    path, [(record[0], record[1])], [], [], "obs:1", 0)
+
+        # The root: one child directory per record, no files of its own.
+        children = [self._child(i) for i in range(len(records))]
+        return DirectoryListing(path, [], children, [], "obs:1", 0)
+
+    def observe(self, path):
+        """The final mutation sweep re-reads this token before finality.
+
+        Returning the SAME token the listing carried means "unchanged", so
+        coverage may become final — which is what these tests want. A test that
+        wants an invalidation returns something else.
+        """
+        return "obs:1"
+
+
 class StreamingHarness:
     """Patches the module-level collaborators ``_run_streaming_session`` uses."""
 
@@ -265,10 +348,18 @@ class StreamingHarness:
         FakeScanner.records = self.records
         FakeScanner.on_start = self.on_scan_start
         FakeScanner.per_record = self.per_record
+        FakeDirectoryScanner.instances = []
+        FakeDirectoryScanner.listed = []
+        FakeDirectoryScanner.records = self.records
+        FakeDirectoryScanner.on_start = self.on_scan_start
+        FakeDirectoryScanner.per_record = self.per_record
         self._patches = [
             # Task 1.1 moved discovery into src.scan_frontier, so the scanner
             # must be patched where it is USED, not on the facade.
             mock.patch.object(sf, "StreamingRemoteScanner", FakeScanner),
+            # The production scanner since Plan 1 completion.
+            mock.patch.object(sf, "DirectoryFrontierScanner",
+                              FakeDirectoryScanner),
             mock.patch.object(ro, "RebootSentinel", _FakeSentinel),
             mock.patch.object(ro, "_ensure_lto_drive_ready", return_value=True),
             mock.patch.object(ro, "_volume_cluster_size", return_value=4096),
@@ -276,6 +367,7 @@ class StreamingHarness:
             mock.patch.object(ro, "_phase", lambda *a, **k: None),
             mock.patch.object(ro, "_status", lambda *a, **k: None),
             mock.patch.object(sf, "_status", lambda *a, **k: None),
+            mock.patch.object(sf.get_logger(), "exception", _shout),
             mock.patch("builtins.print", lambda *a, **k: None),
         ]
         for patch in self._patches:
@@ -477,14 +569,19 @@ class ScannerPlannerCharacterizationTests(unittest.TestCase):
             if path.endswith("2"):
                 first_group.wait(TIMEOUT)
 
-        records = [(f"/vault/f{i}", 900) for i in range(6)]
+        records = [(f"/src/f{i}", 900) for i in range(6)]
         with StreamingHarness(records=records, per_record=per_record):
-            hook = db.mark_remote_scan_complete
+            # CHANGED BY PLAN 1 COMPLETION: scan finality is no longer a single
+            # `mark_remote_scan_complete` call at the end of a whole-root walk.
+            # The frontier finalizes each SCOPE, and only after its directories
+            # are terminal and the mutation sweep agrees. The trace hook
+            # therefore watches scope finalization instead.
+            hook = db.finalize_scan_scope
 
-            def marked(session_id):
+            def marked(scan_scope_id):
                 events.append(("scan_complete", None))
-                return hook(session_id)
-            db.mark_remote_scan_complete = marked
+                return hook(scan_scope_id)
+            db.finalize_scan_scope = marked
             result = orch._run_streaming_session(37)
 
         kinds = [k for k, _ in events]
@@ -507,48 +604,119 @@ class ScannerPlannerCharacterizationTests(unittest.TestCase):
         self.assertIn("for scan_path in scan_paths", loop)
         self.assertNotIn("resume", loop.lower())
 
-    def test_membership_filtering_is_bulk_and_happens_after_boundary_choice(self):
-        """``_append_chunk`` filters known paths only once a chunk is sealed.
+    def test_membership_filtering_is_bulk_and_happens_BEFORE_boundary_choice(self):
+        """THE defect Plan 1 completion fixed. Read the old name in git.
 
-        Two consequences are pinned here: the filter is one BULK query per
-        chunk (not one per file), and rediscovered paths have already moved the
-        ``StreamingChunkBuilder`` boundary by the time they are dropped.
+        This test used to be called
+        ``..._happens_after_boundary_choice`` and it PINNED THE BUG: with the
+        legacy scanner, ``publish_legacy_chunk`` filtered already-planned paths
+        only once a chunk had been sealed, so a rediscovered file had already
+        moved the ``StreamingChunkBuilder`` boundary before being dropped. A
+        resumed scan therefore produced different boundaries from the original
+        run, for the same source.
+
+        The frontier makes the ordering structural instead of incidental:
+        ``SegmentChunkPublisher.entries_for_segment`` reconciles a whole segment
+        in ONE set-based query and hands the builder only the genuinely new
+        entries. There is no code path in which a known file reaches
+        ``builder.add()``.
+
+        Both halves of the original claim are still asserted — the filter is
+        bulk (one query per segment, not one per file), and the boundary is
+        decided by survivors only — but the second half is now asserted with the
+        opposite expectation, which is the point.
         """
         db = FakeStreamingDB(pending=[])
-        # Every scanned path is already known, so all of them are filtered out.
-        db.get_remote_existing_snapshot_paths = (
-            lambda session_id, paths: (
-                db.existing_paths_queries.append(list(paths))
-                or {p.replace("\\", "/") for p in paths}))
+        # Every scanned path is ALREADY planned, so all of them must be
+        # filtered out before the builder ever sees them.
+        db.legacy_snapshot = {f"/src/f{i}": 100 for i in range(6)}
 
-        # 4096-byte clusters (patched) x 2 files == the whole budget, so the
-        # file-count ceiling and the byte budget both seal after two files.
         orch = build_streaming_orchestrator(
             db, chunk_budget=8192, chunk_max_files=2)
-        records = [(f"/vault/f{i}", 100) for i in range(6)]
+        records = [(f"/src/f{i}", 100) for i in range(6)]
         with StreamingHarness(records=records):
             orch._run_streaming_session(37)
 
-        # 3 sealed chunks of 2 files each -> 3 bulk queries, not 6 per-file ones.
-        self.assertEqual(len(db.existing_paths_queries), 3)
-        for query in db.existing_paths_queries:
-            self.assertEqual(len(query), 2)
-        # Everything was filtered, so nothing was appended...
+        # Nothing was appended: every entry was already planned.
         self.assertEqual(db.appended, [])
-        # ...yet the boundaries were still decided by the rediscovered files.
-        self.assertTrue(db.scan_complete)
+        # ...and NO chunk was sealed either, because the builder was never
+        # given a single entry. Under the old order six known files would have
+        # driven three boundary decisions before being dropped.
+        self.assertFalse(db.sealed_chunks)
+        # The reconciliation is once per SEGMENT (one per listed directory),
+        # not once per file: six directories, six imports, six files.
+        self.assertEqual([s["legacy_import_state"] for s in db.segments],
+                         ["imported"] * 6)
 
-    def test_builder_seals_in_discovery_order_not_by_size(self):
-        from src.planning import StreamingChunkBuilder
-        builder = StreamingChunkBuilder(1000, alloc_unit=1, padding_factor=1.0,
-                                        max_files=10)
-        sealed = []
-        for path, size in [("a", 600), ("b", 600), ("c", 600)]:
-            sealed.extend(builder.add(path, size))
-        sealed.extend(builder.flush())
-        # Discovery order preserved; no largest-first reordering.
-        self.assertEqual([[p for p, _ in chunk] for chunk in sealed],
-                         [["a"], ["b"], ["c"]])
+    def test_only_unplanned_entries_move_the_chunk_boundary(self):
+        """The positive case: known files are invisible to the builder.
+
+        Six files, three of them already planned. The boundary must fall
+        exactly where it would if only the three new ones had ever existed.
+        """
+        db = FakeStreamingDB(pending=[])
+        db.legacy_snapshot = {"/src/f0": 100, "/src/f2": 100, "/src/f4": 100}
+
+        orch = build_streaming_orchestrator(
+            db, chunk_budget=10 ** 9, chunk_max_files=2)
+        records = [(f"/src/f{i}", 100) for i in range(6)]
+        with StreamingHarness(records=records):
+            orch._run_streaming_session(37)
+
+        planned = [path for _index, rows in db.appended for (_ci, path, _n, _s)
+                   in rows]
+        self.assertEqual(sorted(planned),
+                         ["/src/f1", "/src/f3", "/src/f5"])
+
+    def test_publication_pauses_at_the_backlog_limit_and_resumes(self):
+        """The limit is a bound on how far the scanner runs ahead, not a
+        barrier that must fully drain."""
+        from src.remote_pipeline import RemotePipelineCoordinator
+
+        db = FakeStreamingDB(pending=[0, 1, 2])
+        for ci in (0, 1, 2):
+            db.statuses[ci] = "pending"
+        host = SimpleNamespace(db=db)
+        coordinator = RemotePipelineCoordinator(
+            host=host, session_id=37, tape_label="T",
+            ready_q=mock.MagicMock(), stop_event=threading.Event(),
+            metrics=mock.MagicMock(), backlog_limit=3)
+
+        self.assertEqual(coordinator.sealed_but_unstaged(), 3)
+        # At the limit the gate holds; it does not return False (that means
+        # "stop"), it simply waits until the backlog falls.
+        blocked = threading.Event()
+
+        def gate():
+            blocked.set()
+            return coordinator.publication_gate()
+
+        waiter = threading.Thread(target=gate, daemon=True)
+        waiter.start()
+        self.assertTrue(blocked.wait(5))
+        time.sleep(0.2)
+        self.assertTrue(waiter.is_alive(), "the gate did not pause at the limit")
+        # One chunk taken by the stager is enough to admit the scanner again.
+        coordinator.next_chunk_to_stage()
+        waiter.join(10)
+        self.assertFalse(waiter.is_alive())
+
+    def test_an_unreadable_backlog_holds_publication(self):
+        """An unknown backlog must never be treated as an empty one."""
+        from src.remote_pipeline import RemotePipelineCoordinator
+
+        class Exploding:
+            def get_chunks_with_status(self, session_id, status):
+                raise RuntimeError("connection lost")
+
+        coordinator = RemotePipelineCoordinator(
+            host=SimpleNamespace(db=Exploding()), session_id=37,
+            tape_label="T", ready_q=mock.MagicMock(),
+            stop_event=threading.Event(), metrics=mock.MagicMock(),
+            backlog_limit=4)
+        self.assertEqual(coordinator.sealed_but_unstaged(), 4)
+        coordinator.stop_event.set()
+        self.assertFalse(coordinator.publication_gate())
 
     def test_file_count_ceiling_seals_a_chunk(self):
         from src.planning import StreamingChunkBuilder
@@ -682,9 +850,19 @@ class RemovedDirectoryFirstPathTests(unittest.TestCase):
 # F. Coverage honesty
 # =============================================================================
 class CoverageHonestyCharacterizationTests(unittest.TestCase):
-    def test_recoverable_find_warnings_still_allow_scan_complete(self):
-        """A permission-denied subtree is recorded as skipped, and the run
-        still reaches ``mark_remote_scan_complete``. No row proves coverage."""
+    def test_a_recoverable_skip_still_allows_coverage_to_finalize(self):
+        """A permission-denied subtree is recorded as skipped, and coverage
+        can still finalize.
+
+        CHANGED BY PLAN 1 COMPLETION, deliberately. Finality no longer comes
+        from ``mark_remote_scan_complete`` at the end of a whole-root walk — the
+        frontier finalizes each scope only after its directories are terminal
+        and the mutation sweep agrees. The assertion therefore moved from "the
+        session flag was set" to "the scope reached final coverage", which is
+        the fact that actually means the source was explored. What has not
+        changed, and is still asserted, is that **no catalog row proves
+        coverage**: only traversal does.
+        """
         db = FakeStreamingDB(pending=[])
         orch = build_streaming_orchestrator(db, chunk_budget=10 ** 9)
 
@@ -695,8 +873,11 @@ class CoverageHonestyCharacterizationTests(unittest.TestCase):
         with StreamingHarness(records=[("/vault/ok", 10)], per_record=per_record):
             orch._run_streaming_session(37)
 
-        self.assertTrue(db.scan_complete)
         self.assertTrue(orch.skipped_tracker.add.called)
+        self.assertEqual([s["coverage_state"] for s in db.scopes], ["final"])
+        # The session flag follows scope finality, never precedes it: it is
+        # set here only BECAUSE every scope reached final coverage.
+        self.assertIn("mark_remote_scan_complete", db.calls)
 
     def test_scan_failure_records_an_error_and_stops_resumably(self):
         db = FakeStreamingDB(pending=[])

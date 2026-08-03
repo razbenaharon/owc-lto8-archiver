@@ -738,7 +738,8 @@ class SegmentChunkPublisher:
     """
 
     def __init__(self, *, db, session_id, archive_root, builder_factory,
-                 legacy_session=False):
+                 legacy_session=False, publication_gate=None, on_sealed=None,
+                 budget_guard=None):
         self.db = db
         self.session_id = session_id
         self.archive_root = archive_root
@@ -746,6 +747,18 @@ class SegmentChunkPublisher:
         #: True when this session pre-dates the frontier and still has
         #: whole-root snapshot rows to reconcile against.
         self.legacy_session = legacy_session
+        #: Production accounting hooks (Task 2.4 wiring). All optional so the
+        #: unit tests can drive the publisher with none of them.
+        #: ``publication_gate()`` returns False to stop sealing (backlog bound);
+        #: ``budget_guard(bytes)`` returns False when the chunk would overfill
+        #: the tape's DB safety budget; ``on_sealed(index, files, bytes)``
+        #: records the sealed chunk for the pipeline's state and metrics.
+        self._publication_gate = publication_gate
+        self._on_sealed = on_sealed
+        self._budget_guard = budget_guard
+        #: Set when a gate or the budget stopped publication mid-way, so the
+        #: caller can stop claiming directories instead of spinning.
+        self.halted = False
         self.blocked_segments = []
         #: Paths the legacy catalog key cannot represent faithfully.
         self.unrepresentable = []
@@ -763,7 +776,16 @@ class SegmentChunkPublisher:
         outcome = self.db.import_legacy_scan_segment(
             self.session_id, segment["scan_segment_id"], pairs)
         if outcome.get("already_imported"):
-            return pairs
+            # The import is once-only, so a segment whose import already
+            # committed comes back with EMPTY lists. Returning ``pairs`` here
+            # (as this did) handed the full rediscovered set to the chunk
+            # builder on every restart between "segment imported" and "chunk
+            # sealed" — re-planning already-planned files and shifting chunk
+            # boundaries. Recompute the classification read-only instead: same
+            # one bulk query, no side effects, same answer.
+            outcome = dict(
+                self.db.classify_segment_entries(self.session_id, pairs),
+                already_imported=True)
         if outcome["source_changed"]:
             # Fail closed. The segment is marked 'blocked' by the repository;
             # nothing here plans a replacement.
@@ -815,39 +837,125 @@ class SegmentChunkPublisher:
         return safe
 
     def publish_ready_segments(self, next_chunk_index, limit=50):
-        """Seal chunks from whatever is ready. Returns the sealed indices."""
+        """Seal chunks from whatever is ready. Returns the sealed indices.
+
+        Retirement is deliberately deferred to the very end. A segment's
+        entries can sit in the builder as an unsealed *tail* — the builder only
+        emits a chunk when a boundary is crossed — so retiring a segment as
+        soon as its entries were handed over would mark it finished while some
+        of them existed only in memory. If publication then halted (gate,
+        budget, crash) that tail would be lost and the segment would never be
+        re-offered. So: seal everything first, then retire only if the flush
+        completed.
+        """
         sealed = []
         builder = self._builder_factory()
-        pending = []                      # (files, segment, first, last)
+        pending = []                       # [(entries, segment), ...]
+        covered_only = []                  # nothing to plan, but done with
+
         for segment in self.db.get_ready_segments(self.session_id, limit=limit):
             entries = self.entries_for_segment(segment)
             if not entries:
+                # Two very different reasons for an empty result:
+                #   * every entry was already planned -> nothing to do, and the
+                #     segment must still be retired or it is re-offered for
+                #     ever and (with the LIMIT) starves later segments;
+                #   * the segment is BLOCKED by a source change -> it must stay
+                #     visible for an operator and must never be retired.
+                if segment["scan_segment_id"] not in self.blocked_segments:
+                    covered_only.append(segment)
                 continue
             pending.append((entries, segment))
 
+        contributed = []                   # segments whose entries were sealed
         for entries, segment in pending:
             chunks = []
             for path, size in entries:
                 chunks.extend(builder.add(path, size))
             for chunk in chunks:
-                next_chunk_index = self._seal(chunk, next_chunk_index, segment)
+                nxt = self._guarded_seal(chunk, next_chunk_index, segment)
+                if nxt is None:
+                    self._retire_all(covered_only)
+                    return sealed          # tail still buffered: retire nothing
+                next_chunk_index = nxt
                 sealed.append(next_chunk_index - 1)
+            contributed.append(segment)
+
         for chunk in builder.flush():
-            next_chunk_index = self._seal(chunk, next_chunk_index,
-                                          pending[-1][1] if pending else None)
+            nxt = self._guarded_seal(chunk, next_chunk_index,
+                                     pending[-1][1] if pending else None)
+            if nxt is None:
+                self._retire_all(covered_only)
+                return sealed
+            next_chunk_index = nxt
             sealed.append(next_chunk_index - 1)
+
+        # The builder is empty: everything every contributing segment offered is
+        # now sealed membership, so they have nothing left to give.
+        self._retire_all(covered_only + contributed)
         self.chunks_sealed += len(sealed)
         return sealed
 
+    def _retire_all(self, segments):
+        for segment in segments:
+            self._retire(segment)
+
+    def _retire(self, segment):
+        """Stop offering a segment the publisher has fully classified."""
+        if segment is None:
+            return
+        marker = getattr(self.db, "mark_segment_fully_allocated", None)
+        if marker is None:
+            return
+        try:
+            marker(segment["scan_segment_id"])
+        except Exception:
+            get_logger().warning(
+                "could not retire segment %s; it may be re-offered",
+                segment.get("scan_segment_id"), exc_info=True)
+
+    def _guarded_seal(self, chunk_files, chunk_index, segment):
+        """Seal one chunk under the production gate and tape budget.
+
+        Returns the next chunk index, or ``None`` to stop publishing. The
+        checks run BEFORE the insert so a refused chunk leaves the segment
+        ready and unconsumed — the segment is re-offered on the next pass
+        rather than being half-allocated.
+        """
+        if self._publication_gate is not None and not self._publication_gate():
+            self.halted = True
+            return None
+        if self._budget_guard is not None:
+            logical_bytes = sum(size for _, size in chunk_files)
+            if not self._budget_guard(logical_bytes):
+                self.halted = True
+                return None
+        before = chunk_index
+        next_index, files, size_bytes = self._seal_counted(
+            chunk_files, chunk_index, segment)
+        if next_index != before and self._on_sealed is not None:
+            self._on_sealed(before, files, size_bytes)
+        return next_index
+
     def _seal(self, chunk_files, chunk_index, segment):
         """Append the members, then seal — atomically expectation-first."""
+        return self._seal_counted(chunk_files, chunk_index, segment)[0]
+
+    def _seal_counted(self, chunk_files, chunk_index, segment):
+        """:meth:`_seal`, also returning ``(inserted_files, inserted_bytes)``.
+
+        The production coordinator needs the counts to advance the pipeline's
+        remaining-tape budget and scan metrics; the unit tests only need the
+        next index, which is what :meth:`_seal` keeps returning.
+        """
         rows = [(chunk_index, path, os.path.basename(path), size)
                 for path, size in chunk_files]
         result = self.db.append_remote_streaming_chunk(
             self.session_id, chunk_index, rows)
         inserted = int(result.get("inserted_files", 0))
+        inserted_bytes = int(result.get("inserted_bytes", 0))
         if inserted == 0:
-            return chunk_index
+            return chunk_index, 0, 0
 
         first = last = None
         if segment is not None:
@@ -858,10 +966,215 @@ class SegmentChunkPublisher:
         self.db.seal_remote_chunk(
             self.session_id, chunk_index,
             expected_file_count=inserted,
-            expected_bytes=int(result.get("inserted_bytes", 0)),
+            expected_bytes=inserted_bytes,
             scan_segment_id=(segment or {}).get("scan_segment_id"),
             first_scan_ordinal=first, last_scan_ordinal=last)
-        return chunk_index + 1
+        return chunk_index + 1, inserted, inserted_bytes
+
+
+class FrontierScanCoordinator:
+    """**The production scanner.** Traversal and planning, one directory at a time.
+
+    Plan 1 completion. This is what the pipeline's scanner thread runs, and it
+    is the only scan coordinator a production session may use. It composes the
+    two halves that already existed but were never connected to a run:
+
+    * :class:`DirectoryFrontierCoordinator` explores the source one directory
+      at a time and publishes each listing as a ready segment artifact, so a
+      crash replays at most that directory;
+    * :class:`SegmentChunkPublisher` turns ready segments into sealed chunks,
+      reading entries from the local artifacts rather than re-discovering them.
+
+    Why this ordering matters, and what it fixes
+    --------------------------------------------
+    The legacy :class:`RemoteScanCoordinator` filtered already-planned files
+    **after** they had already moved the chunk boundary (see its
+    ``publish_legacy_chunk`` docstring), so a resumed scan produced different
+    boundaries from the original run. Here the filter is structural: for a
+    migrated legacy session ``SegmentChunkPublisher.entries_for_segment`` runs
+    the one-time set-based reconciliation and returns only genuinely **new**
+    entries, and only those reach ``builder.add()``. Rediscovered files
+    therefore cannot shift a boundary — there is no code path in which they
+    reach the builder at all.
+
+    It is also bounded work: one set-based query per **segment**, never one per
+    file, matched on canonical path AND size against the
+    ``(snapshot_id, remote_path)`` unique index.
+
+    Fail-closed behaviour, all inherited rather than re-implemented:
+
+    * a ``source_changed`` entry blocks its segment and plans nothing;
+    * a path that cannot round-trip through the catalog's canonical form (the
+      Linux literal-backslash case) is withheld, never silently merged;
+    * scan finality comes only from :meth:`DirectoryFrontierCoordinator.finalize`,
+      which requires traversal evidence — catalog rows alone never establish it.
+    """
+
+    def __init__(self, *, db, session_id, scan_paths, archive_root, state,
+                 remaining_lock, stop_event, scanner_factory, builder_factory,
+                 legacy_session=False, publication_gate=None,
+                 on_chunk_published=None, on_budget_exceeded=None,
+                 on_scan_error=None, on_finished=None, ui=None,
+                 max_directories=None, owner_token=None):
+        self.db = db
+        self.session_id = session_id
+        self.state = state
+        self.remaining_lock = remaining_lock
+        self.stop_event = stop_event
+        self._on_budget_exceeded = on_budget_exceeded
+        self._on_chunk_published = on_chunk_published
+        self._on_scan_error = on_scan_error
+        self._on_finished = on_finished
+        self.frontier = DirectoryFrontierCoordinator(
+            db=db, session_id=session_id, scan_paths=scan_paths,
+            archive_root=archive_root, scanner_factory=scanner_factory,
+            stop_event=stop_event, owner_token=owner_token, ui=ui,
+            metrics=getattr(state, "metrics", None),
+            max_directories=max_directories)
+        self.publisher = SegmentChunkPublisher(
+            db=db, session_id=session_id, archive_root=archive_root,
+            builder_factory=builder_factory, legacy_session=legacy_session,
+            publication_gate=publication_gate,
+            budget_guard=self._budget_guard, on_sealed=self._on_sealed)
+
+    def _stopping(self):
+        return CANCEL.is_set() or self.stop_event.is_set()
+
+    def _budget_guard(self, logical_bytes):
+        """False when this chunk would overfill the tape's DB safety budget."""
+        state = self.state
+        with self.remaining_lock:
+            if logical_bytes <= state.remaining_bytes:
+                return True
+            msg = (
+                f"next remote chunk needs {logical_bytes / 1024**3:.2f} GiB, "
+                f"but only {state.remaining_bytes / 1024**3:.2f} GiB "
+                "remains on the mounted tape under the DB safety budget"
+            )
+        state.scan_error = msg
+        self.db.mark_remote_scan_error(self.session_id, msg)
+        print(f"[TAPE] {msg}. Stopping before overfill.")
+        if self._on_budget_exceeded is None:
+            raise TapeBudgetExceeded(msg)
+        self._on_budget_exceeded(msg)
+        return False
+
+    def _on_sealed(self, chunk_index, files, size_bytes):
+        state = self.state
+        state.metrics.mark_first_sealed_chunk()
+        with self.remaining_lock:
+            state.remaining_bytes = max(0, state.remaining_bytes - size_bytes)
+        state.next_chunk_index = chunk_index + 1
+        state.chunks += 1
+        state.files += files
+        state.bytes += size_bytes
+        _status('SCAN', f"Chunk {chunk_index + 1} planned: "
+                        f"{files:,} file(s), {size_bytes / 1024**3:.2f} GiB")
+        if self._on_chunk_published is not None:
+            self._on_chunk_published(chunk_index)
+
+    def _publish(self):
+        """Seal whatever is ready. Returns False when publication halted."""
+        self.publisher.halted = False
+        self.publisher.publish_ready_segments(self.state.next_chunk_index)
+        return not self.publisher.halted
+
+    def _mark_scan_complete_if_every_scope_is_final(self):
+        """Set the session's scan-complete flag — from traversal, only.
+
+        ``remote_sessions.scan_complete`` is what tells a later run "the plan's
+        full membership is known", so it decides whether the session can ever be
+        considered finished. The legacy scanner set it whenever its whole-root
+        walk returned without raising. The frontier must be stricter: it sets it
+        only when **every scope reports final coverage**, which
+        :meth:`DirectoryFrontierCoordinator.finalize` grants only after each
+        directory is terminal, every descendant subtree is final and the final
+        mutation sweep found nothing changed.
+
+        So a run that hit a permission error, left a directory partial, or
+        found the source mutating leaves the flag alone and the session stays
+        resumable. That is the honest outcome, and it is the whole reason the
+        report can say "the scan never completed" about session 37 rather than
+        guessing from its 23M catalog rows.
+        """
+        try:
+            scopes = self.db.get_scan_scopes(self.session_id)
+        except Exception:
+            get_logger().warning("could not read scan scopes; leaving the "
+                                 "scan incomplete", exc_info=True)
+            return False
+        if not scopes:
+            return False
+        if not all(scope.get("coverage_state") == "final" for scope in scopes):
+            provisional = [scope.get("source_root") for scope in scopes
+                           if scope.get("coverage_state") != "final"]
+            _status('SCAN', "Coverage is NOT final for "
+                            f"{len(provisional)} scope(s); the session stays "
+                            "resumable.")
+            return False
+        self.db.mark_remote_scan_complete(self.session_id)
+        return True
+
+    def run(self):
+        """Explore the frontier and plan what it discovers.
+
+        Traversal and planning interleave deliberately: publishing after each
+        directory keeps the stager fed while exploration continues, and means
+        an interrupted run has already sealed everything it could.
+        """
+        state = self.state
+        # Ownership evidence: the attempt row carries the owner token, PID and
+        # process creation identity that startup reconciliation reads to tell a
+        # live worker from a dead one. Claiming a directory without it would
+        # leave an unattributable claim behind after a crash.
+        self.frontier.attempt_id = self.frontier._start_attempt()
+        try:
+            self.frontier.establish_scopes()
+            while not self._stopping():
+                claimed = self.frontier.process_one_directory()
+                if not self._publish():
+                    return                     # gate or budget stopped us
+                if not claimed:
+                    break
+                if (self.frontier.max_directories is not None
+                        and self.frontier.directories_listed
+                        >= self.frontier.max_directories):
+                    break
+            if self._stopping():
+                return
+            self.frontier.final_mutation_sweep()
+            self._publish()
+            # Finality comes from traversal evidence only. If any directory is
+            # still provisional or errored this leaves the scan incomplete,
+            # which is the correct outcome — never inferred from catalog rows.
+            self.frontier.finalize()
+            self._mark_scan_complete_if_every_scope_is_final()
+            _status('SCAN', f"Frontier pass complete: {state.chunks:,} new "
+                            f"chunk(s), {state.files:,} file(s), "
+                            f"{state.bytes / 1024**3:.2f} GiB")
+        except Exception as exc:
+            get_logger().exception("frontier scanner failed")
+            state.scan_error = str(exc)
+            try:
+                self.db.mark_remote_scan_error(self.session_id, str(exc))
+            except Exception:
+                get_logger().warning("could not record the scan error",
+                                     exc_info=True)
+            if self._on_scan_error is None:
+                raise
+            self._on_scan_error(exc)
+        finally:
+            attempt_id = self.frontier.attempt_id
+            if attempt_id is not None:
+                try:
+                    self.db.finish_worker_attempt(
+                        attempt_id,
+                        "abandoned" if self._stopping() else "completed")
+                except Exception:
+                    get_logger().warning("could not close the scan attempt",
+                                         exc_info=True)
+            if self._on_finished is not None:
+                self._on_finished()
 
 
 def build_frontier_scanner_factory(*, remote_user, remote_host,

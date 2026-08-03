@@ -149,8 +149,10 @@ from .ram_telemetry import RamStageSampler
 from .remote_transport import _remote_tar_fetch
 from .resource_governor import ResourceGovernor
 from .reporting import _write_source_missing_only_log
-from .scan_frontier import (RemoteScanCoordinator,
-                            build_legacy_scanner_factory, decide_scan_mode)
+from .planning import StreamingChunkBuilder
+from .scan_frontier import (FrontierScanCoordinator,
+                            build_frontier_scanner_factory,
+                            incremental_scan_schema_ready)
 from .runtime import (CANCEL, _acquire_tape_io_lock, _fmt_eta, _phase,
                       _priority_class, _progress_done, _progress_line,
                       _release_tape_io_lock, _status, compute_affinity_sets,
@@ -878,48 +880,50 @@ class RemoteOrchestrator:
             cartridge_verifications=self._cartridge_verifications - cart0,
             writer_invocations=len(started))
 
-    def _session_bound_to_frontier(self, session_id):
-        """Has this session already published incremental-scan state?
+    def _session_predates_frontier(self, session_id):
+        """True when this session still has whole-root snapshot rows to match.
 
-        Fails **safe-for-legacy** only when the database says a definite "no".
-        A database that cannot answer is treated as *bound*, so an unreadable
-        frontier can never be silently overwritten by a whole-root replay.
-        Before migration 014 exists there is no such state and no such probe,
-        so this is a definite "no" and the legacy path is unaffected.
+        Such a session was planned before the frontier existed, so every
+        segment imported for it must be reconciled ONCE against
+        ``remote_snapshot_files`` before its entries reach the chunk builder.
+        A session that already owns frontier scopes needs no such reconciliation
+        — its membership came from segments in the first place.
+
+        Fails towards *reconcile* on any uncertainty: reconciling a session that
+        did not need it costs one set-based query per segment, while skipping it
+        for one that did would re-plan files that are already on tape.
         """
         probe = getattr(self.db, 'session_has_frontier_state', None)
         if probe is None:
-            return False
+            return True
         try:
-            return bool(probe(session_id))
+            return not bool(probe(session_id))
         except Exception:
             get_logger().warning(
-                "could not determine incremental-scan frontier state for "
-                "session %s; treating it as frontier-bound", session_id,
-                exc_info=True)
+                "could not determine frontier state for session %s; "
+                "reconciling imported segments against the legacy snapshot",
+                session_id, exc_info=True)
             return True
 
-    def _resolve_scan_mode(self, session_id):
-        """Record the scanner this run may use; return a StopResult to block.
+    def _scan_artifact_root(self):
+        """Where scan-segment artifacts live. Never staging, never LTFS."""
+        return self.cfg.local_manifest_archive_root
 
-        Sets ``self._scan_mode`` for the scanner thread. Returns ``None`` when
-        the run may proceed (legacy or frontier), or a finalized-ready
-        :class:`StopResult` when the state is ambiguous enough that no scanner
-        may run at all.
+    def _require_frontier_schema(self, session_id):
+        """Refuse to scan unless the frontier schema is usable. Fail closed.
+
+        The frontier is now the only scanner, so an unusable schema is a hard
+        stop rather than a quiet downgrade — a downgrade is what would put a
+        second scanner on one frontier. Nothing has been claimed or written at
+        this point, so the session stays exactly where it was.
         """
-        decision = decide_scan_mode(
-            self.cfg, self.db,
-            session_bound_to_frontier=self._session_bound_to_frontier(
-                session_id))
-        self._scan_mode = decision
-        get_logger().info("scan_mode_selected: mode=%s reason=%s",
-                          decision.mode, decision.reason)
-        if not decision.blocked:
-            if decision.detail:
-                print(f"[SCAN] {decision.detail}")
+        ready, reason = incremental_scan_schema_ready(self.db)
+        if ready:
             return None
-        msg = (f"session {session_id}: {decision.reason}. "
-               f"{decision.detail or ''}").strip()
+        msg = (f"session {session_id}: the incremental-scan schema is not "
+               f"usable ({reason}). Apply migration 014 with "
+               f"`inspect_db.py --apply-incremental-scan-schema --execute "
+               f"--yes --finalize` before scanning.")
         print(f"\n[SCAN] SAFETY STOP: {msg}")
         get_logger().error("scan_frontier_unavailable: %s", msg)
         send_best_effort(self.notifier, f"[PIPELINE] SAFETY STOP: {msg}")
@@ -963,11 +967,11 @@ class RemoteOrchestrator:
         session_row = self.db.get_remote_session(session_id)
         tape_label = session_row['tape_label']
 
-        # Which scanner may run (Task 0.3). Fails towards the legacy scanner on
-        # every kind of uncertainty; fails CLOSED for a session already bound to
-        # frontier state, because two scanners must never run against one
-        # frontier. Nothing here touches the drive, the mount or the source.
-        scan_mode_block = self._resolve_scan_mode(session_id)
+        # The frontier is the only scanner, so this is a hard schema gate now
+        # rather than a mode choice: no usable schema means no scan, not a
+        # quiet downgrade to whole-root replay. Nothing here touches the drive,
+        # the mount or the source.
+        scan_mode_block = self._require_frontier_schema(session_id)
         if scan_mode_block is not None:
             return self._finalize(scan_mode_block, phase="scan-mode")
 
@@ -1083,25 +1087,41 @@ class RemoteOrchestrator:
                 'scan_complete')),
             writer_path='streaming')
 
-        scan_coordinator = RemoteScanCoordinator(
+        # Plan 1 completion: the frontier scanner is THE production scanner.
+        # There is no legacy fallback here on purpose — a runtime fallback is
+        # how two scanners end up running against one frontier. Git history and
+        # the verified PostgreSQL backup are the rollback path.
+        budget_bytes = self._chunk_budget()
+        alloc_unit = _volume_cluster_size(self.staging_dir)
+        padding_factor = self.staging_padding
+        max_files = self.chunk_max_files
+
+        def _builder_factory():
+            return StreamingChunkBuilder(
+                budget_bytes, alloc_unit=alloc_unit,
+                padding_factor=padding_factor, max_files=max_files)
+
+        scan_coordinator = FrontierScanCoordinator(
             db=self.db,
             session_id=session_id,
             scan_paths=self.remote_scan_paths,
+            archive_root=self._scan_artifact_root(),
             state=state,
             remaining_lock=remaining_lock,
             stop_event=stop_pipeline,
-            budget_bytes=self._chunk_budget(),
-            alloc_unit=_volume_cluster_size(self.staging_dir),
-            padding_factor=self.staging_padding,
-            max_files=self.chunk_max_files,
-            scanner_factory=build_legacy_scanner_factory(
+            builder_factory=_builder_factory,
+            # A session that pre-dates the frontier still has whole-root
+            # snapshot rows, so each imported segment is reconciled against
+            # them ONCE, set-based, before anything reaches the chunk builder.
+            legacy_session=self._session_predates_frontier(session_id),
+            scanner_factory=build_frontier_scanner_factory(
                 remote_user=self.remote_user,
                 remote_host=self.remote_host,
                 remote_password=self.remote_password,
                 skipped_tracker=self.skipped_tracker,
                 ui=self.ui,
-                cipher=self.ssh_cipher,
             ),
+            ui=self.ui,
             on_budget_exceeded=_on_budget_exceeded,
             on_scan_error=_on_scan_error,
             publication_gate=pipeline.publication_gate,
