@@ -191,3 +191,259 @@ class MinimalBackupDB:
     def recalculate_tape_used_space(self, tape_label):
         self.recalc_calls += 1
         return 0
+
+
+# ===========================================================================
+# Frontier catalog fake (Plan 1 completion)
+# ===========================================================================
+class FakeFrontierCatalog:
+    """In-memory stand-in for the migration-014 half of the catalog.
+
+    The frontier is now the production scanner, so any fake that stands in for
+    the database during a streaming run has to answer the frontier's questions
+    too — schema readiness, scopes, the directory queue, ready segments and
+    segment-range consumption. Before Plan 1 completion a streaming fake only
+    needed the whole-root scanner's handful of calls.
+
+    Deliberately reports the schema as INSTALLED and FINALIZED, because that is
+    production's state; a test that wants the not-ready path sets the flags to
+    False and asserts the run stops.
+    """
+
+    def __init__(self):
+        self.schema_installed = True
+        self.schema_finalized = True
+        self.scopes = []
+        self.directories = []
+        self.segments = []
+        self.scan_errors = []
+        self.attempts = {}
+        self.consumed = []
+        self.frontier_state = False
+        self._next_frontier_id = 1
+
+    # -- schema ----------------------------------------------------------
+    def incremental_scan_schema_installed(self):
+        return self.schema_installed
+
+    def incremental_scan_schema_finalized(self):
+        return self.schema_finalized
+
+    def session_has_frontier_state(self, session_id):
+        return self.frontier_state
+
+    def _fid(self):
+        value = self._next_frontier_id
+        self._next_frontier_id += 1
+        return value
+
+    # -- scopes ----------------------------------------------------------
+    def create_scan_scopes(self, session_id, roots):
+        for ordinal, (root, kind) in enumerate(roots):
+            self.scopes.append({
+                "scan_scope_id": self._fid(), "session_id": session_id,
+                "scope_ordinal": ordinal, "source_root": root,
+                "scope_kind": kind, "coverage_state": "provisional"})
+        return list(self.scopes)
+
+    def get_scan_scopes(self, session_id):
+        return list(self.scopes)
+
+    def finalize_scan_scope(self, scan_scope_id):
+        for scope in self.scopes:
+            if scope["scan_scope_id"] == scan_scope_id:
+                unfinished = [d for d in self.directories
+                              if d["scan_scope_id"] == scan_scope_id
+                              and d["listing_state"] != "complete"]
+                if not unfinished:
+                    scope["coverage_state"] = "final"
+                return scope["coverage_state"]
+        return None
+
+    # -- directories -----------------------------------------------------
+    def enqueue_scan_directories(self, scan_scope_id, entries,
+                                 parent_directory_id=None):
+        added = []
+        for path, ordinal in entries:
+            if any(d["scan_scope_id"] == scan_scope_id
+                   and d["canonical_path"] == path for d in self.directories):
+                continue                       # unique (scope, path)
+            row = {"scan_directory_id": self._fid(),
+                   "scan_scope_id": scan_scope_id, "canonical_path": path,
+                   "traversal_ordinal": ordinal,
+                   "parent_directory_id": parent_directory_id,
+                   "listing_state": "pending",
+                   "subtree_coverage_state": "provisional",
+                   "owner_token": None}
+            self.directories.append(row)
+            added.append(row)
+        return added
+
+    def claim_next_directory(self, session_id, owner_token, attempt_id,
+                             **kwargs):
+        for row in sorted(self.directories,
+                          key=lambda d: (d["scan_scope_id"],
+                                         d["traversal_ordinal"])):
+            if row["listing_state"] in ("pending", "partial"):
+                row["listing_state"] = "scanning"
+                row["owner_token"] = owner_token
+                return row
+        return None
+
+    def complete_directory_listing(self, directory_id, owner_token, **kwargs):
+        for row in self.directories:
+            if row["scan_directory_id"] == directory_id:
+                row["listing_state"] = ("error" if kwargs.get("error_count")
+                                        else "complete")
+                row["owner_token"] = None
+                return row["listing_state"]
+        return None
+
+    def mark_directory_partial(self, directory_id, owner_token, **kwargs):
+        for row in self.directories:
+            if row["scan_directory_id"] == directory_id:
+                row["listing_state"] = "partial"
+                row["owner_token"] = None
+        return None
+
+    def finalize_directory_subtree(self, directory_id):
+        for row in self.directories:
+            if row["scan_directory_id"] == directory_id:
+                if row["listing_state"] == "complete":
+                    row["subtree_coverage_state"] = "final"
+                    return True, "final"
+                return False, row["listing_state"]
+        return False, "missing"
+
+    def get_covered_directories(self, scan_scope_id):
+        return [d for d in self.directories
+                if d["scan_scope_id"] == scan_scope_id
+                and d["listing_state"] == "complete"]
+
+    def record_scan_error(self, **kwargs):
+        self.scan_errors.append(kwargs)
+        return kwargs
+
+    # -- segments --------------------------------------------------------
+    def publish_scan_segment(self, directory_id, *, first_scan_ordinal,
+                             last_scan_ordinal, locator, **kwargs):
+        row = {"scan_segment_id": self._fid(),
+               "scan_directory_id": directory_id, "locator": locator,
+               "first_scan_ordinal": first_scan_ordinal,
+               "last_scan_ordinal": last_scan_ordinal,
+               "next_unconsumed_ordinal": first_scan_ordinal,
+               "state": "ready",
+               "legacy_import_state": "not_imported"}
+        row.update({k: v for k, v in kwargs.items() if k not in row})
+        self.segments.append(row)
+        return row
+
+    def get_ready_segments(self, session_id, limit=50):
+        return [s for s in self.segments
+                if s["state"] == "ready"][:limit]
+
+    def consume_segment_range(self, segment_id, session_id, chunk_index,
+                              count):
+        segment = next(s for s in self.segments
+                       if s["scan_segment_id"] == segment_id)
+        first = segment["next_unconsumed_ordinal"]
+        last = min(segment["last_scan_ordinal"], first + count - 1)
+        segment["next_unconsumed_ordinal"] = last + 1
+        if segment["next_unconsumed_ordinal"] > segment["last_scan_ordinal"]:
+            segment["state"] = "consumed"
+        self.consumed.append((segment_id, chunk_index, first, last))
+        return first, last
+
+    # -- worker attempts -------------------------------------------------
+    def start_worker_attempt(self, **kwargs):
+        attempt_id = self._fid()
+        self.attempts[attempt_id] = dict(kwargs, state="running")
+        return attempt_id
+
+    def finish_worker_attempt(self, attempt_id, terminal_state):
+        if attempt_id in self.attempts:
+            self.attempts[attempt_id]["state"] = terminal_state
+        return terminal_state
+
+    # -- legacy reconciliation -------------------------------------------
+    #: A legacy session's existing membership, ``{path: size}``. Empty means
+    #: every rediscovered entry is genuinely new.
+    legacy_snapshot = None
+
+    def _snapshot(self):
+        if self.legacy_snapshot is None:
+            self.legacy_snapshot = {}
+        return self.legacy_snapshot
+
+    def _classify(self, entries):
+        snapshot = self._snapshot()
+        covered, fresh, changed = [], [], []
+        for path, size in entries:
+            known = snapshot.get(path.replace("\\", "/"))
+            if known is None:
+                fresh.append((path, size))
+            elif known == size:
+                covered.append((path, size))
+            else:
+                changed.append((path, known, size))
+        return covered, fresh, changed
+
+    def import_legacy_scan_segment(self, session_id, segment_id, entries):
+        segment = next((s for s in self.segments
+                        if s["scan_segment_id"] == segment_id), None)
+        if segment is None:
+            raise RuntimeError(f"segment {segment_id} does not exist")
+        if segment["legacy_import_state"] != "not_imported":
+            # Once-only, exactly like the repository: EMPTY lists, which is why
+            # the caller must reclassify rather than replay the raw entries.
+            return {"covered": [], "new": [], "source_changed": [],
+                    "already_imported": True}
+        covered, fresh, changed = self._classify(entries)
+        segment["legacy_import_state"] = "blocked" if changed else "imported"
+        for path, planned, observed in changed:
+            self.scan_errors.append({"category": "source_changed", "path": path,
+                                     "disposition": "unresolved"})
+        return {"covered": covered, "new": fresh, "source_changed": changed,
+                "already_imported": False}
+
+    def classify_segment_entries(self, session_id, entries):
+        """Read-only reclassification. Must NOT change import state."""
+        covered, fresh, changed = self._classify(entries)
+        return {"covered": covered, "new": fresh, "source_changed": changed}
+
+    # -- chunk sealing ---------------------------------------------------
+    #: ``[{chunk_index, expected_file_count, expected_bytes, ...}, ...]``
+    sealed_chunks = None
+
+    def seal_remote_chunk(self, session_id, chunk_index, *,
+                          expected_file_count, expected_bytes,
+                          scan_segment_id=None, first_scan_ordinal=None,
+                          last_scan_ordinal=None):
+        """Seal once. A second identical seal is a no-op; a differing one is a
+        contradiction, exactly as the repository treats it."""
+        if self.sealed_chunks is None:
+            self.sealed_chunks = []
+        for existing in self.sealed_chunks:
+            if existing["chunk_index"] == chunk_index:
+                if (existing["expected_file_count"] == expected_file_count
+                        and existing["expected_bytes"] == expected_bytes):
+                    return False
+                raise RuntimeError(
+                    f"chunk {chunk_index} already sealed with a different "
+                    "expectation")
+        self.sealed_chunks.append({
+            "chunk_index": chunk_index,
+            "expected_file_count": expected_file_count,
+            "expected_bytes": expected_bytes,
+            "scan_segment_id": scan_segment_id,
+            "first_scan_ordinal": first_scan_ordinal,
+            "last_scan_ordinal": last_scan_ordinal})
+        return True
+
+    def mark_segment_fully_allocated(self, scan_segment_id):
+        for segment in self.segments:
+            if segment["scan_segment_id"] == scan_segment_id:
+                if segment["state"] in ("ready", "partially_consumed"):
+                    segment["state"] = "consumed"
+                    return True
+        return False

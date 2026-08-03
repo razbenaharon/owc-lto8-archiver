@@ -121,6 +121,35 @@ def _require_maintenance_safe(cfg):
         cfg.local_manifest_archive_root, (cfg.staging_dir,))
 
 
+def _run_all_session_health(cfg):
+    """READ-ONLY health classification across every session (Plan 1).
+
+    Opens no LTFS path, reads no tape, starts nothing, and writes no row.
+
+    ``init_schema=False`` is load-bearing, not a micro-optimisation: the default
+    ``PgDatabaseManager`` constructor APPLIES PENDING MIGRATIONS and commits
+    them. A command advertised as read-only that quietly migrates the catalog
+    would be a lie, and would make this report unusable as pre-change evidence —
+    the thing it exists to be. The liveness inputs are host-wide, so a run while
+    the archiver is active is reported rather than silently ignored.
+    """
+    from src.pg_db import PgDatabaseManager
+    from src.session_health import all_session_health
+
+    conninfo = _conninfo(cfg)
+    db = PgDatabaseManager(conninfo, init_schema=False)
+    try:
+        report = all_session_health(
+            db,
+            active_processes=active_archive_processes(),
+            lock_holders=archiver_lock_status(conninfo))
+    finally:
+        db.close()
+    report["database"] = cfg.pg_dbname
+    _print_json(report)
+    return 0
+
+
 def _apply_incremental_scan_schema(cfg, args, parser):
     """Guarded entry point for migration 014 (Plan 1, Task 2.1).
 
@@ -236,7 +265,12 @@ def _run_frontier_bootstrap(cfg, args, parser):
                 skipped_tracker=SkippedFileTracker(), ui=ConsoleUI(),
                 timeout=cfg.ssh_command_timeout_seconds),
             stop_event=threading.Event(), source_host=cfg.remote_host,
-            ui=ConsoleUI())
+            ui=ConsoleUI(),
+            # Real liveness evidence. Without these the bootstrap's
+            # quiescence gate would be told 'nothing is running' without
+            # anything having looked.
+            active_processes_probe=active_archive_processes,
+            lock_holders_probe=lambda: archiver_lock_status(_conninfo(cfg)))
         if not args.execute:
             report = bootstrap.dry_run()
             report["note"] = ("dry run; nothing was created. Re-run with "
@@ -458,6 +492,9 @@ def _build_parser():
                              "incremental frontier. Dry run unless --execute "
                              "--yes; traverses the source READ-ONLY and never "
                              "rewrites a chunk.")
+    parser.add_argument("--all-session-health", action="store_true",
+                        help="READ-ONLY health classification for EVERY "
+                             "session. Creates no state, touches no LTFS.")
     parser.add_argument("--session-frontier-report", action="store_true",
                         help="READ-ONLY frontier/membership report for one or "
                              "more sessions (--session-id). Creates no state "
@@ -582,6 +619,9 @@ def _dispatch(parser, args):
             "applied": True,
         })
         return 0
+
+    if args.all_session_health:
+        return _run_all_session_health(cfg)
 
     if args.session_frontier_report:
         return _run_session_frontier_report(cfg, args, parser)

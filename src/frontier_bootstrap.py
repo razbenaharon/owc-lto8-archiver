@@ -37,6 +37,7 @@ so an abandoned attempt costs nothing but the traversal.
 import os
 
 from .logsetup import get_logger
+from .pipeline_types import ChunkStatus
 from .scan_frontier import (DirectoryFrontierCoordinator, canonicalize_scopes,
                             reconcile_scope_order)
 
@@ -56,7 +57,12 @@ class FrontierBootstrap:
 
     def __init__(self, *, db, session_id, scan_paths, archive_root,
                  scanner_factory, stop_event, source_host=None, ui=None,
-                 max_directories=None):
+                 max_directories=None, active_processes_probe=None,
+                 lock_holders_probe=None):
+        #: Liveness probes. Injected so tests can drive them, but NEVER
+        #: defaulted to "nothing is running" — see :meth:`_session_report`.
+        self.active_processes_probe = active_processes_probe
+        self.lock_holders_probe = lock_holders_probe
         self.db = db
         self.session_id = session_id
         self.scan_paths = list(scan_paths)
@@ -121,34 +127,139 @@ class FrontierBootstrap:
                 "describes")
 
         report["session_report"] = self._session_report()
-        if report["session_report"] is not None:
-            for reason in report["session_report"].get("blocking", []):
-                # A shared plan or an ambiguous chunk must be resolved by a
-                # human before a migration, not during one.
-                report["blocking"].append(f"session state: {reason}")
+        report["blocking"].extend(
+            self._bootstrap_blockers(report["session_report"]))
 
         report["would_proceed"] = not report["blocking"]
         return report
 
+    @staticmethod
+    def _bootstrap_blockers(session_report):
+        """What must stop a bootstrap, derived from the report's FACTS.
+
+        This deliberately does **not** adopt every blocking reason the
+        read-only session report raises. The two answer different questions:
+
+        * ``session_frontier_report`` answers "is this session finished, and is
+          it safe to treat it as done?" — for which an unfinished scan is
+          correctly blocking;
+        * a bootstrap asks "can I safely establish a conservative frontier for
+          this session?" — for which **an unfinished scan is the expected
+          input**, not an obstacle. Refusing it there made the bootstrap
+          unable to do the one job Task 4.2 defines for it: migrate an
+          incomplete historical scan.
+
+        So ``scan_complete = false`` is allowed through, and everything it
+        implies is handled by initialising the frontier as pending/partial and
+        never marking the scan complete. What still blocks is anything that
+        makes the session's *current* state unsafe to build on. Each is read as
+        a structured fact rather than by matching the report's prose, so a
+        reworded message can never silently disable a gate.
+        """
+        AMBIGUOUS_CHUNK_STATE = ChunkStatus.BACKING.value
+        blockers = []
+        if session_report is None:
+            return ["the session report could not be produced, so the "
+                    "session's state is unknown"]
+
+        for problem in session_report.get("errors", []):
+            blockers.append(f"session state could not be read: {problem}")
+
+        transient = session_report.get("transient_chunks") or {}
+        ambiguous = transient.get(AMBIGUOUS_CHUNK_STATE)
+        if ambiguous:
+            blockers.append(
+                f"{ambiguous} chunk(s) are '{AMBIGUOUS_CHUNK_STATE}': a tape "
+                "write began and its on-tape outcome cannot be known from the "
+                "catalog alone (incident 010). A human must compare the tape "
+                "against the catalog first.")
+        mid_flight = {k: v for k, v in transient.items()
+                      if k != AMBIGUOUS_CHUNK_STATE}
+        if mid_flight:
+            blockers.append(
+                f"chunks are mid-flight ({mid_flight}); a worker may still be "
+                "running, and a bootstrap must observe a still session")
+
+        shared = session_report.get("shared_plan_sessions") or []
+        if shared:
+            blockers.append(
+                f"this session shares its plan with {shared}; migrating one of "
+                "them would change what the others see")
+
+        liveness = session_report.get("liveness") or {}
+        if liveness.get("lock_holders"):
+            blockers.append(
+                f"the archiver lock is held by {liveness['lock_holders']}")
+        if liveness.get("active_processes"):
+            blockers.append(
+                f"archive processes are running: {liveness['active_processes']}")
+
+        orphans = (session_report.get("artifacts") or {}).get("orphan_parts")
+        if orphans:
+            blockers.append(
+                f"{len(orphans)} orphaned .part artifact(s) exist; reconcile "
+                "them before publishing new segments")
+        return blockers
+
     def _session_report(self):
+        """The session report, with REAL liveness evidence.
+
+        This used to pass ``lock_holders=[]`` and ``active_processes=[]`` —
+        hard-coded emptiness, which told the report "nothing is running"
+        without looking. Every liveness gate downstream was therefore vacuous:
+        a bootstrap could have been approved while an archiver held the lock.
+        The evidence is now measured, and a probe that cannot answer returns
+        the string it failed with, so the gate blocks rather than assuming
+        quiet.
+        """
         from .startup_reconcile import session_frontier_report
         try:
             return session_frontier_report(
                 self.db, self.session_id, archive_root=self.archive_root,
-                lock_holders=[], active_processes=[])
+                lock_holders=self._lock_holders(),
+                active_processes=self._active_processes())
         except Exception as exc:
             get_logger().warning("bootstrap session report failed: %s", exc)
             return None
 
+    def _active_processes(self):
+        """Archive/transfer processes on this host, or a blocking marker."""
+        if self.active_processes_probe is not None:
+            probe = self.active_processes_probe
+        else:
+            from .local_manifest_archive import active_archive_processes
+            probe = active_archive_processes
+        try:
+            return probe()
+        except Exception as exc:
+            return [{"probe_failed": str(exc)}]
+
+    def _lock_holders(self):
+        """Archiver advisory-lock holders, or a blocking marker."""
+        if self.lock_holders_probe is None:
+            # No conninfo to probe with. Unknown must not read as "nobody".
+            return [{"probe_unavailable":
+                     "no archiver-lock probe was supplied to the bootstrap"}]
+        try:
+            return self.lock_holders_probe()
+        except Exception as exc:
+            return [{"probe_failed": str(exc)}]
+
     # ------------------------------------------------------------------
     # Execute — explicit, transactional, resumable
     # ------------------------------------------------------------------
-    def execute(self, approved=False):
+    def execute(self, approved=False, conservative=False):
         """Perform the migration. Requires explicit approval.
 
         Resumable: the run record and the directory frontier both persist, so
         an interrupted bootstrap continues from the directories it had already
         listed rather than starting over.
+
+        ``conservative=True`` performs the **structure-only** bootstrap: it
+        creates the scope rows and enqueues each configured root as a
+        ``pending`` directory, and stops there. See
+        :meth:`execute_conservative` for why that is the right shape for a
+        session whose historical scan never finished.
         """
         if not approved:
             raise BootstrapRefused(
@@ -159,6 +270,9 @@ class FrontierBootstrap:
         if not plan["would_proceed"]:
             raise BootstrapRefused(
                 "refusing to bootstrap: " + "; ".join(plan["blocking"]))
+
+        if conservative:
+            return self.execute_conservative(plan)
 
         run = self.db.start_frontier_bootstrap(self.session_id,
                                                source_host=self.source_host)
@@ -189,6 +303,94 @@ class FrontierBootstrap:
             "segments_published": coordinator.segments_published,
             "coverage_final": final,
             **imported,
+        })
+        return result
+
+    def execute_conservative(self, plan=None):
+        """Structure-only bootstrap: scopes and pending roots, nothing else.
+
+        This is the correct migration for a session whose historical scan never
+        finished, and it is deliberately the *smallest* thing that can be true.
+
+        What it writes
+        --------------
+        Scope rows for the configured roots, and one ``pending`` directory row
+        per directory scope — its own root. That is all. It lists no directory,
+        publishes no segment, imports no membership and finalizes nothing.
+
+        Why not traverse here
+        ---------------------
+        A full traversal is a multi-hour SSH walk of the whole source, and it
+        would be doing the *scanner's* job during a migration window. Worse, it
+        would have to decide coverage for directories the historical scan may or
+        may not have reached — and any such decision made now is a guess. By
+        leaving every root ``pending`` the next approved run simply scans, and
+        the frontier's own rules decide coverage from real traversal evidence.
+
+        Why this cannot lose or duplicate work
+        --------------------------------------
+        * **Nothing is skipped.** Every root starts ``pending``, so the whole
+          configured source is queued for exploration. There is no directory
+          this bootstrap could mark covered without having looked at it,
+          because it marks nothing covered.
+        * **Nothing is duplicated.** When the next run lists a directory and
+          publishes its segment, ``import_legacy_scan_segment`` reconciles that
+          segment ONCE against the existing 23M snapshot rows — path AND size —
+          and only the genuinely ``new`` entries reach the chunk builder. Files
+          already planned by the historical scan are recorded as ``covered``
+          and never appended again.
+        * **Existing work is untouched.** No chunk, ordinal, status, membership
+          row, ZIP container or tape locator is read for writing here.
+        * **The scan is never marked complete.** ``finalize()`` is not called,
+          and the session's ``scan_complete`` flag is not written.
+
+        Idempotence
+        -----------
+        Provably identical rather than refused. ``establish_scopes()`` creates
+        scopes only when none are persisted and reconciles the order otherwise,
+        and enqueueing a root that already exists is a no-op on the
+        ``(scope, path)`` unique constraint. A second conservative run over an
+        unchanged configuration therefore writes nothing new. A *changed* root
+        set is refused by ``reconcile_scope_order`` rather than silently
+        re-shaped.
+        """
+        plan = plan if plan is not None else self.dry_run()
+        run = self.db.start_frontier_bootstrap(self.session_id,
+                                               source_host=self.source_host)
+        bootstrap_id = run["bootstrap_id"]
+        coordinator = DirectoryFrontierCoordinator(
+            db=self.db, session_id=self.session_id,
+            scan_paths=self.scan_paths, archive_root=self.archive_root,
+            scanner_factory=self.scanner_factory, stop_event=self.stop_event,
+            ui=self.ui, max_directories=0)
+        try:
+            scopes = coordinator.establish_scopes()
+        except Exception as exc:
+            self._record(bootstrap_id, coordinator,
+                         state=STATE_FAILED, detail=str(exc))
+            get_logger().exception("conservative_bootstrap_failed: %s",
+                                   bootstrap_id)
+            raise
+
+        # RUNNING, never COMPLETED: coverage is not final and the source has
+        # not been traversed. Recording it completed would be the same lie as
+        # inferring coverage from catalog rows.
+        self._record(bootstrap_id, coordinator, state=STATE_RUNNING,
+                     coverage_final=False, segments_imported=0,
+                     entries_covered=0, entries_new=0, entries_changed=0,
+                     detail="conservative structure-only bootstrap: scopes "
+                            "created, roots queued pending, no traversal")
+        result = dict(plan)
+        result.update({
+            "bootstrap_id": bootstrap_id,
+            "mode": "conservative",
+            "scopes_established": len(scopes),
+            "directories_listed": 0,
+            "segments_published": 0,
+            "coverage_final": False,
+            "scan_marked_complete": False,
+            "segments_imported": 0, "entries_covered": 0,
+            "entries_new": 0, "entries_changed": 0,
         })
         return result
 

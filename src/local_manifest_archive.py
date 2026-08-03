@@ -63,12 +63,24 @@ def active_archive_processes():
             name = (proc.info.get("name") or "").lower()
             cmdline = " ".join(proc.info.get("cmdline") or [])
             lowered = cmdline.lower().replace("\\", "/")
+            # The module-name heuristics below match a COMMAND LINE, so any
+            # process that merely mentions the archiver counts — an editor, a
+            # grep, a code-review tool invoked with a prompt naming
+            # `remote_orchestrator.py`. That was observed reporting a live
+            # archiver when none existed, which turns every quiescence gate
+            # into a false alarm. The archiver itself is always a Python
+            # interpreter, so requiring one keeps every true positive and drops
+            # the impostors. `hard_names` is unaffected: robocopy/scp/tar are
+            # matched by executable name and never by command line.
+            interpreter = name.startswith("python") or name.startswith("pythonw")
             is_archiver = (
                 name in hard_names
-                or bool(re.search(r"(^|/)run\.py(?:\s|$)", lowered))
-                or "remote_orchestrator" in lowered
-                or "local_orchestrator" in lowered
                 or "catalog-sync" in lowered
+                or (interpreter and (
+                    bool(re.search(r"(^|/)run\.py(?:\s|$)", lowered))
+                    or "remote_orchestrator" in lowered
+                    or "local_orchestrator" in lowered
+                ))
             )
             if is_archiver:
                 results.append({"pid": proc.info["pid"], "name": name,

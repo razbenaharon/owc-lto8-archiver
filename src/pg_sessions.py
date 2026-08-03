@@ -1233,6 +1233,19 @@ class PgSessionMixin:
             f"get_chunk_state_counts({session_id})")
         return [dict(row) for row in rows]
 
+    def list_remote_sessions(self):
+        """Every remote session, oldest first. Read-only.
+
+        The all-session health report discovers its subjects here rather than
+        from a list in code, so a session created after the report was written
+        is still audited.
+        """
+        return self._run_read(
+            lambda conn: conn.execute(
+                "SELECT * FROM remote_sessions ORDER BY session_id"
+            ).fetchall(),
+            "list remote sessions")
+
     def find_sessions_sharing_plan(self, session_id):
         """Other sessions on the SAME plan or snapshot. Read-only.
 

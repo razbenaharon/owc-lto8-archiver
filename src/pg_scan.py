@@ -752,6 +752,100 @@ class PgScanMixin:
         return self._transaction(
             operation, f"import legacy scan segment {scan_segment_id}")
 
+    def mark_segment_fully_allocated(self, scan_segment_id):
+        """Mark a segment ``consumed`` once the publisher has accounted for ALL
+        of its entries — including the ones it did not plan.
+
+        ``consume_segment_range`` advances the cursor by the number of entries
+        that became chunk membership, and sets ``consumed`` only when the cursor
+        reaches the end of the ready range. That is correct when every entry is
+        planned, and wrong the moment filtering removes some: a segment whose
+        entries were mostly already planned never reaches its end ordinal, stays
+        ``ready`` for ever, and is handed back to the publisher on the next pass
+        — which re-plans its new entries and duplicates them.
+
+        Allocation is therefore two facts, not one: how many ordinals became
+        membership (the cursor), and whether the segment still has anything left
+        to offer (this). A segment the publisher has fully classified has
+        nothing left to offer regardless of how much of it was planned.
+        """
+        self._require_incremental_scan_schema()
+        now = _now_utc()
+
+        def operation(conn):
+            row = conn.execute(
+                """UPDATE remote_scan_segments
+                   SET state=%s, updated_at=%s
+                   WHERE scan_segment_id=%s AND state IN (%s, %s)
+                   RETURNING scan_segment_id, state""",
+                (ScanSegmentState.CONSUMED.value, now, scan_segment_id,
+                 ScanSegmentState.READY.value,
+                 ScanSegmentState.PARTIALLY_CONSUMED.value),
+            ).fetchone()
+            return bool(row)
+
+        return self._transaction(
+            operation, f"mark segment {scan_segment_id} fully allocated")
+
+    def classify_segment_entries(self, session_id, entries):
+        """Classify entries against the legacy snapshot WITHOUT writing.
+
+        The same set-based comparison :meth:`import_legacy_scan_segment`
+        performs, with none of its side effects — no error rows, no state
+        change, no marking. It exists because the import is deliberately
+        once-only, which left a hole:
+
+        A segment whose import already committed returns
+        ``already_imported=True`` with **empty** lists, and the caller then had
+        nothing to filter with. On any restart between "segment imported" and
+        "chunk sealed" it therefore fed the FULL rediscovered set back into the
+        chunk builder — re-planning files that were already planned and moving
+        chunk boundaries, which is precisely what the frontier exists to
+        prevent. Recomputing the classification is safe (it is a pure read),
+        bounded (one query per segment against the ``(snapshot_id,
+        remote_path)`` unique index) and idempotent.
+
+        Returns ``{"covered": [...], "new": [...], "source_changed": [...]}``
+        with the same shapes as the import.
+        """
+        self._require_incremental_scan_schema()
+        entries = [(str(path), int(size)) for path, size in entries]
+        if not entries:
+            return {"covered": [], "new": [], "source_changed": []}
+
+        def operation(conn):
+            snapshot_id_row = conn.execute(
+                """SELECT p.snapshot_id
+                   FROM remote_sessions s
+                   JOIN remote_plans p ON p.plan_id = s.plan_id
+                   WHERE s.session_id=%s""",
+                (session_id,),
+            ).fetchone()
+            existing = {}
+            if snapshot_id_row is not None:
+                for row in conn.execute(
+                    """SELECT remote_path, file_size_bytes
+                       FROM remote_snapshot_files
+                       WHERE snapshot_id=%s AND remote_path = ANY(%s)""",
+                    (snapshot_id_row["snapshot_id"],
+                     [path for path, _size in entries]),
+                ).fetchall():
+                    existing[row["remote_path"]] = int(row["file_size_bytes"])
+
+            covered, fresh, changed = [], [], []
+            for path, size in entries:
+                known = existing.get(path.replace("\\", "/"))
+                if known is None:
+                    fresh.append((path, size))
+                elif known == size:
+                    covered.append((path, size))
+                else:
+                    changed.append((path, known, size))
+            return {"covered": covered, "new": fresh, "source_changed": changed}
+
+        return self._run_read(
+            operation, f"classify segment entries for session {session_id}")
+
     def invalidate_segment(self, scan_segment_id, reason):
         """Mark a segment unusable. Never deletes: the row is evidence."""
         self._require_incremental_scan_schema()
