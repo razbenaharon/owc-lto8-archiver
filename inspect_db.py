@@ -279,7 +279,8 @@ def _run_frontier_bootstrap(cfg, args, parser):
             return 0
         if not args.yes:
             parser.error("--bootstrap-frontier --execute requires --yes")
-        _print_json(bootstrap.execute(approved=True))
+        _print_json(bootstrap.execute(approved=True,
+                                      conservative=args.conservative))
         return 0
     finally:
         db.close()
@@ -495,6 +496,14 @@ def _build_parser():
     parser.add_argument("--all-session-health", action="store_true",
                         help="READ-ONLY health classification for EVERY "
                              "session. Creates no state, touches no LTFS.")
+    parser.add_argument("--conservative", action="store_true",
+                        help="With --bootstrap-frontier --execute: the "
+                             "STRUCTURE-ONLY migration. Creates scope rows "
+                             "and queues each root pending; lists no "
+                             "directory, imports no membership and never "
+                             "marks the scan complete. This is the correct "
+                             "shape for a session whose historical scan "
+                             "never finished.")
     parser.add_argument("--session-frontier-report", action="store_true",
                         help="READ-ONLY frontier/membership report for one or "
                              "more sessions (--session-id). Creates no state "
