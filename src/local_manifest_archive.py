@@ -85,8 +85,30 @@ def active_archive_processes():
             if is_archiver:
                 results.append({"pid": proc.info["pid"], "name": name,
                                 "command": cmdline[:500]})
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
+        except psutil.NoSuchProcess:
             continue
+        except psutil.AccessDenied:
+            # An elevated process refuses its command line. Skipping it
+            # outright is a fail-OPEN in a safety probe: an archiver started
+            # elevated would simply vanish from the evidence. But most
+            # inaccessible processes on Windows are system services, and
+            # reporting all of them would block every gate forever.
+            #
+            # The name is almost always readable even when the cmdline is not,
+            # so use it: only a process that could plausibly BE the archiver —
+            # a Python interpreter, or one of the hard-named transfer tools —
+            # is recorded, and it is recorded as *indeterminate* rather than as
+            # a confirmed archiver, because nobody could read what it is doing.
+            try:
+                name = (proc.info.get("name") or "").lower()
+            except Exception:                     # pragma: no cover
+                continue
+            if name in hard_names or name.startswith("python"):
+                results.append({
+                    "pid": proc.info.get("pid"), "name": name,
+                    "command": "<access denied: cannot read the command line, "
+                               "so this process cannot be ruled out>",
+                    "indeterminate": True})
     return results
 
 
