@@ -410,15 +410,19 @@ class ConfigManager:
     def incremental_scan_enabled(self):
         """Opt-in for the persistent incremental directory frontier (Plan 1).
 
-        **Default false**, and false is also what any malformed value means:
-        the legacy ``StreamingRemoteScanner`` stays the production scanner
-        until an operator turns this on deliberately.
+        **Default false**, and false is also what any malformed value means,
+        so a configuration that never mentions the setting cannot end up with
+        the frontier active.
 
-        The flag alone is not sufficient. ``src.scan_frontier.decide_scan_mode``
-        additionally requires migration 014 *and* its finalized constraints to
-        validate before the frontier can activate; it never backfills or
-        migrates a session implicitly. Turning this on against an unmigrated or
-        drifted database keeps the legacy scanner and says why.
+        UPDATED AT PLAN 1 COMPLETION. This used to say the legacy
+        ``StreamingRemoteScanner`` stayed the production scanner until an
+        operator opted in. That is no longer true: the frontier is the only
+        scanner a production run can build, and there is no runtime fallback.
+        What this flag now gates is whether the *incremental* frontier state is
+        used at all; an unusable migration-014 schema **stops the run**
+        (``SAFETY_BLOCK`` / ``scan_frontier_unavailable``) rather than
+        downgrading, because a downgrade is how two scanners end up running
+        against one frontier.
         """
         return self.config.get(
             'REMOTE', 'incremental_scan',
