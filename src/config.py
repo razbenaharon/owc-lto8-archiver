@@ -96,12 +96,10 @@ class ConfigManager:
             'remote_path':      '',
             'remote_selected_paths': '',
             'confirm_before_backup': 'true',
+            'tape_label': '',
             'staging_fill_pct': '0.80',
-            'scan_mode': 'directories',
-            'remote_scan_depth': '2',
             'large_file_min_mb': '10',
-            'directory_chunk_max_gb': '50',
-            'directory_chunk_max_files': '100000',
+            'incremental_scan': 'false',
         }
         self.config['PIPELINE'] = {
             # Byte-bounded ready queue (Phase 4). Values are BYTES and describe
@@ -372,25 +370,59 @@ class ConfigManager:
     @property
     def staging_fill_pct(self):
         return self._get_float('REMOTE', 'staging_fill_pct', 0.80)
-    @property
-    def remote_scan_mode(self):
-        return self.config.get(
-            'REMOTE', 'scan_mode', fallback='directories').strip().lower()
-    @property
-    def remote_scan_depth(self):
-        return self._get_int('REMOTE', 'remote_scan_depth', 2, minimum=0)
+    # ``scan_mode``, ``remote_scan_depth``, ``directory_chunk_max_gb`` and
+    # ``directory_chunk_max_files`` were removed by Plan 1 Task 1.6: the audit
+    # found no reader for any of them — they configured the dormant
+    # directory-first scanner that was never wired into the production
+    # new-session path. An existing config.ini may still contain the keys;
+    # configparser ignores keys nothing asks for, so no operator action is
+    # needed. Plan 1 Task 2.3's directory frontier introduces its own settings.
     @property
     def large_file_min_mb(self):
+        """Threshold above which a file is archived loose rather than packed.
+
+        Retained (unlike its directory-first siblings) because it is a real
+        archival policy figure, defaulting to the catalog's own
+        ``index_min_file_mb``, and Plans 2-3 size loose/stored-TAR behaviour on
+        it. It currently has no reader in the remote path.
+        """
         return self._get_float('REMOTE', 'large_file_min_mb',
                                self.index_min_file_mb)
     @property
-    def directory_chunk_max_gb(self):
-        return self._get_float('REMOTE', 'directory_chunk_max_gb',
-                               self.chunk_cap_gb)
+    def remote_tape_label(self):
+        """The cartridge a NEW remote session should target (Plan 1 Task 1.4).
+
+        Blank by default. It exists so a fresh session can name its target
+        **without reading the drive**: the old flow auto-detected the label by
+        reading the mounted volume before anything else happened, which is a
+        device access outside a finite write group — exactly what Task 1.4
+        removes. When this is blank an interactive run prompts for the label;
+        a headless run without ``--resume`` still refuses to start, blank or
+        not, because a fresh session also needs the capacity confirmation.
+
+        A RESUMED session ignores this entirely and uses its persisted
+        label/generation, so editing config.ini can never re-point work that is
+        already planned against a cartridge.
+        """
+        return (self.config.get('REMOTE', 'tape_label', fallback='') or '').strip()
+
     @property
-    def directory_chunk_max_files(self):
-        return self._get_int('REMOTE', 'directory_chunk_max_files',
-                             self.chunk_max_files, minimum=1)
+    def incremental_scan_enabled(self):
+        """Opt-in for the persistent incremental directory frontier (Plan 1).
+
+        **Default false**, and false is also what any malformed value means:
+        the legacy ``StreamingRemoteScanner`` stays the production scanner
+        until an operator turns this on deliberately.
+
+        The flag alone is not sufficient. ``src.scan_frontier.decide_scan_mode``
+        additionally requires migration 014 *and* its finalized constraints to
+        validate before the frontier can activate; it never backfills or
+        migrates a session implicitly. Turning this on against an unmigrated or
+        drifted database keeps the legacy scanner and says why.
+        """
+        return self.config.get(
+            'REMOTE', 'incremental_scan',
+            fallback='false').strip().lower() in ('1', 'true', 'yes', 'on')
 
     # --- [PERFORMANCE] : continuous-streaming pipeline tuning -----------------
     @property
@@ -460,6 +492,24 @@ class ConfigManager:
         raw = self._get_int('PIPELINE', 'ready_queue_staging_reserve_bytes', 0,
                             minimum=0)
         return auto if raw == 0 else raw
+
+    @property
+    def max_unstaged_backlog_chunks(self):
+        """How far the scanner may run ahead of the stager (Plan 1 Task 1.3).
+
+        A **bound**, not a barrier. The pipeline re-derives the number of sealed
+        chunks that no worker has started staging from authoritative chunk
+        status on every scheduling decision, and pauses publication while that
+        number is at this limit. As soon as the stager takes one chunk,
+        exploration resumes — which is what stops a large resumed backlog from
+        indefinitely postponing renewed scanning, the failure mode the old
+        bounded hand-off queue had.
+
+        Raising it costs only planning rows; lowering it below a handful will
+        make the scanner wait on the (much slower) fetch/pack stage.
+        """
+        return self._get_int('PIPELINE', 'max_unstaged_backlog_chunks', 64,
+                             minimum=1)
 
     def validated_ready_queue_limits(self):
         """Ready-queue limits proven to leave room for fetch/pack (Phase 4.5).

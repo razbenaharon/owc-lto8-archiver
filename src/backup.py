@@ -131,6 +131,13 @@ class LTOBackup:
             if self.governor:
                 details.update(self.governor.telemetry_details())
             return details
+        def _stage_scan_details():
+            """Run-level scan telemetry captured when this chunk was staged.
+
+            Aggregates only (see ScanMetrics); never a file or directory name.
+            Empty for local/direct runs and for any producer that did not scan.
+            """
+            return dict(getattr(stage_stats, "scan_stats", None) or {})
         print(f"\n[BACKUP] Starting... Tape: {tape_label} | Drive: {tape_drive}")
         if not _ensure_lto_drive_ready(tape_drive, prefix="[BACKUP]"):
             raise RuntimeError("LTO drive is not ready for backup.")
@@ -478,6 +485,7 @@ class LTOBackup:
                             skipped_tracker.write_csv(self.log_dir or BACKUP_LOG_DIR)
                             if skipped_tracker and skipped_tracker.has_items() else '',
                         **_stage_ram_details(),
+                        **_stage_scan_details(),
                         **tape_sampler.as_details("tape"),
                         **tape_profiler.as_details("tape"),
                     },
@@ -701,6 +709,7 @@ class LTOBackup:
                 'skipped_files_count': skipped_count,
                 'skipped_files_report': skipped_report,
                 **_stage_ram_details(),
+                **_stage_scan_details(),
                 **tape_sampler.as_details("tape"),
                 **tape_profiler.as_details("tape"),
                 **db_sampler.as_details("db_sync"),

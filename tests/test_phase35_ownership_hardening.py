@@ -283,10 +283,13 @@ class OwnershipFailureClassificationTests(unittest.TestCase):
         import inspect
         # Phase 4: ownership + the gate moved to the group boundary; the
         # per-chunk body (which owns the 'backing' transition) is separate.
+        # Task 1.2: the write group lives in src.remote_writer now; the
+        # orchestrator method is a delegating façade.
+        from src.remote_writer import RemoteChunkWriter
         group_src = textwrap.dedent(
-            inspect.getsource(ro.RemoteOrchestrator._write_chunk_group))
+            inspect.getsource(RemoteChunkWriter._write_chunk_group))
         one_src = textwrap.dedent(
-            inspect.getsource(ro.RemoteOrchestrator._write_one_chunk_owned))
+            inspect.getsource(RemoteChunkWriter._write_one_chunk_owned))
         group_fn = ast.parse(group_src).body[0]
 
         # The ownership handler must set preserve_pack=True with our reason.
@@ -303,14 +306,26 @@ class OwnershipFailureClassificationTests(unittest.TestCase):
         # An ownership failure must never set 'backing': the group boundary
         # contains no such transition at all.
         def backing_setters(src):
+            """Every call that moves a chunk to 'backing', literal or typed.
+
+            Task 1.5 replaced the bare strings with ``ChunkStatus.BACKING.value``
+            and routed writes through ``transition_chunk``; both spellings must
+            be recognised, or this proof silently stops proving anything.
+            """
             out = []
             for node in ast.walk(ast.parse(src)):
-                if (isinstance(node, ast.Call)
+                if not (isinstance(node, ast.Call)
                         and isinstance(node.func, ast.Attribute)
-                        and node.func.attr == "update_chunk_status"):
-                    args = [a.value for a in node.args
-                            if isinstance(a, ast.Constant)]
-                    if "backing" in args:
+                        and node.func.attr in ("update_chunk_status",
+                                               "transition_chunk")):
+                    continue
+                for arg in list(node.args) + [kw.value for kw in node.keywords]:
+                    if isinstance(arg, ast.Constant) and arg.value == "backing":
+                        out.append(node.lineno)
+                    elif (isinstance(arg, ast.Attribute)
+                          and arg.attr == "value"
+                          and isinstance(arg.value, ast.Attribute)
+                          and arg.value.attr == "BACKING"):
                         out.append(node.lineno)
             return out
 

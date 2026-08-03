@@ -1,11 +1,15 @@
 """Phase 5B / 5B.5: sealed-batch schema + repository against ISOLATED PostgreSQL.
 
 Safety model (must hold before any DDL runs):
-* Opt-in only: skips unless ``LTO_PG_SEALED_BATCH_IT=1``. Never connects to
-  production by default.
-* Throwaway database name is ``sealed_batch_test_<uuid>``, asserted to carry the
-  prefix and to differ from every production database name.
-* ``DROP DATABASE`` runs only for a verified throwaway prefix.
+* Opt-in only: skips unless ``LTO_PG_SEALED_BATCH_IT=1``.
+* The SERVER is chosen by ``tests/pg_test_guard.py``, which refuses anything
+  that is not provably disposable — no implicit defaults, no port 5432, no
+  non-loopback host, and no server hosting the production catalog. Formerly
+  this module inherited ``build_conninfo``'s defaults, which point at the
+  production container on this workstation.
+* Throwaway database names carry the guard's per-run marker, and are asserted
+  here to differ from every production database name as a second layer.
+* ``DROP DATABASE`` runs only for a name THIS run created.
 * PostgreSQL-specific: no SQLite fallback.
 
 No production database is created, modified, or dropped. Parent tables
@@ -19,9 +23,9 @@ import time
 import unittest
 import uuid
 
-from src.config import ConfigManager, _load_env_file
-from src.constants import PROJECT_ROOT
-from src.pg_bulk import build_conninfo
+from src.config import ConfigManager
+from pg_test_guard import (RUN_PREFIX, create_test_database,
+                           drop_test_database, pg_available)
 from src import sealed_batch_repository as sbr
 from src.sealed_batch_repository import (
     SealedBatchRepository, SealedBatchError, ImmutableBatchError,
@@ -37,7 +41,8 @@ try:
 except ImportError:                          # pragma: no cover
     psycopg = None
 
-THROWAWAY_PREFIX = "sealed_batch_test_"
+#: Supplied by the guard, unique per pytest run.
+THROWAWAY_PREFIX = RUN_PREFIX
 _OPT_IN = os.environ.get("LTO_PG_SEALED_BATCH_IT") == "1"
 GiB = 1024 ** 3
 
@@ -63,40 +68,23 @@ CREATE TABLE IF NOT EXISTS remote_chunks (
 """
 
 
-def _password():
-    env = _load_env_file(os.path.join(PROJECT_ROOT, ".env"))
-    return os.environ.get("PGPASSWORD") or env.get("PGPASSWORD")
-
-
 def _production_dbnames():
     cfg = ConfigManager()
     return {cfg.pg_dbname, "lto_archive"}
 
 
 def _pg_reachable():
+    """Guard-mediated: an UNSAFE configured target raises rather than skips."""
     if psycopg is None or not _OPT_IN:
         return False
-    try:
-        with psycopg.connect(build_conninfo(dbname="postgres",
-                                            password=_password()),
-                             connect_timeout=4):
-            return True
-    except Exception:
-        return False
+    return pg_available()
 
 
 def _create_throwaway(with_parents=True, with_012=True):
     """Create an isolated throwaway DB (verified name) and return (name, repo)."""
-    pw = _password()
-    name = f"{THROWAWAY_PREFIX}{uuid.uuid4().hex[:12]}"
+    name, conninfo = create_test_database("sealed_batch")
     assert name.startswith(THROWAWAY_PREFIX)
     assert name not in _production_dbnames()
-    maint = build_conninfo(dbname="postgres", password=pw)
-    with psycopg.connect(maint, autocommit=True) as conn:
-        assert conn.execute("SELECT current_database()").fetchone()[0] == \
-            "postgres"
-        conn.execute(f'CREATE DATABASE "{name}"')
-    conninfo = build_conninfo(dbname=name, password=pw)
     if with_parents:
         with psycopg.connect(conninfo) as conn:
             conn.execute(_MINIMAL_PARENTS)
@@ -108,15 +96,11 @@ def _create_throwaway(with_parents=True, with_012=True):
 
 
 def _drop_throwaway(name):
-    if not name.startswith(THROWAWAY_PREFIX) or name in _production_dbnames():
-        print(f"[SAFETY] refusing to drop {name!r}")     # pragma: no cover
+    if name in _production_dbnames():                    # pragma: no cover
+        print(f"[SAFETY] refusing to drop {name!r}")
         return
-    with psycopg.connect(build_conninfo(dbname="postgres", password=_password()),
-                         autocommit=True) as conn:
-        conn.execute(
-            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-            "WHERE datname=%s AND pid <> pg_backend_pid()", (name,))
-        conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+    # Refuses on its own if the name lacks this run's marker.
+    drop_test_database(name)
 
 
 def _seed_session(conninfo, n_chunks=12, tape="Tape_5BTEST", scan_complete=False):

@@ -344,10 +344,22 @@ class TapeWriteGovernorLifecycleTests(unittest.TestCase):
             backup.eject_tape = lambda _drive: None
             result = SimpleNamespace(
                 stdout=stdout, stderr="", returncode=returncode)
+            # The memory sample MUST be mocked, like every other governor test
+            # in this file. Without it these two cases construct a real
+            # governor that reads real host RAM and then blocks FOREVER in
+            # `wait_or_pause("tape", "start")` whenever the machine has less
+            # than governor_tape_min_free_ram_gb (3.0 GB) available — which is
+            # routine on this 15.6 GB host, where psutil counts reclaimable
+            # file cache as used (see docs/incidents/001). The wait is
+            # unbounded by design in production; a test must not depend on it.
             with mock.patch("src.backup._ensure_lto_drive_ready",
                             return_value=True), \
                  mock.patch("src.backup._run_robocopy_tuned",
                             return_value=result), \
+                 mock.patch("src.resource_governor.psutil.virtual_memory",
+                            return_value=_vm()), \
+                 mock.patch("src.resource_governor.shutil.disk_usage",
+                            return_value=_disk()), \
                  mock.patch.object(backup, "_write_backup_log",
                                    return_value=""):
                 if returncode >= 8:

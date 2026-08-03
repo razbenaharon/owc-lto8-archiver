@@ -82,6 +82,40 @@ SUMMARY_COLUMNS = [
     'tape_close_seconds',
     'tape_stall_seconds',
     'tape_stall_count',
+    # Scan/planning telemetry (Plan 1 Task 0.2), appended at the end so older
+    # SUMMARY.csv files migrate without any field shifting. These are the
+    # measurements that decide between the three scan models: exploration cost,
+    # database membership cost, replay cost, and time-to-first-work.
+    #
+    # They are RUN-LEVEL AGGREGATES ONLY — counts, byte totals and elapsed
+    # times. No individual file or directory name appears in any of them; the
+    # pre-existing source_host/source_path columns remain the only path-bearing
+    # fields and are unchanged.
+    'scan_enumeration_seconds',
+    'scan_entries_seen',
+    'scan_entries_new',
+    'scan_entries_duplicate',
+    'scan_listing_starts',
+    'scan_discarded_partial_entries',
+    'scan_membership_query_seconds',
+    'scan_membership_query_paths',
+    # Round trips, counted separately from the rows they carried, so a bulk
+    # query is never mistaken for one query per file.
+    'scan_membership_query_count',
+    'scan_plan_insert_seconds',
+    'scan_plan_insert_rows',
+    'scan_plan_insert_calls',
+    'scan_sql_executions',
+    'scan_sql_rows',
+    'scan_seconds_to_first_sealed_chunk',
+    'scan_seconds_to_first_staged_chunk',
+    'scan_seconds_to_first_writer_group',
+]
+
+#: The Task 0.2 columns, in schema order. Kept as its own list so the writer
+#: and the tests agree on exactly which fields are scan telemetry.
+SCAN_METRIC_COLUMNS = [
+    column for column in SUMMARY_COLUMNS if column.startswith('scan_')
 ]
 
 
@@ -325,6 +359,12 @@ def append_backup_summary_row(log_dir=None, details=None, robocopy_result=None):
         'tape_stall_seconds': details.get('tape_stall_seconds', ''),
         'tape_stall_count': details.get('tape_stall_count', ''),
     })
+    # Scan telemetry is optional and non-fatal: a run without a scanner (a
+    # scan-complete resume, a local backup) simply leaves these blank, and a
+    # missing counter never blocks the row from being written.
+    for column in SCAN_METRIC_COLUMNS:
+        value = details.get(column)
+        row[column] = '' if value is None else value
     return _append_row(log_dir, row)
 
 

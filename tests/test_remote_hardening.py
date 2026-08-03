@@ -8,8 +8,6 @@ from unittest import mock
 from src.constants import LOCAL_STAGING_RESERVE_BYTES
 from src.orchestrators import (
     ChunkPlanner,
-    DirectoryPlanUnit,
-    DirectoryUnitPlanner,
     RemoteOrchestrator,
     RemoteScanner,
     StreamingChunkBuilder,
@@ -231,23 +229,6 @@ class StreamingChunkBuilderTests(unittest.TestCase):
         self.assertEqual(builder.flush(), [[("/f/c", 1)]])
 
 
-class DirectoryUnitPlannerTests(unittest.TestCase):
-    def test_keeps_whole_directory_when_under_thresholds(self):
-        unit = DirectoryPlanUnit("/root/project", 10, 100)
-        planner = DirectoryUnitPlanner(max_bytes=200, max_files=20)
-        self.assertEqual(planner.plan([unit]), [unit])
-
-    def test_descends_when_directory_exceeds_thresholds(self):
-        child_a = DirectoryPlanUnit("/root/project/a", 5, 50)
-        child_b = DirectoryPlanUnit("/root/project/b", 6, 60)
-        root = DirectoryPlanUnit(
-            "/root/project", 11, 110, children=[child_b, child_a])
-        planner = DirectoryUnitPlanner(max_bytes=75, max_files=10)
-        self.assertEqual(
-            [unit.original_dir_path for unit in planner.plan([root])],
-            ["/root/project/a", "/root/project/b"])
-
-
 class RemoteResumeChunkLimitTests(unittest.TestCase):
     def _orchestrator(self, allow_override=False):
         class FakeDB:
@@ -289,8 +270,8 @@ class FetchWatchdogTests(unittest.TestCase):
         orch = self._orchestrator()
         stop, abort = threading.Event(), threading.Event()
         plenty = SimpleNamespace(total=10**12, used=0, free=10**12)
-        with mock.patch("src.remote_orchestrator._dir_tree_size", return_value=300), \
-             mock.patch("src.remote_orchestrator.shutil.disk_usage",
+        with mock.patch("src.remote_staging._dir_tree_size", return_value=300), \
+             mock.patch("src.remote_staging.shutil.disk_usage",
                         return_value=plenty):
             orch._start_fetch_monitor(stop, abort, r"C:\stage\_fetch", 100)
             self.assertTrue(abort.wait(timeout=15),
@@ -302,8 +283,8 @@ class FetchWatchdogTests(unittest.TestCase):
         stop, abort = threading.Event(), threading.Event()
         low = SimpleNamespace(total=10**12, used=0,
                               free=LOCAL_STAGING_RESERVE_BYTES - 1)
-        with mock.patch("src.remote_orchestrator._dir_tree_size", return_value=10), \
-             mock.patch("src.remote_orchestrator.shutil.disk_usage",
+        with mock.patch("src.remote_staging._dir_tree_size", return_value=10), \
+             mock.patch("src.remote_staging.shutil.disk_usage",
                         return_value=low):
             orch._start_fetch_monitor(stop, abort, r"C:\stage\_fetch", 100)
             self.assertTrue(abort.wait(timeout=15),
@@ -314,8 +295,8 @@ class FetchWatchdogTests(unittest.TestCase):
         orch = self._orchestrator()
         stop, abort = threading.Event(), threading.Event()
         plenty = SimpleNamespace(total=10**12, used=0, free=10**12)
-        with mock.patch("src.remote_orchestrator._dir_tree_size", return_value=90), \
-             mock.patch("src.remote_orchestrator.shutil.disk_usage",
+        with mock.patch("src.remote_staging._dir_tree_size", return_value=90), \
+             mock.patch("src.remote_staging.shutil.disk_usage",
                         return_value=plenty):
             orch._start_fetch_monitor(stop, abort, r"C:\stage\_fetch", 100)
             self.assertFalse(abort.wait(timeout=3))
@@ -328,8 +309,8 @@ class FetchWatchdogTests(unittest.TestCase):
         orch.fetch_stall_timeout = 1
         stop, abort = threading.Event(), threading.Event()
         plenty = SimpleNamespace(total=10**12, used=0, free=10**12)
-        with mock.patch("src.remote_orchestrator._dir_tree_size", return_value=40), \
-             mock.patch("src.remote_orchestrator.shutil.disk_usage",
+        with mock.patch("src.remote_staging._dir_tree_size", return_value=40), \
+             mock.patch("src.remote_staging.shutil.disk_usage",
                         return_value=plenty):
             orch._start_fetch_monitor(stop, abort, r"C:\stage\_fetch", 100)
             self.assertTrue(abort.wait(timeout=15),
@@ -341,8 +322,8 @@ class FetchWatchdogTests(unittest.TestCase):
         orch.fetch_stall_timeout = 0
         stop, abort = threading.Event(), threading.Event()
         plenty = SimpleNamespace(total=10**12, used=0, free=10**12)
-        with mock.patch("src.remote_orchestrator._dir_tree_size", return_value=40), \
-             mock.patch("src.remote_orchestrator.shutil.disk_usage",
+        with mock.patch("src.remote_staging._dir_tree_size", return_value=40), \
+             mock.patch("src.remote_staging.shutil.disk_usage",
                         return_value=plenty):
             orch._start_fetch_monitor(stop, abort, r"C:\stage\_fetch", 100)
             self.assertFalse(abort.wait(timeout=3))

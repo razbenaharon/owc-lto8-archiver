@@ -19,8 +19,14 @@ import configparser
 import os
 import shutil
 import subprocess
+import sys
 
 import pytest
+
+# ``pg_test_guard`` lives beside this file. pytest normally puts this directory
+# on sys.path itself; make it certain, because the PostgreSQL guard below is
+# useless if importing it can fail.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # TEST ISOLATION. Give every pytest PROCESS a unique LTFS ownership identity so
 # two accidentally-parallel test runs never contend on the real Global mutex and
@@ -150,3 +156,88 @@ def block_production_drive(monkeypatch):
             subprocess, attr, guard_cmd(original, f"subprocess.{attr}"))
 
     yield
+
+
+# ===========================================================================
+# The same idea, for PostgreSQL: no test may open a connection to a server
+# that has not been proven disposable.
+#
+# The individual PostgreSQL test modules already route through
+# ``tests/pg_test_guard.py``, but that only protects the modules that remember
+# to use it. This hook wraps ``psycopg.connect`` for the whole session so a new
+# test — or a production code path a test calls into, such as
+# ``PgDatabaseManager`` built from an unvetted conninfo — cannot reach the
+# production catalog server either. It compares the resolved host/port against
+# the one configured test server; with no test server configured, every real
+# connection is refused.
+# ===========================================================================
+_PSYCOPG_ORIGINAL_CONNECT = None
+
+
+def _guarded_connect(original):
+    from psycopg.conninfo import conninfo_to_dict
+
+    import pg_test_guard as guard
+
+    def wrapper(conninfo="", **kwargs):
+        try:
+            parsed = conninfo_to_dict(conninfo, **{
+                k: v for k, v in kwargs.items()
+                if k in ("host", "port", "dbname", "user", "password")})
+        except Exception:
+            parsed = {}
+        target = ((parsed.get("host") or "").strip(),
+                  str(parsed.get("port") or "").strip())
+
+        dsn = guard.configured_dsn()          # raises on an UNSAFE setting
+        if dsn is None:
+            raise guard.UnsafeTestDatabase(
+                f"BLOCKED: a test tried to open a PostgreSQL connection to "
+                f"host={target[0] or '<default>'} port={target[1] or '<default>'} "
+                f"but {guard.TEST_DSN_ENV} is not set. With no configured test "
+                f"server the implicit default is localhost:5432 — the "
+                f"production catalog container. {guard.SKIP_REASON}")
+
+        allowed = guard.assert_safe_dsn(dsn)  # (host, port, dbname)
+        if target != (allowed[0], str(allowed[1])):
+            raise guard.UnsafeTestDatabase(
+                f"BLOCKED: a test tried to open a PostgreSQL connection to "
+                f"host={target[0] or '<default>'} port={target[1] or '<default>'}, "
+                f"which is not the configured disposable test server "
+                f"({allowed[0]}:{allowed[1]}). Tests must derive every "
+                f"connection from tests/pg_test_guard.py.")
+        return original(conninfo, **kwargs)
+
+    wrapper.__wrapped__ = original
+    return wrapper
+
+
+def pytest_configure(config):
+    global _PSYCOPG_ORIGINAL_CONNECT
+    try:
+        import psycopg
+    except ImportError:                       # pragma: no cover
+        return
+    _PSYCOPG_ORIGINAL_CONNECT = psycopg.connect
+    psycopg.connect = _guarded_connect(_PSYCOPG_ORIGINAL_CONNECT)
+
+
+def pytest_unconfigure(config):
+    """Restore psycopg, then sweep away every database THIS run created."""
+    global _PSYCOPG_ORIGINAL_CONNECT
+    if _PSYCOPG_ORIGINAL_CONNECT is None:
+        return
+    import psycopg
+    guarded = psycopg.connect
+    try:
+        import pg_test_guard as guard
+        leaked = guard.drop_all_run_databases()
+        if leaked:
+            print(f"\n[pg_test_guard] swept {len(leaked)} leaked test "
+                  f"database(s): {sorted(leaked)}")
+    except Exception as exc:                  # pragma: no cover - best effort
+        print(f"\n[pg_test_guard] sweep failed: {exc}")
+    finally:
+        if psycopg.connect is guarded:
+            psycopg.connect = _PSYCOPG_ORIGINAL_CONNECT
+        _PSYCOPG_ORIGINAL_CONNECT = None

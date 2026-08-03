@@ -47,6 +47,7 @@ from typing import Any, cast
 from .cli_errors import OperationalError
 from .directory_catalog_validation import archiver_lock_status
 from .local_manifest_archive import active_archive_processes
+from .pipeline_types import ChunkStatus
 
 try:  # keep import-light; the caller already proved psycopg is available
     import psycopg
@@ -65,10 +66,19 @@ ABANDONED_STATUS = "abandoned"
 #: Its on-tape/on-staging outcome is unknown, so the session is never classified
 #: automatically — this is the ``ambiguous_backing_chunk`` rule from
 #: ``exit_codes``, applied to reconciliation.
-TRANSIENT_CHUNK_STATES = ("fetching", "packing", "backing")
-FAILED_CHUNK_STATES = ("fetch_failed", "backup_failed")
-DONE_CHUNK_STATE = "done"
-PENDING_CHUNK_STATE = "pending"
+# Derived from the single ChunkStatus vocabulary rather than re-spelled as
+# literals. These four names, pg_sessions.RECLAIMABLE_CHUNK_STATES and
+# startup_reconcile's constants all have to agree; when they were four
+# independent tuples of strings, nothing made them agree except care.
+# tests/test_status_vocabulary.py pins the derived values to the exact literals
+# these used to hold, so the simplification is proven, not assumed.
+TRANSIENT_CHUNK_STATES = (ChunkStatus.FETCHING.value,
+                          ChunkStatus.PACKING.value,
+                          ChunkStatus.BACKING.value)
+FAILED_CHUNK_STATES = (ChunkStatus.FETCH_FAILED.value,
+                       ChunkStatus.BACKUP_FAILED.value)
+DONE_CHUNK_STATE = ChunkStatus.DONE.value
+PENDING_CHUNK_STATE = ChunkStatus.PENDING.value
 
 #: How long a session must have been silent before it can be called stale.
 #: A full chunk cycle on this host is ~70 minutes and a slow PACK can sit

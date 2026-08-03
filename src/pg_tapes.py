@@ -44,25 +44,83 @@ class PgTapeMixin:
         return [row["tape_path"] for row in rows if row["tape_path"]]
 
     def register_tape(self, volume_label, capacity_gb=None):
-        # ON CONFLICT DO NOTHING (not try/except UniqueViolation) keeps this
-        # idempotent under the ambiguous-commit retry loop in _transaction: a
-        # retry whose first COMMIT actually landed reports rowcount 0 instead
-        # of raising and being misreported as "already in the database".
-        inserted = self._transaction(
-            lambda conn: conn.execute(
+        """Register a cartridge AND its matching active generation, atomically.
+
+        Plan 1 Task 1.4. ``tapes.current_generation`` defaults to 1, but before
+        this the matching ``tape_generations`` row was only created by migration
+        013's backfill — so a tape registered *after* the migration had a
+        generation number with no generation row behind it. Every guard that
+        asks "is this session's generation still the active one?" then had
+        nothing to compare against, and the safest available answer for a
+        missing row is to refuse a resume. Creating both in ONE transaction
+        removes that state entirely.
+
+        Idempotent by ``ON CONFLICT DO NOTHING`` (not try/except) so it stays
+        correct under the ambiguous-commit retry loop in ``_transaction``: a
+        retry whose first COMMIT actually landed reports rowcount 0 rather than
+        raising and being misreported as "already in the database".
+        """
+        now = _now_utc()
+
+        def operation(conn):
+            rowcount = conn.execute(
                 """INSERT INTO tapes
                    (volume_label, date_formatted, total_capacity)
                    VALUES (%s, %s, %s)
                    ON CONFLICT (volume_label) DO NOTHING""",
-                (volume_label, _now_utc(), capacity_gb),
-            ).rowcount,
-            f"register tape {volume_label}",
-        )
+                (volume_label, now, capacity_gb),
+            ).rowcount
+            # The generation row is created whenever the schema supports it,
+            # including for a tape row that already existed without one.
+            if self._table_exists_conn(conn, 'tape_generations'):
+                conn.execute(
+                    """INSERT INTO tape_generations
+                           (tape_id, volume_label, generation, state,
+                            formatted_at)
+                       SELECT tape_id, volume_label, current_generation,
+                              'active', %s
+                       FROM tapes
+                       WHERE volume_label=%s
+                       ON CONFLICT (tape_id, generation) DO NOTHING""",
+                    (now, volume_label),
+                )
+            return rowcount
+
+        inserted = self._transaction(
+            operation, f"register tape {volume_label}")
         if inserted:
             print(f"[DB] Tape '{volume_label}' registered successfully.")
             return True
         print(f"[DB] Tape '{volume_label}' is already in the database.")
         return False
+
+    def get_active_tape_generation(self, volume_label):
+        """The catalog's ACTIVE generation number for a cartridge, or None.
+
+        Read-only, PostgreSQL-only (Plan 1 Task 1.4). ``None`` means "no active
+        generation row" — which callers must treat as a refusal, not as
+        agreement: a generation number in ``tapes.current_generation`` with no
+        active row behind it is exactly the state that makes "has this cartridge
+        been reformatted since?" unanswerable.
+
+        Returns ``None`` on a database without ``tape_generations`` (pre-013);
+        the caller's column-presence check has already established there is
+        nothing to compare in that case.
+        """
+        def operation(conn):
+            if not self._table_exists_conn(conn, 'tape_generations'):
+                return None
+            row = conn.execute(
+                """SELECT g.generation
+                   FROM tape_generations g
+                   JOIN tapes t ON t.tape_id = g.tape_id
+                   WHERE t.volume_label=%s AND g.state='active'""",
+                (volume_label,),
+            ).fetchone()
+            return row["generation"] if row else None
+
+        return self._run_read(
+            operation, f"get_active_tape_generation({volume_label})")
 
     def tape_exists(self, volume_label):
         with self._pool.connection() as conn:
@@ -303,6 +361,30 @@ class PgTapeMixin:
                        VALUES (%s, %s, %s, %s)""",
                     (new_label, old["date_formatted"],
                      old["total_capacity"], old["used_space"]),
+                )
+            # Migration 013 added two tables keyed by tape_id, both with
+            # ON DELETE RESTRICT. A rename creates a NEW tapes row and deletes
+            # the old one, so anything still pointing at the old tape_id blocks
+            # that delete outright. Repoint them here, for the same reason
+            # every tape_label table above is repointed: a relabel is the SAME
+            # cartridge, so its generation history and reset history must
+            # follow it. (Surfaced by the isolated-PostgreSQL suite once
+            # register_tape started creating a generation row for every tape.)
+            new_tape_id = conn.execute(
+                "SELECT tape_id FROM tapes WHERE volume_label=%s",
+                (new_label,),
+            ).fetchone()["tape_id"]
+            if self._table_exists_conn(conn, "tape_generations"):
+                conn.execute(
+                    """UPDATE tape_generations
+                       SET tape_id=%s, volume_label=%s WHERE tape_id=%s""",
+                    (new_tape_id, new_label, old["tape_id"]),
+                )
+            if self._table_exists_conn(conn, "tape_reset_operations"):
+                conn.execute(
+                    """UPDATE tape_reset_operations
+                       SET target_tape_id=%s WHERE target_tape_id=%s""",
+                    (new_tape_id, old["tape_id"]),
                 )
             conn.execute(
                 "UPDATE catalog_directories SET tape_label=%s WHERE tape_label=%s",

@@ -3,7 +3,8 @@ import os
 import tempfile
 import unittest
 
-from src.reporting import SUMMARY_CSV, append_backup_summary_row
+from src.reporting import (SCAN_METRIC_COLUMNS, SUMMARY_CSV,
+                           append_backup_summary_row)
 from src.robocopy import _parse_robocopy_summary
 
 
@@ -73,8 +74,13 @@ class ReportingAndRobocopyTests(unittest.TestCase):
             self.assertIn("skipped_files_count", header)
             self.assertIn("skipped_files_report", header)
             self.assertIn("governor_wait_reasons", header)
-            self.assertEqual(header[-2:], [
-                "tape_stall_seconds", "tape_stall_count"])
+            # The tape-profiler block keeps its position; the Task 0.2 scan
+            # telemetry was appended strictly AFTER it, so no pre-existing
+            # field shifted during the migration.
+            stall_at = header.index("tape_stall_seconds")
+            self.assertEqual(header[stall_at:stall_at + 2],
+                             ["tape_stall_seconds", "tape_stall_count"])
+            self.assertEqual(header[-1], "scan_seconds_to_first_writer_group")
             self.assertEqual(rows[-1]["tape_used_after_bytes"], "3633327538007")
             self.assertEqual(rows[-1]["robocopy_exit_code"], "0")
             self.assertEqual(rows[-1]["robocopy_speed_mbs"], "342.1")
@@ -154,8 +160,81 @@ class ReportingAndRobocopyTests(unittest.TestCase):
             self.assertEqual(rows[0]["tape_stream_mbs"], "")
             self.assertEqual(rows[0]["tape_stall_count"], "")
             self.assertIn("governor_wait_reasons", header)
-            self.assertEqual(header[-2:], [
-                "tape_stall_seconds", "tape_stall_count"])
+            # The tape-profiler block keeps its position; the Task 0.2 scan
+            # telemetry was appended strictly AFTER it, so no pre-existing
+            # field shifted during the migration.
+            stall_at = header.index("tape_stall_seconds")
+            self.assertEqual(header[stall_at:stall_at + 2],
+                             ["tape_stall_seconds", "tape_stall_count"])
+            self.assertEqual(header[-1], "scan_seconds_to_first_writer_group")
+
+    def test_scan_metric_columns_append_and_blank_when_missing(self):
+        """Task 0.2 columns are additive and optional.
+
+        A run with no scanner (a scan-complete resume, a local backup) writes
+        the same row it always did, with the scan fields blank.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = append_backup_summary_row(tmp, {
+                "status": "completed",
+                "record_counts": {},
+                "rc_sum": {},
+            })
+            with open(path, newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            for column in SCAN_METRIC_COLUMNS:
+                self.assertEqual(rows[0][column], "", column)
+            # Still an ordinary backup row: the record type did not fork.
+            self.assertEqual(rows[0]["record_type"], "backup")
+            self.assertEqual(rows[0]["operation"], "backup")
+
+    def test_scan_metrics_are_written_as_plain_aggregates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = append_backup_summary_row(tmp, {
+                "status": "completed",
+                "source_host": "so02",
+                "source": r"C:\staging\_pack_s0037_108",
+                "record_counts": {},
+                "rc_sum": {},
+                "scan_entries_seen": 40000,
+                "scan_entries_duplicate": 17624,
+                "scan_sql_executions": 30,
+                "scan_sql_rows": 57624,
+                "scan_seconds_to_first_sealed_chunk": 0.002,
+            })
+            with open(path, newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            row = rows[0]
+            self.assertEqual(row["scan_entries_seen"], "40000")
+            self.assertEqual(row["scan_entries_duplicate"], "17624")
+            # Round trips and rows stay SEPARATE figures.
+            self.assertEqual(row["scan_sql_executions"], "30")
+            self.assertEqual(row["scan_sql_rows"], "57624")
+            self.assertEqual(row["scan_seconds_to_first_sealed_chunk"], "0.002")
+            # The pre-existing source columns are untouched...
+            self.assertEqual(row["source_host"], "so02")
+            self.assertTrue(row["source_path"].endswith("_pack_s0037_108"))
+            # ...and no scan column carries a path.
+            for column in SCAN_METRIC_COLUMNS:
+                self.assertNotIn("\\", row[column], column)
+                self.assertNotIn("/", row[column], column)
+
+    def test_a_metrics_failure_cannot_stop_the_row_from_being_written(self):
+        """Counters must never change control flow."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = append_backup_summary_row(tmp, {
+                "status": "completed",
+                "record_counts": {},
+                "rc_sum": {},
+                # A counter that was never populated arrives as None.
+                "scan_entries_seen": None,
+                "scan_seconds_to_first_writer_group": None,
+            })
+            with open(path, newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(rows[0]["status"], "completed")
+            self.assertEqual(rows[0]["scan_entries_seen"], "")
+            self.assertEqual(rows[0]["scan_seconds_to_first_writer_group"], "")
 
     def test_robocopy_bytes_parser_accepts_integer_byte_summary(self):
         output = """

@@ -121,6 +121,172 @@ def _require_maintenance_safe(cfg):
         cfg.local_manifest_archive_root, (cfg.staging_dir,))
 
 
+def _apply_incremental_scan_schema(cfg, args, parser):
+    """Guarded entry point for migration 014 (Plan 1, Task 2.1).
+
+    Read-only by default. ``--dry-run`` (or neither flag) prints the preflight
+    and changes nothing; ``--execute --yes`` applies the BASE half, and adding
+    ``--finalize`` also applies the audit + final constraints.
+
+    Everything that could make this unsafe is checked BEFORE any DDL:
+
+    * the exact database identity is printed and must be confirmed, so a
+      migration cannot land on the wrong catalog;
+    * ``--backup-file`` must name a backup this tool can verify — a migration
+      whose only recovery path is "hope" is not a migration;
+    * no archiver process may hold the cluster advisory lock, because migrating
+      under a live run changes a session's schema mid-write;
+    * duplicate legacy plan ordinals are reported, and the finalize step will
+      REFUSE rather than resequence them.
+    """
+    db = _open_db(cfg)
+    try:
+        preflight = db.incremental_scan_schema_preflight()
+    finally:
+        db.close()
+    preflight["requested"] = {
+        "execute": bool(args.execute),
+        "finalize": bool(args.finalize),
+        "database": cfg.pg_dbname,
+    }
+
+    if not args.execute:
+        preflight["applied"] = []
+        preflight["note"] = (
+            "read-only preflight; re-run with --execute --yes "
+            "--backup-file <verified backup> to apply")
+        _print_json(preflight)
+        return 0
+
+    if not args.yes:
+        parser.error("--apply-incremental-scan-schema --execute requires --yes")
+    if not args.backup_file:
+        parser.error(
+            "--apply-incremental-scan-schema --execute requires --backup-file "
+            "naming a PostgreSQL backup this tool can verify")
+
+    holders = archiver_lock_status(_conninfo(cfg))
+    if holders:
+        raise OperationalError(
+            "[MIGRATION 014] Refusing to migrate while the archiver lock is "
+            f"held: {holders}. Stop the archive run first.")
+    processes = active_archive_processes()
+    if processes:
+        raise OperationalError(
+            "[MIGRATION 014] Refusing to migrate while archive/transfer "
+            f"processes are running: {processes}")
+    if preflight["archiver_lock_held"]:
+        raise OperationalError(
+            "[MIGRATION 014] The cluster advisory lock is held; refusing.")
+
+    preflight["backup"] = _verify_hot_backup(cfg, args.backup_file)
+
+    if args.finalize and preflight["duplicate_ordinal_groups"]:
+        raise OperationalError(
+            "[MIGRATION 014] Refusing to finalize: "
+            f"{preflight['duplicate_ordinal_groups']} duplicate "
+            "(plan_id, chunk_index, ordinal) group(s) exist in "
+            "remote_plan_files. They are NOT auto-resequenced — an ordinal "
+            "positions a file inside a chunk that may already be on tape. "
+            "Review them and decide per chunk. Sample: "
+            f"{preflight['duplicate_ordinal_sample']}")
+
+    db = _open_db(cfg)
+    try:
+        preflight["applied"] = db.apply_incremental_scan_schema(
+            finalize=bool(args.finalize))
+        preflight["installed"] = db.incremental_scan_schema_installed()
+        preflight["finalized"] = db.incremental_scan_schema_finalized()
+    finally:
+        db.close()
+    _print_json(preflight)
+    return 0
+
+
+def _run_frontier_bootstrap(cfg, args, parser):
+    """Dry-run / execute pair for the one-time frontier bootstrap (Task 4.2).
+
+    Dry run by default and always read-only: it validates the scope
+    configuration and the session's state and reports what would happen.
+    ``--execute --yes`` performs the migration, which traverses the source
+    read-only and creates persistent scope/directory/segment state.
+
+    It never rewrites a chunk, never changes the chunk format, and never
+    touches LTFS.
+    """
+    from src.frontier_bootstrap import FrontierBootstrap
+    from src.scan_frontier import build_frontier_scanner_factory
+    from src.skipped import SkippedFileTracker
+    from src.ui import ConsoleUI
+    import threading
+
+    if not args.session_id or len(args.session_id) != 1:
+        parser.error("--bootstrap-frontier requires exactly one --session-id")
+    session_id = args.session_id[0]
+
+    db = _open_db(cfg)
+    try:
+        bootstrap = FrontierBootstrap(
+            db=db, session_id=session_id,
+            scan_paths=cfg.remote_scan_paths,
+            archive_root=cfg.local_manifest_archive_root,
+            scanner_factory=build_frontier_scanner_factory(
+                remote_user=cfg.remote_user, remote_host=cfg.remote_host,
+                remote_password=cfg.remote_password,
+                skipped_tracker=SkippedFileTracker(), ui=ConsoleUI(),
+                timeout=cfg.ssh_command_timeout_seconds),
+            stop_event=threading.Event(), source_host=cfg.remote_host,
+            ui=ConsoleUI())
+        if not args.execute:
+            report = bootstrap.dry_run()
+            report["note"] = ("dry run; nothing was created. Re-run with "
+                              "--execute --yes to perform the migration.")
+            _print_json(report)
+            return 0
+        if not args.yes:
+            parser.error("--bootstrap-frontier --execute requires --yes")
+        _print_json(bootstrap.execute(approved=True))
+        return 0
+    finally:
+        db.close()
+
+
+def _run_session_frontier_report(cfg, args, parser):
+    """READ-ONLY frontier/membership report for one session (Task 4.1).
+
+    Creates no state, changes no row, and never touches LTFS. Liveness is
+    gathered here (the advisory lock and local archive processes) so the report
+    can say "a worker may still be running" instead of assuming it is not.
+    """
+    from src.startup_reconcile import session_frontier_report
+
+    if not args.session_id:
+        parser.error("--session-frontier-report requires --session-id")
+
+    try:
+        holders = archiver_lock_status(_conninfo(cfg))
+    except Exception:
+        holders = None                       # unknown, not "none"
+    try:
+        processes = active_archive_processes()
+    except Exception:
+        processes = None
+
+    db = _open_db(cfg)
+    try:
+        reports = [
+            session_frontier_report(
+                db, session_id,
+                archive_root=cfg.local_manifest_archive_root,
+                lock_holders=holders, active_processes=processes)
+            for session_id in args.session_id
+        ]
+    finally:
+        db.close()
+    _print_json({"database": cfg.pg_dbname, "reports": reports})
+    return 0
+
+
 def _verify_hot_backup(cfg, path):
     restore_list = verify_backup_file(cfg, path)
     return {"backup_path": os.path.abspath(path),
@@ -287,6 +453,24 @@ def _build_parser():
                         help="Explicit DB name for --create-migrated-db.")
     parser.add_argument("--apply-directory-catalog-schema", action="store_true",
                         help="Apply scripts/sql/007 to the selected DB.")
+    parser.add_argument("--bootstrap-frontier", action="store_true",
+                        help="One-time migration of a session onto the "
+                             "incremental frontier. Dry run unless --execute "
+                             "--yes; traverses the source READ-ONLY and never "
+                             "rewrites a chunk.")
+    parser.add_argument("--session-frontier-report", action="store_true",
+                        help="READ-ONLY frontier/membership report for one or "
+                             "more sessions (--session-id). Creates no state "
+                             "and never touches LTFS.")
+    parser.add_argument("--apply-incremental-scan-schema", action="store_true",
+                        help="Migration 014 (incremental scan frontier). "
+                             "Read-only preflight unless --execute --yes "
+                             "--backup-file are all given; add --finalize for "
+                             "the audit + final constraints.")
+    parser.add_argument("--finalize", action="store_true",
+                        help="With --apply-incremental-scan-schema: also apply "
+                             "the legacy membership audit and the final unique "
+                             "constraints. Refuses on duplicate ordinals.")
     parser.add_argument("--backfill-directory-catalog", action="store_true",
                         help="Backfill directory catalog from legacy files_index.")
     parser.add_argument("--dry-run", action="store_true",
@@ -398,6 +582,15 @@ def _dispatch(parser, args):
             "applied": True,
         })
         return 0
+
+    if args.session_frontier_report:
+        return _run_session_frontier_report(cfg, args, parser)
+
+    if args.bootstrap_frontier:
+        return _run_frontier_bootstrap(cfg, args, parser)
+
+    if args.apply_incremental_scan_schema:
+        return _apply_incremental_scan_schema(cfg, args, parser)
 
     if args.validate_directory_catalog:
         _print_json(validate_directory_catalog(_conninfo(cfg)))
