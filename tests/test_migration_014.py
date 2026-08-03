@@ -315,14 +315,19 @@ class SchemaStatePredicateTests(unittest.TestCase):
                      indexes=("uq_remote_plan_files_chunk_ordinal",))
         self.assertTrue(core.incremental_scan_schema_finalized())
 
-    def test_the_scan_mode_gate_sees_both_answers(self):
-        from src.scan_frontier import decide_scan_mode, MODE_FRONTIER, MODE_LEGACY
-        cfg = SimpleNamespace(incremental_scan_enabled=True)
+    def test_the_production_schema_gate_sees_both_answers(self):
+        from src.scan_frontier import incremental_scan_schema_ready
         base_only = _core(tables=ALL_TABLES, columns=ALL_COLUMNS)
-        self.assertEqual(decide_scan_mode(cfg, base_only).mode, MODE_LEGACY)
+        self.assertEqual(
+            incremental_scan_schema_ready(base_only),
+            (False, "migration_014_not_finalized"),
+        )
         ready = _core(tables=ALL_TABLES, columns=ALL_COLUMNS,
                       indexes=("uq_remote_plan_files_chunk_ordinal",))
-        self.assertEqual(decide_scan_mode(cfg, ready).mode, MODE_FRONTIER)
+        self.assertEqual(
+            incremental_scan_schema_ready(ready),
+            (True, "schema_ready"),
+        )
 
 
 class PreflightTests(unittest.TestCase):

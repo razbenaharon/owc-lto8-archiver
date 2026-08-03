@@ -11,7 +11,7 @@ This module replaces both with one coordinator over one
 :class:`~src.ready_queue.ReadyQueue`, one
 :class:`~src.remote_staging.RemoteChunkStager`, one
 :class:`~src.remote_writer.RemoteChunkWriter`, and an **optional**
-:class:`~src.scan_frontier.RemoteScanCoordinator`. A scan-complete session is
+:class:`~src.scan_frontier.FrontierScanCoordinator`. A scan-complete session is
 simply the case where the scanner is ``None``.
 
 Fairness — the reason work selection changed

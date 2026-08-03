@@ -31,8 +31,8 @@ What the bootstrap therefore does, in order:
 Existing sealed chunk membership always wins. This module never rewrites a
 chunk, never changes the chunk format, and never touches LTFS.
 
-A failed bootstrap leaves the legacy scanner available and coverage non-final,
-so an abandoned attempt costs nothing but the traversal.
+A failed bootstrap leaves coverage non-final and must be retried or reconciled;
+it never makes a legacy scanner available to production.
 """
 import os
 

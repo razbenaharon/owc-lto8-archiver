@@ -32,8 +32,8 @@ cartridge, a double write, or a lost index.
 - Not introducing automatic retries for hard tape failures.
 - Not a group-level durability shortcut: "all robocopy returned 0" is explicitly
   **not** durability.
-- Not resuming Session 37, not touching Chunk 108, not converting anything
-  in-place.
+- Not resuming Session 37, not touching any production chunk, and not converting
+  anything in-place.
 
 ## 3. Existing Phase 4 behavior (baseline)
 
@@ -206,16 +206,19 @@ chunk ambiguous. None requires physical intervention.
 
 ## 11. Session 37 compatibility
 
-Session 37 is `active`, `scan_complete=false`, legacy ZIP, chunks 0–107 `done`,
-chunk 108 conservatively `backing` but physically unwritten, later chunks
-packing/pending. The design **explicitly supports introducing sealed batches for
-future prepared chunks only**, leaving prior completed chunks untouched:
+Current corrected baseline: Session 37 is `active`, `scan_complete=false`, and
+legacy ZIP. Chunks 0–48 are `done` on Tape_02; chunks 49–112 are pending. Its
+`tape_label = Tape_03` names the next target, not completed work: all 9 Session
+37 `archive_runs` name Tape_02, zero `archive_runs` reference Tape_03, and
+`files_index` has zero Tape_03 rows. Tape_03 separately received the 24 GiB
+Phase 5E synthetic pilot and was reformatted twice. The design **explicitly
+supports introducing sealed batches for future prepared chunks only**, leaving
+prior completed chunks untouched:
 
 - No conversion to TAR; `format_generation=1`.
-- Chunks 0–107 are **not** rewritten, regenerated, or re-batched.
-- Chunk 108's preserved pack is untouched; if it joins a future batch it does so
-  by its existing stable pack identity, and its `backing` classification is
-  unchanged.
+- Chunks 0–48 are **not** rewritten, regenerated, or re-batched.
+- Pending chunks retain their existing identities and may join a future batch
+  only after the repository's production rollout gates are satisfied.
 - Sealing a physical group does **not** claim the session scan/plan is complete
   (§12; model tests 13, 14). `scan_complete=false` never blocks sealing.
 - The currently discovered chunk set is never treated as the final plan.
@@ -409,14 +412,15 @@ diagnostic/append-only — never prune, restore, mark durable, or override
 
 **Mismatch taxonomy** (per member vs authority): `prepared_chunk_already_done`
 → DATA_INCONSISTENCY; `backing_chunk_unresolved_ambiguity` → RECONCILIATION_REQUIRED
-(chunk 108's exact case — flagged from PostgreSQL truth alone, never inferred
+(the historical shadow fixture's chunk-108 case — flagged from PostgreSQL truth alone, never inferred
 reusable from outside evidence); `chunk_eligible_in_queue_but_not_in_db`,
 `duplicate_active_claim`, `byte_count_mismatch`, `missing_pack_metadata`,
 `chunk_order_mismatch`, `expected_tape_mismatch`, `fingerprint_mismatch`.
 Classifications: MATCH, EXPECTED_DIFFERENCE, OBSERVER_ERROR, SCHEDULER_ERROR,
-DATA_INCONSISTENCY, RECONCILIATION_REQUIRED. Validated against a **full-data
-production shadow** replaying real Session 37 (done 0-107, backing 108, pending
-3, packing 1): 108→RECONCILIATION_REQUIRED, done→DATA_INCONSISTENCY,
+DATA_INCONSISTENCY, RECONCILIATION_REQUIRED. The original validation used a
+**historical full-data production shadow** with the then-recorded state (done
+0–107, backing 108, pending 3, packing 1); it is not a current Session 37 status
+report. In that fixture: 108→RECONCILIATION_REQUIRED, done→DATA_INCONSISTENCY,
 `reconcile_member(not_started, done)`→release. Observer cost ~62 µs per 12-chunk
 group (1000 groups ≈ 62 ms) — the basis for a future async observation budget.
 

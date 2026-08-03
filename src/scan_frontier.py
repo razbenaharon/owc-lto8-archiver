@@ -1,39 +1,18 @@
-"""Scan-model selection and (from Task 1.1) scan/frontier coordination.
+"""Persistent directory-frontier scanning and coordination.
 
-Task 0.3 records the target decision as code rather than prose:
+The persistent frontier scanner is the sole production scanner. There is no
+legacy scan mode and no incremental-scan feature flag. Before constructing the
+frontier coordinator, the production path requires both halves of migration
+014 and fails closed when their state is absent or indeterminate. This keeps an
+active frontier from ever being handed to a second scanner.
 
-**Adopt the persistent incremental directory frontier.** Task 0.2's harness
-measures the three candidates and the frontier is the only one that removes
-completed-directory replay *while keeping* the scanner/stager/writer overlap.
-Full-scan-before-processing is retained only as an offline diagnostic in
-``scripts/benchmark_scan_models.py``; it is not a production prerequisite,
-because nothing about a tape write requires a complete inventory first — chunks
-are sealed and written incrementally today and that must not regress.
-
-The rationale that matters is a *safety* one, and it is asserted by tests, not
-argued here: today's whole-root replay is recovery **by re-walking every file
-already visited**. No tape invariant requires that. A persisted frontier can
-publish chunks before global scan completion exactly as the current scanner
-does, and it bounds a crash to the single directory that was mid-listing.
-
-Activation is deliberately hard
--------------------------------
-``decide_scan_mode`` is the single gate. It fails **towards the legacy
-scanner** on every kind of uncertainty — flag off, migration 014 absent,
-constraints not finalized, database that cannot answer — and it fails
-**closed** (blocked, no scanner at all) for a session already bound to frontier
-state, because silently returning such a session to root replay would re-walk a
-source whose frontier rows say it was already covered.
-
-Two scanners must never run against one active frontier. That is the whole
-reason this returns a three-valued decision instead of a boolean.
+The whole-root scanner factory at the end of this module remains test and
+diagnostic support only; no production module imports it.
 """
 import os
 import posixpath
 import time
 import uuid
-from dataclasses import dataclass
-from typing import Optional
 
 from .archive_artifacts import (ArtifactConflict, ArtifactError,
                                 JsonlZstArtifactWriter,
@@ -46,51 +25,15 @@ from .pipeline_types import SCOPE_KIND_DIRECTORY, SCOPE_KIND_FILE
 from .runtime import CANCEL, _status
 from .scanning import DirectoryFrontierScanner, StreamingRemoteScanner
 
-#: The legacy whole-root ``find`` scanner (``StreamingRemoteScanner``).
-MODE_LEGACY = "legacy"
-#: The persistent incremental directory frontier.
-MODE_FRONTIER = "frontier"
-#: No scanner may run: the state is ambiguous and needs an operator.
-MODE_BLOCKED = "blocked"
-
-
-@dataclass(frozen=True)
-class ScanModeDecision:
-    """Which scanner may run, and the reason — always both."""
-
-    mode: str
-    reason: str
-    #: True only for ``MODE_FRONTIER``; convenience for call sites.
-    frontier_enabled: bool = False
-    #: True only for ``MODE_BLOCKED``; the run must stop before scanning.
-    blocked: bool = False
-    detail: Optional[str] = None
-
-    def __post_init__(self):
-        object.__setattr__(self, "frontier_enabled", self.mode == MODE_FRONTIER)
-        object.__setattr__(self, "blocked", self.mode == MODE_BLOCKED)
-
-
-def _legacy(reason, detail=None):
-    return ScanModeDecision(MODE_LEGACY, reason, detail=detail)
-
-
-def _blocked(reason, detail=None):
-    return ScanModeDecision(MODE_BLOCKED, reason, detail=detail)
-
-
 def incremental_scan_schema_ready(db):
-    """``(ready, reason)`` — can the frontier schema be relied on?
+    """Return ``(ready, reason)`` for the production frontier schema.
 
     Requires **both** halves of migration 014: the base tables/columns, and the
     separately-applied finalized constraints (the legacy membership audit plus
     the unique ``(plan_id, chunk_index, ordinal)`` index). A database that
-    cannot answer either question is treated as not ready — never as ready.
-
-    Task 2.1 implements the two predicates on ``PgConnectionCore``. Until then
-    they are absent, so this correctly reports "not ready" and the frontier
-    cannot activate, which is what every Plan 1 gate before the rehearsal
-    expects.
+    cannot answer either question is treated as not ready, never as ready. The
+    orchestrator turns that answer into a safety stop; it never selects another
+    scanner.
     """
     for probe, missing_reason in (
         ("incremental_scan_schema_installed", "migration_014_not_installed"),
@@ -107,45 +50,6 @@ def incremental_scan_schema_ready(db):
                 "incremental_scan_schema_probe_failed: %s: %s", probe, exc)
             return False, "schema_state_indeterminate"
     return True, "schema_ready"
-
-
-def decide_scan_mode(cfg, db, *, session_bound_to_frontier=False):
-    """Choose the scanner for this run. The ONLY activation gate.
-
-    ``session_bound_to_frontier`` must be true when the session has already
-    published frontier state (scope/directory/segment rows or a ready
-    artifact). Such a session can never be handed back to the legacy scanner:
-    if the frontier cannot be used, the run is blocked for an operator instead.
-
-    Returns a :class:`ScanModeDecision`; callers must honour ``blocked``.
-    """
-    enabled = bool(getattr(cfg, "incremental_scan_enabled", False))
-    ready, schema_reason = incremental_scan_schema_ready(db)
-
-    if enabled and ready:
-        return ScanModeDecision(MODE_FRONTIER, "enabled_and_schema_ready")
-
-    if session_bound_to_frontier:
-        # Never mix scanners against one frontier, and never silently re-walk a
-        # source the frontier rows already describe as covered.
-        detail = ("this session has already published incremental-scan state, "
-                  "so it cannot fall back to whole-root replay. "
-                  + ("Re-enable [REMOTE] incremental_scan."
-                     if not enabled else
-                     f"Resolve the schema state first ({schema_reason})."))
-        get_logger().error("scan_mode_blocked: enabled=%s schema=%s",
-                           enabled, schema_reason)
-        return _blocked(
-            "frontier_session_cannot_use_legacy_scanner", detail=detail)
-
-    if not enabled:
-        return _legacy("disabled_by_config")
-    get_logger().info("scan_mode_legacy: incremental scan requested but %s",
-                      schema_reason)
-    return _legacy(schema_reason,
-                   detail="incremental_scan is enabled in config but the "
-                          "frontier schema is not usable; the legacy scanner "
-                          "stays active and nothing was migrated.")
 
 
 class TapeBudgetExceeded(Exception):

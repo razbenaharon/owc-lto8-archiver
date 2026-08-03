@@ -49,10 +49,11 @@ Scanning and planning (``_run_streaming_session`` -> ``FrontierScanCoordinator``
    (WAS: ``StreamingRemoteScanner.iter_scan()`` ran ``find`` from every
    configured root on every incomplete-session run, recovering by replaying
    visited files rather than resuming a persisted position.)
-3. ``SegmentChunkPublisher`` reads a segment's entries from its local artifact
-   and, for a session that pre-dates the frontier, reconciles it **once** against
-   the legacy snapshot — one set-based query per segment, on canonical path AND
-   size — passing only genuinely new entries onward.
+3. ``SegmentChunkPublisher`` reads a segment's entries from its local artifact.
+   A durable bootstrap row identifies migrated legacy membership; without one,
+   only a proven-empty snapshot skips the conservative path. Reconciliation is
+   **once** per segment, one set-based query on canonical path AND size, and
+   passes only genuinely new entries onward.
 4. ``StreamingChunkBuilder`` then chooses chunk boundaries in discovery order
    using ``ChunkPlanner.footprint()``, the byte budget from ``_chunk_budget()``
    and ``chunk_max_files``. Because step 3 already removed known paths, a
@@ -193,9 +194,9 @@ class RemoteOrchestrator:
     Behaviour lives in four focused modules, each owning one invariant:
 
     ===========================  ==================================================
-    :mod:`src.scan_frontier`     which scanner may run, discovery, chunk sealing
+    :mod:`src.scan_frontier`     persistent-frontier discovery and chunk sealing
     :mod:`src.remote_staging`    fetch + pack onto local staging — never any tape
-    :mod:`src.remote_writer`     the finite write group — the ONLY tape path
+    :mod:`src.remote_writer`     the sole finite-group tape-write entry path
     :mod:`src.remote_pipeline`   the single scheduling loop over the three
     ===========================  ==================================================
 
@@ -896,29 +897,52 @@ class RemoteOrchestrator:
             writer_invocations=len(started))
 
     def _session_predates_frontier(self, session_id):
-        """True when this session still has whole-root snapshot rows to match.
+        """Whether segment publication needs migration-safe reconciliation.
 
-        Such a session was planned before the frontier existed, so every
-        segment imported for it must be reconciled ONCE against
-        ``remote_snapshot_files`` before its entries reach the chunk builder.
-        A session that already owns frontier scopes needs no such reconciliation
-        — its membership came from segments in the first place.
+        A conservative bootstrap deliberately creates frontier scopes for a
+        legacy session, so scope presence cannot say how the session was born.
+        ``remote_frontier_bootstraps`` can: its rows exist only for migrations
+        from whole-root scanning. Those sessions must reconcile every imported
+        segment against ``remote_snapshot_files`` before the builder sees it.
 
-        Fails towards *reconcile* on any uncertainty: reconciling a session that
-        did not need it costs one set-based query per segment, while skipping it
-        for one that did would re-plan files that are already on tape.
+        Without a bootstrap row, only a definite empty snapshot proves that a
+        session needs no reconciliation. Existing membership may pre-date the
+        frontier; treating frontier-born resumed membership as legacy is the
+        safe false positive and costs only one set-based query per segment.
+
+        Fails towards *reconcile* on any uncertainty. The false positive costs
+        one set-based query per segment; the false negative can re-plan files
+        already on tape.
         """
-        probe = getattr(self.db, 'session_has_frontier_state', None)
+        probe = getattr(self.db, 'get_frontier_bootstrap', None)
         if probe is None:
             return True
         try:
-            return not bool(probe(session_id))
+            bootstrap = probe(session_id)
         except Exception:
             get_logger().warning(
-                "could not determine frontier state for session %s; "
+                "could not determine bootstrap history for session %s; "
                 "reconciling imported segments against the legacy snapshot",
                 session_id, exc_info=True)
             return True
+        if bootstrap is not None:
+            return True
+
+        membership_probe = getattr(
+            self.db, 'session_has_snapshot_membership', None)
+        if membership_probe is None:
+            return True
+        try:
+            has_membership = membership_probe(session_id)
+        except Exception:
+            get_logger().warning(
+                "could not determine snapshot membership for session %s; "
+                "reconciling imported segments against the legacy snapshot",
+                session_id, exc_info=True)
+            return True
+        if has_membership is False:
+            return False
+        return True
 
     def _scan_artifact_root(self):
         """Where scan-segment artifacts live — proven, not assumed.
@@ -969,7 +993,8 @@ class RemoteOrchestrator:
         return StopResult(
             exit_code=ExitCode.SAFETY_BLOCK,
             reason=REASON_SCAN_FRONTIER_UNAVAILABLE, resumable=False,
-            source="scan-mode", session_id=session_id, detailed_reason=msg)
+            source="frontier-schema", session_id=session_id,
+            detailed_reason=msg)
 
     def _build_pipeline(self, *, session_id, tape_label, ready_q, stop_event,
                         metrics, scan_coordinator, scan_complete, writer_path):
@@ -1010,9 +1035,9 @@ class RemoteOrchestrator:
         # rather than a mode choice: no usable schema means no scan, not a
         # quiet downgrade to whole-root replay. Nothing here touches the drive,
         # the mount or the source.
-        scan_mode_block = self._require_frontier_schema(session_id)
-        if scan_mode_block is not None:
-            return self._finalize(scan_mode_block, phase="scan-mode")
+        schema_block = self._require_frontier_schema(session_id)
+        if schema_block is not None:
+            return self._finalize(schema_block, phase="frontier-schema")
 
         # PostgreSQL-only: it compares the session's persisted generation with
         # the catalog's, and needs no tape, mount or ownership to do it.
@@ -1149,9 +1174,9 @@ class RemoteOrchestrator:
             remaining_lock=remaining_lock,
             stop_event=stop_pipeline,
             builder_factory=_builder_factory,
-            # A session that pre-dates the frontier still has whole-root
-            # snapshot rows, so each imported segment is reconciled against
-            # them ONCE, set-based, before anything reaches the chunk builder.
+            # A durable bootstrap row identifies a migrated legacy session.
+            # With no row, only a proven-empty snapshot avoids reconciliation;
+            # existing or unreadable membership fails toward the safe path.
             legacy_session=self._session_predates_frontier(session_id),
             scanner_factory=build_frontier_scanner_factory(
                 remote_user=self.remote_user,

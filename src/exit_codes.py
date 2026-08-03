@@ -68,12 +68,10 @@ REASON_AMBIGUOUS_ACTIVE_SESSIONS = "ambiguous_active_sessions"
 #: refuses BEFORE any worker thread rather than fall back to legacy behaviour
 #: after the operator opted in. No tape or batch operation was attempted.
 REASON_SEALED_BATCH_FEATURE_UNAVAILABLE = "sealed_batch_feature_unavailable"
-#: This session has already published incremental-scan frontier state, but the
-#: frontier cannot be used for this run (flag off, or migration 014 missing /
-#: not finalized / indeterminate). Returning it to whole-root replay would
-#: re-walk a source the frontier rows already describe as covered, and would
-#: mean two scanners against one frontier — so the run stops for an operator
-#: instead. No scan, staging or tape work was started.
+#: The sole production frontier scanner cannot rely on migration 014 because
+#: the schema is missing, unfinalized, or indeterminate. There is no legacy
+#: scan mode to select instead, so the run stops before scan, staging, or tape
+#: work starts.
 REASON_SCAN_FRONTIER_UNAVAILABLE = "scan_frontier_unavailable"
 # 30 — FATAL_CONFIG
 REASON_SSH_AUTHENTICATION_FAILED = "ssh_authentication_failed"

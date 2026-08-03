@@ -4,7 +4,14 @@
   ([incident 010](010-20260724-ltfs-write-perm-readonly.md))
 - **Physical intervention required:** no — the swap itself was physical, but every
   blocker below was diagnosed and fixed remotely
-- **Status:** fixed. Session 37 resumed onto Tape_03.
+- **Status:** fixed. Session 37 was re-pointed to Tape_03, but no Session 37
+  archive run completed there.
+
+**Later evidence correction (2026-08-03):** all 9 Session 37 `archive_runs` name
+Tape_02; zero `archive_runs` reference Tape_03; and `files_index` has zero rows
+for Tape_03. Tape_03 was still written for a separate 24 GiB Phase 5E synthetic
+pilot and was reformatted twice. The incident fixes and retargeting below are
+real, but "re-pointed" is not evidence that Session 37 data landed there.
 
 ## Context
 
@@ -104,6 +111,9 @@ on `archive_bundles.tape_label`, so chunks 0–48 correctly remain on Tape_02:
 Tape_01  295 bundles
 Tape_02   73 bundles   ← unchanged by the re-point
 ```
+
+No later Session 37 archive run completed on Tape_03. The session row names the
+next target; completed Session 37 work remains on Tape_02.
 
 ## Also fixed — the reboot override only worked at the start gate
 

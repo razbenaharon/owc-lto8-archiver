@@ -1198,6 +1198,28 @@ class PgSessionMixin:
             f"get_remote_existing_snapshot_paths({session_id})")
         return {row["remote_path"] for row in rows}
 
+    def session_has_snapshot_membership(self, session_id):
+        """Whether the session's snapshot already contains any file row.
+
+        This is a cheap existence probe, not a count. It is used only when no
+        durable bootstrap row exists: a definite empty snapshot proves that
+        reconciliation is unnecessary, while any membership could pre-date
+        the frontier and must be treated conservatively.
+        """
+        return self._run_read(
+            lambda conn: bool(conn.execute(
+                """SELECT EXISTS (
+                         SELECT 1
+                         FROM remote_sessions s
+                         JOIN remote_plans p ON p.plan_id=s.plan_id
+                         JOIN remote_snapshot_files sf
+                           ON sf.snapshot_id=p.snapshot_id
+                         WHERE s.session_id=%s
+                       ) AS has_membership""",
+                (session_id,),
+            ).fetchone()["has_membership"]),
+            f"session_has_snapshot_membership({session_id})")
+
     def get_session_membership_summary(self, session_id):
         """Read-only membership facts for a session (Plan 1, Task 4.1).
 

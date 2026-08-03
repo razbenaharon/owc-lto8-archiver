@@ -1,5 +1,10 @@
 # Plan 1 — Core Simplification and Incremental Scan
 
+> **Closure correction (2026-08-03):** the persistent frontier scanner is the
+> sole production scanner. There is no legacy scan mode and no incremental-scan
+> feature flag. The schema-readiness gate fails closed; it never chooses a
+> fallback scanner. The requirements below use that final architecture.
+
 ## Execution contract
 
 1. Implement this plan before Plans 2–4.
@@ -57,23 +62,23 @@
 
 ### Task 0.3 — Record the target decision
 
-- **Change:** Adopt the persistent incremental directory frontier unless Task 0.2 disproves either restart safety or overlap. Retain full-scan mode only as an offline diagnostic, not the production prerequisite. Add `ConfigManager.incremental_scan_enabled`, default false in code and `config.example.ini`; the existing `StreamingRemoteScanner` remains the production default through all Plan 1 implementation/rehearsal gates.
+- **Change:** Adopt the persistent directory frontier once Task 0.2 establishes restart safety and overlap. It becomes the sole production scanner; historical whole-root scanners may remain for offline characterization but are not a runtime mode. Do not add a scanner-selection feature flag.
 - **Rationale that must be asserted by tests, not prose:** current root replay is recovery by visited-file replay; no tape invariant requires it; a persisted frontier can publish chunks before global scan completion.
-- **Exact files/symbols:** `src/config.py::ConfigManager`; `config.example.ini`; `src/remote_orchestrator.py::RemoteOrchestrator._run_streaming_session`; new `src/scan_frontier.py::RemoteScanCoordinator`.
-- **Database:** The flag cannot activate unless migration 014 and its finalized constraints validate; it does not backfill or migrate a session implicitly.
+- **Exact files/symbols:** `src/remote_orchestrator.py::RemoteOrchestrator._run_streaming_session`, `_require_frontier_schema`; `src/scan_frontier.py::incremental_scan_schema_ready`, `FrontierScanCoordinator`.
+- **Database:** Production scanning cannot start unless migration 014 and its finalized constraints validate; schema readiness does not backfill or migrate a session implicitly.
 - **Dependencies:** Tasks 0.1–0.2.
-- **Tests:** Default-off, malformed-config fallback, missing/drifted-schema refusal, explicit test-only activation, and legacy-default flow.
-- **Failure/recovery:** Any configuration/schema uncertainty keeps the legacy scanner active for a new session and blocks activation for a session already explicitly bound to frontier state; never mix two scanners for the same active frontier.
+- **Tests:** Missing, drifted, exceptional, and indeterminate schema probes refuse startup; production construction always selects the frontier; no production module imports the historical whole-root factory.
+- **Failure/recovery:** Any schema uncertainty stops the run. Never mix two scanners for the same active frontier and never downgrade to whole-root replay.
 - **Acceptance gate:** The chosen model has measured time-to-first-chunk, bounded restart replay, and no completed-directory re-enumeration.
-- **Rollback:** Turn off the new frontier for future/unmigrated sessions; keep the legacy scanner as default. A session already publishing frontier state uses explicit rollback/reconciliation from Task 4.2 rather than silently switching scanners.
+- **Rollback:** Stop publication and use the verified code/database rollback path. A session that has published frontier state requires explicit reconciliation; it never silently switches scanners.
 
 ## Phase 1 — Establish focused module and state boundaries
 
 ### Task 1.1 — Extract scan/frontier coordination without changing behavior
 
-- **Change:** Keep `RemoteOrchestrator` as the public façade, but move its nested scanner/planner coordination into `src/scan_frontier.py::RemoteScanCoordinator`. Keep remote listing/parsing in `src/scanning.py`, chunk sizing in `src/planning.py`, and database operations behind `PgDatabaseManager`.
+- **Change:** Keep `RemoteOrchestrator` as the public façade, but first extract its nested scanner/planner coordination into the compatibility-only `src/scan_frontier.py::RemoteScanCoordinator`; Task 2.3 replaces that production path with the persistent frontier. Keep remote listing/parsing in `src/scanning.py`, chunk sizing in `src/planning.py`, and database operations behind `PgDatabaseManager`.
 - **Exact files/symbols:**
-  - Move the logic currently nested in `RemoteOrchestrator._run_streaming_session::_scanner_planner` and `_append_chunk` into `RemoteScanCoordinator.run()` and `publish_legacy_chunk()`.
+  - Move the then-current logic nested in `RemoteOrchestrator._run_streaming_session::_scanner_planner` and `_append_chunk` into `RemoteScanCoordinator.run()` and `publish_legacy_chunk()` as an intermediate compatibility extraction.
   - Add scan/frontier dataclasses and string-backed enums to `src/pipeline_types.py`: `ScanCoverageState`, `ScanDirectoryState`, `ScanSegmentState`, `ScanScope`, and `ScanSegmentRef`.
   - Preserve exports from `src/orchestrators.py` and callers in `src/cli.py`.
 - **Database:** None in this task.
@@ -98,8 +103,8 @@
 
 ### Task 1.3 — Consolidate complete and incomplete sessions into one pipeline loop
 
-- **Change:** Replace the separate scheduling in `_run_streaming_session()` and scan-complete `_run_session()` with `src/remote_pipeline.py::RemotePipelineCoordinator`. Feed it persisted pending chunk identities plus an optional `RemoteScanCoordinator`; use one `RemoteChunkStager`, one `ReadyQueue`, and one `RemoteChunkWriter`. Before migration 014 exists, scanner publication uses a configured in-memory backlog limit and derives the current sealed-but-unstaged count from authoritative chunk status on every scheduling decision, so old pending staging cannot indefinitely block renewed exploration. The coordinator selects work in authoritative index/order; durable claims arrive only in Task 3.1.
-- **Exact files/symbols:** `src/remote_orchestrator.py::RemoteOrchestrator._run_streaming_session`, `_run_session`; new `src/remote_pipeline.py::RemotePipelineCoordinator`; `src/scan_frontier.py::RemoteScanCoordinator`; `src/remote_staging.py::RemoteChunkStager`; `src/ready_queue.py::ReadyQueue`; `src/remote_writer.py::RemoteChunkWriter`.
+- **Change:** Replace the separate scheduling in `_run_streaming_session()` and scan-complete `_run_session()` with `src/remote_pipeline.py::RemotePipelineCoordinator`. Feed it persisted pending chunk identities plus the production `FrontierScanCoordinator`; use one `RemoteChunkStager`, one `ReadyQueue`, and one `RemoteChunkWriter`. Scanner publication uses a configured in-memory backlog limit and derives the current sealed-but-unstaged count from authoritative chunk status on every scheduling decision, so old pending staging cannot indefinitely block renewed exploration. If migration 014 is unavailable, the schema gate stops before the coordinator is built. The coordinator selects work in authoritative index/order; durable claims arrive only in Task 3.1.
+- **Exact files/symbols:** `src/remote_orchestrator.py::RemoteOrchestrator._run_streaming_session`, `_run_session`; new `src/remote_pipeline.py::RemotePipelineCoordinator`; `src/scan_frontier.py::FrontierScanCoordinator`; `src/remote_staging.py::RemoteChunkStager`; `src/ready_queue.py::ReadyQueue`; `src/remote_writer.py::RemoteChunkWriter`.
 - **Database:** No new schema in this task. One coordinator owns current state transitions; scanner completion remains independent of chunk completion. Derive the sealed-but-unstaged backlog from authoritative `remote_chunks` rows and keep the limit in configuration rather than persisting a second counter that can drift. Task 3.1 later adds claims after migration 014 is available.
 - **Dependencies:** Tasks 1.1–1.2.
 - **Tests:** Existing incomplete and complete session fixtures must traverse the same coordinator. Add resumed-backlog fairness, scanner optional, producer failure, final partial group, safe cancellation, and ordering tests.
@@ -157,9 +162,9 @@
 - **Exact files/symbols:** `scripts/sql/001_postgres_schema.sql` for current references only; new migration 014; `src/pg_core.py::PgConnectionCore`; new `src/pg_scan.py::PgScanMixin`; `src/pg_db.py::PgDatabaseManager`; `inspect_db.py`.
 - **Dependencies:** Phase 1 boundary and a schema audit command that is read-only by default.
 - **Tests:** Add migration unit tests plus isolated PostgreSQL tests in `tests/test_pg_integration.py` for preflight/backup/quiescence/confirmation, idempotent base apply, legacy null semantics, finalized constraints, claim compare-and-swap, atomic segment readiness/range consumption/chunk seal, duplicate ordinal audit refusal, and unchanged optional-migration behavior.
-- **Failure/recovery:** Base DDL is additive, but legacy repair/final unique constraints are a separate explicit operation. Refuse feature enablement on missing/drifted/unfinalized schema. A failed transaction leaves the old scanner active and retains its audit report.
+- **Failure/recovery:** Base DDL is additive, but legacy repair/final unique constraints are a separate explicit operation. Refuse production scanning on missing/drifted/unfinalized schema. A failed transaction leaves scanning blocked and retains its audit report; it never selects a fallback scanner.
 - **Acceptance gate:** Schema can be applied twice, old sessions remain readable, and no existing chunk is marked sealed or assigned ownership without an explicit backfill report.
-- **Rollback:** Disable the feature and retain populated tables/columns/audit. A reviewed rollback may drop only an unused finalized index or empty frontier tables; restore legacy data from the verified backup rather than guessing a reverse resequence.
+- **Rollback:** Stop frontier publication and retain populated tables/columns/audit. A reviewed rollback may drop only an unused finalized index or empty frontier tables; restore legacy data from the verified backup rather than guessing a reverse resequence.
 
 ### Task 2.2 — Add local scan-segment artifacts
 
@@ -178,7 +183,7 @@
 - **Coverage rule:** Mark `listing_state='complete'` only when that directory's immediate listing/segments are valid. Mark traversal-only `subtree_coverage_state='final'` after every descendant listing is terminal, the final mutation observations agree, and no unresolved traversal/error state remains; segment allocation is deliberately irrelevant to this fact. Advance independent `planning_state` as ready segment ranges are sealed/consumed. Mark scan finality in one transaction when the directory queue is empty and all traversal subtrees are final; mark `planning_complete` only when every ready segment range is fully allocated. This lets operators distinguish “the source tree was explored” from “all discovered entries were assigned to plans.”
 - **Final mutation sweep:** Before global finality, re-read lightweight source observation tokens for every covered directory. A changed token invalidates that directory and its ancestors and requeues the bounded subtree. Stable path/size/structure checks still cannot detect same-size content replacement; record that residual risk.
 - **Continuation rule:** A crash may replay only the current `partial` directory, never a completed directory or all source roots. Already-ready segments are matched by stable canonical path/ordinal from local artifacts, not by PostgreSQL path lookups. If exact within-directory continuation cannot be proved, restart that directory and perform a deterministic artifact merge; do not guess an opaque GNU `find` cursor.
-- **Exact files/symbols:** `src/scanning.py` add an immediate-child NUL-framed iterator and bounded deterministic ordering; `src/scan_frontier.py::RemoteScanCoordinator`; `src/remote_transport.py::_ssh_run`/streaming process helpers; `src/pg_scan.py::PgScanMixin.claim_next_directory`, `publish_scan_segment`, `complete_directory_listing`, `finalize_directory_subtree`, `finalize_scan_scope`.
+- **Exact files/symbols:** `src/scanning.py` add an immediate-child NUL-framed iterator and bounded deterministic ordering; `src/scan_frontier.py::DirectoryFrontierCoordinator`; `src/remote_transport.py::_ssh_run`/streaming process helpers; `src/pg_scan.py::PgScanMixin.claim_next_directory`, `publish_scan_segment`, `complete_directory_listing`, `finalize_directory_subtree`, `finalize_scan_scope`.
 - **Database:** Transactionally claim one directory, publish ready segment metadata, enqueue child directories, and advance directory state. Store no successful per-file scan rows.
 - **Dependencies:** Tasks 2.1–2.2.
 - **Tests:** Add `tests/test_incremental_scan_frontier.py` for root normalization, overlapping-root rejection, reordered-identical scope reuse, added/removed scope refusal, single-file roots, deterministic ordinals independent of worker timing, empty directory listing/subtree coverage, partial-directory restart, no completed-directory replay, final observation sweep/mutation invalidation, multiple roots, spaces/tabs/newlines/Unicode, literal Linux backslash handling, invalid UTF-8/error coverage, and cancellation at each commit boundary.
@@ -193,7 +198,7 @@
 ### Task 2.4 — Preserve legacy chunk publication while removing replay lookups
 
 - **Change:** During Plan 1, keep `PgSessionMixin.get_chunk_files()` as the production planning source, but feed it from ready scan segments. Normal frontier progress must never call `get_remote_existing_snapshot_paths()` for every rediscovered file. For a migrated incomplete legacy session, use a one-time set-based comparison per imported segment against `remote_snapshot_files`, matching both canonical path and expected size, then record that segment as imported so it is never repeated. A path match with a different size is `source_changed`: preserve any existing sealed membership, block automatic replanning or duplicate append, keep the affected directory/scope coverage provisional, and require an explicit operator reconciliation that chooses retain-old, abandon, or create a separately approved later plan. It is never silently anti-joined away.
-- **Exact files/symbols:** `src/scan_frontier.py::RemoteScanCoordinator.publish_legacy_chunk`; `src/pg_sessions.py::append_remote_streaming_chunk`; `src/pg_scan.py::import_legacy_scan_segment`; `src/planning.py::StreamingChunkBuilder` or its narrowed replacement.
+- **Exact files/symbols:** `src/scan_frontier.py::SegmentChunkPublisher`; `src/pg_sessions.py::append_remote_streaming_chunk`; `src/pg_scan.py::import_legacy_scan_segment`; `src/planning.py::StreamingChunkBuilder` or its narrowed replacement.
 - **Database:** Seal chunk membership atomically with expected count/bytes and the ready scan-segment reference. Do not allow later membership append to a sealed chunk. Allocate chunk indexes under the session lock and reread after ambiguous commits.
 - **Dependencies:** Tasks 2.1–2.3.
 - **Tests:** Extend `tests/test_pg_integration.py` for immutable sealed membership, ambiguous-commit retry, no duplicate ordinals, and one-time legacy anti-join. Add an end-to-end fake test showing scan, staging, and write overlap.
@@ -252,24 +257,24 @@
 ### Task 4.2 — Define the one-time conservative frontier bootstrap
 
 - **Change:** Plan an operator-approved bootstrap that imports existing Session 37 membership as immutable legacy-covered paths, creates persisted scope rows, and performs a controlled read-only source traversal to establish directory coverage. Existing path rows alone must not mark any directory complete. Unresolved/error directories remain provisional and queued.
-- **Exact files/symbols:** `src/scan_frontier.py::RemoteScanCoordinator`; `src/pg_scan.py`; `src/pg_sessions.py::get_remote_existing_snapshot_paths`; artifact helpers from Task 2.2; `inspect_db.py` dry-run/execute command pair.
+- **Exact files/symbols:** `src/frontier_bootstrap.py::FrontierBootstrap`; `src/scan_frontier.py::FrontierScanCoordinator`; `src/pg_scan.py`; `src/pg_sessions.py::get_remote_existing_snapshot_paths`; artifact helpers from Task 2.2; `inspect_db.py` dry-run/execute command pair.
 - **Database:** Bootstrap state must be transactional and resumable; record its run ID, source/session IDs, imported segment counts, and coverage status. Do not change chunk format in Plan 1.
 - **Dependencies:** Task 4.1 reports a quiescent, reconcilable state.
 - **Tests:** Rehearse against an isolated clone with missing roots, partial current inventory, overlapping roots, changed sizes, deleted paths, and restart during bootstrap.
-- **Failure/recovery:** Existing sealed chunk membership wins. Rediscovered path-and-size matches are recorded as covered and never appended again; a same-path/different-size observation is `source_changed`, remains provisional, and is never silently suppressed. Uncovered paths become future chunks. A failed pre-activation bootstrap leaves legacy scanning available and coverage non-final.
+- **Failure/recovery:** Existing sealed chunk membership wins. Rediscovered path-and-size matches are recorded as covered and never appended again; a same-path/different-size observation is `source_changed`, remains provisional, and is never silently suppressed. Uncovered paths become future chunks. A failed bootstrap leaves coverage non-final and stops production scanning until explicitly reconciled.
 - **Acceptance gate:** A shadow rehearsal proves no existing member is duplicated, no newly discovered path is skipped, and no directory becomes final without traversal evidence.
-- **Rollback:** Before activation/publication, abandon the rehearsal and leave Session 37 on its legacy scanner. After any frontier-backed publication, stop and preserve frontier/artifacts for explicit reconciliation; never run both scanners or blindly return to root replay. Do not delete or rewrite completed work.
+- **Rollback:** Before activation/publication, abandon the rehearsal. After any frontier-backed publication, stop and preserve frontier/artifacts for explicit reconciliation; never run a second scanner or blindly return to root replay. Do not delete or rewrite completed work.
 
 ### Task 4.3 — Rehearse the frontier rollout without resuming Session 37
 
-- **Change:** Execute the future implementation progression through full offline tests, isolated PostgreSQL tests, and a small synthetic hardware pilot using ZIP/loose behavior and one finite group. Review scan frontier, no-idle-LTFS, writer, restore, and catalog evidence. Keep `incremental_scan_enabled=false` in production and defer the one bounded Session 37 production group to Plan 3 after format/catalog changes are also ready.
+- **Change:** Execute the future implementation progression through full offline tests, isolated PostgreSQL tests, and a small synthetic hardware pilot using ZIP/loose behavior and one finite group. Review scan frontier, no-idle-LTFS, writer, restore, and catalog evidence. The frontier remains the sole production scanner; defer actual production traversal and the one bounded Session 37 production group until separately approved.
 - **Exact files/symbols:** all Plan 1 test files; `tests/lto_fakes.py::FakeLtfsAdapter`, `TapeOperationLog`, `TapeLockObserver`; `src/remote_pipeline.py`; `src/remote_writer.py`; `src/scan_frontier.py`.
 - **Database:** Synthetic pilot uses an isolated catalog/session. Session 37 report/bootstrap remains dry-run against restored evidence only.
 - **Dependencies:** Tasks 4.1–4.2 and all prior Plan 1 gates.
 - **Tests:** Full offline suite, isolated migration/frontier suite, synthetic single-file/directory/error/restart dataset, one finite hardware group, and local ZIP/loose restore.
 - **Failure/recovery:** A hard tape failure stops the pilot immediately under Task 1.4 rules. Preserve evidence; do not resume Session 37 or automatically recover hardware.
-- **Acceptance gate:** Pilot/review evidence is complete and the production feature remains disabled pending Plan 3's bounded-group approval.
-- **Rollback:** Disable the test/pilot flag; preserve pilot artifacts/catalog and no-tape diagnostics.
+- **Acceptance gate:** Pilot/review evidence is complete before any bounded production group; scanner behaviour is not controlled by a feature flag.
+- **Rollback:** Stop after the pilot; preserve pilot artifacts/catalog and no-tape diagnostics.
 
 ## Phase 5 — Documentation, typing, and focused cleanup
 
@@ -303,14 +308,14 @@ Proceed to Plan 2 only when all software items below pass in offline and isolate
 - [ ] Full-lifecycle tests prove zero LTFS access before/after/between finite groups, exactly one owned readiness/cartridge gate per group, no remote auto-eject, and immediate stop after a hard tape failure.
 - [ ] `RemoteOrchestrator` is a pipeline façade; scan, staging, and writer responsibilities have one implementation each.
 - [ ] A source-size/control-flow report shows reduced mixed-responsibility and duplicate code; new modules own behavior rather than forwarding through unnecessary wrappers.
-- [ ] A read-only Session 37 report and isolated bootstrap rehearsal exist; Session 37 itself has not been modified.
-- [ ] The synthetic ZIP/loose hardware pilot is reviewed; `incremental_scan_enabled` remains false in production until Plan 3's bounded rollout.
+- [ ] A read-only Session 37 report and isolated bootstrap rehearsal exist; any production bootstrap is conservative and changes no chunks or membership.
+- [ ] The synthetic ZIP/loose hardware pilot is reviewed before any bounded production group; the scanner has no feature flag.
 - [ ] Stored TAR creation remains disabled and no PostgreSQL pruning has occurred.
 
 ### Plan 1 rollback gate
 
-- [ ] Disable incremental-scan claims and future segment publication.
+- [ ] Stop future frontier segment publication.
 - [ ] Allow already sealed legacy DB-backed chunks to drain through the unchanged ZIP path.
 - [ ] Preserve all ready scan artifacts and additive database state.
-- [ ] Return future exploration to the legacy scanner only for unmigrated sessions that never published frontier state; preserve and explicitly reconcile every frontier-publishing session.
+- [ ] Preserve and explicitly reconcile every frontier-publishing session; do not introduce a legacy fallback mode.
 - [ ] Do not reset `backing`, delete coverage, rewrite chunks, or touch tape during rollback.

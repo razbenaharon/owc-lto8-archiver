@@ -11,9 +11,9 @@ downward dependencies:
 Plan 1 also split the remote pipeline itself, so behaviour lives in focused
 modules rather than one 3.6k-line class:
 
-- :mod:`src.scan_frontier`   — scan-model gate + discovery/publication
+- :mod:`src.scan_frontier`   — persistent-frontier discovery/publication
 - :mod:`src.remote_staging`  — fetch + pack onto local staging (no tape)
-- :mod:`src.remote_writer`   — the finite write group (the only tape path)
+- :mod:`src.remote_writer`   — the sole finite-group tape-write entry path
 - :mod:`src.remote_pipeline` — the single scheduling loop over the three
 
 This module re-exports the public classes so existing imports keep working.

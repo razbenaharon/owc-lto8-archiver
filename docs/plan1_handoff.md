@@ -6,9 +6,9 @@ Full evidence: [`plan1_completion_gate.md`](plan1_completion_gate.md).
 ## In one sentence
 
 The remote pipeline was one 3,657-line file that did everything; it is now a
-small façade over four focused modules, the tape is touched from exactly one of
-them, and the faster "only scan what changed" scanner is **live** — it is the
-only scanner a production run can build.
+façade over four focused modules, `remote_writer.py` is the sole entry path for a
+finite tape-write group, and the persistent frontier scanner is the only scanner
+a production run can build. Cartridge checks also remain in the façade.
 
 ## What an operator will actually notice on the next run
 
@@ -31,8 +31,11 @@ Nothing about how you start a run changes. Five behaviours differ:
 
 ## Production activation — 2026-08-03
 
-Two passes. The first applied migration 014 and set the flag; the second made the
-flag mean something and migrated Session 37.
+Two passes. The first applied migration 014; the second made the persistent
+frontier the sole production scanner and migrated Session 37. The former
+`incremental_scan` key was never a runtime selector and is no longer a feature
+flag. If the old key remains in an untracked live config, it is deprecated and
+ignored.
 
 | Step | Result |
 |---|---|
@@ -40,9 +43,8 @@ flag mean something and migrated Session 37.
 | Verified production backup | 647 MB dump + `pg_restore --list` verified |
 | Migration 014 on production | **Applied and finalized**; existing data unchanged |
 | All-session health report | 4 sessions audited — [`session_health_report.md`](session_health_report.md) |
-| Frontier wired into the runtime | **Done** — legacy scanner unreachable |
+| Production scanner | **Persistent frontier only** — no legacy scan mode or feature flag |
 | Session 37 conservative bootstrap | **done** — 65 scopes, 65 pending roots, nothing traversed |
-| `incremental_scan = true` | **Set, and now functional** |
 | Shadow rehearsal on a restored copy | **PASS** — 12/12 invariants unchanged |
 | Any session resumed | **No.** No run, no scan, no tape operation |
 
@@ -55,9 +57,11 @@ Migration 014 changed no existing data: 113 chunks / 49 done / 64 pending /
 was retired as *destroyed*. An earlier revision concluded its 49 `done` chunks
 were therefore lost. They are not. All 9 of the session's archive runs wrote to
 **Tape_02**, `files_index` records 2,036 stored objects / 710 GB from them on
-Tape_02, and **Tape_03 has never been written to at all** (zero runs, zero index
-rows, `used_space = 0`). The finished work sits on Tape_02 generation 1, still
-active, and is restorable.
+Tape_02, zero archive runs reference Tape_03, and `files_index` has zero rows on
+Tape_03. No Session 37 archive work was written to Tape_03. That cartridge was
+nevertheless written for a separate 24 GiB Phase 5E synthetic pilot and was
+reformatted twice, so it must not be described as never written. The finished
+Session 37 work sits on Tape_02 generation 1, still active, and is restorable.
 
 `tape_label = Tape_03` is the session's **next** target, set when Tape_02
 filled. `_verify_session_tape_generation` still blocks a resume, correctly —
@@ -76,15 +80,20 @@ Nothing is skipped (every root starts `pending`, so the whole source is queued)
 and nothing is duplicated (when the next run lists a directory, its segment is
 reconciled once against the 23.2M existing rows and only genuinely new entries
 reach the chunk builder). Repeating it writes nothing new, and a completed
-bootstrap refuses a second one.
+bootstrap refuses a second one. The durable `remote_frontier_bootstraps` row is
+also what identifies this as a migrated legacy session after bootstrap. With no
+row, only a definite empty snapshot is treated as frontier-born; existing
+membership or missing, exceptional, or indeterminate evidence fails toward
+reconciliation, never toward replay.
 
-### `incremental_scan = true` is now REAL
+### The persistent frontier is the sole production scanner
 
-The 2026-08-03 activation set the flag but it did nothing: `decide_scan_mode()`
-returned `MODE_FRONTIER` and no run consumed the decision. That is fixed. The
-production streaming path now builds
-[`FrontierScanCoordinator`](../src/scan_frontier.py), and the legacy whole-root
-scanner is no longer imported by any module under `src/`.
+The first activation pass exposed that the old `incremental_scan` property and
+`decide_scan_mode()` helper had zero effect on the run path. They were not a
+working mode gate. The production streaming path now builds
+[`FrontierScanCoordinator`](../src/scan_frontier.py) unconditionally. The dead
+decision API and feature property are gone: there is no legacy scan mode and no
+incremental-scan feature flag.
 
 **The new architecture, in one picture:**
 
@@ -95,20 +104,21 @@ DirectoryFrontierCoordinator   claims a directory, writes its listing as a
         |                      JSONL.zst segment, queues its children, commits
         |                      -> a crash replays at most that one directory
         |
-SegmentChunkPublisher      reads the segment artifact, reconciles it ONCE
-        |                  against the legacy snapshot (path AND size, one
+SegmentChunkPublisher      reads the segment artifact; for a migrated session,
+        |                  reconciles it ONCE against the legacy snapshot
+        |                  (path AND size, one
         |                  set-based query per segment), and passes ONLY the
         |                  genuinely new entries to the chunk builder
         |
 StreamingChunkBuilder      chooses chunk boundaries -- from survivors only
         |
-sealed chunk -> stager -> ready queue -> finite write group (the only tape path)
+sealed chunk -> stager -> ready queue -> finite write group (sole tape-writing path)
 ```
 
-The ordering is the point. The legacy scanner filtered already-planned files
+The ordering is the point. The old whole-root path filtered already-planned files
 *after* they had moved the chunk boundary, so a resumed scan produced different
 boundaries from the original run for the same source. Now a known file never
-reaches the builder at all — there is no code path in which it can.
+reaches the builder at all.
 
 **No runtime fallback, deliberately.** An unusable migration-014 schema stops the
 run (`SAFETY_BLOCK` / `scan_frontier_unavailable`) instead of quietly picking the
@@ -149,13 +159,14 @@ docker run -d --name lto_pg_test -e POSTGRES_DB=postgres -e POSTGRES_USER=lto `
 
 $env:LTO_TEST_PG_DSN = "postgresql://lto:<pw>@127.0.0.1:15432/postgres"
 $env:LTO_PG_SEALED_BATCH_IT = "1"
-python -m pytest tests/ -q            # 1408 passed, 0 skipped
+python -m pytest tests/ -q            # 1461 passed, 0 skipped; 12 subtests passed
 
 docker rm -f lto_pg_test              # tmpfs: the server vanishes with it
 ```
 
-Without `LTO_TEST_PG_DSN` the suite still runs (1259 passed, 149 skipped) and
-opens no database connection. Point it at port 5432 and it **fails loudly** at
+Without `LTO_TEST_PG_DSN` the suite still runs (1312 passed, 149 skipped,
+12 subtests passed; 2 warnings) and opens no database connection. Point it at
+port 5432 and it **fails loudly** at
 collection rather than skipping — an unsafe run must never look green. Details:
 [`tests/pg_test_guard.py`](../tests/pg_test_guard.py).
 
@@ -164,9 +175,8 @@ collection rather than skipping — an unsafe run must never look green. Details
 | # | Item | Who |
 |---|---|---|
 | 1 | **Operator-supervised tape rehearsal** — stage 3 of `scripts/plan1_rehearsal.py`. Nine of its ten claims are already proven against fakes; this confirms a real drive agrees. Status: **NOT RUN**. | operator, at the drive |
-| 2 | Read-only session-frontier report against production session 37 (`inspect_db.py --session-frontier-report --session-id 37`). | operator |
-| 3 | Migration 014 on production, after a verified backup, with no archiver running. | operator |
-| 4 | Three pending `config.ini` changes from session 37, all unrelated to Plan 1: revert `allow_resume_oversized_chunks` to `false`, revert `fetch_overrun_abort_factor` to `2.0`, and apply the narrowed 5-root selection staged in `backup_logs/next_session_selected_paths.txt`. **All three only after session 37 reaches `status='completed'`** — editing `remote_selected_paths` in flight changes the session key and makes `--resume` fail to find the session. | operator |
+| 2 | Remove the obsolete `incremental_scan` line from the untracked live `config.ini`. It is ignored and no longer selects runtime behaviour. | operator |
+| 3 | Three pending `config.ini` changes from session 37, all unrelated to Plan 1: revert `allow_resume_oversized_chunks` to `false`, revert `fetch_overrun_abort_factor` to `2.0`, and apply the narrowed 5-root selection staged in `backup_logs/next_session_selected_paths.txt`. **All three only after session 37 reaches `status='completed'`** — editing `remote_selected_paths` in flight changes the session key and makes `--resume` fail to find the session. | operator |
 
 Item 1 must **not** include an ambiguous-write test on real media: provoking a
 latching write error can leave a cartridge permanently read-only.
@@ -175,11 +185,11 @@ latching write error can leave a cartridge permanently read-only.
 
 | File | Role |
 |---|---|
-| [`src/remote_orchestrator.py`](../src/remote_orchestrator.py) | Façade. Session setup and delegation. 3,657 → 2,330 lines. |
-| [`src/remote_writer.py`](../src/remote_writer.py) | **The only module that touches tape.** If a change cannot affect the drive, it does not belong here. |
+| [`src/remote_orchestrator.py`](../src/remote_orchestrator.py) | Façade. Session setup, cartridge checks, and delegation. 3,657 → 2,506 lines. |
+| [`src/remote_writer.py`](../src/remote_writer.py) | The sole finite write-group entry path; owns remote tape-copy execution. |
 | [`src/remote_staging.py`](../src/remote_staging.py) | Fetch and pack. |
 | [`src/remote_pipeline.py`](../src/remote_pipeline.py) | One scheduling loop for both session kinds. |
-| [`src/scan_frontier.py`](../src/scan_frontier.py) | Scan-mode gate and the frontier coordinator. |
+| [`src/scan_frontier.py`](../src/scan_frontier.py) | Sole production scanner and frontier coordinator; schema readiness fails closed. |
 | [`src/startup_reconcile.py`](../src/startup_reconcile.py) | What to do about an interrupted previous run. |
 | [`tests/pg_test_guard.py`](../tests/pg_test_guard.py) | Refuses any PostgreSQL connection that is not provably disposable. |
 
