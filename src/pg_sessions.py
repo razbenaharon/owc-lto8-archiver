@@ -1246,6 +1246,33 @@ class PgSessionMixin:
             ).fetchall(),
             "list remote sessions")
 
+    def session_tape_footprint(self, session_id):
+        """Which tapes this session ACTUALLY wrote to, with what. Read-only.
+
+        Derived from ``archive_runs`` and ``files_index``, not from
+        ``remote_sessions.tape_label`` — that column is the session's *next*
+        write target and says nothing about where finished chunks landed. The
+        two diverge routinely after a cartridge change, and reading the label as
+        if it were the footprint once produced a wrong conclusion that a
+        session's completed work had been destroyed.
+        """
+        return self._run_read(
+            lambda conn: conn.execute(
+                """SELECT r.tape_label,
+                          count(DISTINCT r.run_id)      AS runs,
+                          count(f.file_id)              AS stored_objects,
+                          coalesce(sum(f.file_size_bytes), 0) AS bytes,
+                          min(r.started_at)             AS first_run,
+                          max(r.started_at)             AS last_run
+                   FROM archive_runs r
+                   LEFT JOIN files_index f ON f.archive_run_id = r.run_id
+                   WHERE r.remote_session_id = %s
+                   GROUP BY r.tape_label
+                   ORDER BY r.tape_label""",
+                (session_id,),
+            ).fetchall(),
+            f"tape footprint for session {session_id}")
+
     def find_sessions_sharing_plan(self, session_id):
         """Other sessions on the SAME plan or snapshot. Read-only.
 

@@ -51,14 +51,18 @@ Migration 014 changed no existing data: 113 chunks / 49 done / 64 pending /
 
 ### Session 37: conservative bootstrap, and a serious finding
 
-**The finding first, because it changes what a resume means.** Session 37 is
-bound to **Tape_03 generation 1**, which was *retired* on 2026-08-02 with the
-reason `physical contents intentionally destroyed by tape reset` — and retired
-again at generation 2. The active generation is **3**, and `tapes.used_space` for
-Tape_03 is `0`. So its 49 `done` chunks are done **in the catalog only**; the
-bytes are not on the cartridge. `_verify_session_tape_generation` blocks a
-resume before the drive is touched. Do not bypass that guard. Deciding what to do
-about those 49 chunks is an operator decision and is out of Plan 1 scope.
+**A correction first.** Session 37 is bound to **Tape_03 generation 1**, which
+was retired as *destroyed*. An earlier revision concluded its 49 `done` chunks
+were therefore lost. They are not. All 9 of the session's archive runs wrote to
+**Tape_02**, `files_index` records 2,036 stored objects / 710 GB from them on
+Tape_02, and **Tape_03 has never been written to at all** (zero runs, zero index
+rows, `used_space = 0`). The finished work sits on Tape_02 generation 1, still
+active, and is restorable.
+
+`tape_label = Tape_03` is the session's **next** target, set when Tape_02
+filled. `_verify_session_tape_generation` still blocks a resume, correctly —
+the session would continue writing onto a cartridge reformatted twice since it
+was planned. Where the 64 pending chunks should go is an operator decision.
 
 **What the bootstrap did.** The gate used to refuse any session whose scan had
 not finished — which is every session it exists for. That was wrong: an
