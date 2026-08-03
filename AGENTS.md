@@ -71,29 +71,43 @@ Three rules the code now enforces rather than documents:
   `backing → done`; an unreadable chunk status now *stops the run* instead of
   being treated as clear.
 
-Plan 1 was **activated in production on 2026-08-03**. Start here:
+Plan 1 is **COMPLETE AND ACTIVATED** (2026-08-03). Start here:
 `docs/plan1_handoff.md` — one page, what changes for an operator and what is
-still outstanding. Full evidence, the task-by-task matrix and the activation
-record: `docs/plan1_completion_gate.md` §13.
+still outstanding. Evidence and the task matrix: `docs/plan1_completion_gate.md`
+(§14 is the completion record). Every session was audited:
+`docs/session_health_report.md`.
 
 Current production state — verify, don't assume:
 
+- **The frontier scanner is the ONLY scanner a production run can build.**
+  `_run_streaming_session` constructs `FrontierScanCoordinator`; no module under
+  `src/` imports `build_legacy_scanner_factory` any more. There is deliberately
+  **no runtime fallback**: an unusable migration-014 schema stops the run
+  (`SAFETY_BLOCK` / `scan_frontier_unavailable`) rather than downgrading, because
+  a fallback is how two scanners end up on one frontier. Git history and the
+  verified backup are the rollback path.
 - Migration 014 is **applied and finalized** on
-  `lto_archive_directory_catalog_20260710_103359`. Existing data was unchanged.
-- `[REMOTE] incremental_scan = true`, **but it is currently a no-op.**
-  `decide_scan_mode()` returns `MODE_FRONTIER` and nothing reads the result:
-  `_resolve_scan_mode` sets `self._scan_mode`, which is never used, and the
-  streaming path always builds `build_legacy_scanner_factory()`
-  (`remote_orchestrator.py:1097`). `build_frontier_scanner_factory()` has zero
-  callers. **Wiring the run path to the decision is the remaining Plan 1 work.**
-- **Session 37 is not frontier-bound and cannot be bootstrapped**: its scan
-  never finished (`scan_complete = false`), so `--session-frontier-report`
-  returns `blocked` and `--bootstrap-frontier --dry-run` returns
-  `would_proceed: false`. All seven migration-014 tables are empty.
+  `lto_archive_directory_catalog_20260710_103359`, and
+  `[REMOTE] incremental_scan = true` **now has a real runtime effect**.
+- **Known files are filtered before the chunk builder**, structurally: a segment
+  is reconciled once against the legacy snapshot (path AND size, one set-based
+  query per segment) and only genuinely new entries reach `builder.add()`. A
+  rediscovered file cannot move a chunk boundary.
+- **Scan finality needs traversal evidence.** `scan_complete` is written only
+  when every scope reports final coverage. Catalog rows never establish it.
+- **Session 37** has a conservative frontier: 65 scopes and 65 roots queued
+  `pending`, nothing traversed, nothing marked complete (shadow-rehearsed
+  first, 12/12 invariants unchanged). **It is bound to
+  Tape_03 generation 1, which was RETIRED with "physical contents intentionally
+  destroyed by tape reset"** — the active generation is 3 and `used_space` is 0,
+  so its 49 `done` chunks are done in the catalog only.
+  `_verify_session_tape_generation` blocks a resume; do not bypass it.
+- **Session 36** is partial and **superseded by 37** (its chunks 1–10 are 100%
+  covered by plan 37; its `done` chunk 0 is unique and must be preserved). It
+  received **no intervention** by design — see the health report.
 - The scheduled tasks **`LTO-Archive-Resume`** and **`LTO-Archive-Watchdog`**
-  (10-minute repeating trigger) were **disabled** for the activation and are
-  still disabled. Re-enable with `Enable-ScheduledTask` when a run is
-  authorised, or the archiver will never restart on its own again.
+  (10-minute repeating trigger) are **disabled**. The archiver cannot restart
+  itself. Re-enable with `Enable-ScheduledTask` when a run is authorised.
 - The operator-supervised tape rehearsal (`scripts/plan1_rehearsal.py` stage 3)
   is **NOT RUN**.
 

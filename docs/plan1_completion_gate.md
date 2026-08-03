@@ -10,11 +10,12 @@ covered by tests; §1 is the task-by-task matrix. **1408 tests pass, 0 skipped,
 **Hardware validation: NOT RUN, OPERATOR-SUPERVISED TAPE WRITE REQUIRED LATER.**
 That is a production-activation gate, not a Plan 1 code defect — see §9.
 
-**Production activation ran on 2026-08-03 — see §13 for what actually landed.**
-Migration 014 is applied and finalized on the production catalog and
-`incremental_scan = true` is set, but the Session 37 frontier bootstrap is
-**blocked by design** and the flag is currently a **no-op** because no run
-consumes the scan-mode decision. Operational summary for the next person:
+**Production activation ran on 2026-08-03 in two passes.** §13 records the
+first (migration 014 applied and finalized; the flag set but inert). §14
+records the completion: the frontier is now the runtime's only scanner, the
+legacy scanner is unreachable from production, and Session 37 has a
+conservative frontier. Every session was audited —
+[`session_health_report.md`](session_health_report.md). Operational summary:
 [`docs/plan1_handoff.md`](plan1_handoff.md).
 
 Reproduce every claim below with:
@@ -479,3 +480,212 @@ Two consequences, one reassuring and one not:
 Wiring the run path to the decision is **remaining Plan 1 work** (gate 6 in
 §10). It is code work, not an operator decision, and it needs its own test
 proving a frontier-mode run actually constructs the frontier scanner.
+
+## 14. Plan 1 completion — 2026-08-03 (second pass)
+
+§13 left `incremental_scan = true` set but **inert**: `decide_scan_mode()`
+returned `MODE_FRONTIER` and nothing consumed the decision. This pass makes the
+flag mean something and closes Plan 1.
+
+Performed with the archiver stopped, both archiver scheduled tasks disabled, and
+**no tape operation, no run, no `--resume` and no scan of any kind**.
+
+### 14.1 The inert-flag defect, and why the tests missed it
+
+The runtime never read the decision. `_resolve_scan_mode()` assigned
+`self._scan_mode` and nothing else referenced it; `_run_streaming_session` built
+its scanner with `build_legacy_scanner_factory()` unconditionally;
+`build_frontier_scanner_factory()` had **zero callers** in `src/` or `tests/`;
+and `DirectoryFrontierCoordinator` was constructed only by
+`FrontierBootstrap.execute()`.
+
+**Why 1408 passing tests did not catch it** — because of what they asserted.
+Every scan-mode test exercised `decide_scan_mode` *in isolation*
+(`test_scan_mode_gate.py`, `test_migration_014.py`, `test_pg_integration.py`),
+verifying the function returned the right enum. Not one asked what a run
+actually **constructs**. A pure-function test can prove a decision is correct
+and say nothing about whether anybody acts on it. The new
+`tests/test_frontier_is_the_production_scanner.py` asks exactly that question,
+including a repository-wide AST check that no `src/` module imports the legacy
+factory.
+
+### 14.2 The final scanner architecture
+
+```text
+DirectoryFrontierScanner -> DirectoryFrontierCoordinator -> SegmentChunkPublisher -> StreamingChunkBuilder
+  lists ONE directory        claims/lists/publishes one      reconciles the segment    boundaries chosen
+  over SSH                   segment, queues children,       ONCE against the legacy   from SURVIVORS only
+                             commits per directory           snapshot (path AND size)
+```
+
+`FrontierScanCoordinator` composes the two halves and satisfies the pipeline's
+`scan_coordinator.run()` contract. Traversal and publication interleave: after
+each directory whatever became ready is sealed, so the stager stays fed and an
+interrupted run has already sealed everything it could.
+
+**Known files are filtered before the chunk builder, structurally.** The legacy
+coordinator filtered *after* the builder had seen the paths — its own docstring
+said so — so a rediscovered file moved the boundary before being dropped. Now
+`entries_for_segment()` returns only genuinely `new` entries and only those reach
+`builder.add()`. The work is bounded: one set-based query per **segment**,
+matched against the `(snapshot_id, remote_path)` unique index, never one query
+per file.
+
+### 14.3 Legacy code removed
+
+| Removed | What it was |
+|---|---|
+| `RemoteOrchestrator._resolve_scan_mode` | recorded a decision nothing read |
+| `RemoteOrchestrator._session_bound_to_frontier` | chose between two scanners |
+| `self._scan_mode` | written once, never read |
+| `build_legacy_scanner_factory` / `RemoteScanCoordinator` imports | the production legacy path |
+
+Replaced by `_require_frontier_schema()`, which **fails closed**: an unusable
+migration-014 schema stops the run with `SAFETY_BLOCK` /
+`scan_frontier_unavailable` rather than downgrading. A runtime fallback is how
+two scanners end up on one frontier; git history and the verified backup are the
+rollback path.
+
+`RemoteScanCoordinator` and `build_legacy_scanner_factory` still exist in
+`src/scan_frontier.py` and are still exercised by tests that characterise the old
+behaviour — the plan forbids deleting the legacy PlanSource, and later plans need
+it. What is gone is any way for a production run to reach them.
+
+### 14.4 Three defects found during this pass
+
+Two by the Codex review, one by a new test.
+
+| # | Defect | Consequence | Found by |
+|---|---|---|---|
+| 1 | `entries_for_segment` returned the **raw unfiltered pairs** when `import_legacy_scan_segment` reported `already_imported` (the import is once-only and returns empty lists the second time). | Any restart between "segment imported" and "chunk sealed" re-fed already-planned files into the builder — re-planning them and shifting boundaries. Exactly what the frontier exists to prevent. | Codex |
+| 2 | `FrontierBootstrap._session_report()` passed `lock_holders=[]` and `active_processes=[]` — hard-coded emptiness. | Every liveness gate downstream was **vacuous**: a bootstrap could be approved while an archiver held the lock. | Codex |
+| 3 | `consume_segment_range` advances the cursor by the *inserted* count and marks `consumed` only at the end of the range. With filtering, inserted is less than the raw entry count, so a segment never reached its end, stayed `ready`, and was re-offered on the next pass — planning its new entries **twice**. | Duplicate chunk membership. Reproduced as `['/src/f1', '/src/f1', ...]` in a characterization test. | new test |
+
+Fixes: (1) `PgScanMixin.classify_segment_entries` — a read-only recomputation of
+the same set-based comparison, no side effects, so a restart reclassifies rather
+than replays; (2) real liveness probes injected, with a failed or absent probe
+returning a blocking marker so *unknown* never reads as *nobody*; (3)
+`mark_segment_fully_allocated` plus `SegmentChunkPublisher._retire`, so a segment
+the publisher has fully classified stops being offered regardless of how much of
+it was planned.
+
+### 14.5 Session 37 — conservative bootstrap
+
+The gate was corrected first. The bootstrap adopted **every** blocking reason
+from the read-only session report, including "the scan never completed" — which
+is the condition it exists to handle. The two answer different questions: the
+report asks "is this session finished?", the bootstrap asks "can I safely build a
+frontier for it?". `scan_complete = false` is now allowed through; `backing`
+chunks, mid-flight chunks, a shared plan, held locks, live processes, orphan
+`.part` artifacts and unreadable state still block — each read as a **structured
+fact**, so rewording a message cannot disable a gate.
+
+`execute_conservative()` creates the scope rows and queues each configured root
+as `pending`. It lists no directory, publishes no segment, imports no membership,
+finalizes nothing, and never writes `scan_complete`. It is recorded `running`,
+not `completed`, because coverage is not final.
+
+Why structure-only rather than a full traversal: a traversal is a multi-hour SSH
+walk that would have to decide coverage for directories the historical scan may
+or may not have reached, and any such decision made now is a guess. Leaving every
+root `pending` means the next approved run simply scans, and the frontier's own
+rules decide coverage from real evidence.
+
+**Serious finding, recorded because it changes what a resume means.** Session 37
+is bound to Tape_03 **generation 1**, retired 2026-08-02 with
+`physical contents intentionally destroyed by tape reset`; generation 2 was also
+retired; generation 3 is active and `tapes.used_space` is `0`. Its 49 `done`
+chunks are done in the catalog only. `_verify_session_tape_generation` blocks a
+resume before the drive is touched. What to do about those chunks is an operator
+decision and is explicitly out of Plan 1 scope.
+
+### 14.6 Session 36 and the all-session audit
+
+Full report: [`session_health_report.md`](session_health_report.md).
+
+Session 36 is **partial and superseded**, and receives **no intervention**.
+Measured: 5,720,920 planned paths, of which 2,414,473 are also in plan 37. Chunk
+0 holds 3,306,447 files, is `done`, and has **zero** overlap with plan 37 — it is
+the only copy of that work, on Tape_02 generation 1 which is still active.
+Chunks 1 to 10 hold exactly the remaining 2,414,473 files (one `fetch_failed`,
+nine `pending`) and are **100%** covered by plan 37.
+
+So bootstrapping 36 would queue a second exploration of a source 37 already
+covers; resetting its `fetch_failed` chunk would invite re-fetching bytes 37
+already plans; and marking it `completed` would invent completion its scan never
+earned. It has no `backing` chunk, no owner, no lease, no frontier state and no
+shared plan, so nothing about it makes the new scanner unsafe. Sessions 34
+(completed) and 35 (abandoned, zero chunks) are terminal and consistent.
+
+The audit also exposed a defect in the shared quiescence probe:
+`active_archive_processes()` matched **any** process whose command line contained
+`remote_orchestrator` or `run.py`, so a review tool invoked with a prompt naming
+those files was reported as a running archiver, turning every verdict into
+`ambiguous`. It now additionally requires a Python interpreter, which keeps every
+true positive (the archiver is always Python) and drops the impostors.
+`robocopy`/`scp`/`tar` are matched by executable name and are unaffected.
+
+### 14.7 Shadow rehearsal and production execution
+
+**Shadow rehearsal** (`scripts/plan1_shadow_rehearsal.py`). The verified
+production dump was restored into a throwaway `plan1_shadow_*` database — never
+production; the script refuses a target that lacks the prefix or matches the
+configured production name — fingerprinted, bootstrapped, and re-fingerprinted.
+The scanner handed to it raises on any `list_directory`/`observe` call, so a
+conservative bootstrap that traversed anything would fail loudly.
+
+| Result | |
+|---|---|
+| Verdict | **PASS** |
+| Invariants violated | **none** |
+| Unchanged (12 of 12) | sessions · chunks · chunk_counts · membership_totals · membership_per_chunk · snapshot_totals · tapes · tape_generations · file_state · files_index · zip_containers · locators |
+| Tables that grew | `remote_scan_scopes` 0→65 · `remote_scan_directories` 0→65 · `remote_frontier_bootstraps` 0→1 |
+| Repeat run | wrote nothing new — fingerprints identical (`idempotent: true`) |
+
+**Production execution**, gated on that PASS. Immediately before: no archiver
+process, zero advisory locks, all frontier tables empty, both archiver scheduled
+tasks disabled.
+
+```
+mode                 : conservative        directories_listed  : 0
+scopes_established   : 65                  segments_published  : 0
+coverage_final       : False               scan_marked_complete: False
+segments_imported    : 0                   entries_covered/new/changed: 0/0/0
+```
+
+Post-change invariants — **identical to the shadow, and to the pre-change
+state**:
+
+| Measure | Value |
+|---|---|
+| `remote_chunks` session 37 | 113 (49 done / 64 pending) |
+| plan 37 member rows | 23,214,474 |
+| sessions · all chunks | 4 · 130 |
+| `files_index` · ZIP containers | 3,336,421 · 3,335,288 |
+| session 37 row | `active`, `scan_complete=false`, `chunk_count=113`, `completed_at NULL`, Tape_03 gen 1 |
+| `tapes.used_space` | Tape_01 10,624,686,466,311 · Tape_02 4,999,755,772,612 · Tape_03 0 |
+
+What the bootstrap added, and nothing else: 65 scope rows (all
+`coverage_state=provisional`), 65 directory rows (**all `listing_state=pending`**),
+and one bootstrap record (`state=running`, `coverage_final=false`). Zero
+segments, zero chunk–segment links, zero scan errors, zero worker attempts.
+
+Session 37 is now `frontier_bound=true` with 65 scopes. **No session was
+resumed, no scan ran, and no tape operation occurred.**
+
+### 14.8 Codex findings NOT fixed — deferred with reasons
+
+The independent review raised more than was actioned. These remain open and are
+recorded rather than quietly dropped:
+
+| Finding | Why deferred |
+|---|---|
+| `consume_segment_range` is not idempotent under an ambiguous-commit retry (no idempotency key tying the operation to its chunk) | Real, and **pre-existing**. Fixing it means adding an idempotency key to the segment-consumption protocol — a schema and protocol change beyond a completion pass. No segment has been consumed in production yet (zero segments exist), so nothing is at risk today. |
+| `scan_complete` can still be reached through a stale `final` scope (`invalidate_directory` does not demote an already-final ancestor) or an indeterminate observation token (`observe` returning `None` is skipped rather than blocking) | Real, and pre-existing in the finalize logic. It cannot trigger before a first real traversal, which has not happened. |
+| A withheld literal-backslash path records its scan error without a `scan_directory_id`, so it does not block scope finality | Real. The path is correctly withheld and never merged (the incident invariant holds); what is imprecise is coverage accounting. |
+| An indeterminate LTFS `sync_type` probe proceeds rather than blocking | Pre-existing, and already documented in the incident notes. Out of scope for a scanner change. |
+| `session_health` treats an unknown tape generation or absent liveness input as no finding, and misses "declared chunks > 0, actual 0" | Mine. The report is advisory and read-only; each gap over-reports health rather than under-reporting danger, and the operative gates live in the bootstrap and orchestrator, not here. |
+
+Each is a genuine observation. None of them is reachable by the state production
+is in now (no segments, no traversal, no run), which is why activation proceeded
+and why they are listed here rather than silently closed.
