@@ -372,3 +372,39 @@ class NewSqlMatchesTheRealSchemaTests(unittest.TestCase):
         for state in (ScanSegmentState.READY, ScanSegmentState.CONSUMED,
                       ScanSegmentState.PARTIALLY_CONSUMED):
             self.assertIn(state.value, declared)
+
+
+class ThePublicFacadeDoesNotAdvertiseTheLegacyScannerTests(unittest.TestCase):
+    """`src.orchestrators` is what application code imports from.
+
+    Leaving the legacy scanners on it kept them one import away from being used
+    again, and contradicted the documented rule that the frontier is the only
+    scanner a production run may build. They still exist in `src.scanning` —
+    the plan forbids deleting the legacy PlanSource — but the facade must not
+    hand them out.
+    """
+
+    def test_the_facade_exports_neither_legacy_scanner(self):
+        from src import orchestrators
+        for name in ("StreamingRemoteScanner", "RemoteScanner"):
+            self.assertNotIn(name, orchestrators.__all__)
+            self.assertFalse(hasattr(orchestrators, name),
+                             f"{name} is still importable from the facade")
+
+    def test_the_cli_imports_no_scanner_from_the_facade(self):
+        """The CLI is the actual production entrypoint."""
+        text = open(os.path.join(PROJECT_ROOT, "src", "cli.py"),
+                    encoding="utf-8").read()
+        tree = ast.parse(text)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module and \
+                    node.module.endswith("orchestrators"):
+                imported = {a.name for a in node.names}
+                self.assertEqual(
+                    imported & {"StreamingRemoteScanner", "RemoteScanner",
+                                "RemoteScanCoordinator"}, set())
+
+    def test_the_legacy_scanner_still_exists_for_its_tests(self):
+        """Unreachable from production is the goal; deleted is not."""
+        from src.scanning import StreamingRemoteScanner
+        self.assertTrue(callable(StreamingRemoteScanner))

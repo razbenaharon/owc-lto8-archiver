@@ -9,10 +9,12 @@ from src.constants import LOCAL_STAGING_RESERVE_BYTES
 from src.orchestrators import (
     ChunkPlanner,
     RemoteOrchestrator,
-    RemoteScanner,
     StreamingChunkBuilder,
-    StreamingRemoteScanner,
 )
+# The legacy scanners are imported from their own module, not the public
+# facade: Plan 1 completion removed them from that facade so it cannot
+# advertise a class no production path may build.
+from src.scanning import RemoteScanner, StreamingRemoteScanner
 from src.pipeline_types import StagedChunk
 from src.remote_transport import (
     _ASKPASS_HELPERS,

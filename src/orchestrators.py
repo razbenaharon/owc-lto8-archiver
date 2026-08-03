@@ -21,6 +21,13 @@ Note for tests: ``mock.patch`` targets must name the module a symbol is *used*
 in (e.g. ``src.scanning._ssh_run``, ``src.remote_staging._dir_tree_size``,
 ``src.scan_frontier.StreamingRemoteScanner``), not this facade.
 
+Removed from this facade at Plan 1 completion: ``RemoteScanner`` and
+``StreamingRemoteScanner``. The frontier is the only scanner a production
+run may build, so the public facade must not advertise the legacy ones. The
+classes still exist in ``src.scanning`` — the plan forbids deleting the
+legacy PlanSource and later plans need it — and the tests that characterise
+their behaviour import them from there.
+
 Removed by Plan 1 Task 1.6 after a repository-wide audit found no production
 caller: ``DirectoryFirstRemoteScanner``, ``DirectoryUnitPlanner`` and
 ``DirectoryPlanUnit``. They were never wired into the new-session path, and two
@@ -34,12 +41,10 @@ from .local_orchestrator import LocalOrchestrator
 from .planning import ChunkPlanner, StreamingChunkBuilder
 from .remote_orchestrator import RemoteOrchestrator
 from .resource_governor import ResourceGovernor
-from .scanning import RemoteScanner, StreamingRemoteScanner
 
 __all__ = [
     "ChunkPlanner",
     "LocalOrchestrator", "RemoteOrchestrator",
     "ResourceGovernor",
-    "RemoteScanner", "StreamingChunkBuilder",
-    "StreamingRemoteScanner",
+    "StreamingChunkBuilder",
 ]

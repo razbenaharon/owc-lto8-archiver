@@ -1,12 +1,17 @@
 """RemoteOrchestrator: streaming remote-host -> staging -> tape pipeline.
 
-Current-flow characterization map (Plan 1, Task 0.1)
-====================================================
+Flow map (Plan 1 Task 0.1, updated at Plan 1 completion)
+=======================================================
 
-This map records what the code does **today**, so a later refactor can be
-proved behaviour-preserving instead of argued about. Every statement below is
-pinned by a test in ``tests/test_pipeline_characterization.py``; if you change
-the behaviour, change that test in the same commit.
+This map records what the code does **today**. It began life as a
+characterization of the pre-Plan-1 flow so the refactor could be proved
+behaviour-preserving; Plan 1 then deliberately changed that flow, and the map
+was updated with it. Every statement below is pinned by a test in
+``tests/test_pipeline_characterization.py``; if you change the behaviour,
+change that test in the same commit.
+
+Where the old behaviour is worth remembering — because the new behaviour exists
+to fix it — it is marked **WAS**, not left standing as if it were current.
 
 Entry flows
 -----------
@@ -31,23 +36,31 @@ which creates a *growable* ``remote_snapshots`` row and a ``remote_plans`` row
 with ``remote_sessions.scan_complete = FALSE``. Chunks are appended to that plan
 as the scan discovers them.
 
-Scanning and planning (``_run_streaming_session._scanner_planner``)
+Scanning and planning (``_run_streaming_session`` -> ``FrontierScanCoordinator``)
 -------------------------------------------------------------------
-1. Every existing non-``done`` chunk is pushed onto ``chunk_q`` **before** any
-   new exploration starts. ``chunk_q`` is bounded (``prefetch_ahead * 2``), so a
-   large resumed backlog can postpone renewed scanning for as long as the stager
-   needs to drain it. Renewed scanning is not starvation-proof today; Task 1.3
-   is where the fairness rule arrives.
-2. ``StreamingRemoteScanner.iter_scan()`` then runs
-   ``LC_ALL=C find <root> -type f -printf '%s %p\\0'`` from **every** configured
-   root, on **every** incomplete-session run. Recovery is by replaying visited
-   files, not by resuming a persisted position.
-3. ``StreamingChunkBuilder`` chooses chunk boundaries in *discovery order* using
-   ``ChunkPlanner.footprint()``, the byte budget from ``_chunk_budget()`` (which
-   is sampled once per run from live free space), and ``chunk_max_files``.
-4. ``_append_chunk()`` filters already-known paths **after** those rediscovered
-   paths have already influenced the builder's boundaries — so a resumed scan's
-   chunk boundaries differ from the original run's.
+1. Work selection is **authoritative**: the stager reads pending chunks from
+   their persisted status, so a resumed backlog never queues in front of renewed
+   exploration. (WAS: every non-``done`` chunk was pushed onto a bounded
+   ``chunk_q`` before exploration started, so a large backlog plus a slow stager
+   could postpone scanning indefinitely.)
+2. :class:`~src.scan_frontier.FrontierScanCoordinator` explores the source **one
+   directory at a time**, publishing each listing as a ready segment artifact and
+   committing per directory, so a crash replays at most that directory.
+   (WAS: ``StreamingRemoteScanner.iter_scan()`` ran ``find`` from every
+   configured root on every incomplete-session run, recovering by replaying
+   visited files rather than resuming a persisted position.)
+3. ``SegmentChunkPublisher`` reads a segment's entries from its local artifact
+   and, for a session that pre-dates the frontier, reconciles it **once** against
+   the legacy snapshot — one set-based query per segment, on canonical path AND
+   size — passing only genuinely new entries onward.
+4. ``StreamingChunkBuilder`` then chooses chunk boundaries in discovery order
+   using ``ChunkPlanner.footprint()``, the byte budget from ``_chunk_budget()``
+   and ``chunk_max_files``. Because step 3 already removed known paths, a
+   rediscovered file **cannot** influence a boundary. (WAS: the membership filter
+   ran *after* the builder had seen the paths, so a resumed scan produced
+   different boundaries from the original run for the same source.)
+5. Scan finality comes from traversal evidence only: ``scan_complete`` is written
+   when every scope reports final coverage, never inferred from catalog rows.
 5. ``_append_chunk()`` and ``PgSessionMixin.append_remote_streaming_chunk()``
    each issue **one chunk-bulk** membership query (``remote_path = ANY(...)``).
    This is *not* one SQL round trip per file; the per-file cost is in the
