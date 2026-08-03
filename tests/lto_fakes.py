@@ -14,8 +14,16 @@ from unittest import mock
 
 # Modules that do `from .runtime import _acquire_tape_io_lock`, so the name must
 # be patched at each use site rather than on src.runtime alone.
+# Keep this in step with `grep -l _acquire_tape_io_lock src/*.py`. A module
+# missing from this list is NOT observed, and a test that relies on the
+# observer then silently proves nothing. Plan 1's Task 1.2 moved the remote
+# write group into src.remote_writer, which is where the group's single
+# ownership period is now taken — omitting it made TapeLockObserver blind to
+# the one acquisition that matters most.
 TAPE_LOCK_USE_SITES = (
-    "src.ltfs", "src.backup", "src.local_orchestrator", "src.remote_orchestrator",
+    "src.ltfs", "src.backup", "src.local_orchestrator",
+    "src.remote_orchestrator", "src.remote_writer", "src.retriever",
+    "src.tape_reset",
 )
 
 
@@ -129,15 +137,20 @@ class TapeLockObserver:
         self.events = []
         self.depth = 0
         self.max_depth = 0
+        self.timeouts = []
         self._stack = []
 
-    def _acquire(self, reason):
+    def _acquire(self, reason=None, *args, **kwargs):
+        # Mirrors runtime._acquire_tape_io_lock(reason, timeout=...). Accepting
+        # the full signature matters: a TypeError here would surface as the
+        # observed code failing, not as the observer being out of date.
+        self.timeouts.append(kwargs.get("timeout"))
         self.depth += 1
         self.max_depth = max(self.max_depth, self.depth)
         self._stack.append(reason)
         self.events.append(("acquire", reason, self.depth))
 
-    def _release(self):
+    def _release(self, *args, **kwargs):
         reason = self._stack.pop() if self._stack else None
         self.events.append(("release", reason, self.depth))
         self.depth -= 1

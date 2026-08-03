@@ -130,6 +130,160 @@ class PgConnectionCore:
                 cur.execute(sql_path.read_text(encoding="utf-8"))
             conn.commit()
 
+    # ------------------------------------------------------------------
+    # Migration 014 — incremental scan frontier (Plan 1, Task 2.1)
+    # ------------------------------------------------------------------
+
+    #: Tables the BASE half creates. All of them must exist before the frontier
+    #: can even be considered.
+    INCREMENTAL_SCAN_TABLES = (
+        "remote_scan_scopes",
+        "remote_scan_directories",
+        "remote_scan_segments",
+        "remote_chunk_scan_segments",
+        "remote_scan_errors",
+        "remote_worker_attempts",
+        "remote_frontier_bootstraps",
+    )
+    #: Nullable-for-legacy columns the BASE half adds to remote_chunks.
+    INCREMENTAL_SCAN_CHUNK_COLUMNS = (
+        "owner_token", "lease_expires_at", "attempt_id", "membership_state",
+        "expected_file_count", "expected_bytes",
+    )
+    #: What the FINALIZE half creates. Installed != finalized.
+    INCREMENTAL_SCAN_FINAL_INDEX = "uq_remote_plan_files_chunk_ordinal"
+
+    def incremental_scan_schema_installed(self):
+        """True when migration 014's BASE half is fully present.
+
+        Read-only. Checks every table AND every added column: a half-applied
+        migration must not read as installed, because the frontier would then
+        write rows into a schema that cannot hold all of them.
+        """
+        with self._pool.connection() as conn:
+            if not all(self._table_exists_conn(conn, name)
+                       for name in self.INCREMENTAL_SCAN_TABLES):
+                return False
+            return all(
+                self._column_exists_conn(conn, "remote_chunks", column)
+                for column in self.INCREMENTAL_SCAN_CHUNK_COLUMNS)
+
+    def incremental_scan_schema_finalized(self):
+        """True when migration 014's FINALIZE half has also been applied.
+
+        The finalize step is what makes duplicate chunk membership structurally
+        impossible. Until it has run, the base tables exist but nothing
+        prevents two ordinals colliding, so the frontier must not activate.
+        """
+        with self._pool.connection() as conn:
+            return conn.execute(
+                """SELECT 1 FROM pg_indexes
+                   WHERE schemaname='public' AND indexname=%s""",
+                (self.INCREMENTAL_SCAN_FINAL_INDEX,),
+            ).fetchone() is not None
+
+    def incremental_scan_schema_preflight(self):
+        """Read-only report of what applying migration 014 would face.
+
+        Never writes. Returns a dict an operator (and the ``inspect_db.py``
+        command) can read BEFORE deciding to execute anything:
+
+          ``installed`` / ``finalized``   current state
+          ``archiver_lock_held``          another process is running
+          ``duplicate_ordinal_groups``    rows the FINALIZE half would refuse
+          ``blocking``                    human-readable reasons not to proceed
+        """
+        report = {
+            "database": None,
+            "installed": False,
+            "finalized": False,
+            "archiver_lock_held": None,
+            "duplicate_ordinal_groups": None,
+            "duplicate_ordinal_sample": [],
+            "blocking": [],
+        }
+        with self._pool.connection() as conn:
+            report["database"] = conn.execute(
+                "SELECT current_database() AS db").fetchone()["db"]
+            report["installed"] = all(
+                self._table_exists_conn(conn, name)
+                for name in self.INCREMENTAL_SCAN_TABLES) and all(
+                self._column_exists_conn(conn, "remote_chunks", column)
+                for column in self.INCREMENTAL_SCAN_CHUNK_COLUMNS)
+            report["finalized"] = conn.execute(
+                """SELECT 1 FROM pg_indexes
+                   WHERE schemaname='public' AND indexname=%s""",
+                (self.INCREMENTAL_SCAN_FINAL_INDEX,),
+            ).fetchone() is not None
+
+            # Another archiver holding the cluster-wide advisory lock means a
+            # live run. Migrating under it is how a session gets its schema
+            # changed mid-write.
+            # A bigint advisory key appears in pg_locks split across
+            # classid (high 32 bits) / objid (low 32), with objsubid=1.
+            # Constraining all three avoids matching an unrelated advisory lock.
+            held = conn.execute(
+                """SELECT COUNT(*) AS n FROM pg_locks
+                   WHERE locktype='advisory' AND granted
+                     AND classid=%s AND objid=%s AND objsubid=1""",
+                (self.ARCHIVER_LOCK_KEY >> 32,
+                 self.ARCHIVER_LOCK_KEY & 0xFFFFFFFF),
+            ).fetchone()["n"]
+            report["archiver_lock_held"] = bool(held)
+            if held:
+                report["blocking"].append(
+                    "an archiver process holds the cluster advisory lock; stop "
+                    "it before migrating")
+
+            rows = conn.execute(
+                """SELECT plan_id, chunk_index, ordinal, COUNT(*) AS n
+                   FROM remote_plan_files
+                   GROUP BY plan_id, chunk_index, ordinal
+                   HAVING COUNT(*) > 1
+                   ORDER BY plan_id, chunk_index, ordinal
+                   LIMIT 10"""
+            ).fetchall()
+            total = conn.execute(
+                """SELECT COUNT(*) AS n FROM (
+                       SELECT 1 FROM remote_plan_files
+                       GROUP BY plan_id, chunk_index, ordinal
+                       HAVING COUNT(*) > 1) d"""
+            ).fetchone()["n"]
+            report["duplicate_ordinal_groups"] = total
+            report["duplicate_ordinal_sample"] = [dict(r) for r in rows]
+            if total:
+                report["blocking"].append(
+                    f"{total} duplicate (plan_id, chunk_index, ordinal) "
+                    "group(s) in remote_plan_files; the finalize step will "
+                    "refuse rather than resequence them")
+        return report
+
+    def apply_incremental_scan_schema(self, finalize=False):
+        """Install migration 014. Explicit, never part of startup.
+
+        ``finalize=False`` applies only the additive BASE half. ``True`` also
+        applies the FINALIZE half, which AUDITS legacy membership and raises
+        rather than repairing it.
+
+        This is intentionally not called from ``_init_schema``: a production
+        migration must happen after a verified backup, on the database the
+        operator chose, with no archiver running — none of which this method
+        can establish for itself. ``inspect_db.py
+        --apply-incremental-scan-schema`` is the guarded entry point that does.
+        """
+        sql_dir = Path(PROJECT_ROOT) / "scripts" / "sql"
+        files = ["014_postgres_incremental_scan.sql"]
+        if finalize:
+            files.append("014_postgres_incremental_scan_finalize.sql")
+        applied = []
+        for name in files:
+            with self._pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute((sql_dir / name).read_text(encoding="utf-8"))
+                conn.commit()
+            applied.append(name)
+        return applied
+
     @staticmethod
     def _table_exists_conn(conn, table_name):
         return conn.execute(

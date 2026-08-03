@@ -5,10 +5,10 @@ import re
 import shlex
 import subprocess
 import threading
+import time
 
 from .remote_transport import _ssh_run, _ssh_stream_command
 from .runtime import CANCEL, _kill_proc_tree, register_proc, unregister_proc
-from .planning import DirectoryPlanUnit
 from .skipped import SkippedFileTracker
 from .ui import ConsoleUI
 
@@ -146,11 +146,214 @@ class RemoteScanner:
             manifest.extend(self._scan_one(scan_path))
         return manifest
 
+#: One immediate-child listing plus a mutation-observation token, all
+#: NUL-framed so a filename containing a newline cannot break the framing.
+#: ``%y`` is a single character (f, d, l, ...), so the ``OBS `` prefix on the
+#: first record can never collide with an entry record.
+_LIST_DIRECTORY_SCRIPT = (
+    'printf "OBS %s\\0" "$(stat -c %Y:%Z:%i -- "$0" 2>/dev/null || '
+    'printf unknown)"; '
+    'find "$0" -mindepth 1 -maxdepth 1 -printf "%y %s %p\\0"'
+)
+
+#: Directory entry kinds we descend into / archive. Anything else (symlink,
+#: socket, fifo, device) is recorded as an exceptional entry rather than
+#: silently dropped: "we chose not to archive this" is coverage information.
+_ENTRY_FILE = 'f'
+_ENTRY_DIRECTORY = 'd'
+
+
+class DirectoryListing:
+    """The result of listing ONE directory's immediate children."""
+
+    __slots__ = ("path", "files", "directories", "errors", "observation",
+                 "returncode")
+
+    def __init__(self, path, files, directories, errors, observation,
+                 returncode):
+        self.path = path
+        #: ``[(canonical_path, size), ...]`` sorted by canonical path.
+        self.files = files
+        #: ``[canonical_path, ...]`` sorted by canonical path.
+        self.directories = directories
+        #: ``[(category, path_or_None, message), ...]`` — exceptional entries.
+        self.errors = errors
+        #: Lightweight source-mutation token (mtime:ctime:inode), or None.
+        self.observation = observation
+        self.returncode = returncode
+
+    @property
+    def file_count(self):
+        return len(self.files)
+
+    @property
+    def byte_count(self):
+        return sum(size for _path, size in self.files)
+
+
+class DirectoryFrontierScanner(RemoteScanner):
+    """List ONE directory's immediate children at a time.
+
+    Plan 1, Task 2.3. The production scanner enumerates whole roots
+    recursively, so a crash replays every file already visited. This one is the
+    unit the frontier persists: a single immediate listing, bounded in size,
+    that can be committed and never repeated.
+
+    Two properties make the ordering reproducible regardless of which worker
+    listed what, or when:
+
+    * a directory's entries are sorted by canonical path **within** the
+      listing, so entry ordinals depend on the source, not on ``find``'s
+      arbitrary directory order;
+    * the listing is bounded (immediate children only), so that sort is
+      bounded too — the reason this scanner never sorts a whole tree.
+
+    An unreadable subdirectory, a non-UTF-8 name and a non-regular entry are
+    each recorded as an EXCEPTIONAL ENTRY rather than dropped. Missing coverage
+    that nobody recorded is indistinguishable from coverage.
+    """
+
+    def __init__(self, remote_user, remote_host, remote_password='',
+                 timeout=None, skipped_tracker=None, ui=None, metrics=None):
+        super().__init__(
+            remote_user, remote_host, remote_password=remote_password,
+            timeout=timeout, skipped_tracker=skipped_tracker, ui=ui)
+        self.metrics = metrics
+
+    def _note(self, method, *args):
+        if self.metrics is None:
+            return
+        try:
+            getattr(self.metrics, method)(*args)
+        except Exception:               # never fail a scan for a counter
+            pass
+
+    def list_directory(self, dir_path):
+        """Return a :class:`DirectoryListing` for one directory.
+
+        Never recurses. Never raises for a per-entry problem — those become
+        ``errors`` so the caller can decide whether coverage may be final.
+        Raises only when the listing as a whole could not be obtained, because
+        "we do not know what is in here" must not read as "it is empty".
+        """
+        self._note('note_listing_start')
+        started = time.monotonic()
+        root = posixpath.normpath(str(dir_path).replace('\\', '/').strip())
+        command = ("LC_ALL=C sh -c " + shlex.quote(_LIST_DIRECTORY_SCRIPT)
+                   + " " + shlex.quote(root))
+        result = _ssh_run(
+            self.remote_user, self.remote_host, command, capture=True,
+            password=self.remote_password, timeout=self.timeout)
+
+        stdout = result.stdout or ''
+        stderr = (result.stderr or '').strip()
+        if result.returncode == 124:
+            raise RuntimeError(
+                f"[SCAN] Listing {root!r} timed out. The partial output was "
+                "discarded so a directory cannot be recorded as covered on "
+                "incomplete evidence.")
+        if result.returncode == 255:
+            raise RuntimeError(
+                f"[SCAN] SSH failed while listing {root!r} "
+                f"(exit {result.returncode}):\n{stderr}")
+
+        files, directories, errors = [], [], []
+        observation = None
+        for record in stdout.split('\0'):
+            if not record:
+                continue
+            if record.startswith('OBS '):
+                token = record[4:].strip()
+                observation = None if token in ('', 'unknown') else token
+                continue
+            parsed = self._parse_entry(record, root)
+            if parsed is None:
+                errors.append(('unparsable_entry', None,
+                               'listing record could not be parsed'))
+                continue
+            kind, size, path, problem = parsed
+            if problem is not None:
+                errors.append(problem)
+                continue
+            if kind == _ENTRY_FILE:
+                files.append((path, size))
+            elif kind == _ENTRY_DIRECTORY:
+                directories.append(path)
+            else:
+                errors.append((
+                    'non_regular_entry', path,
+                    f"entry type {kind!r} is not archived"))
+
+        if result.returncode != 0 and stderr:
+            self._record_find_warnings(stderr)
+            for line in stderr.splitlines():
+                line = line.strip()
+                if line:
+                    errors.append(('listing_warning', None, line))
+
+        files.sort(key=lambda item: item[0])
+        directories.sort()
+        self._note('note_enumeration', time.monotonic() - started, len(files))
+        return DirectoryListing(root, files, directories, errors, observation,
+                                result.returncode)
+
+    def observe(self, dir_path):
+        """Re-read a directory's mutation token only — the final sweep.
+
+        Cheap by design: one ``stat``, no listing. A changed token invalidates
+        that directory and its ancestors.
+        """
+        root = posixpath.normpath(str(dir_path).replace('\\', '/').strip())
+        command = ("LC_ALL=C sh -c "
+                   + shlex.quote('stat -c %Y:%Z:%i -- "$0" 2>/dev/null '
+                                 '|| printf unknown')
+                   + " " + shlex.quote(root))
+        result = _ssh_run(
+            self.remote_user, self.remote_host, command, capture=True,
+            password=self.remote_password, timeout=self.timeout)
+        token = (result.stdout or '').strip()
+        if result.returncode != 0 or not token or token == 'unknown':
+            return None
+        return token
+
+    def _parse_entry(self, record, root):
+        """``'<type> <size> <path>'`` -> ``(kind, size, path, problem)``."""
+        parts = record.split(' ', 2)
+        if len(parts) != 3:
+            return None
+        kind, size_s, path = parts
+        try:
+            size = int(size_s)
+        except ValueError:
+            return kind, 0, path, (
+                'invalid_size', path, f"invalid find size token: {size_s}")
+        # U+FFFD means the original name was not valid UTF-8. Planning it would
+        # send a mangled name to the remote tar, which silently reports it
+        # "missing" — record the omission loudly instead.
+        if '�' in path:
+            self.skipped_tracker.add(
+                'remote', path,
+                "filename is not valid UTF-8 and cannot be fetched faithfully; "
+                "rename it on the source host to archive it", 'scan')
+            return kind, size, path, (
+                'invalid_utf8_name', None,
+                "a child name is not valid UTF-8 and was not archived")
+        # An immediate child must lie directly under the directory listed.
+        # Anything else is a corrupt record, and planning it could make a fetch
+        # stream an entirely unplanned tree.
+        normalized = posixpath.normpath(path)
+        if posixpath.dirname(normalized) != root:
+            return kind, size, path, (
+                'entry_outside_directory', path,
+                "listing record is not an immediate child (truncated stream?)")
+        return kind, size, normalized, None
+
+
 class StreamingRemoteScanner(RemoteScanner):
     """Yield remote find records as they arrive over a long-lived SSH stream."""
 
     def __init__(self, remote_user, remote_host, remote_password='',
-                 skipped_tracker=None, ui=None, cipher=''):
+                 skipped_tracker=None, ui=None, cipher='', metrics=None):
         super().__init__(
             remote_user,
             remote_host,
@@ -160,6 +363,18 @@ class StreamingRemoteScanner(RemoteScanner):
             ui=ui,
         )
         self.cipher = cipher
+        # Optional src.pipeline_types.ScanMetrics. Purely observational: a
+        # counter must never change what is scanned, planned or written, so
+        # every call goes through _note(), which swallows its own failures.
+        self.metrics = metrics
+
+    def _note(self, method, *args):
+        if self.metrics is None:
+            return
+        try:
+            getattr(self.metrics, method)(*args)
+        except Exception:                       # never fail a scan for a counter
+            pass
 
     def _parse_record(self, record, root):
         parts = record.split(' ', 1)
@@ -198,6 +413,11 @@ class StreamingRemoteScanner(RemoteScanner):
 
     def _iter_scan_one(self, scan_path, stop_evt=None):
         self.ui.info(f"[REMOTE] Streaming scan {scan_path} ...")
+        # One listing start per root, every run. On a resumed session this is
+        # the replay: the same root is enumerated again from the beginning.
+        self._note('note_listing_start')
+        listing_started = time.monotonic()
+        entries_yielded = 0
         root = posixpath.normpath(scan_path.replace('\\', '/').strip())
         find_cmd = f"LC_ALL=C find {shlex.quote(scan_path)} -type f -printf '%s %p\\0'"
         ssh_cmd, env, err = _ssh_stream_command(
@@ -276,6 +496,7 @@ class StreamingRemoteScanner(RemoteScanner):
                     parsed = self._parse_record(record, root)
                     if parsed is not None:
                         saw_record = True
+                        entries_yielded += 1
                         yield parsed
             tail = decoder.decode(b'', final=True)
             if tail:
@@ -285,9 +506,12 @@ class StreamingRemoteScanner(RemoteScanner):
                     "[REMOTE] Scan stream ended mid-record (truncated transfer?); "
                     "the partial record was discarded and recorded as skipped."
                 )
+                self._note('note_discarded_partial', 1)
                 self._parse_record(buffer, root)
         finally:
             watcher_done.set()
+            self._note('note_enumeration',
+                       time.monotonic() - listing_started, entries_yielded)
             try:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
@@ -317,130 +541,3 @@ class StreamingRemoteScanner(RemoteScanner):
             raise RuntimeError(
                 f"[REMOTE] SSH scan failed (exit {proc.returncode}):\n{stderr}"
             )
-
-
-class DirectoryFirstRemoteScanner(RemoteScanner):
-    """Directory-level remote scanner for directory-first planning.
-
-    This scanner keeps the high-cardinality tiny-file names on the remote host
-    during planning. It emits directory statistics and exposes a separate
-    large-file iterator for files that must remain searchable in files_index.
-    """
-
-    def __init__(self, remote_user, remote_host, remote_password='',
-                 timeout=None, skipped_tracker=None, ui=None, depth=2,
-                 large_file_min_mb=10):
-        super().__init__(
-            remote_user, remote_host, remote_password=remote_password,
-            timeout=timeout, skipped_tracker=skipped_tracker, ui=ui)
-        self.depth = max(0, int(depth))
-        self.large_file_min_mb = float(large_file_min_mb or 10)
-
-    def discover_candidate_dirs(self, scan_path):
-        cmd = (
-            f"LC_ALL=C find {shlex.quote(scan_path)} -mindepth 0 "
-            f"-maxdepth {self.depth} -type d -print0"
-        )
-        result = _ssh_run(
-            self.remote_user, self.remote_host, cmd, capture=True,
-            password=self.remote_password, timeout=self.timeout)
-        stderr = (result.stderr or '').strip()
-        if result.returncode != 0 and stderr:
-            self._record_find_warnings(stderr)
-        if result.returncode == 255:
-            raise RuntimeError(
-                f"[REMOTE] SSH directory scan failed:\n{stderr}")
-        root = posixpath.normpath(scan_path.replace('\\', '/').strip())
-        dirs = []
-        for path in (result.stdout or '').split('\0'):
-            if not path:
-                continue
-            norm = posixpath.normpath(path)
-            if norm == root or norm.startswith(root + '/'):
-                dirs.append(norm)
-        return dirs
-
-    def stat_directory(self, dir_path):
-        threshold = int(self.large_file_min_mb * 1024 * 1024)
-        script = r"""
-root=$1
-threshold=$2
-find "$root" -type f -printf '%s %h\0' |
-awk -v RS='\0' -v root="$root" -v threshold="$threshold" '
-BEGIN { direct_count=0; direct_bytes=0; rec_count=0; rec_bytes=0;
-        small_count=0; small_bytes=0; large_count=0; large_bytes=0; }
-NF {
-  size=$1; dir=$0; sub(/^[0-9]+ /, "", dir);
-  rec_count++; rec_bytes += size;
-  if (dir == root) { direct_count++; direct_bytes += size; }
-  if (size < threshold) { small_count++; small_bytes += size; }
-  else { large_count++; large_bytes += size; }
-}
-END { printf "%d %d %d %d %d %d %d %d\n",
-      direct_count, direct_bytes, rec_count, rec_bytes,
-      small_count, small_bytes, large_count, large_bytes; }'
-"""
-        cmd = (
-            "bash -lc " + shlex.quote(script)
-            + " _ " + shlex.quote(dir_path) + " " + str(threshold)
-        )
-        result = _ssh_run(
-            self.remote_user, self.remote_host, cmd, capture=True,
-            password=self.remote_password, timeout=self.timeout)
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"[REMOTE] Directory stat failed for {dir_path}:\n"
-                f"{(result.stderr or '').strip()}")
-        parts = (result.stdout or '').strip().split()
-        if len(parts) != 8:
-            raise RuntimeError(
-                f"[REMOTE] Could not parse directory stats for {dir_path}: "
-                f"{result.stdout!r}")
-        values = [int(part) for part in parts]
-        return DirectoryPlanUnit(
-            original_dir_path=posixpath.normpath(dir_path),
-            direct_file_count=values[0],
-            direct_bytes=values[1],
-            recursive_file_count=values[2],
-            recursive_bytes=values[3],
-            small_file_count=values[4],
-            small_file_bytes=values[5],
-            large_file_count=values[6],
-            large_file_bytes=values[7],
-            depth=len([p for p in dir_path.strip('/').split('/') if p]),
-        )
-
-    def iter_large_files(self, dir_path):
-        threshold = int(self.large_file_min_mb)
-        cmd = (
-            f"LC_ALL=C find {shlex.quote(dir_path)} -type f "
-            f"-size +{threshold - 1}M -printf '%s %p\\0'"
-        )
-        result = _ssh_run(
-            self.remote_user, self.remote_host, cmd, capture=True,
-            password=self.remote_password, timeout=self.timeout)
-        if result.returncode != 0 and (result.stderr or '').strip():
-            self._record_find_warnings(result.stderr)
-        root = posixpath.normpath(dir_path.replace('\\', '/').strip())
-        for record in (result.stdout or '').split('\0'):
-            parsed = self._parse_large_record(record, root)
-            if parsed is not None:
-                yield parsed
-
-    def _parse_large_record(self, record, root):
-        if not record:
-            return None
-        parts = record.split(' ', 1)
-        if len(parts) != 2:
-            return None
-        size_s, path = parts
-        try:
-            size = int(size_s)
-        except ValueError:
-            return None
-        norm = posixpath.normpath(path)
-        if norm == root or norm.startswith(root + '/'):
-            return norm, size
-        self.skipped_tracker.add(
-            'remote', path, "large-file record outside directory root", 'scan')
-        return None

@@ -23,6 +23,7 @@ from unittest import mock
 
 from src import windows_update_guard as wug
 from src import remote_orchestrator as ro
+from src import remote_staging as rs
 from src.pipeline_types import StagedChunk
 
 
@@ -636,7 +637,7 @@ class TransientFetchRetryTests(unittest.TestCase):
             calls["n"] += 1
             return (True, "") if calls["n"] >= 3 else (False, self.DNS_ERR)
 
-        with mock.patch.object(ro, "_remote_tar_fetch", side_effect=fake_fetch):
+        with mock.patch.object(rs, "_remote_tar_fetch", side_effect=fake_fetch):
             ok, err = orch._fetch_one_batch("base", [(0, "rel", 0)], "d", abort)
         self.assertTrue(ok)
         self.assertEqual(calls["n"], 3, "should retry until it succeeds")
@@ -650,7 +651,7 @@ class TransientFetchRetryTests(unittest.TestCase):
             calls["n"] += 1
             return False, "tar: missing.txt: No such file or directory"
 
-        with mock.patch.object(ro, "_remote_tar_fetch", side_effect=fake_fetch):
+        with mock.patch.object(rs, "_remote_tar_fetch", side_effect=fake_fetch):
             ok, err = orch._fetch_one_batch("base", [(0, "rel", 0)], "d", abort)
         self.assertFalse(ok)
         self.assertEqual(calls["n"], 1, "a fatal error must fail fast")
@@ -664,7 +665,7 @@ class TransientFetchRetryTests(unittest.TestCase):
             calls["n"] += 1
             return False, self.DNS_ERR
 
-        with mock.patch.object(ro, "_remote_tar_fetch", side_effect=fake_fetch):
+        with mock.patch.object(rs, "_remote_tar_fetch", side_effect=fake_fetch):
             ok, err = orch._fetch_one_batch("base", [(0, "rel", 0)], "d", abort)
         self.assertFalse(ok)
         self.assertEqual(calls["n"], 4, "1 initial try + 3 retries, then give up")
@@ -677,7 +678,7 @@ class TransientFetchRetryTests(unittest.TestCase):
             abort.set()  # a sibling stream failed while we were retrying
             return False, self.DNS_ERR
 
-        with mock.patch.object(ro, "_remote_tar_fetch", side_effect=fake_fetch):
+        with mock.patch.object(rs, "_remote_tar_fetch", side_effect=fake_fetch):
             ok, err = orch._fetch_one_batch("base", [(0, "rel", 0)], "d", abort)
         self.assertFalse(ok)
         self.assertEqual(err, "cancelled")

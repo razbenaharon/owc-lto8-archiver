@@ -14,10 +14,12 @@ in a PostgreSQL catalog (see `docker-compose.yml` and `scripts/sql/`).
   strictly downward dependencies: `constants`/`pipeline_types` → `logsetup` →
   `runtime` → `paths` → `reporting`/`config`/`db` →
   `robocopy`/`remote_transport` → `ltfs` → `packer` → `scanning`/`planning` →
-  `backup`/`retriever` → `local_orchestrator`/`remote_orchestrator` →
+  `archive_artifacts` → `backup`/`retriever` →
+  `scan_frontier`/`remote_staging`/`remote_writer` → `remote_pipeline` →
+  `local_orchestrator`/`remote_orchestrator` →
   `orchestrators` (re-export facade) → `cli`; `src/db_inspector_qt.py` holds
   the GUI. The PostgreSQL layer is split the same way: `pg_bulk` → `pg_core`
-  → `pg_catalog`/`pg_sessions`/`pg_tapes` → `pg_db` (facade assembling
+  → `pg_catalog`/`pg_scan`/`pg_sessions`/`pg_tapes` → `pg_db` (facade assembling
   `PgDatabaseManager` from the mixins). Import the facades (`orchestrators`,
   `pg_db`) from application code; in tests, `mock.patch` targets must name the
   module a symbol is *used* in (e.g. `src.scanning._ssh_run`). Data files
@@ -33,10 +35,51 @@ in a PostgreSQL catalog (see `docker-compose.yml` and `scripts/sql/`).
   trace (`archiver.log`, via `src/logsetup.py`) also lives here: status lines
   and full exception tracebacks tee into it, console output unchanged. It is
   a debugging trace, not a statistics file — never parse it for reports.
+
 - `Framework & Drivers/` — installer assets and hardware documentation.
 - `scripts/sql/` — PostgreSQL schema/index/constraint migrations applied on
   startup by `PgDatabaseManager._init_schema`; `docker-compose.yml` runs the
   local database. Catalog rows are runtime data, not source.
+
+### The remote pipeline, after Plan 1
+
+`remote_orchestrator.py` used to be one 3,657-line class. It is now a **façade**
+over four modules, each owning one invariant. When you need to check whether a
+change is safe, this tells you which file to read:
+
+| module | owns | never does |
+| --- | --- | --- |
+| `scan_frontier.py` | which scanner may run; discovery; sealing chunks | touch the tape |
+| `remote_staging.py` | SSH/tar fetch, retry classification, the staging watchdog, packing | touch the tape |
+| `remote_writer.py` | **the finite write group — the only path to the tape** | eject; retry into a failing drive; clear `backing` |
+| `remote_pipeline.py` | the single scheduling loop for BOTH session kinds | decide anything about the tape |
+
+**`remote_writer.py` is 351 lines and is the whole tape surface.** If you want
+to know whether the archiver can do something dangerous to a cartridge, that is
+the only file you have to read.
+
+Three rules the code now enforces rather than documents:
+
+- **No LTFS access outside a finite write group.** Not at startup, not while
+  waiting, not between group members, not at completion. Both loops announce the
+  target cartridge up front instead (it is verified once per group, under
+  ownership).
+- **The remote pipeline never ejects**, even with
+  `[HARDWARE] eject_after_session = true`. The setting still applies to the
+  attended local orchestrator.
+- **`backing` has no automatic retry.** `CHUNK_TRANSITIONS` allows only
+  `backing → done`; an unreadable chunk status now *stops the run* instead of
+  being treated as clear.
+
+The incremental scan frontier (`pg_scan.py`, `archive_artifacts.py`, migration
+014) is written but **disabled**: `[REMOTE] incremental_scan = false`, and 014
+is not applied to any database.
+
+Plan 1 is **closed** (2026-08-03). Start here:
+`docs/plan1_handoff.md` — one page, what changes for an operator and what is
+still outstanding. Full evidence and the task-by-task matrix:
+`docs/plan1_completion_gate.md`. The operator-supervised tape rehearsal
+(`scripts/plan1_rehearsal.py` stage 3) is **NOT RUN**.
 
 ## Build, Test, and Development Commands
 
@@ -61,6 +104,33 @@ after edits. Pure parsing, config, database, path-normalization, and reporting c
 **not** require real tape hardware — validate them directly where possible. For
 tape-related changes, reason carefully about hardware side effects and verify with a
 small staged dataset before a full remote archive run.
+
+### PostgreSQL tests need an explicit disposable server
+
+`python -m pytest -q` on its own is safe and complete except for the PostgreSQL
+suites, which **skip** (1259 passed, 149 skipped) because they refuse to guess a
+server. They used to fall back to `build_conninfo`'s defaults — `localhost:5432`,
+which is exactly where the **production** `lto_pg` container listens.
+`tests/pg_test_guard.py` now forbids that, fail-closed: no implicit defaults, no
+port 5432, no non-loopback host, and no server hosting `lto_archive`. A DSN that
+is set but unsafe **fails at collection**; it never degrades to a skip.
+
+```powershell
+docker run -d --name lto_pg_test -e POSTGRES_DB=postgres -e POSTGRES_USER=lto `
+  -e POSTGRES_PASSWORD=<pw> -p 127.0.0.1:15432:5432 `
+  --tmpfs /var/lib/postgresql/data:rw,size=2g --shm-size=1g postgres:17
+
+$env:LTO_TEST_PG_DSN = "postgresql://lto:<pw>@127.0.0.1:15432/postgres"
+$env:LTO_PG_SEALED_BATCH_IT = "1"
+python -m pytest tests/ -q            # 1408 passed, 0 skipped
+
+docker rm -f lto_pg_test              # tmpfs: the server vanishes with it
+```
+
+Every test database is named `ltotest_<run-id>_…`; cleanup drops only names
+carrying the current run's marker, and `pytest_unconfigure` sweeps any that
+leaked. Port 55432 is blocked by a Windows excluded-port range on this host —
+15432 works.
 
 ## Logging & Reports
 

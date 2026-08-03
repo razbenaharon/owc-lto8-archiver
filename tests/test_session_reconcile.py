@@ -26,7 +26,8 @@ else:
 
 import inspect_db
 from src.cli_errors import OperationalError
-from src.pg_bulk import build_conninfo
+from pg_test_guard import (SKIP_REASON, create_test_database,
+                           drop_test_database, pg_available)
 from src.session_reconcile import (
     ABANDONED_STATUS,
     COMPLETED_STATUS,
@@ -227,16 +228,13 @@ def _connect(*args, **kwargs) -> Any:
 
 
 def _pg_available():
+    """Delegates to the fail-closed guard: an UNSAFE target raises here."""
     if psycopg is None:
         return False
-    try:
-        with _connect(build_conninfo(dbname="postgres"), connect_timeout=3):
-            return True
-    except Exception:
-        return False
+    return pg_available()
 
 
-@unittest.skipUnless(_pg_available(), "PostgreSQL server not reachable")
+@unittest.skipUnless(_pg_available(), SKIP_REASON)
 class ReconcileIntegrationTests(unittest.TestCase):
     """End-to-end against a throwaway database — never the live catalog."""
 
@@ -244,11 +242,7 @@ class ReconcileIntegrationTests(unittest.TestCase):
     def setUpClass(cls):
         from src.pg_db import PgDatabaseManager
 
-        cls.dbname = f"lto_reconcile_{uuid.uuid4().hex[:10]}"
-        with _connect(build_conninfo(dbname="postgres"),
-                      autocommit=True) as conn:
-            conn.execute(f'CREATE DATABASE "{cls.dbname}"')
-        cls.conninfo = build_conninfo(dbname=cls.dbname)
+        cls.dbname, cls.conninfo = create_test_database("lto_reconcile")
         cls.db = PgDatabaseManager(cls.conninfo)
         cls.db.apply_directory_catalog_schema()
         cls.db.register_tape("Tape_T")
@@ -259,13 +253,7 @@ class ReconcileIntegrationTests(unittest.TestCase):
             cls.db.close()
         except Exception:
             pass
-        with _connect(build_conninfo(dbname="postgres"),
-                      autocommit=True) as conn:
-            conn.execute(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                "WHERE datname = %s AND pid <> pg_backend_pid()",
-                (cls.dbname,))
-            conn.execute(f'DROP DATABASE IF EXISTS "{cls.dbname}"')
+        drop_test_database(cls.dbname)
 
     def setUp(self):
         self._exec("DELETE FROM remote_chunks")
@@ -296,11 +284,14 @@ class ReconcileIntegrationTests(unittest.TestCase):
                       scan_complete=False, age_days=18, status="active"):
         stamp = datetime.now(timezone.utc) - timedelta(days=age_days)
         self._exec(
+            # tape_generation is NOT NULL as of migration 013; a fixture that
+            # omits it fails on any migrated database. Latent until the
+            # isolated-PostgreSQL suite could actually be run.
             """INSERT INTO remote_sessions
                (session_id, session_label, remote_host, remote_user,
                 remote_path, tape_label, staging_dir, chunk_count,
-                created_at, status, scan_complete)
-               VALUES (%s,%s,'h','u','/p','Tape_T','C:\\stg',%s,%s,%s,%s)""",
+                created_at, status, scan_complete, tape_generation)
+               VALUES (%s,%s,'h','u','/p','Tape_T','C:\\stg',%s,%s,%s,%s,1)""",
             (session_id, f"S{session_id}_{uuid.uuid4().hex[:6]}", chunk_count,
              stamp, status, scan_complete))
         index = 0
@@ -460,7 +451,7 @@ LEGACY_REMOTE_SESSION_SQL = """
     FROM remote_sessions s ORDER BY s.session_id"""
 
 
-@unittest.skipUnless(_pg_available(), "PostgreSQL server not reachable")
+@unittest.skipUnless(_pg_available(), SKIP_REASON)
 class SessionQueryEquivalenceTests(unittest.TestCase):
     """The optimized Sessions query must agree with the one it replaced."""
 
@@ -468,11 +459,7 @@ class SessionQueryEquivalenceTests(unittest.TestCase):
     def setUpClass(cls):
         from src.pg_db import PgDatabaseManager
 
-        cls.dbname = f"lto_sessq_{uuid.uuid4().hex[:10]}"
-        with _connect(build_conninfo(dbname="postgres"),
-                      autocommit=True) as conn:
-            conn.execute(f'CREATE DATABASE "{cls.dbname}"')
-        cls.conninfo = build_conninfo(dbname=cls.dbname)
+        cls.dbname, cls.conninfo = create_test_database("lto_sessq")
         cls.db = PgDatabaseManager(cls.conninfo)
         cls.db.apply_directory_catalog_schema()
         cls.db.register_tape("Tape_Q")
@@ -484,13 +471,7 @@ class SessionQueryEquivalenceTests(unittest.TestCase):
             cls.db.close()
         except Exception:
             pass
-        with _connect(build_conninfo(dbname="postgres"),
-                      autocommit=True) as conn:
-            conn.execute(
-                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-                "WHERE datname = %s AND pid <> pg_backend_pid()",
-                (cls.dbname,))
-            conn.execute(f'DROP DATABASE IF EXISTS "{cls.dbname}"')
+        drop_test_database(cls.dbname)
 
     @classmethod
     def _build_fixture(cls):
@@ -531,9 +512,9 @@ class SessionQueryEquivalenceTests(unittest.TestCase):
                     """INSERT INTO remote_sessions
                        (session_id, session_label, remote_host, remote_user,
                         remote_path, tape_label, staging_dir, chunk_count,
-                        plan_id, created_at, status)
+                        plan_id, created_at, status, tape_generation)
                        VALUES (%s,%s,'h','u','/p','Tape_Q','C:\\stg',1,%s,%s,
-                               'completed')""",
+                               'completed',1)""",
                     (session_id, f"S{session_id}", plan_id, now))
 
     def _legacy_rows(self):
