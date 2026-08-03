@@ -10,12 +10,12 @@ covered by tests; §1 is the task-by-task matrix. **1408 tests pass, 0 skipped,
 **Hardware validation: NOT RUN, OPERATOR-SUPERVISED TAPE WRITE REQUIRED LATER.**
 That is a production-activation gate, not a Plan 1 code defect — see §9.
 
-Closing Plan 1 does **not** enable anything in production. The incremental scan
-frontier ships **disabled** (`incremental_scan = false`), migration 014 is
-applied to **no** database, and Session 37 is untouched. §10 lists the five
-gates that must be cleared before the frontier may be switched on, each of which
-is an operator decision, not a code change. Operational summary for the next
-person: [`docs/plan1_handoff.md`](plan1_handoff.md).
+**Production activation ran on 2026-08-03 — see §13 for what actually landed.**
+Migration 014 is applied and finalized on the production catalog and
+`incremental_scan = true` is set, but the Session 37 frontier bootstrap is
+**blocked by design** and the flag is currently a **no-op** because no run
+consumes the scan-mode decision. Operational summary for the next person:
+[`docs/plan1_handoff.md`](plan1_handoff.md).
 
 Reproduce every claim below with:
 
@@ -297,15 +297,20 @@ Explicitly still unverified after any tape run: real-drive latching-error
 behaviour, production-scale behaviour (~82M files), and the frontier in
 production.
 
-## 10. Blockers before enabling `incremental_scan`
+## 10. Blockers before the frontier actually runs — status 2026-08-03
 
-1. Apply migration 014 (base **and** finalize) to production after a verified
-   backup, with no archiver running. Currently applied to **no** database.
-2. Run `inspect_db.py --session-frontier-report --session-id 37` against
-   production and confirm `verdict: ready`. **Never done.**
-3. Run `--bootstrap-frontier` dry-run, review, then `--execute --yes`.
-4. Complete the operator-supervised tape rehearsal.
-5. Plan 3 approval for the bounded production group.
+| # | Gate | Status |
+|---|---|---|
+| 1 | Migration 014 (base **and** finalize) on production, after a verified backup, with no archiver running | **DONE** (§13) |
+| 2 | `--session-frontier-report --session-id 37` returns `verdict: ready` | **NOT MET** — returns `blocked`; `scan_complete = false` |
+| 3 | `--bootstrap-frontier` dry run, review, then `--execute --yes` | **dry run DONE** (`would_proceed: false`); execute **NOT RUN**, correctly refused |
+| 4 | Operator-supervised tape rehearsal | **NOT RUN** |
+| 5 | Plan 3 approval for the bounded production group | not started |
+| 6 | **Wire the run path to the scan-mode decision** (new — see §13) | **NOT DONE**; `incremental_scan` is a no-op until it is |
+
+Gate 2 cannot be met without completing Session 37's scan, which requires a
+run. Gate 6 was not in the original plan: it was found during activation and is
+the remaining Plan 1 code work.
 
 ## 11. The PostgreSQL test safety guard (`tests/pg_test_guard.py`)
 
@@ -367,3 +372,110 @@ anywhere under `tests/`.
   access, no LTFS ownership acquisition against real hardware.
 - **Stored TAR / manifest-first TAR** — not implemented; Plan 2 not started.
 - **`incremental_scan`** — still `false`. Migration 014 applied to no database.
+
+## 13. Production activation record — 2026-08-03
+
+Performed with the archiver stopped. **No tape operation of any kind occurred**,
+Session 37 was **not resumed**, and no `--resume`, `--new` or backup command was
+executed.
+
+### Preconditions established first
+
+| Check | Evidence |
+|---|---|
+| No archiver process | `tasklist`: no `python`/`robocopy`; only the vendor LTFS services |
+| No advisory lock | `SELECT count(*) FROM pg_locks WHERE locktype='advisory'` → 0 |
+| No connection to the catalog | `pg_stat_activity` → only the read-only `psql` used for this check |
+| Session 37 idle | `status='active'`, `completed_at IS NULL`, nothing running |
+
+Two scheduled tasks could have started the archiver and were **disabled before
+any production change**:
+
+- **`LTO-Archive-Resume`** — action `run.py remote-archive --resume`, on-demand.
+- **`LTO-Archive-Watchdog`** — `scripts/archive_watchdog.ps1`, **10-minute
+  repeating trigger**, due at 11:06:59.
+
+Verified at 11:08:01 that the watchdog did **not** fire: `LastRun` still
+10:57:00, state `Disabled`, no process appeared. Both remain disabled; re-enable
+with `Enable-ScheduledTask` when a run is next authorised.
+
+### Steps
+
+| # | Step | Result |
+|---|---|---|
+| 1 | Plan 1 code to `origin/main` | fast-forward `f44ca7b..3b810f1` |
+| 2 | Verified production backup | 646,842,636 B dump + 19,006 B `pg_restore --list`, 260 entries, 33 `TABLE DATA` |
+| 3 | Read-only Session 37 frontier report | **`verdict: blocked`**, one blocking reason, no errors |
+| 4 | Migration 014 base | `installed: true` |
+| 5 | Migration 014 finalize | `finalized: true`, `duplicate_ordinal_groups: 0` |
+| 6 | Invariant validation | see below |
+| 7 | Frontier bootstrap dry run | **`would_proceed: false`** |
+| 8 | Frontier bootstrap execute | **NOT RUN** — gate failed |
+| 9 | `incremental_scan = true` | set; `ConfigManager` reads `True` |
+
+### Migration 014 invariants — existing data untouched
+
+Identical before the base migration, after the base, and after finalize:
+
+| Measure | Value |
+|---|---|
+| `remote_chunks` for session 37 | 113 |
+| `done` / `pending` | 49 / 64 |
+| plan 37 member rows | 23,214,474 |
+| session row | `active`, `scan_complete=false`, `chunk_count=113`, `completed_at NULL` |
+| `tapes` used_space | Tape_01 10,624,686,466,311 · Tape_02 4,999,755,772,612 · Tape_03 0 |
+
+All seven new tables (`remote_scan_scopes`, `remote_scan_directories`,
+`remote_scan_segments`, `remote_chunk_scan_segments`, `remote_scan_errors`,
+`remote_worker_attempts`, `remote_frontier_bootstraps`) exist and are **empty**.
+The six new `remote_chunks` columns are all nullable. The finalize index
+`uq_remote_plan_files_chunk_ordinal` exists.
+
+### Why the Session 37 bootstrap did not run
+
+Both the read-only report and the dry run block on one condition:
+
+> the scan never completed, so the plan's full membership is unknown and
+> "all chunks done" cannot mean "finished"
+
+Session 37's scan died on an SSH reset, leaving `scan_complete = false`. This is
+a designed gate, not a defect: `FrontierBootstrap.execute()` re-runs `dry_run()`
+and raises `BootstrapRefused` when `would_proceed` is false
+(`src/frontier_bootstrap.py:158-161`), so the bootstrap is refused in code as
+well as by policy. Unblocking it requires completing Session 37's scan, which
+requires a run — a separate operator decision.
+
+Consequently step 7 of the activation checklist (post-bootstrap comparison
+against the dry run) is **not applicable**: no bootstrap occurred, and all seven
+frontier tables are still empty.
+
+### Finding: `incremental_scan` is currently a no-op
+
+Found during activation, confirmed independently (Codex review plus direct
+inspection and an empirical gate evaluation against the production schema).
+
+`decide_scan_mode()` does return `MODE_FRONTIER` — measured against this
+catalog: `enabled=True, bound=False → mode='frontier', blocked=False`. But
+nothing consumes the decision:
+
+- `RemoteOrchestrator._resolve_scan_mode()` assigns `self._scan_mode`
+  (`remote_orchestrator.py:914`), and `self._scan_mode` is **never read**.
+- The streaming path builds its scanner with `build_legacy_scanner_factory()`
+  **unconditionally** (`remote_orchestrator.py:1097`).
+- `build_frontier_scanner_factory()` (`scan_frontier.py:867`) has **zero
+  callers** in `src/` or `tests/`.
+- `DirectoryFrontierCoordinator` is constructed in exactly one place:
+  `FrontierBootstrap.execute()` (`frontier_bootstrap.py:166`) — reachable only
+  through `--bootstrap-frontier --execute`.
+
+Two consequences, one reassuring and one not:
+
+- **Safe.** Setting the flag cannot hand Session 37 — or any session — to a
+  scanner it was never bound to. The activation carries no behavioural risk.
+- **Inert.** The flag does not deliver the frontier speed-up either. The
+  existing tests cover `decide_scan_mode` in isolation and none asserts that a
+  run uses the frontier scanner, which is why this was not caught earlier.
+
+Wiring the run path to the decision is **remaining Plan 1 work** (gate 6 in
+§10). It is code work, not an operator decision, and it needs its own test
+proving a frontier-mode run actually constructs the frontier scanner.

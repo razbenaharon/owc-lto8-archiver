@@ -349,8 +349,24 @@ class ProductionGateTests(unittest.TestCase):
             parser.get("REMOTE", "incremental_scan").strip().lower(), "false")
 
     def test_the_default_config_object_reports_it_disabled(self):
+        """The CODE default, not whatever the live config.ini currently says.
+
+        ``ConfigManager()`` reads the host's real ``config.ini``, so this used
+        to assert the operator's current production setting — and broke when
+        the flag was legitimately enabled in production on 2026-08-03. The
+        default is the fallback in ``src/config.py``; that is what must stay
+        false, so that a config which never mentions the setting cannot end up
+        with the frontier active. The shipped default is covered separately by
+        ``test_incremental_scan_is_disabled_in_the_shipped_config``.
+        """
+        import tempfile
         from src.config import ConfigManager
-        self.assertFalse(ConfigManager().incremental_scan_enabled)
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".ini", delete=False, encoding="utf-8")
+        handle.write("[REMOTE]\nremote_host = example\n")
+        handle.close()
+        self.assertFalse(
+            ConfigManager(config_path=handle.name).incremental_scan_enabled)
 
     def test_migration_014_is_not_applied_at_startup(self):
         import inspect

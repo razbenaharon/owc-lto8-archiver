@@ -71,9 +71,28 @@ def _cfg(enabled):
 # =============================================================================
 # A. Configuration
 # =============================================================================
+def _config_without_the_key():
+    """A ConfigManager over a config.ini that does not mention the setting.
+
+    Deliberately NOT ``ConfigManager()``: that reads the live ``config.ini`` on
+    whatever host the suite runs on, so it asserts the operator's current
+    production setting rather than the code's default. That made this test fail
+    the moment the flag was legitimately enabled in production on 2026-08-03 —
+    it was measuring the wrong thing. Pointing it at a config that omits the key
+    tests the fallback in ``src/config.py``, which is what "default" means and
+    is the thing a regression would actually break.
+    """
+    import tempfile
+    handle = tempfile.NamedTemporaryFile(
+        "w", suffix=".ini", delete=False, encoding="utf-8")
+    handle.write("[REMOTE]\nremote_host = example\n")
+    handle.close()
+    return ConfigManager(config_path=handle.name)
+
+
 class ConfigFlagTests(unittest.TestCase):
     def test_default_is_off(self):
-        self.assertFalse(ConfigManager().incremental_scan_enabled)
+        self.assertFalse(_config_without_the_key().incremental_scan_enabled)
 
     def test_malformed_values_fall_back_to_off(self):
         cfg = ConfigManager()

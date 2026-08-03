@@ -58,6 +58,14 @@ PRODUCTION_DATABASE_NAMES = frozenset({"lto_archive", "lto_archive_prod"})
 #: host/port it is reached on.
 PRODUCTION_MARKER_DATABASES = frozenset({"lto_archive"})
 
+#: LIKE patterns for the same check. The live catalog is not called
+#: ``lto_archive`` — on this host it is
+#: ``lto_archive_directory_catalog_20260710_103359``, and the migrated-database
+#: workflow (``inspect_db --create-migrated-db``) mints a new dated name every
+#: time. Matching the exact name alone would stop recognising production the
+#: day ``lto_archive`` is finally dropped, so match the family too.
+PRODUCTION_MARKER_PATTERNS = ("lto_archive%",)
+
 #: The standard PostgreSQL port. A test server must NOT use it: on this
 #: workstation it is the production container, and on a developer machine it is
 #: whatever PostgreSQL they installed for real work.
@@ -155,8 +163,10 @@ def assert_server_is_not_production(dsn):
 
     with psycopg.connect(dsn, autocommit=True, connect_timeout=5) as conn:
         rows = conn.execute(
-            "SELECT datname FROM pg_database WHERE datname = ANY(%s)",
-            (sorted(PRODUCTION_MARKER_DATABASES),),
+            "SELECT datname FROM pg_database "
+            "WHERE datname = ANY(%s) OR datname LIKE ANY(%s)",
+            (sorted(PRODUCTION_MARKER_DATABASES),
+             list(PRODUCTION_MARKER_PATTERNS)),
         ).fetchall()
         found = sorted(row[0] for row in rows)
     if found:
