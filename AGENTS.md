@@ -71,15 +71,31 @@ Three rules the code now enforces rather than documents:
   `backing → done`; an unreadable chunk status now *stops the run* instead of
   being treated as clear.
 
-The incremental scan frontier (`pg_scan.py`, `archive_artifacts.py`, migration
-014) is written but **disabled**: `[REMOTE] incremental_scan = false`, and 014
-is not applied to any database.
-
-Plan 1 is **closed** (2026-08-03). Start here:
+Plan 1 was **activated in production on 2026-08-03**. Start here:
 `docs/plan1_handoff.md` — one page, what changes for an operator and what is
-still outstanding. Full evidence and the task-by-task matrix:
-`docs/plan1_completion_gate.md`. The operator-supervised tape rehearsal
-(`scripts/plan1_rehearsal.py` stage 3) is **NOT RUN**.
+still outstanding. Full evidence, the task-by-task matrix and the activation
+record: `docs/plan1_completion_gate.md` §13.
+
+Current production state — verify, don't assume:
+
+- Migration 014 is **applied and finalized** on
+  `lto_archive_directory_catalog_20260710_103359`. Existing data was unchanged.
+- `[REMOTE] incremental_scan = true`, **but it is currently a no-op.**
+  `decide_scan_mode()` returns `MODE_FRONTIER` and nothing reads the result:
+  `_resolve_scan_mode` sets `self._scan_mode`, which is never used, and the
+  streaming path always builds `build_legacy_scanner_factory()`
+  (`remote_orchestrator.py:1097`). `build_frontier_scanner_factory()` has zero
+  callers. **Wiring the run path to the decision is the remaining Plan 1 work.**
+- **Session 37 is not frontier-bound and cannot be bootstrapped**: its scan
+  never finished (`scan_complete = false`), so `--session-frontier-report`
+  returns `blocked` and `--bootstrap-frontier --dry-run` returns
+  `would_proceed: false`. All seven migration-014 tables are empty.
+- The scheduled tasks **`LTO-Archive-Resume`** and **`LTO-Archive-Watchdog`**
+  (10-minute repeating trigger) were **disabled** for the activation and are
+  still disabled. Re-enable with `Enable-ScheduledTask` when a run is
+  authorised, or the archiver will never restart on its own again.
+- The operator-supervised tape rehearsal (`scripts/plan1_rehearsal.py` stage 3)
+  is **NOT RUN**.
 
 ## Build, Test, and Development Commands
 

@@ -29,23 +29,54 @@ Nothing about how you start a run changes. Five behaviours differ:
 5. **`SUMMARY.csv` has 17 new `scan_*` columns**, appended at the end.
    Aggregates only — existing columns and their order are unchanged.
 
-## What is built but OFF
+## Production activation — what actually happened on 2026-08-03
 
-The incremental scan frontier. It replays only the directories that changed
-instead of re-walking the whole root (measured: 6 entries replayed vs 89,430).
-It is off because turning it on is an operator decision with a database
-migration behind it:
+| Step | Result |
+|---|---|
+| Plan 1 code on `origin/main` | **Done** (`3b810f1`) |
+| Verified production backup | **Done** — 647 MB dump + `pg_restore --list` verified |
+| Session 37 frontier report (read-only) | **`verdict: blocked`** |
+| Migration 014 on production | **Applied and finalized**, invariants validated |
+| Frontier bootstrap dry run | **`would_proceed: false`** |
+| Frontier bootstrap execution | **NOT RUN** — gate failed, executor refuses by design |
+| `incremental_scan = true` | **Set** (see the caveat below) |
+| Session 37 resumed | **No.** No run, no tape operation, no scan |
 
-- `incremental_scan = false` in `config.ini`.
-- Migration 014 is applied to **no** database — not production, not anywhere.
-- Session 37 has not been read or modified.
+Migration 014 changed no existing data: 113 chunks / 49 done / 64 pending /
+23,214,474 plan member rows were identical before and after, and all seven new
+tables are empty.
 
-`decide_scan_mode()` in [`src/scan_frontier.py`](../src/scan_frontier.py) is the
-single gate. If anything is missing or unreadable it returns `MODE_LEGACY` or
-`MODE_BLOCKED` — it never guesses its way into the new path.
+### Session 37 cannot be bootstrapped, and that is correct
 
-To enable it later, work through §10 of the completion gate in order. Do not
-skip the dry run.
+Its scan never finished — `scan_complete = false`, killed by an SSH reset — so
+the plan's full membership is unknown and "all chunks done" cannot mean
+"finished". Both the read-only report and the bootstrap dry run block on
+exactly that one condition, and `FrontierBootstrap.execute()` re-runs the dry
+run and raises `BootstrapRefused` rather than proceeding. Nothing here is
+broken; the gate is doing its job.
+
+To unblock it later, Session 37's scan has to complete first. That is a run,
+and a run is a separate operator decision.
+
+### `incremental_scan = true` is set — and is currently a no-op
+
+Measured, not assumed. `decide_scan_mode()` does return `MODE_FRONTIER`, but
+**nothing consumes that decision**:
+
+- `RemoteOrchestrator._resolve_scan_mode()` sets `self._scan_mode`, and
+  `self._scan_mode` is never read anywhere.
+- The streaming path builds its scanner with `build_legacy_scanner_factory()`
+  unconditionally ([remote_orchestrator.py:1097](../src/remote_orchestrator.py#L1097)).
+- `build_frontier_scanner_factory()` has **zero callers** in `src/` or `tests/`.
+- `DirectoryFrontierCoordinator` is constructed in exactly one place —
+  `FrontierBootstrap.execute()` ([frontier_bootstrap.py:166](../src/frontier_bootstrap.py#L166)),
+  reachable only via `--bootstrap-frontier --execute`.
+
+So the flag is safe to leave true — it cannot hand a session to a scanner it
+was never bound to — but it does not yet deliver the speed-up either. **Wiring
+the run path to the scan-mode decision is remaining Plan 1 work**, and it is
+the next thing to do on this plan. The frontier machinery itself is built and
+tested; only the connection from decision to scanner is missing.
 
 ## Two bugs this work found and fixed
 

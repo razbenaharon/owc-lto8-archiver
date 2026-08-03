@@ -138,10 +138,34 @@ class ProductionServerDetectionTests(unittest.TestCase):
                 guard.assert_server_is_not_production(SAFE)
         self.assertIn("PRODUCTION", str(caught.exception))
 
+    def test_a_server_hosting_a_DATED_production_catalog_is_refused(self):
+        """The live catalog is not named 'lto_archive'.
+
+        On this host it is ``lto_archive_directory_catalog_20260710_103359``,
+        and ``--create-migrated-db`` mints a new dated name each time. Matching
+        only the exact name would stop recognising production the day
+        ``lto_archive`` is dropped.
+        """
+        fake = self._fake_psycopg(
+            ["lto_archive_directory_catalog_20260710_103359"])
+        with mock.patch.dict("sys.modules", {"psycopg": fake}):
+            with self.assertRaises(UnsafeTestDatabase) as caught:
+                guard.assert_server_is_not_production(SAFE)
+        self.assertIn("PRODUCTION", str(caught.exception))
+
     def test_a_server_without_the_production_catalog_is_accepted(self):
         fake = self._fake_psycopg([])
         with mock.patch.dict("sys.modules", {"psycopg": fake}):
             self.assertTrue(guard.assert_server_is_not_production(SAFE))
+
+    def test_the_run_prefix_does_not_look_like_production(self):
+        """This run's own databases must not trip the production matcher."""
+        import fnmatch
+        name = guard.test_database_name("db")
+        for pattern in guard.PRODUCTION_MARKER_PATTERNS:
+            self.assertFalse(
+                fnmatch.fnmatch(name, pattern.replace("%", "*")),
+                f"{name!r} matches production pattern {pattern!r}")
 
     def test_the_check_only_reads(self):
         """It must not create, drop or write anything while deciding."""
