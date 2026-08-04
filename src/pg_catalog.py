@@ -102,24 +102,112 @@ class PgCatalogMixin:
             "run_started_at")
         item["source_host"] = _short_source_host(
             item.get("source_host") or LEGACY_DEFAULT_SOURCE_HOST)
-        item["container_name"] = item.get("bundle_tape_path")
+        item["container_id"] = item.get("restore_container_id")
+        item["container_format"] = item.get("restore_container_format")
+        item["format_version"] = item.get("restore_format_version")
+        item["tar_dialect"] = item.get("restore_tar_dialect")
+        item["member_name"] = (item.get("stored_path")
+                               if item.get("container_format") else None)
+        item["container_name"] = item.get("tape_container_locator")
+        item["source_base_path"] = PgCatalogMixin._source_base_path_for_member(
+            item.get("original_path"), item.get("member_name"))
         return item
 
     @staticmethod
-    def _catalog_select():
-        return """SELECT f.*, b.tape_path AS bundle_tape_path,
-                         r.started_at AS run_started_at
+    def _source_base_path_for_member(original_path, member_name):
+        original = str(original_path or "").replace("\\", "/")
+        member = str(member_name or "").replace("\\", "/").lstrip("/")
+        if member and original.endswith(member):
+            return original[:-len(member)].rstrip("/")
+        return _dirname(original)
+
+    @staticmethod
+    def _catalog_select(container_schema=True):
+        if not container_schema:
+            return """SELECT f.*, b.tape_path AS bundle_tape_path,
+                         r.started_at AS run_started_at,
+                         NULL::BIGINT AS restore_container_id,
+                         CASE WHEN f.is_packed AND b.bundle_id IS NOT NULL
+                              THEN 'zip' ELSE NULL END
+                             AS restore_container_format,
+                         CASE WHEN f.is_packed AND b.bundle_id IS NOT NULL
+                              THEN 'legacy-zip-v1' ELSE NULL END
+                             AS restore_format_version,
+                         NULL::TEXT AS restore_tar_dialect,
+                         NULL::TEXT AS local_container_locator,
+                         b.tape_path AS tape_container_locator,
+                         NULL::BIGINT AS tape_generation_id,
+                         NULL::INTEGER AS tape_generation,
+                         NULL::BIGINT AS sidecar_artifact_id,
+                         NULL::TEXT AS sidecar_artifact_version,
+                         NULL::TEXT AS local_sidecar_locator,
+                         NULL::TEXT AS tape_sidecar_locator,
+                         NULL::BIGINT AS expected_member_count,
+                         NULL::BIGINT AS expected_logical_bytes
                   FROM files_index AS f
                   LEFT JOIN archive_bundles AS b ON b.bundle_id = f.bundle_id
                   LEFT JOIN archive_runs AS r ON r.run_id = f.archive_run_id"""
+        return """SELECT f.*, b.tape_path AS bundle_tape_path,
+                         r.started_at AS run_started_at,
+                         c.container_id AS restore_container_id,
+                         CASE
+                           WHEN c.container_id IS NOT NULL
+                             THEN c.container_format
+                           WHEN f.is_packed AND b.bundle_id IS NOT NULL
+                             THEN 'zip'
+                           ELSE NULL
+                         END AS restore_container_format,
+                         CASE
+                           WHEN c.container_id IS NOT NULL THEN c.format_version
+                           WHEN f.is_packed AND b.bundle_id IS NOT NULL
+                             THEN 'legacy-zip-v1'
+                           ELSE NULL
+                         END AS restore_format_version,
+                         c.tar_dialect AS restore_tar_dialect,
+                         c.temporary_data_locator AS local_container_locator,
+                         COALESCE(c.tape_path, b.tape_path)
+                             AS tape_container_locator,
+                         COALESCE(c.tape_generation_id, r.tape_generation_id)
+                             AS tape_generation_id,
+                         tg.generation AS tape_generation,
+                         sidecar.artifact_id AS sidecar_artifact_id,
+                         sidecar.artifact_version AS sidecar_artifact_version,
+                         COALESCE(sidecar.local_locator,
+                                  c.permanent_local_metadata_locator)
+                             AS local_sidecar_locator,
+                         sidecar.tape_locator AS tape_sidecar_locator,
+                         c.expected_member_count,
+                         c.expected_logical_bytes
+                  FROM files_index AS f
+                  LEFT JOIN archive_bundles AS b ON b.bundle_id = f.bundle_id
+                  LEFT JOIN archive_runs AS r ON r.run_id = f.archive_run_id
+                  LEFT JOIN archive_containers AS c
+                    ON c.container_id = b.container_id
+                  LEFT JOIN tape_generations AS tg
+                    ON tg.generation_id = COALESCE(
+                        c.tape_generation_id, r.tape_generation_id)
+                  LEFT JOIN LATERAL (
+                    SELECT a.artifact_id, a.artifact_version,
+                           a.local_locator, a.tape_locator
+                    FROM archive_artifacts a
+                    WHERE a.container_id=c.container_id
+                      AND a.artifact_kind='tar_sidecar'
+                      AND a.readiness_state='ready'
+                    ORDER BY a.artifact_id DESC LIMIT 1
+                  ) sidecar ON TRUE"""
+
+    def _container_restore_schema_available(self, conn):
+        return all(self._table_exists_conn(conn, name) for name in (
+            "archive_containers", "archive_artifacts", "tape_generations"))
 
     def _catalog_rows(self, where="", params=(), order_by=""):
-        sql = self._catalog_select()
-        if where:
-            sql += " WHERE " + where
-        if order_by:
-            sql += " ORDER BY " + order_by
         with self._pool.connection() as conn:
+            sql = self._catalog_select(
+                self._container_restore_schema_available(conn))
+            if where:
+                sql += " WHERE " + where
+            if order_by:
+                sql += " ORDER BY " + order_by
             rows = conn.execute(sql, params).fetchall()
         return [self._hydrate_file_row(row) for row in rows]
 
@@ -764,16 +852,18 @@ class PgCatalogMixin:
             # rescans every skipped row, which is O(n^2) over a large result.
             where.append("f.file_id > %s")
             params.append(int(after_id))
-        sql = self._catalog_select() + " WHERE " + " AND ".join(where)
-        sql += (" ORDER BY f.file_id" if after_id is not None
-                else " ORDER BY f.original_path, f.catalog_name")
-        if limit is not None:
-            sql += " LIMIT %s"
-            params.append(int(limit))
-            if offset is not None and after_id is None:
-                sql += " OFFSET %s"
-                params.append(int(offset))
         with self._pool.connection() as conn:
+            sql = self._catalog_select(
+                self._container_restore_schema_available(conn))
+            sql += " WHERE " + " AND ".join(where)
+            sql += (" ORDER BY f.file_id" if after_id is not None
+                    else " ORDER BY f.original_path, f.catalog_name")
+            if limit is not None:
+                sql += " LIMIT %s"
+                params.append(int(limit))
+                if offset is not None and after_id is None:
+                    sql += " OFFSET %s"
+                    params.append(int(offset))
             rows = conn.execute(sql, params).fetchall()
         return [self._hydrate_file_row(row) for row in rows]
 
@@ -807,18 +897,22 @@ class PgCatalogMixin:
         if after_id is not None:
             where += " AND f.file_id > %s"
             params.append(int(after_id))
-            sql = self._catalog_select() + " WHERE " + where
-            sql += " ORDER BY f.file_id LIMIT %s"
             params.append(int(limit or 250))
             with self._pool.connection() as conn:
+                sql = self._catalog_select(
+                    self._container_restore_schema_available(conn))
+                sql += " WHERE " + where
+                sql += " ORDER BY f.file_id LIMIT %s"
                 rows = conn.execute(sql, params).fetchall()
             return [self._hydrate_file_row(row) for row in rows]
         if limit is None:
             return self._catalog_rows(where, params, "f.original_path")
-        sql = self._catalog_select() + " WHERE " + where
-        sql += " ORDER BY f.original_path LIMIT %s OFFSET %s"
         params.extend([int(limit), int(offset or 0)])
         with self._pool.connection() as conn:
+            sql = self._catalog_select(
+                self._container_restore_schema_available(conn))
+            sql += " WHERE " + where
+            sql += " ORDER BY f.original_path LIMIT %s OFFSET %s"
             rows = conn.execute(sql, params).fetchall()
         return [self._hydrate_file_row(row) for row in rows]
 
@@ -858,18 +952,22 @@ class PgCatalogMixin:
         if after_id is not None:
             where += " AND f.file_id > %s"
             params.append(int(after_id))
-            sql = self._catalog_select() + " WHERE " + where
-            sql += " ORDER BY f.file_id LIMIT %s"
             params.append(int(limit or 250))
             with self._pool.connection() as conn:
+                sql = self._catalog_select(
+                    self._container_restore_schema_available(conn))
+                sql += " WHERE " + where
+                sql += " ORDER BY f.file_id LIMIT %s"
                 rows = conn.execute(sql, params).fetchall()
             return [self._hydrate_file_row(row) for row in rows]
         if limit is None:
             return self._catalog_rows(where, params, "f.original_path")
-        sql = self._catalog_select() + " WHERE " + where
-        sql += " ORDER BY f.original_path LIMIT %s OFFSET %s"
         params.extend([int(limit), int(offset or 0)])
         with self._pool.connection() as conn:
+            sql = self._catalog_select(
+                self._container_restore_schema_available(conn))
+            sql += " WHERE " + where
+            sql += " ORDER BY f.original_path LIMIT %s OFFSET %s"
             rows = conn.execute(sql, params).fetchall()
         return [self._hydrate_file_row(row) for row in rows]
 
@@ -959,18 +1057,12 @@ class PgCatalogMixin:
 
     def find_directory_restore_bundles(self, dir_path, source_host=None,
                                        tape_label=None):
-        """Map a SOURCE directory to the ZIP bundle(s) that physically hold its
-        subtree, for a *bundle-complete* restore (whole directory, including the
-        small files that were never given individual ``files_index`` rows).
+        """Return explicit restore identities for containers covering a route.
 
-        Uses ``directory_tree_index`` (whose ``original_dir_path`` is the
-        canonical SOURCE path — unlike ``directory_archive_bundles``, whose root
-        is the transient staging path). Returns one dict per distinct bundle:
-        ``{tape_label, stored_bundle_path, base_path}``. ``base_path`` is the
-        SOURCE prefix that ZIP entry names are relative to, so the caller can
-        reconstruct each entry's full source path (``base_path + '/' + entry``)
-        and extract only the entries under ``dir_path`` — with no per-small-file
-        catalog lookup and no manifest read.
+        Legacy directory rows without migration-015 linkage are adapted to ZIP
+        here.  Linked rows are routed only by ``archive_containers`` truth.
+        The persisted canonical bundle root supplies ``source_base_path``;
+        ``remote_sessions.remote_path`` is deliberately never consulted.
         """
         self._require_directory_catalog_schema()
         needle = _norm_source_path(dir_path)
@@ -988,20 +1080,76 @@ class PgCatalogMixin:
         with self._pool.connection() as conn:
             rows = conn.execute(
                 "SELECT DISTINCT t.tape_label, t.stored_bundle_path, "
-                "       t.remote_session_id "
+                "       t.remote_session_id, d.original_dir_path, "
+                "       d.container_id AS directory_container_id, "
+                "       d.container_format AS directory_container_format, "
+                "       d.tape_generation_id AS directory_generation_id, "
+                "       c.container_id, c.container_format, c.format_version, "
+                "       c.tar_dialect, c.temporary_data_locator, "
+                "       c.permanent_local_metadata_locator, c.tape_path, "
+                "       c.tape_generation_id, c.expected_member_count, "
+                "       c.expected_logical_bytes, tg.generation, "
+                "       a.artifact_id, a.artifact_version, a.local_locator, "
+                "       a.tape_locator AS sidecar_tape_locator "
                 "FROM directory_tree_index t "
+                "JOIN directory_archive_bundles d ON d.bundle_id=t.bundle_id "
+                "LEFT JOIN archive_containers c ON c.container_id=d.container_id "
+                "LEFT JOIN tape_generations tg ON tg.generation_id="
+                "COALESCE(c.tape_generation_id,d.tape_generation_id) "
+                "LEFT JOIN LATERAL ("
+                "  SELECT aa.artifact_id, aa.artifact_version, "
+                "         aa.local_locator, aa.tape_locator "
+                "  FROM archive_artifacts aa "
+                "  WHERE aa.container_id=c.container_id "
+                "    AND aa.artifact_kind='tar_sidecar' "
+                "    AND aa.readiness_state='ready' "
+                "  ORDER BY aa.artifact_id DESC LIMIT 1"
+                ") a ON TRUE "
                 "WHERE " + " AND ".join(where) +
                 " AND t.stored_bundle_path IS NOT NULL",
                 params,
             ).fetchall()
             out = []
             for row in rows:
+                if (row["directory_container_id"] is not None
+                        and row["container_id"] is None):
+                    raise RuntimeError(
+                        "[DB] Directory restore container linkage is broken; "
+                        "refusing a legacy-format guess")
+                if (row["container_id"] is None
+                        and row["directory_container_format"] not in
+                        (None, "zip")):
+                    raise RuntimeError(
+                        "[DB] Unlinked directory container is not an explicit "
+                        "legacy ZIP; refusing restore")
                 out.append({
                     "tape_label": row["tape_label"],
                     "stored_bundle_path": row["stored_bundle_path"],
-                    "base_path": self._derive_bundle_base_path(
-                        conn, row["stored_bundle_path"],
-                        row["remote_session_id"]),
+                    "base_path": row["original_dir_path"],
+                    "source_base_path": row["original_dir_path"],
+                    "container_id": row["container_id"],
+                    "container_format": (
+                        row["container_format"] if row["container_id"]
+                        is not None else "zip"),
+                    "format_version": (
+                        row["format_version"] if row["container_id"]
+                        is not None else "legacy-zip-v1"),
+                    "tar_dialect": row["tar_dialect"],
+                    "local_container_locator": row["temporary_data_locator"],
+                    "tape_container_locator": (
+                        row["tape_path"] or row["stored_bundle_path"]),
+                    "tape_generation_id": (
+                        row["tape_generation_id"]
+                        or row["directory_generation_id"]),
+                    "tape_generation": row["generation"],
+                    "sidecar_artifact_id": row["artifact_id"],
+                    "sidecar_artifact_version": row["artifact_version"],
+                    "local_sidecar_locator": (
+                        row["local_locator"]
+                        or row["permanent_local_metadata_locator"]),
+                    "tape_sidecar_locator": row["sidecar_tape_locator"],
+                    "expected_member_count": row["expected_member_count"],
+                    "expected_logical_bytes": row["expected_logical_bytes"],
                 })
         return out
 
@@ -1009,12 +1157,19 @@ class PgCatalogMixin:
     def _derive_bundle_base_path(conn, stored_bundle_path, remote_session_id):
         """SOURCE prefix that a bundle's ZIP entry names are relative to.
 
-        Derived from any indexed (>= threshold) packed row in the same physical
-        bundle — ``original_path`` (canonical) minus ``stored_path`` (the ZIP
-        entry) — linked by the on-tape ZIP path. Falls back to the remote
-        session's ``remote_path`` when the bundle has only small (unindexed)
-        files. Empty string means "unknown" (caller then extracts the whole
-        bundle)."""
+        Prefer the canonical root already persisted by the directory catalog.
+        Legacy rows can still derive it from an indexed packed member.  The
+        ``remote_session_id`` argument remains for call compatibility only;
+        newline-composite ``remote_sessions.remote_path`` is never a root."""
+        row = conn.execute(
+            "SELECT original_dir_path FROM directory_archive_bundles "
+            "WHERE stored_bundle_path=%s "
+            "ORDER BY backup_date DESC LIMIT 1",
+            (stored_bundle_path,),
+        ).fetchone()
+        if row and row["original_dir_path"]:
+            return str(row["original_dir_path"]).replace(
+                "\\", "/").rstrip("/")
         row = conn.execute(
             "SELECT f.original_path, f.stored_path "
             "FROM files_index f "
@@ -1028,13 +1183,6 @@ class PgCatalogMixin:
             sp = str(row["stored_path"]).replace("\\", "/").lstrip("/")
             if sp and op.endswith(sp):
                 return op[:len(op) - len(sp)].rstrip("/")
-        if remote_session_id is not None:
-            srow = conn.execute(
-                "SELECT remote_path FROM remote_sessions WHERE session_id=%s",
-                (remote_session_id,),
-            ).fetchone()
-            if srow and srow["remote_path"]:
-                return str(srow["remote_path"]).replace("\\", "/").rstrip("/")
         return ""
 
     def validate_directory_catalog(self, tape_label=None):
@@ -1125,6 +1273,15 @@ class PgCatalogMixin:
         matches = []
         for bundle in bundles:
             path = bundle["manifest_path"]
+            manifest_drive = os.path.splitdrive(str(path or ""))[0].casefold()
+            bundle_drive = os.path.splitdrive(
+                str(bundle["stored_bundle_path"] or ""))[0].casefold()
+            if manifest_drive == "z:" or (
+                    manifest_drive and bundle_drive
+                    and manifest_drive == bundle_drive):
+                raise RuntimeError(
+                    "[DB] Small-file manifest points at LTFS. Local metadata "
+                    "is required; refusing to scan tape.")
             if not path or not os.path.exists(path):
                 continue
             handle = self._open_manifest_reader(

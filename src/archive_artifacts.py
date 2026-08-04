@@ -33,11 +33,13 @@ Artifacts live in their own namespaced subdirectory under
 ``ConfigManager.local_manifest_archive_root`` so they cannot collide with the
 migration-010 small-file manifest exports that share the same root.
 """
+import fnmatch
 import io
 import json
 import os
 import posixpath
 import uuid
+from dataclasses import dataclass
 
 try:
     import zstandard as zstd
@@ -46,9 +48,14 @@ except ImportError:                # pragma: no cover - requirements ships it
 
 from .logsetup import get_logger
 from .paths import _long
+from .tar_container import validate_tar_member_name
 
 #: Artifact format version. A reader refuses anything it does not know.
 ARTIFACT_VERSION = "scan-segment-v1"
+
+# Phase 1 establishes the consumer contract before any TAR producer is enabled.
+TAR_SIDECAR_VERSION = "stored-tar-sidecar-v1"
+MAX_TAR_SIDECAR_RECORDS = 1_000_000
 
 #: Namespaced subdirectory under the local manifest archive root. Keeping
 #: operational scan artifacts out of the migration-010 export namespace means a
@@ -65,6 +72,16 @@ class ArtifactError(RuntimeError):
 
 class ArtifactConflict(ArtifactError):
     """The final artifact name is already taken."""
+
+
+@dataclass(frozen=True)
+class TarSidecarSearchResult:
+    """Validated local TAR-sidecar contents and a bounded route selection."""
+
+    header: dict
+    expected_members: tuple
+    matches: tuple
+    footer: dict
 
 
 def _require_zstd():
@@ -115,6 +132,237 @@ def resolve_locator(archive_root, locator):
         raise ArtifactError(
             f"artifact locator escapes the archive root: {locator!r}")
     return candidate
+
+
+def is_ltfs_locator(locator, *, tape_root=None, tape_locator=None):
+    """Classify a locator lexically, without performing tape I/O."""
+    text = str(locator or "").strip()
+    if not text:
+        return False
+    drive = os.path.splitdrive(text)[0].casefold()
+    if drive == "z:":
+        return True
+    tape_drive = os.path.splitdrive(str(tape_root or ""))[0].casefold()
+    if drive and tape_drive and drive == tape_drive:
+        return True
+    if tape_locator:
+        left = os.path.normcase(os.path.abspath(text))
+        right = os.path.normcase(os.path.abspath(str(tape_locator)))
+        if left == right:
+            return True
+    return False
+
+
+def resolve_local_metadata_locator(archive_root, locator, *, tape_root=None,
+                                   tape_locator=None):
+    """Resolve local metadata, refusing LTFS locators before any probe."""
+    if is_ltfs_locator(locator, tape_root=tape_root,
+                       tape_locator=tape_locator):
+        raise ArtifactError(
+            "local restore metadata points at LTFS; copy/rebuild the sidecar "
+            "on local disk and retry (the tape will not be scanned)")
+    text = str(locator or "").strip()
+    if not text:
+        raise ArtifactError(
+            "local TAR sidecar metadata is missing; restore cannot scan tape "
+            "to reconstruct it")
+    if os.path.isabs(text) or os.path.splitdrive(text)[0]:
+        return os.path.abspath(text)
+    if not archive_root:
+        raise ArtifactError(
+            "relative TAR sidecar locator has no configured local metadata root")
+    return resolve_locator(archive_root, text)
+
+
+def _sidecar_source_path(header, record, member_name):
+    original = record.get("original_path") or record.get("source_path")
+    if original:
+        return str(original).replace("\\", "/")
+    base = str(header.get("source_base_path") or "").replace(
+        "\\", "/").rstrip("/")
+    return f"{base}/{member_name}" if base else member_name
+
+
+def search_tar_sidecar(path, *, directory=None, query=None, limit=10_000,
+                       expected_version=TAR_SIDECAR_VERSION,
+                       expected_container_id=None,
+                       expected_member_count=None,
+                       max_records=MAX_TAR_SIDECAR_RECORDS):
+    """Validate and sequentially search one explicitly selected JSONL.zst.
+
+    Search output and total input records are both bounded.  The complete
+    expectation tuple is retained because a restore validates the whole TAR,
+    not only the selected members.
+    """
+    _require_zstd()
+    if str(path).endswith(".part"):
+        raise ArtifactError("refusing to read an unpublished TAR sidecar .part")
+    limit = max(1, int(limit))
+    max_records = max(1, int(max_records))
+    header = None
+    footer = None
+    expected = []
+    matches = []
+    logical_bytes = 0
+    previous_ordinal = None
+    member_names = set()
+    folded_names = set()
+    directory_norm = (str(directory or "").replace(
+        "\\", "/").rstrip("/") or None)
+    query_text = str(query or "").strip() or None
+
+    try:
+        raw = open(_long(path), "rb")
+    except OSError as exc:
+        raise ArtifactError(
+            f"local TAR sidecar is unavailable at {path!r}; restore will not "
+            "fall back to scanning tape") from exc
+    with raw:
+        reader = zstd.ZstdDecompressor().stream_reader(raw)
+        text = io.TextIOWrapper(reader, encoding="utf-8")
+        try:
+            for line_number, line in enumerate(text, start=1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise ArtifactError(
+                        f"invalid TAR sidecar JSON at line {line_number}") from exc
+                kind = record.get("kind") or record.get("record_type")
+                if header is None:
+                    if kind != "header":
+                        raise ArtifactError("TAR sidecar must begin with a header")
+                    header = record
+                    if (expected_version
+                            and record.get("version") != expected_version):
+                        raise ArtifactError(
+                            "unsupported TAR sidecar version "
+                            f"{record.get('version')!r}")
+                    if (expected_container_id is not None
+                            and record.get("container_id") is not None
+                            and int(record["container_id"])
+                            != int(expected_container_id)):
+                        raise ArtifactError(
+                            "TAR sidecar container identity mismatch")
+                    continue
+                if footer is not None:
+                    raise ArtifactError("records follow the TAR sidecar footer")
+                if kind == "footer":
+                    footer = record
+                    continue
+                if kind not in ("member", "entry", "source_exception"):
+                    raise ArtifactError(
+                        f"unrecognized TAR sidecar record kind {kind!r}")
+                if len(expected) >= max_records:
+                    raise ArtifactError(
+                        f"TAR sidecar exceeds the bounded "
+                        f"{max_records:,}-record reader")
+
+                member_name = record.get("member_name", record.get("name"))
+                source_exception = record.get("source_exception")
+                if kind == "source_exception" and source_exception is None:
+                    source_exception = (record.get("disposition")
+                                        or record.get("status"))
+                if member_name is not None:
+                    try:
+                        member_name = validate_tar_member_name(str(member_name))
+                    except ValueError as exc:
+                        raise ArtifactError(
+                            f"unsafe TAR sidecar member at line {line_number}") \
+                            from exc
+                try:
+                    size = int(record.get(
+                        "logical_size", record.get(
+                            "file_size_bytes", record.get("size"))))
+                    ordinal = int(record.get(
+                        "ordinal", record.get(
+                            "plan_ordinal", record.get("scan_ordinal"))))
+                except (TypeError, ValueError) as exc:
+                    raise ArtifactError(
+                        f"TAR sidecar member at line {line_number} lacks "
+                        "integer size/ordinal") from exc
+                if size < 0 or ordinal < 0:
+                    raise ArtifactError(
+                        "TAR sidecar size/ordinal must be non-negative")
+                if previous_ordinal is not None and ordinal <= previous_ordinal:
+                    raise ArtifactError(
+                        "TAR sidecar ordinals must be strictly ascending")
+                previous_ordinal = ordinal
+                if member_name is not None:
+                    if (member_name in member_names
+                            or member_name.casefold() in folded_names):
+                        raise ArtifactError(
+                            "duplicate or case-fold-colliding TAR sidecar member")
+                    member_names.add(member_name)
+                    folded_names.add(member_name.casefold())
+                item = {
+                    "name": member_name,
+                    "logical_size": size,
+                    "ordinal": ordinal,
+                    "source_exception": source_exception,
+                }
+                expected.append(item)
+                if source_exception is not None:
+                    continue
+                logical_bytes += size
+                original_path = _sidecar_source_path(
+                    header, record, member_name)
+                if "\0" in original_path or any(
+                        part in (".", "..")
+                        for part in original_path.split("/")):
+                    raise ArtifactError(
+                        f"unsafe canonical source path in TAR sidecar: "
+                        f"{original_path!r}")
+                source_base = str(header.get("source_base_path") or "").replace(
+                    "\\", "/").rstrip("/")
+                expected_source = (f"{source_base}/{member_name}"
+                                   if source_base else member_name)
+                if original_path != expected_source:
+                    raise ArtifactError(
+                        "TAR sidecar source path disagrees with its canonical "
+                        "source root/member name")
+                selected = True
+                if directory_norm:
+                    selected = (original_path == directory_norm
+                                or original_path.startswith(
+                                    directory_norm + "/"))
+                if selected and query_text:
+                    selected = fnmatch.fnmatchcase(
+                        posixpath.basename(original_path).casefold(),
+                        query_text.casefold())
+                if selected:
+                    if len(matches) >= limit:
+                        raise ArtifactError(
+                            f"TAR sidecar route matches more than {limit:,} "
+                            "members; select a narrower directory/container route")
+                    matches.append({
+                        "member_name": member_name,
+                        "stored_path": member_name,
+                        "original_path": original_path,
+                        "file_name": posixpath.basename(original_path),
+                        "file_size_bytes": size,
+                        "ordinal": ordinal,
+                    })
+        finally:
+            text.close()
+
+    if header is None or footer is None:
+        raise ArtifactError("TAR sidecar is truncated (header/footer missing)")
+    present_count = sum(1 for item in expected
+                        if item["source_exception"] is None)
+    declared_count = footer.get("member_count", header.get("member_count"))
+    declared_bytes = footer.get("logical_bytes", header.get("logical_bytes"))
+    if declared_count is None or int(declared_count) != present_count:
+        raise ArtifactError("TAR sidecar member-count aggregate mismatch")
+    if declared_bytes is None or int(declared_bytes) != logical_bytes:
+        raise ArtifactError("TAR sidecar logical-byte aggregate mismatch")
+    if (expected_member_count is not None
+            and int(expected_member_count) != present_count):
+        raise ArtifactError("catalog/sidecar member-count mismatch")
+    return TarSidecarSearchResult(
+        header=dict(header), expected_members=tuple(expected),
+        matches=tuple(matches), footer=dict(footer))
 
 
 class JsonlZstArtifactWriter:
@@ -377,8 +625,10 @@ def find_orphan_parts(archive_root):
 
 
 __all__ = [
-    "ARTIFACT_NAMESPACE", "ARTIFACT_VERSION", "ArtifactConflict",
-    "ArtifactError", "JsonlZstArtifactWriter", "artifact_root",
-    "find_orphan_parts", "parse_jsonl_zst_artifact", "resolve_locator",
-    "segment_locator",
+    "ARTIFACT_NAMESPACE", "ARTIFACT_VERSION", "TAR_SIDECAR_VERSION",
+    "ArtifactConflict", "ArtifactError", "JsonlZstArtifactWriter",
+    "TarSidecarSearchResult", "artifact_root", "find_orphan_parts",
+    "is_ltfs_locator", "parse_jsonl_zst_artifact",
+    "resolve_local_metadata_locator", "resolve_locator",
+    "search_tar_sidecar", "segment_locator",
 ]
