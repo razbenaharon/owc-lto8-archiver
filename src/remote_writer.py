@@ -33,7 +33,8 @@ from .exit_codes import (
     REASON_LTFS_OWNERSHIP_UNAVAILABLE, REASON_TAPE_WRITE_FAILED,
     REASON_UNEXPECTED_TAPE_OR_DB_STATE, REASON_USER_REQUESTED_STOP)
 from .logsetup import get_logger
-from .pipeline_types import ChunkStatus
+from .pipeline_types import (ChunkStatus,
+                             validate_staged_chunk_writer_admission)
 from .ltfs_ownership import LtfsOwnershipError, writer_timeout_seconds
 from .reporting import _write_source_missing_only_log
 from .runtime import CANCEL, _acquire_tape_io_lock, _release_tape_io_lock, _status
@@ -68,6 +69,13 @@ class RemoteChunkWriter:
         if not descs:
             return None
 
+        # Validate every descriptor before even the no-tape shortcut is
+        # handled. Unknown format authority is never guessed to be ZIP, and a
+        # TAR handoff must match durable database readiness.
+        for desc in descs:
+            validate_staged_chunk_writer_admission(
+                desc, self.host.db, expected_session_id=session_id)
+
         # skip_tape chunks involve no tape at all — handle them outside
         # ownership so an all-skip group never touches LTFS.
         tape_descs = []
@@ -84,7 +92,8 @@ class RemoteChunkWriter:
 
         group_started = time.time()
         first = tape_descs[0]
-        group_bytes = sum(int(getattr(d, 'staged_bytes', 0) or 0)
+        group_bytes = sum(int(getattr(d, 'prepared_bytes',
+                                      getattr(d, 'staged_bytes', 0)) or 0)
                           for d in tape_descs)
         get_logger().info(
             "tape_write_group_start: chunks=%d indices=%s bytes=%d "

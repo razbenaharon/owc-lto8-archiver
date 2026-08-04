@@ -114,7 +114,7 @@ class KnownFilesNeverReachTheChunkBuilderTests(unittest.TestCase):
 
         published = []
 
-        def append_chunk(_session_id, chunk_index, rows):
+        def append_chunk(_session_id, chunk_index, rows, **_gate_kwargs):
             members = [(row[1], row[3]) for row in rows]
             published.append((chunk_index, members))
             return {

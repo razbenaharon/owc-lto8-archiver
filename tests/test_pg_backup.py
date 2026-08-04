@@ -1,6 +1,7 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 from src.constants import PROJECT_ROOT
 from src.pg_backup import (
@@ -8,11 +9,20 @@ from src.pg_backup import (
     _is_loopback_host,
     _timestamped_migration_db_name,
     _safe_filename_part,
+    create_backup_receipt,
+    verify_backup_receipt,
     verify_backup_file,
 )
 
 
 class PostgresBackupHelperTests(unittest.TestCase):
+    @staticmethod
+    def _identity(database="fixture"):
+        return {
+            "database": database, "server_addr": "127.0.0.1",
+            "server_port": 15432, "database_user": "lto",
+            "database_oid": "123", "system_identifier": "456"}
+
     def test_safe_filename_part_removes_windows_unsafe_characters(self):
         self.assertEqual(
             _safe_filename_part("archive:prod/db", "database"),
@@ -53,6 +63,42 @@ class PostgresBackupHelperTests(unittest.TestCase):
             path.write_bytes(b"")
             with self.assertRaisesRegex(RuntimeError, "missing or empty"):
                 verify_backup_file(Cfg(), path)
+
+    def test_target_bound_receipt_detects_file_or_database_change(self):
+        with TemporaryDirectory() as tmp:
+            backup = Path(tmp) / "fixture.dump"
+            backup.write_bytes(b"custom-format-fixture")
+            cfg = object()
+            patches = (
+                mock.patch("src.pg_backup.verify_backup_file",
+                           return_value=str(backup)),
+                mock.patch("src.pg_backup._backup_database_identity",
+                           return_value=self._identity()),
+                mock.patch("src.pg_backup._backup_catalog_fingerprint",
+                           return_value="catalog-v1"),
+            )
+            with patches[0], patches[1], patches[2]:
+                create_backup_receipt(cfg, backup)
+                verified = verify_backup_receipt(cfg, backup)
+                self.assertTrue(verified["verified"])
+                self.assertEqual(verified["target_database"], "fixture")
+
+                backup.write_bytes(b"changed")
+                with self.assertRaisesRegex(RuntimeError, "does not match"):
+                    verify_backup_receipt(cfg, backup)
+
+            backup.write_bytes(b"custom-format-fixture")
+            with mock.patch(
+                    "src.pg_backup.verify_backup_file",
+                    return_value=str(backup)), \
+                    mock.patch(
+                        "src.pg_backup._backup_database_identity",
+                        return_value=self._identity("other")), \
+                    mock.patch(
+                        "src.pg_backup._backup_catalog_fingerprint",
+                        return_value="catalog-v1"):
+                with self.assertRaisesRegex(RuntimeError, "different database"):
+                    verify_backup_receipt(cfg, backup)
 
     def test_directory_catalog_migration_is_additive_only(self):
         sql = (Path(PROJECT_ROOT) / "scripts" / "sql"

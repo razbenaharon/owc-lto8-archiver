@@ -4,6 +4,7 @@ All bounded by explicit timeouts. No tape, no Z:\\, no IBM helper: LTFS is a
 fake adapter and the writer is a recording double.
 """
 import os
+import tempfile
 import threading
 import time
 import unittest
@@ -19,6 +20,8 @@ from src.exit_codes import (ExitCode, StopResult,
                             REASON_USER_REQUESTED_STOP)
 from src.ready_queue import (ReadyItem, ReadyQueue, ReadyQueueLimits,
                              STATE_PRESERVED, STATE_READY, STATE_WRITTEN)
+from src.pipeline_types import (
+    ArtifactKind, ContainerFormat, StagedArtifact, StagedChunk, StagedContainer)
 
 GiB = 1024 ** 3
 TIMEOUT = 20          # every blocking test is bounded by this
@@ -109,6 +112,69 @@ class ReadyQueueCounterTests(unittest.TestCase):
     def test_prepared_bytes_come_from_the_pack_not_the_remote_size(self):
         it = _item(0, gib=1.7)
         self.assertEqual(it.prepared_bytes, it.desc.staged_bytes)
+
+        # Stored TAR admission counts every actual staged object, not the
+        # remote logical member total: TAR data, sidecar, available Plan 3/4
+        # artifacts, and unchanged loose-large files.
+        with tempfile.TemporaryDirectory() as root:
+            def staged_file(name, size):
+                path = os.path.join(root, name)
+                with open(path, "wb") as handle:
+                    handle.write(b"x" * size)
+                return path
+
+            tar_path = staged_file("container.tar", 100)
+            sidecar_path = staged_file("container.jsonl.zst", 10)
+            plan_path = staged_file("plan.jsonl.zst", 5)
+            terminal_path = staged_file("terminal.jsonl.zst", 7)
+            loose_path = staged_file("large.bin", 11)
+            container = StagedContainer(
+                container_id=1, session_id=37, chunk_index=49,
+                container_ordinal=0,
+                container_format=ContainerFormat.STORED_TAR,
+                format_version="stored-tar-v1",
+                storage_class="small_files", container_name="container.tar",
+                tar_dialect="gnu-pax-sparse-v1",
+                data_path=tar_path, temporary_data_locator=tar_path,
+                data_size_bytes=100, expected_member_count=2,
+                expected_logical_bytes=80, observed_member_count=2,
+                observed_logical_bytes=80)
+            artifacts = [
+                StagedArtifact(
+                    artifact_id=10, session_id=37, chunk_index=49,
+                    container_id=1, artifact_kind=ArtifactKind.TAR_SIDECAR,
+                    artifact_version="tar-sidecar-v1",
+                    staged_path=sidecar_path, local_locator="sidecars/one.zst",
+                    staged_size_bytes=10),
+                StagedArtifact(
+                    artifact_id=11, session_id=37, chunk_index=49,
+                    artifact_kind=ArtifactKind.PLAN_MANIFEST,
+                    artifact_version="plan-v1", staged_path=plan_path,
+                    local_locator="plans/one.zst", staged_size_bytes=5),
+                StagedArtifact(
+                    artifact_id=12, session_id=37, chunk_index=49,
+                    artifact_kind=ArtifactKind.TERMINAL_MANIFEST,
+                    artifact_version="terminal-v1", staged_path=terminal_path,
+                    local_locator="terminal/one.zst", staged_size_bytes=7),
+            ]
+            expected = 100 + 10 + 5 + 7 + 11
+            desc = StagedChunk(
+                chunk_index=49, session_id=37, fetch_dir="",
+                pack_dir=root, packaging_format=ContainerFormat.STORED_TAR,
+                containers=[container], artifacts=artifacts,
+                metadata=[{
+                    "file_name": "large.bin", "original_path": "/large.bin",
+                    "file_size_bytes": 11, "is_packed": False,
+                    "stored_path": loose_path,
+                }], staged_bytes=expected)
+            tar_item = ReadyItem(
+                chunk_index=49, pack_dir=root,
+                prepared_bytes=desc.prepared_bytes, file_count=3, desc=desc)
+            self.assertEqual(tar_item.prepared_bytes, expected)
+            self.assertEqual(desc.container_bytes, 100)
+            self.assertEqual(desc.artifact_bytes, 22)
+            self.assertEqual(desc.loose_file_bytes, 11)
+            self.assertTrue(desc.assert_writer_ready())
 
     def test_chunk_count_limit_is_enforced(self):
         q = ReadyQueue(_limits(chunks=3))
@@ -324,6 +390,7 @@ class GroupWriteSemanticsTests(unittest.TestCase):
         orch.db = mock.MagicMock()
         # Real dict: the fits-tape step unpacks a 3-tuple from .get(...).
         orch.db.get_chunk_size_summary.return_value = {}
+        orch.db.get_chunk_packaging_format.return_value = ContainerFormat.ZIP
         orch.notifier = None
         orch.remote_host = "host.example"
         orch.remote_session_path = "/strg"
@@ -373,6 +440,8 @@ class GroupWriteSemanticsTests(unittest.TestCase):
     def _descs(self, indices):
         return [SimpleNamespace(chunk_index=i, pack_dir=f"/tmp/_pack_{i}",
                                 staged_bytes=int(1.7 * GiB), skip_tape=False,
+                                session_id=37,
+                                packaging_format=ContainerFormat.ZIP,
                                 metadata=[], fetch_dir=f"/tmp/_fetch_{i}",
                                 source_missing_files=[])
                 for i in indices]
@@ -474,6 +543,8 @@ class GroupWriteSemanticsTests(unittest.TestCase):
         orch = self._orchestrator({})
         descs = self._descs([0])
         descs[0].skip_tape = True
+        descs[0].staged_bytes = 0
+        descs[0].source_missing_files = ["missing"]
         with mock.patch("src.remote_orchestrator._write_source_missing_only_log",
                         return_value=None):
             block = orch._write_chunk_group(37, descs, "T", False,

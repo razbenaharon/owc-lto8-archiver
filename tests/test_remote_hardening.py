@@ -15,7 +15,7 @@ from src.orchestrators import (
 # facade: Plan 1 completion removed them from that facade so it cannot
 # advertise a class no production path may build.
 from src.scanning import RemoteScanner, StreamingRemoteScanner
-from src.pipeline_types import StagedChunk
+from src.pipeline_types import ContainerFormat, StagedChunk
 from src.remote_transport import (
     _ASKPASS_HELPERS,
     _cleanup_askpass_helpers,
@@ -80,6 +80,9 @@ class RemoteStagingSafetyTests(unittest.TestCase):
                 # planned counts every file; present excludes source_missing.
                 return {0: (2000, 1000, 2)}
 
+            def get_chunk_packaging_format(self, session_id, chunk_index):
+                return ContainerFormat.ZIP
+
             def get_tape(self, label):
                 return {"total_capacity": 1 / 1024**3}
 
@@ -106,6 +109,8 @@ class RemoteStagingSafetyTests(unittest.TestCase):
             fetch_dir=r"C:\stage\fetch",
             metadata=[{"is_packed": True}],
             staged_bytes=0,
+            session_id=1,
+            packaging_format=ContainerFormat.ZIP,
         )
         result = orch._write_chunk(1, desc, "T1", eject_after=False,
                                    stop_pipeline=_threading.Event())

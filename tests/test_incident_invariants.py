@@ -21,7 +21,7 @@ from src.exit_codes import (ExitCode, StopResult,
                             REASON_AMBIGUOUS_BACKING_CHUNK,
                             REASON_TAPE_WRITE_FAILED,
                             REASON_UNEXPECTED_TAPE_OR_DB_STATE)
-from src.pipeline_types import ChunkStatus, StagedChunk
+from src.pipeline_types import ChunkStatus, ContainerFormat, StagedChunk
 from src.remote_writer import RemoteChunkWriter
 
 from lto_fakes import TapeOperationLog
@@ -73,7 +73,9 @@ def executable_source(module_name):
 def _desc(index, skip_tape=False):
     return StagedChunk(chunk_index=index, fetch_dir=f"/tmp/_f{index}",
                        pack_dir=f"/tmp/_p{index}", metadata=[],
-                       staged_bytes=GiB, source_missing_files=[],
+                       staged_bytes=0 if skip_tape else GiB,
+                       source_missing_files=["missing"] if skip_tape else [],
+                       session_id=37, packaging_format=ContainerFormat.ZIP,
                        skip_tape=skip_tape)
 
 
@@ -117,6 +119,7 @@ class _WriterHarness(unittest.TestCase):
 
         db = mock.MagicMock()
         db.get_chunk_size_summary.return_value = {}
+        db.get_chunk_packaging_format.return_value = ContainerFormat.ZIP
 
         def status(session_id, chunk_index, value):
             outer.statuses.append((chunk_index, value))

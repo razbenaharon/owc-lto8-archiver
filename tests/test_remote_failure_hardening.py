@@ -41,7 +41,7 @@ from src.exit_codes import (ExitCode, StopResult, REASON_NETWORK_RETRY_EXHAUSTED
                             REASON_USER_REQUESTED_STOP,
                             CLASS_DNS_RESOLUTION_FAILURE,
                             CLASS_CONNECTION_TIMEOUT)
-from src.pipeline_types import StagedChunk
+from src.pipeline_types import ContainerFormat, StagedChunk
 from src.ready_queue import ReadyQueueLimits
 
 
@@ -66,7 +66,8 @@ def _orch(**attrs):
 
 def _desc(chunk_index=3):
     return StagedChunk(chunk_index=chunk_index, fetch_dir="f", pack_dir="p",
-                       metadata=[], staged_bytes=10)
+                       metadata=[], staged_bytes=10, session_id=7,
+                       packaging_format=ContainerFormat.ZIP)
 
 
 # ---------------------------------------------------------------------------
@@ -761,6 +762,7 @@ class WriteChunkRaceTests(unittest.TestCase):
         orch.db = SimpleNamespace(
             get_chunks_with_status=lambda sid, st: [],
             get_chunk_size_summary=lambda sid, ci=None: {ci: (10, 10, 1)},
+            get_chunk_packaging_format=lambda sid, ci: ContainerFormat.ZIP,
             get_tape=lambda label: {"total_capacity": 10**9},
             recalculate_tape_used_space=lambda label: 0,
             update_chunk_status=lambda sid, ci, st: statuses.append(st))
@@ -896,6 +898,7 @@ class CooperativeCancelWriteTests(unittest.TestCase):
         orch.db = SimpleNamespace(
             get_chunks_with_status=lambda sid, st: [],
             get_chunk_size_summary=lambda sid, ci=None: {ci: (10, 10, 1)},
+            get_chunk_packaging_format=lambda sid, ci: ContainerFormat.ZIP,
             get_tape=lambda label: {"total_capacity": 10**9},
             recalculate_tape_used_space=lambda label: 0,
             update_chunk_status=lambda sid, ci, st: statuses.append(st))

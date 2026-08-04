@@ -189,6 +189,11 @@ class ConfigManager:
             'block_on_pending_reboot': 'true',
         }
         self.config['FEATURES'] = {
+            # Plan 2 Stored TAR creation/initial assignment.  The reader is a
+            # separate permanent compatibility path; this flag controls only
+            # NEW TAR assignment/production and fails closed when absent or
+            # malformed.
+            'stored_tar_write_enabled': 'false',
             # Phase 5 sealed tape-write batches. FAIL-CLOSED: default false, and
             # the production runtime queries/mutates no batch table while false.
             # Enabling it without the applied 012 schema must fail at startup.
@@ -817,6 +822,16 @@ class ConfigManager:
     def windows_update_block_on_pending_reboot(self):
         return self._get_bool(
             'WINDOWS_UPDATE', 'block_on_pending_reboot', True)
+
+    @property
+    def stored_tar_write_enabled(self):
+        """Allow new Stored TAR assignment/production; fail-closed by default.
+
+        Reader/restore support is intentionally independent so turning this off
+        after the first TAR exists cannot strand an immutable archive object.
+        """
+        return self._get_bool(
+            'FEATURES', 'stored_tar_write_enabled', False)
 
     @property
     def sealed_tape_write_batches_enabled(self):

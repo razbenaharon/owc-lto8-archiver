@@ -273,9 +273,11 @@ class PgSessionMixin:
         return self._transaction(
             operation, "create remote streaming session")
 
-    def create_remote_session_with_plan(self, session_label, remote_host,
-                                        remote_user, remote_path, tape_label,
-                                        staging_dir, rows):
+    def create_remote_session_with_plan(
+            self, session_label, remote_host, remote_user, remote_path,
+            tape_label, staging_dir, rows, *,
+            stored_tar_write_enabled=False, reader_contract_version=None,
+            require_container_format_schema=False):
         """Create a remote session and persist its plan in ONE transaction.
 
         A session must never become visible without its chunk plan: the old
@@ -300,7 +302,11 @@ class PgSessionMixin:
                 (len(rows), total_bytes, chunk_count, session_id),
             )
             self._persist_remote_plan(
-                conn, session_id, remote_host, remote_path, rows, by_path, now)
+                conn, session_id, remote_host, remote_path, rows, by_path, now,
+                stored_tar_write_enabled=stored_tar_write_enabled,
+                reader_contract_version=reader_contract_version,
+                require_container_format_schema=
+                    require_container_format_schema)
             return session_id
 
         return self._transaction(operation, "create remote session with plan")
@@ -374,7 +380,10 @@ class PgSessionMixin:
             raise RuntimeError("[DB] Duplicate canonical paths in remote snapshot")
         return by_path
 
-    def insert_remote_manifest_batch(self, session_id, rows):
+    def insert_remote_manifest_batch(
+            self, session_id, rows, *, stored_tar_write_enabled=False,
+            reader_contract_version=None,
+            require_container_format_schema=False):
         """Persist a canonical snapshot and reusable chunk plan."""
         rows = list(rows)
         session = self.get_remote_session(session_id)
@@ -386,11 +395,18 @@ class PgSessionMixin:
         def operation(conn):
             return self._persist_remote_plan(
                 conn, session_id, session["remote_host"],
-                session["remote_path"], rows, by_path, now)
+                session["remote_path"], rows, by_path, now,
+                stored_tar_write_enabled=stored_tar_write_enabled,
+                reader_contract_version=reader_contract_version,
+                require_container_format_schema=
+                    require_container_format_schema)
 
         return self._transaction(operation, "insert remote manifest batch")
 
-    def append_remote_streaming_chunk(self, session_id, chunk_index, rows):
+    def append_remote_streaming_chunk(
+            self, session_id, chunk_index, rows, *,
+            stored_tar_write_enabled=False, reader_contract_version=None,
+            require_container_format_schema=False):
         """Append one discovered chunk to a streaming remote session.
 
         Duplicate canonical remote paths already present in the session
@@ -402,6 +418,12 @@ class PgSessionMixin:
         now = _now_utc()
 
         def operation(conn):
+            if (require_container_format_schema
+                    and not self._column_exists_conn(
+                        conn, "remote_chunks", "packaging_format")):
+                raise RuntimeError(
+                    "[DB] Migration 015 is required before a production "
+                    "scanner can create a new chunk")
             session = conn.execute(
                 """SELECT s.*, p.snapshot_id
                    FROM remote_sessions s
@@ -479,13 +501,45 @@ class PgSessionMixin:
                     ((session["plan_id"], ids[path], int(chunk_index), ordinal)
                      for ordinal, (_, path, _, _) in enumerate(filtered)),
                 )
-                cur.execute(
-                    """INSERT INTO remote_chunks
-                       (session_id, chunk_index, status, updated_at)
-                       VALUES (%s, %s, 'pending', %s)
-                       ON CONFLICT (session_id, chunk_index) DO NOTHING""",
-                    (session_id, int(chunk_index), now),
-                )
+                has_format_schema = self._column_exists_conn(
+                    conn, "remote_chunks", "packaging_format")
+                if has_format_schema:
+                    packaging_format = self.assign_new_chunk_format(
+                        session_id, int(chunk_index),
+                        stored_tar_write_enabled=stored_tar_write_enabled,
+                        reader_contract_version=reader_contract_version,
+                        conn=conn)
+                    cur.execute(
+                        """INSERT INTO remote_chunks
+                           (session_id, chunk_index, status, updated_at,
+                            packaging_format, packaging_assigned_at)
+                           VALUES (%s, %s, 'pending', %s, %s, %s)
+                           ON CONFLICT (session_id, chunk_index) DO NOTHING""",
+                        (session_id, int(chunk_index), now,
+                         packaging_format.value, now),
+                    )
+                    persisted = conn.execute(
+                        """SELECT packaging_format FROM remote_chunks
+                           WHERE session_id=%s AND chunk_index=%s""",
+                        (session_id, int(chunk_index)),
+                    ).fetchone()
+                    if persisted is None or persisted["packaging_format"] != \
+                            packaging_format.value:
+                        raise RuntimeError(
+                            "[DB] Existing chunk format conflicts with the "
+                            "durable session boundary")
+                else:
+                    if stored_tar_write_enabled:
+                        raise RuntimeError(
+                            "[DB] Stored TAR assignment requested but migration "
+                            "015 is not installed")
+                    cur.execute(
+                        """INSERT INTO remote_chunks
+                           (session_id, chunk_index, status, updated_at)
+                           VALUES (%s, %s, 'pending', %s)
+                           ON CONFLICT (session_id, chunk_index) DO NOTHING""",
+                        (session_id, int(chunk_index), now),
+                    )
 
             inserted_files = len(filtered)
             inserted_bytes = sum(int(row[3]) for row in filtered)
@@ -591,10 +645,19 @@ class PgSessionMixin:
         return self._transaction(
             operation, f"seal chunk {int(chunk_index) + 1}")
 
-    def _persist_remote_plan(self, conn, session_id, remote_host, remote_path,
-                             rows, by_path, now):
+    def _persist_remote_plan(
+            self, conn, session_id, remote_host, remote_path, rows, by_path, now,
+            *, stored_tar_write_enabled=False, reader_contract_version=None,
+            require_container_format_schema=False):
         """Persist snapshot/plan/chunk rows for a session (idempotent by
         fingerprint, so it is safe inside the ambiguous-commit retry loop)."""
+        if (require_container_format_schema
+                and not self._column_exists_conn(
+                    conn, "remote_chunks", "packaging_format")):
+            raise RuntimeError(
+                "[DB] Migration 015 is required before a production plan can "
+                "create new chunks")
+
         snapshot_fp = _snapshot_fingerprint(remote_host, remote_path, by_path)
         plan_fp = _plan_fingerprint(snapshot_fp, rows)
         chunk_indexes = sorted({int(row[0]) for row in rows})
@@ -664,15 +727,56 @@ class PgSessionMixin:
             "UPDATE remote_sessions SET plan_id=%s WHERE session_id=%s",
             (plan_id, session_id),
         )
+        has_format_schema = self._column_exists_conn(
+            conn, "remote_chunks", "packaging_format")
         with conn.cursor() as cur:
-            cur.executemany(
-                """INSERT INTO remote_chunks
-                   (session_id, chunk_index, status, updated_at)
-                   VALUES (%s, %s, 'pending', %s)
-                   ON CONFLICT (session_id, chunk_index) DO NOTHING""",
-                ((session_id, chunk_index, now)
-                 for chunk_index in chunk_indexes),
-            )
+            if has_format_schema:
+                format_rows = []
+                for chunk_index in chunk_indexes:
+                    packaging_format = self.assign_new_chunk_format(
+                        session_id, chunk_index,
+                        stored_tar_write_enabled=stored_tar_write_enabled,
+                        reader_contract_version=reader_contract_version,
+                        conn=conn)
+                    format_rows.append((
+                        session_id, chunk_index, now,
+                        packaging_format.value, now))
+                cur.executemany(
+                    """INSERT INTO remote_chunks
+                       (session_id, chunk_index, status, updated_at,
+                        packaging_format, packaging_assigned_at)
+                       VALUES (%s, %s, 'pending', %s, %s, %s)
+                       ON CONFLICT (session_id, chunk_index) DO NOTHING""",
+                    format_rows,
+                )
+                persisted = {
+                    int(row["chunk_index"]): row["packaging_format"]
+                    for row in conn.execute(
+                        """SELECT chunk_index, packaging_format
+                           FROM remote_chunks
+                           WHERE session_id=%s AND chunk_index=ANY(%s)""",
+                        (session_id, chunk_indexes),
+                    ).fetchall()
+                }
+                expected = {
+                    int(row[1]): row[3] for row in format_rows}
+                if persisted != expected:
+                    raise RuntimeError(
+                        "[DB] Existing chunk format conflicts with the durable "
+                        "session boundary")
+            else:
+                if stored_tar_write_enabled:
+                    raise RuntimeError(
+                        "[DB] Stored TAR assignment requested but migration 015 "
+                        "is not installed")
+                cur.executemany(
+                    """INSERT INTO remote_chunks
+                       (session_id, chunk_index, status, updated_at)
+                       VALUES (%s, %s, 'pending', %s)
+                       ON CONFLICT (session_id, chunk_index) DO NOTHING""",
+                    ((session_id, chunk_index, now)
+                     for chunk_index in chunk_indexes),
+                )
         return plan_id
 
     def get_chunk_files(self, session_id, chunk_index):

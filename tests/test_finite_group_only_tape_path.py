@@ -31,7 +31,7 @@ from src import ltfs
 from src import remote_orchestrator as ro
 from src.exit_codes import (ExitCode, REASON_UNEXPECTED_TAPE_OR_DB_STATE,
                             REASON_NONINTERACTIVE_REQUIRES_RESUME)
-from src.pipeline_types import StagedChunk
+from src.pipeline_types import ContainerFormat, StagedChunk
 
 from lto_fakes import TapeOperationLog
 
@@ -41,7 +41,8 @@ GiB = 1024 ** 3
 def _desc(index):
     return StagedChunk(chunk_index=index, fetch_dir=f"/tmp/_f{index}",
                        pack_dir=f"/tmp/_p{index}", metadata=[],
-                       staged_bytes=GiB, source_missing_files=[])
+                       staged_bytes=GiB, source_missing_files=[],
+                       session_id=37, packaging_format=ContainerFormat.ZIP)
 
 
 class _TapeCallRecorder:
@@ -176,6 +177,8 @@ class NoIdleTapeAccessTests(unittest.TestCase):
         writer = RemoteChunkWriter(orch)
         desc = _desc(0)
         desc.skip_tape = True
+        desc.staged_bytes = 0
+        desc.source_missing_files = ["missing"]
         with _TapeCallRecorder() as recorder, mock.patch("builtins.print"), \
                 mock.patch.object(ro, "send_best_effort", lambda *a, **k: None):
             # eject_after=True on purpose: it must still refuse.
