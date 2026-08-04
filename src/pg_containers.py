@@ -1837,7 +1837,8 @@ class PgContainerMixin:
                 int(row["artifact_id"]): row
                 for row in conn.execute(
                     """SELECT * FROM archive_artifacts
-                       WHERE session_id=%s AND chunk_index=%s""",
+                       WHERE session_id=%s AND chunk_index=%s
+                         AND readiness_state='ready'""",
                     (int(staged_chunk.session_id),
                      int(staged_chunk.chunk_index)),
                 ).fetchall()

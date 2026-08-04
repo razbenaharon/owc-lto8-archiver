@@ -104,6 +104,7 @@ class StoredTarPairPublication:
     sidecar_size: int
     disposition_counts: dict
     pack_sidecar_path: str = ""
+    source_diagnostics: tuple = ()
 
 
 def _require_zstd():
@@ -1115,7 +1116,8 @@ def publish_stored_tar_pair(
         tar_path=final_tar_path, sidecar_path=sidecar_path,
         sidecar_locator=sidecar_locator, tar_size=tar_size,
         sidecar_size=sidecar_size, disposition_counts=dict(counts),
-        pack_sidecar_path=pack_sidecar_path)
+        pack_sidecar_path=pack_sidecar_path,
+        source_diagnostics=tuple(diagnostics))
 
 
 __all__ = [
