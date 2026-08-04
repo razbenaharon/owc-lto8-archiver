@@ -98,6 +98,129 @@ ACTIONABLE_VERDICTS = {
 }
 
 
+def _positive(value):
+    return int(value or 0) > 0
+
+
+def classify_session37_format_boundary_category(evidence):
+    """Apply the Plan-2 Task-4.2 chunk category table.
+
+    This helper is intentionally pure and status is never enough: a chunk may
+    be granted a concrete format only when the category also has membership or
+    writer/catalog evidence.  The approved Session-37 suffix exception is still
+    stricter than "pending": it requires fixed membership and zero ownership,
+    staging, worker, container, artifact, catalog, run, directory, or sealed
+    batch evidence.
+    """
+    row = dict(evidence or {})
+    status = str(row.get("status") or "")
+    fixed_membership = bool(row.get("fixed_membership"))
+    has_owner = bool(row.get("has_owner_evidence")
+                     or row.get("owner_token") is not None)
+    has_lease = bool(row.get("has_lease_evidence")
+                     or row.get("lease_expires_at") is not None)
+    has_attempt = bool(row.get("has_attempt_evidence")
+                       or row.get("attempt_id") is not None)
+    has_error = bool(row.get("has_error_evidence") or row.get("error_msg"))
+    owner_or_failure = has_owner or has_lease or has_attempt or has_error
+    counts = {
+        "file_state": int(row.get("file_state_count") or 0),
+        "worker_attempt": int(row.get("worker_attempt_count") or 0),
+        "catalog_file": int(row.get("catalog_file_count") or 0),
+        "archive_run": int(row.get("archive_run_count") or 0),
+        "container": int(row.get("container_count") or 0),
+        "written_container": int(row.get("written_container_count") or 0),
+        "artifact": int(row.get("artifact_count") or 0),
+        "directory": int(row.get("directory_evidence_count") or 0),
+        "sealed_batch": int(row.get("sealed_batch_evidence_count") or 0),
+        "sealed_batch_written": int(row.get("sealed_batch_written_count") or 0),
+    }
+    written_or_catalog = any(_positive(counts[name]) for name in (
+        "catalog_file", "archive_run", "written_container",
+        "sealed_batch_written"))
+    operational = owner_or_failure or any(_positive(value)
+                                          for value in counts.values())
+    writer_started = bool(row.get("writer_started_at")
+                          or row.get("writer_completed_at")
+                          or _positive(counts["written_container"])
+                          or status == ChunkStatus.BACKING.value)
+    catalog_final = bool(row.get("catalog_committed_at")
+                         or _positive(counts["catalog_file"])
+                         or _positive(counts["archive_run"]))
+
+    def result(category, action, assigned_format=None, confidence="none",
+               blocker=None, eligible=False):
+        return {
+            "observed_category": category,
+            "required_action": action,
+            "assigned_format": assigned_format,
+            "format_confidence": confidence,
+            "blocker": blocker,
+            "eligible_stored_tar_exception": bool(eligible),
+        }
+
+    if row.get("future_chunk"):
+        return result(
+            "future_chunk_after_persisted_boundary",
+            "stored_tar_eligible_at_creation", "stored_tar", "high",
+            eligible=True)
+    if not fixed_membership:
+        return result(
+            "absent_or_conflicting_membership",
+            "manual_reconciliation_do_not_reuse_identity",
+            blocker="fixed contiguous membership is not proven")
+    if status == ChunkStatus.DONE.value and written_or_catalog:
+        return result(
+            "done_with_written_or_catalog_evidence",
+            "immutable_zip_preserve_locators", "zip", "high")
+    if status == ChunkStatus.DONE.value:
+        return result(
+            "done_status_only_with_fixed_membership",
+            "zip_prefix_only_with_operator_visible_residual_risk",
+            "zip", "medium",
+            blocker="no corroborating written/catalog evidence")
+    if status == ChunkStatus.BACKING.value:
+        return result(
+            "backing",
+            "ambiguous_hard_block_no_retry_or_conversion",
+            blocker="physical tape write may have started")
+    if writer_started and not catalog_final:
+        return result(
+            "copy_may_have_succeeded_without_catalog_finality",
+            "manual_reconciliation_no_rewrite",
+            blocker="writer evidence exists without catalog finality")
+    if status == ChunkStatus.FETCHING.value:
+        return result(
+            "fetching",
+            "reconcile_owner_and_staging_retry_zip_only", "zip", "low",
+            blocker="fetch ownership/staging outcome is not final")
+    if status == ChunkStatus.PACKING.value:
+        return result(
+            "packing",
+            "reconcile_owner_and_pack_marker_retry_zip_only", "zip", "low",
+            blocker="pack ownership/marker outcome is not final")
+    if status in (ChunkStatus.FETCH_FAILED.value,
+                  ChunkStatus.BACKUP_FAILED.value):
+        return result(
+            status,
+            "reconcile_exact_attempt_retry_zip_if_safe", "zip", "low",
+            blocker="failed attempt evidence must be reconciled")
+    if status == ChunkStatus.PENDING.value:
+        if not operational:
+            return result(
+                "pending_never_owned_fixed_membership",
+                "eligible_for_approved_boundary_rehearsal", "stored_tar",
+                "high", eligible=True)
+        return result(
+            "pending_with_existing_evidence",
+            "zip_default_no_identity_repurpose", "zip", "low",
+            blocker="pending chunk already has ownership/staging/catalog evidence")
+    return result(
+        "stale_or_conflicting_evidence",
+        "manual_reconciliation_blocks_migration",
+        blocker=f"unrecognized or contradictory status {status!r}")
+
+
 def _connect(conninfo, *, autocommit=False):
     if psycopg is None:  # pragma: no cover - environment guard
         raise OperationalError(

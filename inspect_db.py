@@ -412,6 +412,34 @@ def _run_container_format_schema_report(cfg, *, validate=False):
     return 0
 
 
+def _run_session37_boundary_rehearsal(cfg, args):
+    """READ-ONLY Plan-2 Gate-5.5 format-boundary report.
+
+    The target is normally an isolated restored database selected with
+    ``--db``.  This command opens PostgreSQL read-only, does not inspect local
+    staging or LTFS, and cannot persist the boundary.
+    """
+    session_id = int(args.session_id[0] if args.session_id else 37)
+    conninfo = _conninfo(cfg)
+    db = _open_read_only_db(cfg)
+    try:
+        report = db.classify_format_boundary(session_id)
+    finally:
+        db.close()
+    _print_json({
+        "database": cfg.pg_dbname,
+        "session_id": session_id,
+        "mode": "read_only_rehearsal",
+        "liveness": liveness_evidence(
+            conninfo, getattr(cfg, "backup_log_dir", None)),
+        "stored_tar_write_enabled": bool(
+            getattr(cfg, "stored_tar_write_enabled", False)),
+        "boundary_report": report,
+        "session37_row_unchanged_by_command": True,
+    })
+    return 0
+
+
 def _apply_container_format_schema(cfg, args, parser):
     """Guarded, explicit migration-015 entry point (Plan 2 Task 0.1)."""
     if args.dry_run and args.execute:
@@ -863,6 +891,10 @@ def _build_parser():
     parser.add_argument("--container-format-schema-report",
                         action="store_true",
                         help="Read-only migration-015 schema/format report.")
+    parser.add_argument("--session37-boundary-rehearsal", action="store_true",
+                        help="READ-ONLY Plan-2 Gate-5.5 chunk classification "
+                             "and proposed Stored TAR boundary. Defaults to "
+                             "session 37; override with --session-id.")
     parser.add_argument("--stored-tar-exception-session-id", type=int,
                         help="Individually approved legacy mixed-format session "
                              "for the migration-015 evidence gate.")
@@ -1018,6 +1050,9 @@ def _dispatch(parser, args):
 
     if args.container_format_schema_report:
         return _run_container_format_schema_report(cfg, validate=False)
+
+    if args.session37_boundary_rehearsal:
+        return _run_session37_boundary_rehearsal(cfg, args)
 
     if args.validate_directory_catalog:
         _print_json(validate_directory_catalog(_conninfo(cfg)))
