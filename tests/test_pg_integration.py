@@ -2169,6 +2169,24 @@ class ContainerFormatMigrationTests(unittest.TestCase):
             "checked_at": datetime.now(timezone.utc).isoformat(),
         }
 
+    def _stored_tar_planning_session(self, rows):
+        session_id = self._session(label="TAR_PLAN_FIXTURE")
+        self._append(session_id, 0, member_count=1)
+        self.db.append_remote_streaming_chunk(session_id, 1, rows)
+        self._catalog_done_prefix(session_id, 0)
+        self._ready_014()
+        self.db.apply_container_format_schema(
+            exception_session_id=session_id,
+            expected_boundary=1,
+            approval_id="task-2-1-plan-test",
+            approval_reason="synthetic never-started suffix for planning",
+            staging_evidence=self._staging_evidence([1]))
+        self.db.apply_stored_tar_plan_schema()
+        self.db.seal_remote_chunk(
+            session_id, 1, expected_file_count=len(rows),
+            expected_bytes=sum(int(row[3]) for row in rows))
+        return session_id
+
     def test_015_is_explicit_and_requires_finalized_014(self):
         self.assertFalse(self.db.container_format_schema_installed())
         with self.assertRaisesRegex(Exception, "requires migrations 013 and 014"):
@@ -2228,6 +2246,90 @@ class ContainerFormatMigrationTests(unittest.TestCase):
         self.assertTrue(self.db.validate_container_format_schema()["ready"])
         self.assertEqual(self._query(
             "SELECT count(*) AS n FROM archive_bundles")[0]["n"], 1)
+
+    def test_016_persists_stored_tar_partition_cap_and_member_ordinals(self):
+        from src.stored_tar_planning import GNU_TAR_RECORD_SIZE
+
+        rows = [
+            (1, "/fixture/chunk_001/small_a.bin", "small_a.bin", 9),
+            (1, "/fixture/chunk_001/large.bin", "large.bin", 10),
+            (1, "/fixture/chunk_001/small_b.bin", "small_b.bin", 8),
+        ]
+        session_id = self._stored_tar_planning_session(rows)
+        chunk_files = self.db.get_chunk_files(session_id, 1)
+        plan = self.db.get_or_create_stored_tar_chunk_plan(
+            session_id, 1, chunk_files, loose_threshold_bytes=10,
+            max_size_bytes=GNU_TAR_RECORD_SIZE)
+
+        self.assertEqual(plan.max_size_bytes, GNU_TAR_RECORD_SIZE)
+        self.assertEqual(
+            [(m.plan_ordinal, m.storage_class, m.container_ordinal)
+             for m in plan.members],
+            [(0, "small_files", 0), (1, "loose_files", None),
+             (2, "small_files", 1)])
+        self.assertEqual(
+            [(c.container_ordinal, c.expected_member_count,
+              c.expected_logical_bytes, c.max_size_bytes)
+             for c in plan.containers],
+            [(0, 1, 9, GNU_TAR_RECORD_SIZE),
+             (1, 1, 8, GNU_TAR_RECORD_SIZE)])
+        row = self._query(
+            """SELECT stored_tar_max_size_bytes FROM remote_chunks
+               WHERE session_id=%s AND chunk_index=1""",
+            (session_id,))[0]
+        self.assertEqual(row["stored_tar_max_size_bytes"], GNU_TAR_RECORD_SIZE)
+        stored = self._query(
+            """SELECT plan_ordinal,storage_class,container_ordinal
+               FROM archive_container_members
+               WHERE session_id=%s AND chunk_index=1
+               ORDER BY plan_ordinal""", (session_id,))
+        self.assertEqual(
+            [(r["plan_ordinal"], r["storage_class"], r["container_ordinal"])
+             for r in stored],
+            [(0, "small_files", 0), (1, "loose_files", None),
+             (2, "small_files", 1)])
+
+    def test_stored_tar_plan_is_reused_across_restart_and_config_change(self):
+        rows = [
+            (1, f"/fixture/chunk_001/small_{i}.bin", f"small_{i}.bin", 1)
+            for i in range(5)
+        ]
+        session_id = self._stored_tar_planning_session(rows)
+        chunk_files = self.db.get_chunk_files(session_id, 1)
+        first = self.db.get_or_create_stored_tar_chunk_plan(
+            session_id, 1, chunk_files, loose_threshold_bytes=10,
+            max_size_bytes=512 * 512)
+        self.db.close()
+        from src.pg_db import PgDatabaseManager
+        self.db = PgDatabaseManager(self.conninfo)
+        second = self.db.get_or_create_stored_tar_chunk_plan(
+            session_id, 1, self.db.get_chunk_files(session_id, 1),
+            loose_threshold_bytes=2, max_size_bytes=512 * 512 * 9)
+        self.assertEqual(second.max_size_bytes, first.max_size_bytes)
+        self.assertEqual(second.members, first.members)
+        self.assertEqual(second.containers, first.containers)
+
+    def test_stored_tar_plan_records_source_missing_without_container(self):
+        rows = [
+            (1, "/fixture/chunk_001/missing.bin", "missing.bin", 1),
+            (1, "/fixture/chunk_001/small.bin", "small.bin", 1),
+        ]
+        session_id = self._stored_tar_planning_session(rows)
+        missing_id = self._query(
+            """SELECT pf.plan_file_id FROM remote_sessions s
+               JOIN remote_plan_files pf ON pf.plan_id=s.plan_id
+               WHERE s.session_id=%s AND pf.chunk_index=1
+               ORDER BY pf.ordinal LIMIT 1""", (session_id,))[0]["plan_file_id"]
+        self.db.update_manifest_row(
+            missing_id, session_id=session_id, status="source_missing",
+            error_msg="fixture")
+        plan = self.db.get_or_create_stored_tar_chunk_plan(
+            session_id, 1, self.db.get_chunk_files(session_id, 1),
+            loose_threshold_bytes=10, max_size_bytes=512 * 512)
+        self.assertEqual(
+            [(m.plan_ordinal, m.storage_class, m.container_ordinal)
+             for m in plan.members],
+            [(0, "source_missing", None), (1, "small_files", 0)])
 
     def test_approved_session37_shape_assigns_only_never_started_suffix(self):
         """Session-37's provenance gaps still yield the approved boundary."""

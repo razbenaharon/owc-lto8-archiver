@@ -17,6 +17,9 @@ from src.pipeline_types import (
     StagedChunk, StagedContainer)
 from src.remote_staging import RemoteChunkStager
 from src.remote_writer import RemoteChunkWriter
+from src.stored_tar_planning import (
+    GNU_TAR_RECORD_SIZE, build_stored_tar_chunk_plan,
+    estimate_stored_tar_archive_bytes, estimate_stored_tar_member_bytes)
 
 
 class FeatureGateTests(unittest.TestCase):
@@ -65,6 +68,105 @@ class FeatureGateTests(unittest.TestCase):
             self.assertIn("assign_new_chunk_format", source)
             self.assertIn("packaging_format, packaging_assigned_at", source)
             self.assertIn("if stored_tar_write_enabled", source)
+
+    def test_stored_tar_max_size_defaults_to_current_zip_cap(self):
+        cfg = ConfigManager.__new__(ConfigManager)
+        cfg.config = configparser.ConfigParser()
+        cfg.config["SETTINGS"] = {"max_zip_size_gb": "17"}
+        self.assertEqual(cfg.stored_tar_max_size_gb, 17)
+        cfg.config["SETTINGS"]["stored_tar_max_size_gb"] = "9"
+        self.assertEqual(cfg.stored_tar_max_size_gb, 9)
+
+
+class StoredTarPartitionPlanTests(unittest.TestCase):
+    @staticmethod
+    def _row(ordinal, size):
+        return {
+            "manifest_id": ordinal + 100,
+            "remote_path": f"/src/file_{ordinal:03d}.dat",
+            "file_size_bytes": size,
+        }
+
+    def test_exact_loose_threshold_is_loose(self):
+        plan = build_stored_tar_chunk_plan(
+            1, 2, [self._row(0, 9), self._row(1, 10)],
+            loose_threshold_bytes=10, max_size_bytes=GNU_TAR_RECORD_SIZE * 4)
+        self.assertEqual(
+            [(m.plan_ordinal, m.storage_class, m.container_ordinal)
+             for m in plan.members],
+            [(0, "small_files", 0), (1, "loose_files", None)])
+        self.assertEqual(plan.containers[0].expected_member_count, 1)
+
+    def test_exact_container_cap_stays_in_container(self):
+        member = estimate_stored_tar_member_bytes("/src/one.bin", 1)
+        cap = estimate_stored_tar_archive_bytes([member])
+        plan = build_stored_tar_chunk_plan(
+            1, 0, [self._row(0, 1)], loose_threshold_bytes=10,
+            max_size_bytes=cap)
+        self.assertEqual(len(plan.containers), 1)
+        self.assertEqual(plan.containers[0].estimated_archive_bytes, cap)
+
+    def test_pax_header_and_padding_are_counted(self):
+        estimate = estimate_stored_tar_member_bytes("/src/a", 513)
+        self.assertGreaterEqual(estimate, 512 + 512 + 512 + 1024)
+        self.assertEqual(estimate % 512, 0)
+        self.assertEqual(
+            estimate_stored_tar_archive_bytes([estimate])
+            % GNU_TAR_RECORD_SIZE, 0)
+
+    def test_tar_only_loose_only_mixed_empty_source_missing_and_oversized(self):
+        tar_only = build_stored_tar_chunk_plan(
+            1, 0, [self._row(0, 1), self._row(1, 2)],
+            loose_threshold_bytes=10, max_size_bytes=GNU_TAR_RECORD_SIZE * 4)
+        self.assertEqual(len(tar_only.small_members), 2)
+        self.assertEqual(len(tar_only.loose_members), 0)
+
+        loose_only = build_stored_tar_chunk_plan(
+            1, 0, [self._row(0, 10), self._row(1, 11)],
+            loose_threshold_bytes=10, max_size_bytes=GNU_TAR_RECORD_SIZE * 4)
+        self.assertEqual(len(loose_only.containers), 0)
+        self.assertEqual(len(loose_only.loose_members), 2)
+
+        mixed = build_stored_tar_chunk_plan(
+            1, 0, [self._row(0, 1), self._row(1, 20), self._row(2, 2)],
+            loose_threshold_bytes=10, max_size_bytes=GNU_TAR_RECORD_SIZE * 4)
+        self.assertEqual(
+            [(m.plan_ordinal, m.storage_class, m.container_ordinal)
+             for m in mixed.members],
+            [(0, "small_files", 0), (1, "loose_files", None),
+             (2, "small_files", 1)])
+
+        empty = build_stored_tar_chunk_plan(
+            1, 0, [], loose_threshold_bytes=10,
+            max_size_bytes=GNU_TAR_RECORD_SIZE)
+        self.assertEqual(empty.members, ())
+        self.assertEqual(empty.containers, ())
+
+        missing_row = self._row(0, 1)
+        missing_row["status"] = "source_missing"
+        missing = build_stored_tar_chunk_plan(
+            1, 0, [missing_row], loose_threshold_bytes=10,
+            max_size_bytes=GNU_TAR_RECORD_SIZE)
+        self.assertEqual(len(missing.containers), 0)
+        self.assertEqual(len(missing.source_missing_members), 1)
+
+        oversized = build_stored_tar_chunk_plan(
+            1, 0, [self._row(0, 1)],
+            loose_threshold_bytes=10, max_size_bytes=1)
+        self.assertEqual(len(oversized.containers), 1)
+        self.assertGreater(oversized.containers[0].estimated_archive_bytes, 1)
+
+    def test_assignment_does_not_depend_on_fetch_parallel_streams(self):
+        rows = [self._row(i, i + 1) for i in range(8)]
+        first = build_stored_tar_chunk_plan(
+            1, 0, rows, loose_threshold_bytes=100,
+            max_size_bytes=GNU_TAR_RECORD_SIZE)
+        for _streams in (1, 2, 3, 8):
+            again = build_stored_tar_chunk_plan(
+                1, 0, rows, loose_threshold_bytes=100,
+                max_size_bytes=GNU_TAR_RECORD_SIZE)
+            self.assertEqual(again.members, first.members)
+            self.assertEqual(again.containers, first.containers)
 
 
 class StagingContractTests(unittest.TestCase):
@@ -234,10 +336,13 @@ class ProducerAndWriterGateTests(unittest.TestCase):
         db = mock.Mock()
         db.get_chunk_packaging_format.return_value = ContainerFormat.STORED_TAR
         db.require_existing_stored_tar_recovery.return_value = True
-        host = SimpleNamespace(db=db, _producer_chunk=None)
-        with self.assertRaisesRegex(RuntimeError, "producer is not implemented"):
+        db.get_or_create_stored_tar_chunk_plan.return_value = object()
+        cfg = SimpleNamespace(zip_threshold_mb=10, stored_tar_max_size_gb=1)
+        host = SimpleNamespace(db=db, cfg=cfg, _producer_chunk=None)
+        with self.assertRaisesRegex(RuntimeError, "outside Task 2.1"):
             RemoteChunkStager(host)._stage_chunk(37, 49, [])
         db.require_existing_stored_tar_recovery.assert_called_once_with(37, 49)
+        db.get_or_create_stored_tar_chunk_plan.assert_called_once()
         self.assertFalse(hasattr(host, "stored_tar_write_enabled"))
         self.assertFalse(db.update_chunk_status.called)
 

@@ -138,6 +138,7 @@ class PgConnectionCore:
     # ------------------------------------------------------------------
 
     CONTAINER_FORMAT_MIGRATION = "015_postgres_container_formats.sql"
+    STORED_TAR_PLAN_MIGRATION = "016_postgres_stored_tar_plans.sql"
 
     @classmethod
     def container_format_migration_path(cls):
@@ -253,6 +254,16 @@ class PgConnectionCore:
             with self._pool.connection() as conn:
                 apply_on(conn)
         return [self.CONTAINER_FORMAT_MIGRATION]
+
+    def apply_stored_tar_plan_schema(self):
+        """Explicitly install Task 2.1 plan-assignment persistence."""
+        sql_path = (Path(PROJECT_ROOT) / "scripts" / "sql"
+                    / self.STORED_TAR_PLAN_MIGRATION)
+        with self._pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql_path.read_text(encoding="utf-8"))
+            conn.commit()
+        return [self.STORED_TAR_PLAN_MIGRATION]
 
     @staticmethod
     def _validate_container_format_staging_evidence(evidence):
