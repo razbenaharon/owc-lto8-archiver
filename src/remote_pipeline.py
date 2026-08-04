@@ -190,6 +190,22 @@ class RemotePipelineCoordinator:
         return (self.scan_coordinator is not None
                 and not self._scanner_done.is_set())
 
+    def _plan_source_for(self, chunk_index):
+        """The membership reader for one chunk (Plan 3, Task 1.3).
+
+        Resolved here rather than through a host hook so that every caller -
+        production orchestrator and test double alike - gets the same selection
+        rule without having to reimplement it.
+        """
+        from .plan_source import plan_source_for_chunk
+
+        host = self.host
+        cfg = getattr(host, "cfg", None)
+        return plan_source_for_chunk(
+            host.db, self.session_id, chunk_index,
+            archive_root=getattr(cfg, "local_manifest_archive_root", None),
+            exception_states=getattr(host, "_chunk_exception_states", None))
+
     def _run_stager(self):
         """Take sealed chunks in index order, stage them, enqueue them."""
         host = self.host
@@ -204,13 +220,16 @@ class RemotePipelineCoordinator:
                     self.stop_event.wait(self.poll_seconds)
                     continue
 
-                summary = host.db.get_chunk_size_summary(
-                    self.session_id, chunk_index).get(chunk_index, (0, 0, 0))
-                planned_bytes, _, planned_files = summary
+                # Plan 3, Task 1.3: membership arrives through ONE typed
+                # stream. Which adapter answers is decided by the chunk's
+                # persisted plan_source and nothing else, so a legacy chunk and
+                # a manifest chunk in the same session are both just "a chunk".
+                plan_source, chunk_ref = self._plan_source_for(chunk_index)
+                summary = plan_source.summary(chunk_ref)
+                planned_bytes, _, planned_files = summary.as_tuple()
                 host._validate_chunk_file_limit(
                     self.session_id, chunk_index, planned_files)
-                chunk_files = host.db.get_chunk_files(
-                    self.session_id, chunk_index)
+                chunk_files = plan_source.iter_chunk_entries(chunk_ref)
                 host._await_staging_capacity(
                     planned_bytes, planned_files, self.stop_event,
                     ready_q=self.ready_q, session_id=self.session_id,

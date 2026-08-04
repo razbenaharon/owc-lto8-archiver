@@ -71,6 +71,22 @@ MAX_TAR_SIDECAR_RECORDS = 1_000_000
 #: metadata prune of one can never take the other with it.
 ARTIFACT_NAMESPACE = "scan_segments"
 
+# Plan 3, Task 1.2. Four more versioned artifacts share one publication
+# protocol. Each gets its own namespace for the same reason the scan segments
+# have one: pruning the metadata of a superseded generation must never be able
+# to take a different artifact kind with it.
+PLAN_MANIFEST_VERSION = "plan-manifest-v1"
+TERMINAL_STATE_VERSION = "terminal-state-v1"
+SESSION_DESCRIPTOR_VERSION = "session-descriptor-v1"
+SCAN_STATE_SEGMENT_VERSION = "scan-state-segment-v1"
+
+PLAN_MANIFEST_NAMESPACE = "plan_manifests"
+TERMINAL_STATE_NAMESPACE = "terminal_states"
+SESSION_DESCRIPTOR_NAMESPACE = "session_descriptors"
+SCAN_STATE_SEGMENT_NAMESPACE = "scan_states"
+
+_TRAILER_KIND = "trailer"
+
 _HEADER_KIND = "header"
 _RECORD_KIND = "entry"
 
@@ -691,6 +707,377 @@ def publish_no_clobber(part_path, final_path):
         raise ArtifactConflict(
             f"refusing to overwrite published artifact: {final}") from exc
     return final
+
+
+# ---------------------------------------------------------------------------
+# Plan 3, Task 1.2 - the shared header/detail/trailer artifact protocol
+# ---------------------------------------------------------------------------
+#
+# The scan-segment writer above publishes on close.  That was enough for Plan 1,
+# where a segment is re-derivable from the source.  A Plan 3 artifact is not:
+# a plan manifest IS the membership of a chunk that owns no per-file rows, so a
+# file that parses today and not tomorrow loses the chunk.  Publication here is
+# therefore two-phase and paranoid in a specific order:
+#
+#   unique .part -> flush -> close -> fsync (file AND parent directory)
+#                -> REOPEN AND PARSE THE WHOLE FILE
+#                -> validate counts, bytes, ordinals, cross-artifact identity
+#                -> atomic no-clobber rename -> persist locator/size/readiness
+#
+# The reopen is the point.  A writer validating its own in-memory totals proves
+# nothing about the bytes that reached the disk; only reading them back does.
+
+
+def _safe_label(value, *, what="label"):
+    """A filesystem-safe form of a stable logical identity.
+
+    Session labels come from the database and end up in a path, so they get the
+    same treatment as any other untrusted path component: a fixed alphabet, no
+    separators, no traversal, bounded length.
+    """
+    text = str(value or "").strip()
+    if not text:
+        raise ArtifactError(f"empty {what}")
+    safe = "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in text)
+    safe = safe.strip("._-") or "_"
+    if len(safe) > 96:
+        safe = safe[:96]
+    return safe
+
+
+def plan3_artifact_locator(namespace, session_label, *, chunk_index=None,
+                           kind="artifact", version="v1", generation=0,
+                           container_ordinal=None):
+    """Root-relative locator for a Plan 3 artifact.
+
+    Deterministic and organized by STABLE logical identity - session label and
+    chunk index - never by a generated numeric id, because the rebuild in Task
+    4.2 regenerates those ids and must still find these files.  The filename
+    carries the artifact kind, the schema version and the generation (plus the
+    container ordinal where a chunk has several containers), so append-only
+    generations never collide.
+    """
+    parts = [namespace, f"session_{_safe_label(session_label, what='session label')}"]
+    if chunk_index is not None:
+        parts.append(f"chunk_{int(chunk_index):06d}")
+    name = f"{kind}.{version}.g{int(generation):04d}"
+    if container_ordinal is not None:
+        name += f".c{int(container_ordinal):04d}"
+    parts.append(name + ".jsonl.zst")
+    return posixpath.join(*parts)
+
+
+def _fsync_path(path):
+    """Best-effort durability for a file and the directory naming it."""
+    try:
+        fd = os.open(_long(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:                          # pragma: no cover - platform dep.
+        pass
+    finally:
+        os.close(fd)
+
+
+def _fsync_dir(path):
+    if os.name == "nt":
+        # Windows has no directory handle to fsync through os.open; the rename
+        # itself is the atomic barrier there.
+        return
+    try:                                     # pragma: no cover - POSIX only
+        fd = os.open(_long(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+@dataclass(frozen=True)
+class PublishedPlan3Artifact:
+    """What the caller persists after a validated publication."""
+
+    locator: str
+    path: str
+    version: str
+    size_bytes: int
+    record_count: int
+    byte_total: int
+    header: dict
+    trailer: dict
+
+
+class Plan3ArtifactWriter:
+    """Write one header/detail/trailer artifact and publish it atomically.
+
+    ``validate_record`` is called for every detail record as it is added, and
+    the whole file is validated again after being read back from disk.  Both
+    matter: the first rejects a bad record while the caller still has context,
+    the second proves the published bytes are the ones that were checked.
+    """
+
+    def __init__(self, archive_root, locator, *, version, header,
+                 validate_record=None, validate_artifact=None,
+                 size_field="expected_size", ordinal_field="plan_ordinal",
+                 path_field="canonical_path", require_unique_paths=True):
+        _require_zstd()
+        self.archive_root = os.path.abspath(str(archive_root))
+        self.locator = str(locator)
+        self.final_path = resolve_locator(self.archive_root, self.locator)
+        self.part_path = f"{self.final_path}.{uuid.uuid4().hex[:12]}.part"
+        self.version = str(version)
+        self.header = dict(header or {})
+        self.header.setdefault("kind", _HEADER_KIND)
+        self.header["version"] = self.version
+        self._validate_record = validate_record
+        self._validate_artifact = validate_artifact
+        self._size_field = size_field
+        self._ordinal_field = ordinal_field
+        self._path_field = path_field
+        self._require_unique_paths = require_unique_paths
+
+        self.record_count = 0
+        self.byte_total = 0
+        self.first_ordinal = None
+        self.last_ordinal = None
+        self.published = False
+        self._published = None
+        self._closed = False
+        self._seen_paths = set()
+        self._raw = None
+        self._compressor = None
+        self._text = None
+
+    # -- lifecycle --------------------------------------------------------
+    def open(self):
+        if self._text is not None:
+            return self
+        os.makedirs(_long(os.path.dirname(self.final_path)), exist_ok=True)
+        self._raw = open(_long(self.part_path), "wb")
+        self._compressor = zstd.ZstdCompressor().stream_writer(self._raw)
+        self._text = io.TextIOWrapper(self._compressor, encoding="utf-8")
+        self._emit(self.header)
+        return self
+
+    def __enter__(self):
+        return self.open()
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is not None:
+            self.close(publish=False)
+            return False
+        self.close(publish=True)
+        return False
+
+    def _emit(self, payload):
+        if self._text is None:
+            raise ArtifactError("artifact writer is not open")
+        self._text.write(json.dumps(payload, ensure_ascii=False,
+                                    separators=(",", ":"), sort_keys=True))
+        self._text.write("\n")
+
+    def add(self, record):
+        """Append one validated detail record."""
+        if self._text is None:
+            self.open()
+        if not isinstance(record, dict):
+            raise ArtifactError("artifact detail record must be a mapping")
+        payload = dict(record)
+        payload["kind"] = _RECORD_KIND
+        if self._validate_record is not None:
+            self._validate_record(payload, self.header)
+
+        ordinal = payload.get(self._ordinal_field)
+        if ordinal is not None:
+            ordinal = int(ordinal)
+            if self.last_ordinal is not None and ordinal <= self.last_ordinal:
+                raise ArtifactError(
+                    f"{self._ordinal_field} must ascend: {ordinal} follows "
+                    f"{self.last_ordinal} in {self.locator}")
+            if self.first_ordinal is None:
+                self.first_ordinal = ordinal
+            self.last_ordinal = ordinal
+
+        if self._require_unique_paths and self._path_field:
+            path = payload.get(self._path_field)
+            if path is not None:
+                if path in self._seen_paths:
+                    raise ArtifactError(
+                        f"duplicate {self._path_field} {path!r} in "
+                        f"{self.locator}")
+                self._seen_paths.add(path)
+
+        self._emit(payload)
+        self.record_count += 1
+        size = payload.get(self._size_field) if self._size_field else None
+        if size is not None:
+            self.byte_total += int(size)
+        return self.record_count
+
+    def close(self, publish=True):
+        if self._closed:
+            return self.published
+        self._closed = True
+        if self._text is not None:
+            try:
+                self._emit({
+                    "kind": _TRAILER_KIND,
+                    "record_count": self.record_count,
+                    "byte_total": self.byte_total,
+                    "first_ordinal": self.first_ordinal,
+                    "last_ordinal": self.last_ordinal,
+                })
+                self._text.flush()
+                self._text.detach()
+                # Closing the zstd stream writer also closes the raw file it
+                # wraps, so durability is taken on the path in publish() rather
+                # than on a handle that may already be gone.
+                self._compressor.close()
+            finally:
+                if not self._raw.closed:
+                    self._raw.flush()
+                    os.fsync(self._raw.fileno())
+                    self._raw.close()
+                self._text = None
+        if not publish:
+            return False
+        return self.publish()
+
+    def publish(self):
+        """Reopen, parse, validate, then atomically claim the final name."""
+        if self.published:
+            return self._published
+        if not os.path.isfile(_long(self.part_path)):
+            raise ArtifactError(f"nothing to publish: {self.part_path}")
+        _fsync_path(self.part_path)
+
+        # Phase two: the bytes on disk are the evidence, not our counters.
+        header, records, trailer = _parse_plan3_stream(
+            self.part_path, expected_version=self.version, allow_part=True)
+        self._validate_parsed(header, records, trailer)
+
+        final = publish_no_clobber(self.part_path, self.final_path)
+        _fsync_dir(os.path.dirname(final))
+        self.published = True
+        self._published = PublishedPlan3Artifact(
+            locator=self.locator, path=final, version=self.version,
+            size_bytes=os.path.getsize(_long(final)),
+            record_count=len(records),
+            byte_total=int(trailer.get("byte_total") or 0),
+            header=header, trailer=trailer)
+        get_logger().info(
+            "plan3_artifact_published: kind=%s locator=%s records=%d bytes=%d",
+            self.version, self.locator, len(records),
+            self._published.size_bytes)
+        return self._published
+
+    def _validate_parsed(self, header, records, trailer):
+        if len(records) != self.record_count:
+            raise ArtifactError(
+                f"{self.locator}: wrote {self.record_count} records but read "
+                f"back {len(records)}")
+        if int(trailer.get("record_count", -1)) != len(records):
+            raise ArtifactError(
+                f"{self.locator}: trailer record_count "
+                f"{trailer.get('record_count')!r} != {len(records)}")
+        if self._size_field:
+            actual = sum(int(r[self._size_field]) for r in records
+                         if r.get(self._size_field) is not None)
+            if int(trailer.get("byte_total", -1)) != actual:
+                raise ArtifactError(
+                    f"{self.locator}: trailer byte_total "
+                    f"{trailer.get('byte_total')!r} != {actual}")
+        if self._ordinal_field:
+            ordinals = [int(r[self._ordinal_field]) for r in records
+                        if r.get(self._ordinal_field) is not None]
+            if ordinals != sorted(set(ordinals)):
+                raise ArtifactError(
+                    f"{self.locator}: {self._ordinal_field} values are not "
+                    "strictly ascending and unique")
+        if self._require_unique_paths and self._path_field:
+            paths = [r.get(self._path_field) for r in records
+                     if r.get(self._path_field) is not None]
+            if len(paths) != len(set(paths)):
+                raise ArtifactError(
+                    f"{self.locator}: duplicate {self._path_field} on reparse")
+        if self._validate_artifact is not None:
+            self._validate_artifact(header, records, trailer)
+
+    def abandon(self):
+        """Discard an unpublished attempt; never touches a published file."""
+        self.close(publish=False)
+        try:
+            os.remove(_long(self.part_path))
+        except FileNotFoundError:
+            pass
+        return True
+
+
+def _parse_plan3_stream(path, *, expected_version, allow_part=False):
+    """Read one artifact file into ``(header, records, trailer)``."""
+    _require_zstd()
+    text_path = str(path)
+    if not allow_part and text_path.endswith(".part"):
+        raise ArtifactError(
+            f"refusing to read a .part artifact as ready: {text_path!r}")
+    header = None
+    trailer = None
+    records = []
+    try:
+        with open(_long(text_path), "rb") as raw:
+            reader = zstd.ZstdDecompressor().stream_reader(raw)
+            stream = io.TextIOWrapper(reader, encoding="utf-8")
+            for line in stream:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                kind = record.get("kind")
+                if kind == _HEADER_KIND:
+                    header = record
+                elif kind == _RECORD_KIND:
+                    records.append(record)
+                elif kind == _TRAILER_KIND:
+                    trailer = record
+    except (zstd.ZstdError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ArtifactError(
+            f"artifact is unreadable (truncated or corrupt): "
+            f"{text_path!r}: {exc}") from exc
+
+    if header is None:
+        raise ArtifactError(f"artifact has no header: {text_path!r}")
+    if expected_version and header.get("version") != expected_version:
+        raise ArtifactError(
+            f"unsupported artifact version {header.get('version')!r} "
+            f"(expected {expected_version!r}): {text_path!r}")
+    if trailer is None:
+        raise ArtifactError(f"artifact is truncated (no trailer): {text_path!r}")
+    return header, records, trailer
+
+
+def read_plan3_artifact(archive_root, locator, *, expected_version,
+                        validate_artifact=None):
+    """Parse a published Plan 3 artifact and re-check its own aggregates.
+
+    Every consumer goes through here, so an artifact whose trailer disagrees
+    with its contents is refused at read time as well as at publication time.
+    """
+    path = resolve_locator(os.path.abspath(str(archive_root)), locator)
+    header, records, trailer = _parse_plan3_stream(
+        path, expected_version=expected_version)
+    declared = trailer.get("record_count")
+    if declared is not None and int(declared) != len(records):
+        raise ArtifactError(
+            f"artifact aggregate mismatch in {locator!r}: record_count "
+            f"declared={declared!r} actual={len(records)}")
+    if validate_artifact is not None:
+        validate_artifact(header, records, trailer)
+    return header, records, trailer
 
 
 def tar_sidecar_locator(session_id, chunk_index, container_ordinal):

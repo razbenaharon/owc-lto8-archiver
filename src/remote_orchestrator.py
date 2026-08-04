@@ -1515,6 +1515,17 @@ class RemoteOrchestrator:
         cluster = _volume_cluster_size(self.staging_dir)
         return int((logical_bytes + file_count * cluster) * self.staging_padding)
 
+    def _chunk_exception_states(self, chunk_ref):
+        """Per-ordinal outcomes a manifest chunk still keeps in PostgreSQL.
+
+        Only failures become rows for a manifest chunk, so this is a handful of
+        entries, never the whole membership.
+        """
+        reader = getattr(self.db, "get_manifest_chunk_exception_states", None)
+        if not callable(reader):
+            return {}
+        return reader(chunk_ref.session_id, chunk_ref.chunk_index) or {}
+
     def _validate_chunk_file_limit(self, session_id, chunk_index, file_count):
         limit = int(getattr(self, 'chunk_max_files', 100000))
         if int(file_count) <= limit:

@@ -595,6 +595,10 @@ DECLARE
     blocked_indexes      INTEGER[];
     optional_012_count   INTEGER;
     optional_007_count   INTEGER;
+    run_evidence_sql     TEXT;
+    foreign_bundle_expr  TEXT := '';
+    any_bundle_expr      TEXT := '';
+    good_bundle_expr     TEXT := '';
     ambiguous_file_count BIGINT;
     ambiguous_run_count  BIGINT;
     ambiguous_directory_count BIGINT := 0;
@@ -942,31 +946,67 @@ BEGIN
                     exception_session, ambiguous_file_count;
             END IF;
 
-            SELECT count(*) INTO ambiguous_run_count
-            FROM archive_runs ar
-            WHERE ar.remote_session_id=exception_session
-              AND (
-                (ar.remote_chunk_index IS NOT NULL AND (
-                    NOT EXISTS (SELECT 1 FROM remote_chunks c
-                                WHERE c.session_id=exception_session
-                                  AND c.chunk_index=ar.remote_chunk_index)
-                    OR EXISTS (SELECT 1 FROM files_index fi
-                               WHERE fi.archive_run_id=ar.run_id
-                                 AND (fi.remote_session_id IS DISTINCT FROM
-                                          exception_session
-                                      OR fi.remote_chunk_index IS DISTINCT FROM
-                                          ar.remote_chunk_index))))
-                OR
-                (ar.remote_chunk_index IS NULL AND (
-                    NOT EXISTS (SELECT 1 FROM files_index fi
-                                WHERE fi.archive_run_id=ar.run_id
-                                  AND fi.remote_session_id=exception_session
-                                  AND fi.remote_chunk_index IS NOT NULL)
-                    OR EXISTS (SELECT 1 FROM files_index fi
-                               WHERE fi.archive_run_id=ar.run_id
-                                 AND (fi.remote_session_id IS DISTINCT FROM
-                                          exception_session
-                                      OR fi.remote_chunk_index IS NULL)))));
+            -- A run is ambiguous when its OUTPUT exists and cannot be
+            -- attributed to this session -- not merely when it produced no
+            -- `files_index` rows.
+            --
+            -- `files_index` deliberately indexes only files at or above
+            -- `index_min_file_mb`, so a chunk built entirely from small files
+            -- produces none of them BY DESIGN; requiring one there condemns a
+            -- perfectly healthy run.  The migration-007 bundle rows are the
+            -- evidence such a run does leave, so they count here too.
+            --
+            -- A run with no output of any kind is likewise not ambiguous: it
+            -- wrote nothing that survives (its work was superseded and redone),
+            -- so there is nothing that could be misattributed.
+            --
+            -- What still fails, correctly and deliberately, is a run whose
+            -- output DOES exist but names a different session, or carries no
+            -- chunk identity at all: that is real uncertainty about what
+            -- reached the tape.
+            IF optional_007_count = 3 THEN
+                foreign_bundle_expr := format(
+                    'OR EXISTS (SELECT 1 FROM directory_archive_bundles dab '
+                    'WHERE dab.archive_run_id=ar.run_id '
+                    '  AND dab.remote_session_id IS DISTINCT FROM %L::BIGINT)',
+                    exception_session);
+                any_bundle_expr :=
+                    'OR EXISTS (SELECT 1 FROM directory_archive_bundles dab '
+                    'WHERE dab.archive_run_id=ar.run_id)';
+                good_bundle_expr := format(
+                    'AND NOT EXISTS (SELECT 1 FROM directory_archive_bundles dab '
+                    'WHERE dab.archive_run_id=ar.run_id '
+                    '  AND dab.remote_session_id=%L::BIGINT)',
+                    exception_session);
+            END IF;
+
+            run_evidence_sql := format(
+                'SELECT count(*) FROM archive_runs ar '
+                'WHERE ar.remote_session_id=%1$L::BIGINT AND ('
+                '  (ar.remote_chunk_index IS NOT NULL AND ('
+                '     NOT EXISTS (SELECT 1 FROM remote_chunks c '
+                '                 WHERE c.session_id=%1$L::BIGINT '
+                '                   AND c.chunk_index=ar.remote_chunk_index)'
+                '     OR EXISTS (SELECT 1 FROM files_index fi '
+                '                WHERE fi.archive_run_id=ar.run_id '
+                '                  AND (fi.remote_session_id IS DISTINCT FROM %1$L::BIGINT '
+                '                       OR fi.remote_chunk_index IS DISTINCT FROM ar.remote_chunk_index))))'
+                '  OR (ar.remote_chunk_index IS NULL AND ('
+                '     EXISTS (SELECT 1 FROM files_index fi '
+                '             WHERE fi.archive_run_id=ar.run_id '
+                '               AND (fi.remote_session_id IS DISTINCT FROM %1$L::BIGINT '
+                '                    OR fi.remote_chunk_index IS NULL)) '
+                '     %2$s '
+                '     OR ((EXISTS (SELECT 1 FROM files_index fi '
+                '                  WHERE fi.archive_run_id=ar.run_id) %3$s) '
+                '         AND NOT EXISTS (SELECT 1 FROM files_index fi '
+                '                         WHERE fi.archive_run_id=ar.run_id '
+                '                           AND fi.remote_session_id=%1$L::BIGINT '
+                '                           AND fi.remote_chunk_index IS NOT NULL) '
+                '         %4$s))))',
+                exception_session, foreign_bundle_expr, any_bundle_expr,
+                good_bundle_expr);
+            EXECUTE run_evidence_sql INTO ambiguous_run_count;
             IF ambiguous_run_count <> 0 THEN
                 RAISE EXCEPTION
                     'session % has % archive runs without trustworthy remote chunk provenance',

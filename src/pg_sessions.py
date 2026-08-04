@@ -779,6 +779,447 @@ class PgSessionMixin:
                 )
         return plan_id
 
+    def iter_legacy_chunk_membership(self, session_id, chunk_index,
+                                     *, batch_size=10_000):
+        """Stream one legacy chunk's membership in chunk-local ordinal order.
+
+        Plan 3, Task 3.2. Yields dicts carrying everything a
+        ``legacy_db_export`` plan manifest must preserve: the plan-file id, the
+        snapshot identity, the original ordinal and the canonical path/size.
+
+        Streams with a server-side cursor rather than materializing: a single
+        chunk here holds up to 200,000 rows, and the session as a whole holds
+        tens of millions.
+        """
+        sql = """SELECT pf.plan_file_id, pf.ordinal AS original_ordinal,
+                        pf.chunk_index, sf.snapshot_file_id, sf.remote_path,
+                        sf.file_size_bytes
+                 FROM remote_sessions s
+                 JOIN remote_plan_files pf ON pf.plan_id=s.plan_id
+                 JOIN remote_snapshot_files sf
+                   ON sf.snapshot_file_id=pf.snapshot_file_id
+                 WHERE s.session_id=%s AND pf.chunk_index=%s
+                 ORDER BY pf.ordinal"""
+        with self._pool.connection() as conn:
+            with conn.cursor(name=f"legacy_export_{session_id}_{chunk_index}"
+                             ) as cur:
+                cur.itersize = int(batch_size)
+                cur.execute(sql, (session_id, int(chunk_index)))
+                for row in cur:
+                    yield dict(row)
+
+    def audit_session_transition_evidence(self, session_id):
+        """One locked, read-only audit behind a transition proposal.
+
+        Plan 3, Task 3.1. Every figure the boundary depends on is read in a
+        single snapshot so the proposal describes one instant. Returns ``None``
+        when the session does not exist.
+
+        Deliberately tolerant of absent optional schema: this runs against a
+        production database that may not yet have migrations 015 or 018, and
+        "the column is not there" is a fact to report, not a crash.
+        """
+        def operation(conn):
+            session = conn.execute(
+                """SELECT session_id, session_label, plan_id, scan_complete,
+                          tape_generation
+                   FROM remote_sessions WHERE session_id=%s""",
+                (session_id,)).fetchone()
+            if session is None:
+                return None
+
+            has_format = self._column_exists_conn(
+                conn, "remote_chunks", "packaging_format")
+            has_membership = self._column_exists_conn(
+                conn, "remote_chunks", "membership_state")
+
+            states = {
+                row["status"]: int(row["n"])
+                for row in conn.execute(
+                    "SELECT status, count(*) AS n FROM remote_chunks "
+                    "WHERE session_id=%s GROUP BY status",
+                    (session_id,)).fetchall()}
+
+            bounds = conn.execute(
+                """SELECT count(*) AS chunk_count,
+                          COALESCE(min(chunk_index), -1) AS min_index,
+                          COALESCE(max(chunk_index), -1) AS max_index,
+                          count(DISTINCT chunk_index) AS distinct_index
+                   FROM remote_chunks WHERE session_id=%s""",
+                (session_id,)).fetchone()
+            contiguous = bool(
+                bounds["chunk_count"]
+                and bounds["min_index"] == 0
+                and bounds["chunk_count"] == bounds["distinct_index"]
+                and bounds["chunk_count"] == bounds["max_index"] + 1)
+
+            owned = conn.execute(
+                """SELECT count(*) AS n FROM remote_chunks
+                   WHERE session_id=%s
+                     AND (owner_token IS NOT NULL
+                          OR (lease_expires_at IS NOT NULL
+                              AND lease_expires_at > now()))""",
+                (session_id,)).fetchone()["n"]
+
+            duplicates = conn.execute(
+                """SELECT count(*) AS n FROM (
+                       SELECT pf.chunk_index, pf.ordinal
+                       FROM remote_plan_files pf
+                       WHERE pf.plan_id=%s
+                       GROUP BY pf.chunk_index, pf.ordinal
+                       HAVING count(*) > 1) AS d""",
+                (session["plan_id"],)).fetchone()["n"]
+
+            sharing = conn.execute(
+                "SELECT count(*) AS n FROM remote_sessions WHERE plan_id=%s",
+                (session["plan_id"],)).fetchone()["n"]
+
+            formats = {}
+            conflicting = 0
+            if has_format:
+                formats = {
+                    row["packaging_format"]: int(row["n"])
+                    for row in conn.execute(
+                        """SELECT packaging_format, count(*) AS n
+                           FROM remote_chunks WHERE session_id=%s
+                           GROUP BY packaging_format""",
+                        (session_id,)).fetchall()}
+                if self._table_exists_conn(conn, "archive_containers"):
+                    conflicting = conn.execute(
+                        """SELECT count(*) AS n
+                           FROM archive_containers c
+                           JOIN remote_chunks k
+                             ON k.session_id=c.session_id
+                            AND k.chunk_index=c.chunk_index
+                           WHERE c.session_id=%s
+                             AND k.packaging_format IS DISTINCT FROM
+                                 c.container_format""",
+                        (session_id,)).fetchone()["n"]
+
+            generation_mismatch = False
+            if self._table_exists_conn(conn, "archive_containers"):
+                generation_mismatch = bool(conn.execute(
+                    """SELECT count(*) AS n
+                       FROM archive_containers c
+                       JOIN tape_generations g
+                         ON g.generation_id=c.tape_generation_id
+                       WHERE c.session_id=%s
+                         AND g.generation IS DISTINCT FROM %s""",
+                    (session_id, session["tape_generation"]),
+                ).fetchone()["n"])
+
+            null_membership = 0
+            if has_membership:
+                null_membership = conn.execute(
+                    """SELECT count(*) AS n FROM remote_chunks
+                       WHERE session_id=%s AND membership_state IS NULL""",
+                    (session_id,)).fetchone()["n"]
+
+            scopes, uncovered, frontier_generation = [], False, 0
+            if self._table_exists_conn(conn, "remote_scan_scopes"):
+                for row in conn.execute(
+                        """SELECT source_root, coverage_state
+                           FROM remote_scan_scopes WHERE session_id=%s
+                           ORDER BY scope_ordinal""",
+                        (session_id,)).fetchall():
+                    scopes.append(row["source_root"])
+                    if row["coverage_state"] != "final":
+                        uncovered = True
+
+            bootstrap_state = "absent"
+            if self._table_exists_conn(conn, "remote_frontier_bootstraps"):
+                row = conn.execute(
+                    """SELECT state, coverage_final FROM
+                       remote_frontier_bootstraps WHERE session_id=%s
+                       ORDER BY created_at DESC LIMIT 1""",
+                    (session_id,)).fetchone()
+                if row is not None:
+                    bootstrap_state = row["state"]
+                    frontier_generation = 1 if row["coverage_final"] else 0
+
+            return {
+                "session_id": session["session_id"],
+                "session_label": session["session_label"],
+                "scan_complete": session["scan_complete"],
+                "tape_generation": session["tape_generation"],
+                "chunk_count": int(bounds["chunk_count"]),
+                "max_chunk_index": int(bounds["max_index"]),
+                "chunks_contiguous": contiguous,
+                "chunk_states": states,
+                "owned_chunks": int(owned),
+                "duplicate_ordinals": int(duplicates),
+                "sessions_sharing_plan": int(sharing),
+                "formats": formats,
+                "conflicting_formats": int(conflicting),
+                "tape_generation_mismatch": generation_mismatch,
+                "null_membership_state": int(null_membership),
+                "source_scopes": scopes,
+                "uncovered_scope_remains": uncovered,
+                "frontier_generation": frontier_generation,
+                "bootstrap_state": bootstrap_state,
+            }
+
+        return self._run_read(
+            operation, f"audit session transition evidence ({session_id})")
+
+    def find_manifest_chunk_by_artifact(self, session_id, chunk_index,
+                                        idempotency_key):
+        """Has this exact plan artifact already produced a chunk?
+
+        Plan 3, Task 1.4 crash rule: a ready plan artifact whose database
+        outcome is unknown must be looked up by stable
+        ``(session_label, chunk_index)`` plus the artifact-generation
+        idempotency key **before** another chunk is allocated. Without this a
+        crash between publishing the artifact and committing the row produces a
+        second chunk covering the same files.
+        """
+        def operation(conn):
+            if not self._column_exists_conn(conn, "remote_chunks",
+                                            "plan_source"):
+                return None
+            return conn.execute(
+                """SELECT c.session_id, c.chunk_index, c.plan_source,
+                          c.membership_state, c.expected_file_count,
+                          c.expected_bytes, a.local_locator, a.readiness_state
+                   FROM remote_chunks c
+                   JOIN archive_artifacts a
+                     ON a.artifact_id=c.plan_manifest_artifact_id
+                   WHERE c.session_id=%s AND c.chunk_index=%s
+                     AND a.local_locator=%s""",
+                (session_id, int(chunk_index), str(idempotency_key)),
+            ).fetchone()
+
+        return self._run_read(
+            operation,
+            f"find_manifest_chunk_by_artifact({session_id}, {chunk_index})")
+
+    def create_manifest_chunk(self, session_id, chunk_index, *,
+                              plan_locator, packaging_format,
+                              expected_file_count, expected_bytes,
+                              artifact_size_bytes=None,
+                              scan_segment_consumption=()):
+        """Atomically seal one manifest-first chunk.
+
+        Plan 3, Task 1.4. One transaction records the artifact, the chunk, its
+        aggregates and its sealed membership, plus every scan-segment range the
+        chunk consumed. Split across transactions, a crash between them leaves
+        either a chunk nobody can read or a segment range nobody consumed.
+
+        **No ``remote_snapshot_files`` or ``remote_plan_files`` row is written.**
+        That absence is the entire point of manifest-first planning: the chunk's
+        membership lives in the local artifact, and the database keeps only
+        aggregates. Large files still get ``files_index`` rows later, through the
+        existing successful catalog path.
+        """
+        if not plan_locator or str(plan_locator).endswith(".part"):
+            raise RuntimeError(
+                "[DB] a manifest chunk needs a ready (non-.part) plan artifact")
+        now = _now_utc()
+
+        def operation(conn):
+            for column in ("plan_source", "packaging_format"):
+                if not self._column_exists_conn(conn, "remote_chunks", column):
+                    raise RuntimeError(
+                        "[DB] manifest-first chunks require migrations 015 and "
+                        f"018 (remote_chunks has no {column} column)")
+
+            session = conn.execute(
+                "SELECT session_id FROM remote_sessions WHERE session_id=%s "
+                "FOR UPDATE", (session_id,)).fetchone()
+            if not session:
+                raise RuntimeError(
+                    f"[DB] Remote session not found: {session_id}")
+
+            existing = conn.execute(
+                """SELECT c.chunk_index, c.plan_source, c.expected_file_count,
+                          c.expected_bytes, a.local_locator
+                   FROM remote_chunks c
+                   LEFT JOIN archive_artifacts a
+                     ON a.artifact_id=c.plan_manifest_artifact_id
+                   WHERE c.session_id=%s AND c.chunk_index=%s
+                   FOR UPDATE OF c""",
+                (session_id, int(chunk_index)),
+            ).fetchone()
+            if existing is not None:
+                # Idempotent re-entry after an ambiguous commit: the same
+                # artifact and the same expectation means this call already
+                # succeeded. Anything else is a genuine collision.
+                same = (existing["local_locator"] == str(plan_locator)
+                        and existing["expected_file_count"] ==
+                        int(expected_file_count)
+                        and existing["expected_bytes"] == int(expected_bytes))
+                if same:
+                    return {"created": False, "chunk_index": int(chunk_index)}
+                raise RuntimeError(
+                    f"[DB] chunk {int(chunk_index)} of session {session_id} "
+                    "already exists with different membership; refusing to "
+                    "overwrite a sealed chunk")
+
+            artifact_id = conn.execute(
+                """INSERT INTO archive_artifacts
+                       (session_id, chunk_index, artifact_kind,
+                        artifact_version, local_locator, artifact_size_bytes,
+                        readiness_state, published_at, created_at, updated_at)
+                   VALUES (%s,%s,'plan_manifest','plan-manifest-v1',%s,%s,
+                           'ready',%s,%s,%s)
+                   RETURNING artifact_id""",
+                (session_id, int(chunk_index), str(plan_locator),
+                 artifact_size_bytes, now, now, now),
+            ).fetchone()["artifact_id"]
+
+            conn.execute(
+                """INSERT INTO remote_chunks
+                       (session_id, chunk_index, status, updated_at,
+                        membership_state, expected_file_count, expected_bytes,
+                        plan_source, plan_manifest_artifact_id,
+                        packaging_format, packaging_assigned_at)
+                   VALUES (%s,%s,'pending',%s,'sealed',%s,%s,'manifest',%s,%s,
+                           %s)""",
+                (session_id, int(chunk_index), now, int(expected_file_count),
+                 int(expected_bytes), artifact_id, str(packaging_format), now),
+            )
+
+            for segment_id, first_ordinal, last_ordinal in (
+                    scan_segment_consumption or ()):
+                conn.execute(
+                    """INSERT INTO remote_chunk_scan_segments
+                           (session_id, chunk_index, scan_segment_id,
+                            first_scan_ordinal, last_scan_ordinal, created_at)
+                       VALUES (%s,%s,%s,%s,%s,%s)
+                       ON CONFLICT (scan_segment_id, first_scan_ordinal,
+                                    last_scan_ordinal) DO NOTHING""",
+                    (session_id, int(chunk_index), segment_id,
+                     int(first_ordinal), int(last_ordinal), now),
+                )
+
+            conn.execute(
+                """UPDATE remote_plans SET chunk_count=GREATEST(chunk_count,%s)
+                   WHERE plan_id=(SELECT plan_id FROM remote_sessions
+                                  WHERE session_id=%s)""",
+                (int(chunk_index) + 1, session_id),
+            )
+            return {"created": True, "chunk_index": int(chunk_index),
+                    "artifact_id": artifact_id}
+
+        return self._transaction(
+            operation, f"create manifest chunk {int(chunk_index)}")
+
+    def record_terminal_manifest(self, session_id, chunk_index, *,
+                                 terminal_locator, disposition_counts,
+                                 archived_bytes=0, artifact_size_bytes=None):
+        """Persist a chunk's final dispositions and its terminal artifact.
+
+        Plan 3, Task 1.5. Recorded only after the artifact has been published
+        and validated locally. The terminal manifest stays on local disk and in
+        the database-backup procedure; it is never written to tape after the
+        data write.
+        """
+        if not terminal_locator or str(terminal_locator).endswith(".part"):
+            raise RuntimeError(
+                "[DB] a terminal manifest locator must name a ready artifact")
+        now = _now_utc()
+        counts = dict(disposition_counts or {})
+
+        def operation(conn):
+            if not self._column_exists_conn(conn, "remote_chunks",
+                                            "final_archived_count"):
+                raise RuntimeError(
+                    "[DB] terminal state requires migration 018")
+            artifact_id = conn.execute(
+                """INSERT INTO archive_artifacts
+                       (session_id, chunk_index, artifact_kind,
+                        artifact_version, local_locator, artifact_size_bytes,
+                        readiness_state, published_at, created_at, updated_at)
+                   VALUES (%s,%s,'terminal_manifest','terminal-state-v1',%s,%s,
+                           'ready',%s,%s,%s)
+                   ON CONFLICT (session_id, chunk_index, artifact_kind,
+                                artifact_version)
+                   DO UPDATE SET local_locator=EXCLUDED.local_locator,
+                                 artifact_size_bytes=
+                                     EXCLUDED.artifact_size_bytes,
+                                 readiness_state='ready',
+                                 published_at=EXCLUDED.published_at,
+                                 updated_at=EXCLUDED.updated_at
+                   RETURNING artifact_id""",
+                (session_id, int(chunk_index), str(terminal_locator),
+                 artifact_size_bytes, now, now, now),
+            ).fetchone()["artifact_id"]
+
+            conn.execute(
+                """UPDATE remote_chunks
+                   SET terminal_manifest_artifact_id=%s,
+                       final_archived_count=%s,
+                       final_source_missing_count=%s,
+                       final_source_permission_denied_count=%s,
+                       final_source_unreadable_count=%s,
+                       final_source_changed_count=%s,
+                       final_unresolved_count=%s,
+                       final_archived_bytes=%s,
+                       updated_at=%s
+                   WHERE session_id=%s AND chunk_index=%s""",
+                (artifact_id,
+                 int(counts.get("archived", 0)),
+                 int(counts.get("source_missing", 0)),
+                 int(counts.get("source_permission_denied", 0)),
+                 int(counts.get("source_unreadable", 0)),
+                 int(counts.get("source_changed", 0)),
+                 int(counts.get("unresolved", 0)),
+                 int(archived_bytes or 0), now,
+                 session_id, int(chunk_index)),
+            )
+            return artifact_id
+
+        return self._transaction(
+            operation, f"record terminal manifest {int(chunk_index)}")
+
+    def get_remote_chunk(self, session_id, chunk_index):
+        """One chunk row, including its Plan 3 planning columns when present.
+
+        Plan 3, Task 1.3. The plan-source selection reads this, so it has to
+        answer on a database that has not had migration 018 applied: there the
+        planning columns simply do not exist and every chunk is ``legacy_db`` by
+        definition. Returning a partial row is correct; inventing a
+        ``plan_source`` value would not be.
+        """
+        def operation(conn):
+            has_plan_source = self._column_exists_conn(
+                conn, "remote_chunks", "plan_source")
+            columns = ("c.session_id, c.chunk_index, c.status, "
+                       "c.membership_state, c.expected_file_count, "
+                       "c.expected_bytes, s.session_label")
+            if has_plan_source:
+                columns += (", c.plan_source, c.plan_manifest_artifact_id, "
+                            "c.terminal_manifest_artifact_id")
+            row = conn.execute(
+                f"""SELECT {columns}
+                    FROM remote_chunks c
+                    JOIN remote_sessions s ON s.session_id=c.session_id
+                    WHERE c.session_id=%s AND c.chunk_index=%s""",
+                (session_id, int(chunk_index)),
+            ).fetchone()
+            if row is None:
+                return None
+            row = dict(row)
+            artifact_id = row.get("plan_manifest_artifact_id")
+            if artifact_id is not None and self._table_exists_conn(
+                    conn, "archive_artifacts"):
+                locator = conn.execute(
+                    """SELECT local_locator FROM archive_artifacts
+                       WHERE artifact_id=%s AND readiness_state='ready'""",
+                    (artifact_id,),
+                ).fetchone()
+                # A locator is exposed only when the artifact is READY. A chunk
+                # pointing at a non-ready artifact must block, not read a file
+                # that is still being written.
+                row["plan_manifest_locator"] = (
+                    locator["local_locator"] if locator else None)
+            else:
+                row["plan_manifest_locator"] = None
+            return row
+
+        return self._run_read(operation,
+                              f"get_remote_chunk({session_id}, {chunk_index})")
+
     def get_chunk_files(self, session_id, chunk_index):
         return self._run_read(
             lambda conn: _rows(conn.execute(

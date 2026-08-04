@@ -1283,9 +1283,11 @@ class PgCatalogMixin:
         """SOURCE prefix that a bundle's ZIP entry names are relative to.
 
         Prefer the canonical root already persisted by the directory catalog.
-        Legacy rows can still derive it from an indexed packed member.  The
-        ``remote_session_id`` argument remains for call compatibility only;
-        newline-composite ``remote_sessions.remote_path`` is never a root."""
+        Legacy rows can still derive it from an indexed packed member, but a
+        remote-session candidate is constrained by persisted scan scopes when
+        migration 014 is installed.  The ``remote_sessions.remote_path`` value
+        is never used as a root: it is session configuration, not provenance
+        for a particular bundle."""
         row = conn.execute(
             "SELECT original_dir_path FROM directory_archive_bundles "
             "WHERE stored_bundle_path=%s "
@@ -1307,7 +1309,21 @@ class PgCatalogMixin:
             op = str(row["original_path"]).replace("\\", "/")
             sp = str(row["stored_path"]).replace("\\", "/").lstrip("/")
             if sp and op.endswith(sp):
-                return op[:len(op) - len(sp)].rstrip("/")
+                candidate = op[:len(op) - len(sp)].rstrip("/")
+                if remote_session_id is not None and self._table_exists_conn(
+                        conn, "remote_scan_scopes"):
+                    scopes = conn.execute(
+                        "SELECT root_path FROM remote_scan_scopes "
+                        "WHERE session_id=%s AND root_path IS NOT NULL",
+                        (int(remote_session_id),),
+                    ).fetchall()
+                    roots = [str(item["root_path"]).replace("\\", "/").rstrip("/")
+                             for item in scopes]
+                    if roots and not any(
+                            candidate == root or candidate.startswith(root + "/")
+                            for root in roots):
+                        return ""
+                return candidate
         return ""
 
     def validate_directory_catalog(self, tape_label=None):

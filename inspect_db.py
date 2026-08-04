@@ -42,6 +42,7 @@ from src.pg_backup import (
 )
 from src.pg_bulk import build_conninfo, make_conninfo
 from src.remote_staging import inspect_resume_pack_marker
+from src.schema_audit import audit_manager, render_schema_audit
 from src.session_reconcile import (
     DEFAULT_IDLE_SECONDS,
     format_report,
@@ -490,6 +491,102 @@ def _run_container_format_schema_report(cfg, *, validate=False):
     return 0
 
 
+def _run_manifest_directory_catalog_schema_report(cfg, *, validate=False):
+    """Read-only migration-018 report/validation; never initializes schema."""
+    db = _open_read_only_db(cfg)
+    try:
+        report = (db.validate_manifest_directory_catalog_schema()
+                  if validate
+                  else db.manifest_directory_catalog_schema_report())
+    finally:
+        db.close()
+    _print_json(report)
+    return 0
+
+
+def _apply_manifest_directory_catalog_schema(cfg, args, parser):
+    """Guarded, explicit migration-018 entry point (Plan 3 Tasks 1.1/2.1)."""
+    if args.dry_run and args.execute:
+        parser.error(
+            "--apply-manifest-directory-catalog-schema accepts only one of "
+            "--dry-run or --execute")
+
+    db = _open_read_only_db(cfg)
+    try:
+        schema_report = db.manifest_directory_catalog_schema_report()
+    finally:
+        db.close()
+    preflight = {
+        "database": cfg.pg_dbname,
+        "schema": schema_report,
+        "blocking": list(schema_report.get("apply_blocking", ())),
+        "requested": {"execute": bool(args.execute)},
+    }
+
+    if not args.execute:
+        preflight["applied"] = []
+        preflight["note"] = (
+            "read-only preflight; execute requires --execute --yes and a "
+            "verified --backup-file")
+        _print_json(preflight)
+        return 0
+
+    if not args.yes:
+        parser.error(
+            "--apply-manifest-directory-catalog-schema --execute requires "
+            "--yes")
+    if not args.backup_file:
+        parser.error(
+            "--apply-manifest-directory-catalog-schema --execute requires "
+            "--backup-file naming a PostgreSQL backup this tool can verify")
+    if preflight["blocking"]:
+        raise OperationalError(
+            "[MIGRATION 018] Refusing migration: "
+            + "; ".join(preflight["blocking"]))
+
+    holders = archiver_lock_status(_conninfo(cfg))
+    if holders:
+        raise OperationalError(
+            "[MIGRATION 018] Refusing while the archiver lock is held: "
+            f"{holders}")
+    processes = active_archive_processes()
+    if processes:
+        raise OperationalError(
+            "[MIGRATION 018] Refusing while archive/transfer processes are "
+            f"running ({len(processes)} detected)")
+    preflight["backup"] = verify_backup_receipt(cfg, args.backup_file)
+
+    db = _open_no_init_db(cfg)
+    try:
+        db.acquire_archiver_lock()
+        processes = active_archive_processes()
+        if processes:
+            raise OperationalError(
+                "[MIGRATION 018] Refusing after final liveness check "
+                f"({len(processes)} archive/transfer process(es) detected)")
+        locked_backup = verify_backup_receipt(cfg, args.backup_file)
+        if locked_backup["receipt_id"] != preflight["backup"]["receipt_id"]:
+            raise OperationalError(
+                "[MIGRATION 018] Backup receipt changed before locked apply")
+
+        final_report = db.manifest_directory_catalog_schema_report()
+        final_blocking = list(final_report.get("apply_blocking", ()))
+        if final_blocking:
+            raise OperationalError(
+                "[MIGRATION 018] Final locked preflight refused migration: "
+                + "; ".join(final_blocking))
+        preflight["applied"] = (
+            db.apply_manifest_directory_catalog_schema(
+                require_archiver_lock=True))
+        preflight["validation"] = (
+            db.validate_manifest_directory_catalog_schema())
+        preflight["final_locked_preflight"] = final_report
+    finally:
+        db.close()
+    _print_json(preflight)
+    return 0
+
+
 def _run_session37_boundary_rehearsal(cfg, args):
     """READ-ONLY Plan-2 Gate-5.5 format-boundary report.
 
@@ -935,6 +1032,12 @@ def _build_parser():
                         help="Skip supported interactive confirmations.")
     parser.add_argument("--print-db-target", action="store_true",
                         help="Print configured target and read-only DB identity.")
+    parser.add_argument("--schema-provenance-audit", action="store_true",
+                        help="Read-only installed-schema/catalog-provenance audit; "
+                             "never applies migrations or reads LTFS.")
+    parser.add_argument("--json", action="store_true",
+                        help="Render supported reports as JSON (the default for "
+                             "machine-readable maintenance commands).")
     parser.add_argument("--backup-postgres", action="store_true",
                         help="Create and verify a custom-format PostgreSQL dump.")
     parser.add_argument("--create-migrated-db", action="store_true",
@@ -983,6 +1086,17 @@ def _build_parser():
     parser.add_argument("--container-format-schema-report",
                         action="store_true",
                         help="Read-only migration-015 schema/format report.")
+    parser.add_argument("--apply-manifest-directory-catalog-schema",
+                        action="store_true",
+                        help="Migration 018. Read-only preflight unless "
+                             "--execute --yes --backup-file are supplied.")
+    parser.add_argument("--validate-manifest-directory-catalog-schema",
+                        action="store_true",
+                        help="Fail-closed read-only validation of migration 018 "
+                             "schema, manifest authority, and boundaries.")
+    parser.add_argument("--manifest-directory-catalog-schema-report",
+                        action="store_true",
+                        help="Read-only migration-018 schema/authority report.")
     parser.add_argument("--session37-boundary-rehearsal", action="store_true",
                         help="READ-ONLY Plan-2 Gate-5.5 chunk classification "
                              "and proposed Stored TAR boundary. Defaults to "
@@ -1105,6 +1219,18 @@ def _dispatch(parser, args):
             lock_db.close()
         return 0
 
+    if args.schema_provenance_audit:
+        db = _open_read_only_db(cfg)
+        try:
+            report = audit_manager(db)
+        finally:
+            db.close()
+        if args.json:
+            _print_json(report)
+        else:
+            print(render_schema_audit(report))
+        return 0
+
     if args.create_migrated_db:
         if not args.backup_file:
             parser.error("--create-migrated-db requires --backup-file")
@@ -1142,6 +1268,17 @@ def _dispatch(parser, args):
 
     if args.container_format_schema_report:
         return _run_container_format_schema_report(cfg, validate=False)
+
+    if args.apply_manifest_directory_catalog_schema:
+        return _apply_manifest_directory_catalog_schema(cfg, args, parser)
+
+    if args.validate_manifest_directory_catalog_schema:
+        return _run_manifest_directory_catalog_schema_report(
+            cfg, validate=True)
+
+    if args.manifest_directory_catalog_schema_report:
+        return _run_manifest_directory_catalog_schema_report(
+            cfg, validate=False)
 
     if args.session37_boundary_rehearsal:
         return _run_session37_boundary_rehearsal(cfg, args)

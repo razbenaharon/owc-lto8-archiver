@@ -141,6 +141,8 @@ class PgConnectionCore:
     STORED_TAR_PLAN_MIGRATION = "016_postgres_stored_tar_plans.sql"
     STORED_TAR_PUBLICATION_MIGRATION = (
         "017_postgres_stored_tar_publication.sql")
+    MANIFEST_DIRECTORY_CATALOG_MIGRATION = (
+        "018_postgres_manifest_directory_catalog.sql")
 
     @classmethod
     def container_format_migration_path(cls):
@@ -271,6 +273,80 @@ class PgConnectionCore:
                         cur.execute((sql_dir / migration).read_text(
                             encoding="utf-8"))
         return list(migrations)
+
+    @classmethod
+    def manifest_directory_catalog_migration_path(cls):
+        return (Path(PROJECT_ROOT) / "scripts" / "sql"
+                / cls.MANIFEST_DIRECTORY_CATALOG_MIGRATION)
+
+    @classmethod
+    def manifest_directory_catalog_migration_checksum(cls):
+        """SHA-256 identity of explicit migration 018 (read-only)."""
+        return hashlib.sha256(
+            cls.manifest_directory_catalog_migration_path().read_bytes()
+        ).hexdigest()
+
+    def apply_manifest_directory_catalog_schema(
+            self, *, require_archiver_lock=False):
+        """Atomically apply migration 018 through its checksum guard.
+
+        Migration 018 is explicit-only and is deliberately absent from
+        :meth:`_init_schema`.  A single PostgreSQL transaction owns its
+        checksum authorization, all DDL, and the legacy ``plan_source``
+        backfill.  The guarded inspector command pins the archiver advisory
+        lock to this same database session; isolated tests may apply directly
+        without that operational precondition.
+        """
+        reporter = getattr(
+            self, "manifest_directory_catalog_schema_report", None)
+        if callable(reporter):
+            report = reporter()
+            state = report.get("installation_state")
+            if state == "partial" or (
+                    state == "installed"
+                    and not report.get("ready")):
+                raise RuntimeError(
+                    "[DB] Refusing to apply migration 018 over a partial or "
+                    "drifted installation: "
+                    + "; ".join(report.get("schema_issues")
+                                or report.get("issues") or ("unknown drift",)))
+
+        sql_path = self.manifest_directory_catalog_migration_path()
+        checksum = self.manifest_directory_catalog_migration_checksum()
+
+        def apply_on(conn):
+            with conn.transaction():
+                if require_archiver_lock:
+                    owned = conn.execute(
+                        """SELECT EXISTS (
+                               SELECT 1 FROM pg_locks
+                               WHERE locktype='advisory' AND granted
+                                 AND pid=pg_backend_pid()
+                                 AND classid=%s AND objid=%s
+                                 AND objsubid=1) AS owned""",
+                        (self.ARCHIVER_LOCK_KEY >> 32,
+                         self.ARCHIVER_LOCK_KEY & 0xFFFFFFFF),
+                    ).fetchone()["owned"]
+                    if not owned:
+                        raise RuntimeError(
+                            "[DB] Migration 018 requires the current database "
+                            "session to own the archiver advisory lock")
+                conn.execute(
+                    "SELECT set_config(%s, %s, true)",
+                    ("lto.manifest_directory_catalog_migration_checksum",
+                     checksum))
+                with conn.cursor() as cur:
+                    cur.execute(sql_path.read_text(encoding="utf-8"))
+
+        if require_archiver_lock:
+            if self._lock_conn is None:
+                raise RuntimeError(
+                    "[DB] Migration 018 requires a pinned archiver lock")
+            apply_on(self._lock_conn)
+        else:
+            with self._pool.connection() as conn:
+                apply_on(conn)
+        return [self.MANIFEST_DIRECTORY_CATALOG_MIGRATION]
 
     @staticmethod
     def _validate_container_format_staging_evidence(evidence):

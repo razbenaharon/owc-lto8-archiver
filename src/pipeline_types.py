@@ -109,6 +109,22 @@ class MembershipState(str, Enum):
     SEALED = "sealed"
 
 
+class DirectoryBackupStatus(str, Enum):
+    """The five directory states, in strict precedence order.
+
+    Plan 3, Task 2.2. Order matters: :func:`resolve_directory_status` walks
+    these top to bottom, and the first match wins. ``AMBIGUOUS`` is first
+    because conflicting evidence must never be resolved by a later, more
+    optimistic rule.
+    """
+
+    AMBIGUOUS = "ambiguous"
+    PROVISIONAL = "provisional"
+    INCOMPLETE = "incomplete"
+    COMPLETE_WITH_SOURCE_EXCEPTIONS = "complete_with_source_exceptions"
+    COMPLETE = "complete"
+
+
 class ContainerFormat(str, Enum):
     """Durable ``remote_chunks`` / ``archive_containers`` format authority.
 
