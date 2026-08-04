@@ -174,6 +174,8 @@ class ConfigManager:
             'mbuffer_size':          '512M',
             'staging_padding_factor':      '1.15',
             'fetch_overrun_abort_factor':  '2.0',
+            'stored_tar_sidecar_fixed_reserve_bytes': '4096',
+            'stored_tar_sidecar_member_reserve_bytes': '1024',
         }
         self.config['TELEGRAM'] = {
             'enabled': 'false',
@@ -789,6 +791,18 @@ class ConfigManager:
         except ValueError:
             return 30.0
         return max(0.0, value)
+
+    @property
+    def stored_tar_sidecar_fixed_reserve_bytes(self):
+        return self._get_int(
+            'PERFORMANCE', 'stored_tar_sidecar_fixed_reserve_bytes',
+            4096, minimum=0)
+
+    @property
+    def stored_tar_sidecar_member_reserve_bytes(self):
+        return self._get_int(
+            'PERFORMANCE', 'stored_tar_sidecar_member_reserve_bytes',
+            1024, minimum=0)
 
     @property
     def telegram_bot_token(self):

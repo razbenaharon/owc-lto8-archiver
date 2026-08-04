@@ -209,15 +209,17 @@ class RemotePipelineCoordinator:
                 planned_bytes, _, planned_files = summary
                 host._validate_chunk_file_limit(
                     self.session_id, chunk_index, planned_files)
+                chunk_files = host.db.get_chunk_files(
+                    self.session_id, chunk_index)
                 host._await_staging_capacity(
                     planned_bytes, planned_files, self.stop_event,
-                    ready_q=self.ready_q)
+                    ready_q=self.ready_q, session_id=self.session_id,
+                    chunk_index=chunk_index, chunk_files=chunk_files)
                 if self._stopping():
                     break
 
                 desc = host._stage_chunk(
-                    self.session_id, chunk_index,
-                    host.db.get_chunk_files(self.session_id, chunk_index))
+                    self.session_id, chunk_index, chunk_files)
                 if desc is None:
                     if not CANCEL.is_set():
                         host._producer_err = (

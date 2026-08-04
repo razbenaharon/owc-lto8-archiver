@@ -164,6 +164,7 @@ class ReadyQueue:
                 "chunks_failed": self.chunks_failed,
                 "groups_started": self.groups_started,
                 "producer_closed": self._closed,
+                "staging_pressure": self._staging_pressure,
             }
 
     # -- producer side ----------------------------------------------------

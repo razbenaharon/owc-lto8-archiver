@@ -33,6 +33,11 @@ from src.remote_transport import (
     _ssh_run,
     _ssh_stream_command,
 )
+from src.remote_staging import (
+    RemoteChunkStager,
+    StagingReservation,
+    _tar_progress_watchdog_action,
+)
 from src.skipped import SkippedFileTracker
 
 
@@ -53,10 +58,32 @@ class RemoteStagingSafetyTests(unittest.TestCase):
         planned = 100
         free = 2 * planned + LOCAL_STAGING_RESERVE_BYTES - 1
         usage = SimpleNamespace(total=free, used=0, free=free)
-        with mock.patch("src.remote_orchestrator.shutil.disk_usage",
+        with mock.patch("src.remote_staging.shutil.disk_usage",
                         return_value=usage):
             with self.assertRaisesRegex(RuntimeError, "Insufficient local staging"):
                 orch._await_staging_capacity(planned, 0, threading.Event())
+
+    def test_direct_tar_admission_accepts_exact_disk_boundary(self):
+        orch = self._orchestrator()
+        reserve = StagingReservation(ContainerFormat.STORED_TAR, 12345)
+        free = reserve.needed_bytes + LOCAL_STAGING_RESERVE_BYTES
+        usage = SimpleNamespace(total=free, used=0, free=free)
+        with mock.patch("src.remote_staging.shutil.disk_usage",
+                        return_value=usage):
+            got = orch._await_staging_capacity(
+                10**9, 10**6, threading.Event(), reservation=reserve)
+        self.assertIs(got, reserve)
+
+    def test_direct_tar_admission_rejects_below_disk_boundary(self):
+        orch = self._orchestrator()
+        reserve = StagingReservation(ContainerFormat.STORED_TAR, 12345)
+        free = reserve.needed_bytes + LOCAL_STAGING_RESERVE_BYTES - 1
+        usage = SimpleNamespace(total=free, used=0, free=free)
+        with mock.patch("src.remote_staging.shutil.disk_usage",
+                        return_value=usage):
+            with self.assertRaisesRegex(RuntimeError, "Insufficient local staging"):
+                orch._await_staging_capacity(
+                    10**9, 10**6, threading.Event(), reservation=reserve)
 
     def test_chunk_budget_creates_staging_and_reserves_floor(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -343,6 +370,60 @@ class FetchWatchdogTests(unittest.TestCase):
                         return_value=plenty):
             orch._start_fetch_monitor(stop, abort, r"C:\stage\_fetch", 100)
             self.assertFalse(abort.wait(timeout=3))
+        stop.set()
+
+    def test_tar_progress_aggregate_overrun_aborts(self):
+        snapshot = {"parts": {"a.part": 90, "b.part": 80}, "loose_bytes": 0,
+                    "total_bytes": 170}
+        action = _tar_progress_watchdog_action(
+            snapshot=snapshot, previous_snapshot=None,
+            part_last_growth={}, aggregate_last_growth=0, now=10,
+            total_bytes=100, abort_factor=1.5, stall_timeout=600,
+            free_bytes=10**12, reserve_bytes=LOCAL_STAGING_RESERVE_BYTES)
+        self.assertEqual(action, "overrun")
+
+    def test_tar_progress_detects_one_stalled_part_while_sibling_grows(self):
+        part_growth = {"a.part": 0, "b.part": 9}
+        previous = {"parts": {"a.part": 50, "b.part": 50},
+                    "loose_bytes": 0, "total_bytes": 100}
+        snapshot = {"parts": {"a.part": 50, "b.part": 60},
+                    "loose_bytes": 0, "total_bytes": 110}
+        action = _tar_progress_watchdog_action(
+            snapshot=snapshot, previous_snapshot=previous,
+            part_last_growth=part_growth, aggregate_last_growth=9, now=10,
+            total_bytes=1000, abort_factor=2.0, stall_timeout=5,
+            free_bytes=10**12, reserve_bytes=LOCAL_STAGING_RESERVE_BYTES)
+        self.assertEqual(action, "part_stall")
+
+    def test_sparse_tar_part_growth_is_progress(self):
+        part_growth = {"sparse.part": 0}
+        previous = {"parts": {"sparse.part": 4096}, "loose_bytes": 0,
+                    "total_bytes": 4096}
+        snapshot = {"parts": {"sparse.part": 8192}, "loose_bytes": 0,
+                    "total_bytes": 8192}
+        action = _tar_progress_watchdog_action(
+            snapshot=snapshot, previous_snapshot=previous,
+            part_last_growth=part_growth, aggregate_last_growth=10, now=10,
+            total_bytes=10**9, abort_factor=2.0, stall_timeout=5,
+            free_bytes=10**12, reserve_bytes=LOCAL_STAGING_RESERVE_BYTES)
+        self.assertIsNone(action)
+        self.assertEqual(part_growth["sparse.part"], 10)
+
+    def test_tar_monitor_cancels_on_part_overrun(self):
+        orch = self._orchestrator()
+        stager = RemoteChunkStager(orch)
+        stop, abort = threading.Event(), threading.Event()
+        plenty = SimpleNamespace(total=10**12, used=0, free=10**12)
+        with tempfile.TemporaryDirectory() as root:
+            part = os.path.join(root, "container.tar.owner.part")
+            with open(part, "wb") as handle:
+                handle.write(b"x" * 300)
+            with mock.patch("src.remote_staging.shutil.disk_usage",
+                            return_value=plenty):
+                stager._start_fetch_monitor(
+                    stop, abort, root, 100, tar_part_paths=[part])
+                self.assertTrue(abort.wait(timeout=15))
+            self.assertTrue(os.path.isfile(part))
         stop.set()
 
 
