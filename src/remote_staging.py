@@ -195,6 +195,41 @@ class RemoteChunkStager:
         #: The RemoteOrchestrator façade that owns session state and config.
         self.host = host
 
+    def _start_stored_tar_attempt(self, owner, session_id, chunk_index):
+        """Persist process identity so a restart can prove this owner dead."""
+        starter = getattr(self.host.db, "start_worker_attempt", None)
+        if not callable(starter):
+            return None
+        started_at = None
+        try:
+            import psutil
+            started_at = psutil.Process(os.getpid()).create_time()
+        except Exception:
+            # PID absence after a crash remains useful evidence.  If the PID is
+            # later reused, missing creation identity correctly blocks reclaim.
+            pass
+        try:
+            return starter(
+                owner_token=owner, attempt_kind="stored_tar_build",
+                session_id=session_id, chunk_index=chunk_index,
+                local_pid=os.getpid(),
+                local_process_started_at=started_at)
+        except Exception:
+            get_logger().warning(
+                "could not record a durable Stored TAR build attempt; a crash "
+                "will require fail-closed owner reconciliation", exc_info=True)
+            return None
+
+    def _finish_stored_tar_attempt(self, attempt_id):
+        if attempt_id is None:
+            return
+        try:
+            self.host.db.finish_worker_attempt(attempt_id, "completed")
+        except Exception:
+            get_logger().warning(
+                "could not close Stored TAR build attempt %s", attempt_id,
+                exc_info=True)
+
     def _build_stored_tar_container(
             self, session_id, chunk_index, container_plan, plan_members,
             pack_dir, *, owner_token=None, abort_evt=None, crash_hook=None):
@@ -235,6 +270,7 @@ class RemoteChunkStager:
         if container_row is None:
             raise RuntimeError("Stored TAR container identity is absent")
         container_id = int(container_row["container_id"])
+        existing_state = container_row.get("validation_state")
         existing_owner = container_row.get("owner_token")
         existing_part = container_row.get("validated_part_locator")
         if (existing_part and container_row.get("validation_state") in (
@@ -243,10 +279,13 @@ class RemoteChunkStager:
             part_path = existing_part
         else:
             part_path = f"{final_tar}.{uuid.uuid4().hex[:12]}.part"
-        self.host.db.claim_stored_tar_container_build(
+        claimed = self.host.db.claim_stored_tar_container_build(
             container_id, owner, part_path)
-
-        existing_state = container_row.get("validation_state")
+        claimed_state = (claimed.get("validation_state")
+                         if isinstance(claimed, dict) else existing_state)
+        attempt_id = (None if claimed_state == "ready"
+                      else self._start_stored_tar_attempt(
+                          owner, session_id, chunk_index))
         if existing_state in ("validated_part", "ready"):
             summary = container_row.get("validation_summary") or {}
             diagnostics = tuple(summary.get("source_diagnostics") or ())
@@ -270,7 +309,7 @@ class RemoteChunkStager:
                     container_id, owner, part_path)
                 existing_state = "building"
             else:
-                return publish_stored_tar_pair(
+                publication = publish_stored_tar_pair(
                     self.host.cfg.local_manifest_archive_root,
                     part_path, final_tar, sidecar_plan, diagnostics,
                     validation=None, session_id=session_id,
@@ -278,6 +317,8 @@ class RemoteChunkStager:
                     container_ordinal=container_plan.container_ordinal,
                     owner_token=owner, db=self.host.db, pack_dir=pack_dir,
                     crash_hook=crash_hook)
+                self._finish_stored_tar_attempt(attempt_id)
+                return publication
 
         retries = max(0, int(getattr(
             self.host, "fetch_transient_retries", 0)))
@@ -330,7 +371,7 @@ class RemoteChunkStager:
             result.diagnostics)
         if crash_hook is not None:
             crash_hook("after_validated_part_state")
-        return publish_stored_tar_pair(
+        publication = publish_stored_tar_pair(
             self.host.cfg.local_manifest_archive_root,
             part_path, final_tar, sidecar_plan, result.diagnostics,
             validation=validation, session_id=session_id,
@@ -338,6 +379,8 @@ class RemoteChunkStager:
             container_ordinal=container_plan.container_ordinal,
             owner_token=owner, db=self.host.db, pack_dir=pack_dir,
             crash_hook=crash_hook)
+        self._finish_stored_tar_attempt(attempt_id)
+        return publication
 
     @staticmethod
     def _source_diagnostic_ordinals(diagnostics):
@@ -450,7 +493,10 @@ class RemoteChunkStager:
             fetch_dir, pack_dir, ram_stats, fetch_seconds, fetch_bytes):
         self.host.db.update_chunk_status(
             session_id, chunk_index, ChunkStatus.PACKING.value)
-        self.host._cleanup_dir(pack_dir)
+        # Task 2.6 may have adopted a crash-published TAR/sidecar pair in this
+        # deterministic pack.  Reconciliation has already validated every
+        # surviving local member; deleting the directory here would discard
+        # the very no-refetch recovery it just proved safe.
         os.makedirs(_long(pack_dir), exist_ok=True)
         _phase('PACK', f"Staging Stored TAR chunk {chunk_index + 1}: "
                        "small files -> TAR, large files staged loose")
@@ -677,14 +723,6 @@ class RemoteChunkStager:
             self.host.staging_dir, f"_fetch_s{session_id:04d}_{chunk_index:03d}")
         pack_dir  = os.path.join(
             self.host.staging_dir, f"_pack_s{session_id:04d}_{chunk_index:03d}")
-        resumed = self.host._try_resume_pack(session_id, chunk_index, pack_dir)
-        if resumed is not None:
-            return resumed
-        if os.path.isdir(pack_dir):
-            get_logger().warning(
-                "clearing an unusable leftover pack dir before repacking "
-                "chunk %s: %s", chunk_index + 1, pack_dir)
-            self.host._cleanup_dir(pack_dir)
         if chunk_format is ContainerFormat.STORED_TAR:
             recovery_guard = getattr(
                 self.host.db, "require_existing_stored_tar_recovery", None)
@@ -708,6 +746,38 @@ class RemoteChunkStager:
                 max_size_bytes=int(
                     self.host.cfg.stored_tar_max_size_gb * 1024**3),
             )
+            from .startup_reconcile import (TAR_RECONCILE_BLOCKED,
+                                            reconcile_tar_artifacts)
+            if chunk_plan.containers:
+                reconcile_report = reconcile_tar_artifacts(
+                    self.host.db, session_id, chunk_index,
+                    archive_root=self.host.cfg.local_manifest_archive_root,
+                    pack_dir=pack_dir,
+                    remote_base=getattr(self.host, "remote_path", None),
+                    owner_probe=getattr(
+                        self.host, "stored_tar_owner_probe", None),
+                    plan=chunk_plan)
+            else:
+                # All-source-missing/loose-only plans have no TAR artifact pair
+                # to reconcile.  Their existing skip/loose path remains the
+                # authority and performs no LTFS operation.
+                reconcile_report = {
+                    "verdict": "ready", "blocking": [], "cases": []}
+            if reconcile_report["verdict"] == TAR_RECONCILE_BLOCKED:
+                raise RuntimeError(
+                    "[STAGING] Stored TAR startup reconciliation blocked the "
+                    "chunk: " + "; ".join(reconcile_report["blocking"]))
+            preserve_reconciled = any(
+                item.get("action") in (
+                    "adopted_pair", "none", "quarantined_equivalent_part")
+                and item.get("container_id") is not None
+                for item in reconcile_report["cases"])
+            if (not preserve_reconciled and os.path.isdir(pack_dir)):
+                self.host._cleanup_dir(pack_dir)
+            resumed = self.host._try_resume_pack(
+                session_id, chunk_index, pack_dir)
+            if resumed is not None:
+                return resumed
             self.host.db.update_chunk_status(session_id, chunk_index,
                     ChunkStatus.FETCHING.value)
             fetch_start = time.perf_counter()
@@ -738,6 +808,14 @@ class RemoteChunkStager:
                 desc.fetch_bytes = _dir_tree_size(fetch_dir)
                 desc.ram_stats.update(ram_stats)
             return desc
+        resumed = self.host._try_resume_pack(session_id, chunk_index, pack_dir)
+        if resumed is not None:
+            return resumed
+        if os.path.isdir(pack_dir):
+            get_logger().warning(
+                "clearing an unusable leftover pack dir before repacking "
+                "chunk %s: %s", chunk_index + 1, pack_dir)
+            self.host._cleanup_dir(pack_dir)
         # The session id is embedded so the on-tape root (basename(pack_dir),
         # see LTOBackup._run_locked) is unique per session — two sessions on the
         # same tape never collide on '_pack_NNN'. Resuming a session reuses the
@@ -1115,6 +1193,17 @@ class RemoteChunkStager:
                 "(inventory changed); re-fetching", chunk_index + 1)
             print(f"[REMOTE] Preserved pack for chunk {chunk_index + 1} failed "
                   f"its integrity check — re-fetching it.")
+            return None
+
+        # The marker authorizes reuse but is not archive payload.  Consume it
+        # before the descriptor reaches the writer's exact-pack validator, so
+        # it can never be copied to tape as an undeclared extra file.
+        try:
+            os.remove(marker)
+        except OSError:
+            get_logger().warning(
+                "validated resume marker for chunk %s could not be consumed; "
+                "refusing reuse", chunk_index + 1, exc_info=True)
             return None
 
         containers = [
