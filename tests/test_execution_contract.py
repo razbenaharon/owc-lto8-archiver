@@ -19,7 +19,7 @@ from unittest import mock
 from src import ltfs_ownership as own
 from src import remote_orchestrator as ro
 from src.exit_codes import ExitCode, REASON_AMBIGUOUS_BACKING_CHUNK
-from src.pipeline_types import ChunkStatus, StagedChunk
+from src.pipeline_types import ChunkStatus, ContainerFormat, StagedChunk
 from src.remote_writer import RemoteChunkWriter
 
 from lto_fakes import TapeLockObserver, TapeOperationLog
@@ -31,6 +31,7 @@ def _desc(index, skip_tape=False):
     return StagedChunk(chunk_index=index, fetch_dir=f"/tmp/_f{index}",
                        pack_dir=f"/tmp/_p{index}", metadata=[],
                        staged_bytes=GiB, source_missing_files=[],
+                       session_id=37, packaging_format=ContainerFormat.ZIP,
                        skip_tape=skip_tape)
 
 
@@ -73,6 +74,7 @@ class _ContractHarness(unittest.TestCase):
 
         db = mock.MagicMock()
         db.get_chunk_size_summary.return_value = {}
+        db.get_chunk_packaging_format.return_value = ContainerFormat.ZIP
         db.update_chunk_status.side_effect = (
             lambda sid, ci, status: outer.statuses.append((ci, status)))
         orch.db = db

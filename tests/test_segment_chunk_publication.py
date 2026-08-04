@@ -22,6 +22,7 @@ from unittest import mock
 
 from src.archive_artifacts import JsonlZstArtifactWriter, segment_locator
 from src.planning import StreamingChunkBuilder
+from src.pipeline_types import ContainerFormat
 from src import scan_frontier as sf
 from src.scan_frontier import SegmentChunkPublisher
 
@@ -38,6 +39,7 @@ class PublisherDB:
         self.consumed = []
         self.errors = []
         self.import_calls = []
+        self.append_gate_kwargs = []
         self.membership_queries = 0
 
     # -- segments ---------------------------------------------------------
@@ -122,14 +124,25 @@ class PublisherDB:
         return first, last
 
     # -- chunks -----------------------------------------------------------
-    def append_remote_streaming_chunk(self, session_id, chunk_index, rows):
+    def append_remote_streaming_chunk(
+            self, session_id, chunk_index, rows, *,
+            stored_tar_write_enabled=False, reader_contract_version=None,
+            require_container_format_schema=False):
         rows = list(rows)
         if any(s["chunk_index"] == chunk_index for s in self.sealed):
             raise RuntimeError(
                 f"[DB] Chunk {chunk_index + 1} is SEALED; refusing to append.")
         self.appended.append((chunk_index, rows))
+        self.append_gate_kwargs.append({
+            "stored_tar_write_enabled": stored_tar_write_enabled,
+            "reader_contract_version": reader_contract_version,
+            "require_container_format_schema": require_container_format_schema,
+        })
         return {"inserted_files": len(rows),
                 "inserted_bytes": sum(int(r[3]) for r in rows)}
+
+    def get_chunk_packaging_format(self, session_id, chunk_index):
+        return ContainerFormat.ZIP
 
     def seal_remote_chunk(self, session_id, chunk_index, *,
                           expected_file_count, expected_bytes,

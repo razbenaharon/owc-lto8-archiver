@@ -2,7 +2,9 @@
 import argparse
 import json
 import os
+import stat
 import sys
+from datetime import datetime, timezone
 from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -36,8 +38,9 @@ from src.pg_backup import (
     create_migrated_database_from_backup,
     create_verified_production_backup,
     verify_backup_file,
+    verify_backup_receipt,
 )
-from src.pg_bulk import build_conninfo
+from src.pg_bulk import build_conninfo, make_conninfo
 from src.session_reconcile import (
     DEFAULT_IDLE_SECONDS,
     format_report,
@@ -102,6 +105,28 @@ def _print_json(payload):
 def _open_db(cfg):
     try:
         return create_database_manager(cfg)
+    except RuntimeError as exc:
+        print(f"\n{exc}")
+        raise SystemExit(1) from exc
+
+
+def _open_no_init_db(cfg):
+    """Open PostgreSQL without implicit startup DDL."""
+    from src.pg_db import PgDatabaseManager
+    try:
+        return PgDatabaseManager(_conninfo(cfg), init_schema=False)
+    except RuntimeError as exc:
+        print(f"\n{exc}")
+        raise SystemExit(1) from exc
+
+
+def _open_read_only_db(cfg):
+    """Open a manager whose server sessions reject every write."""
+    from src.pg_db import PgDatabaseManager
+    conninfo = make_conninfo(
+        _conninfo(cfg), options="-c default_transaction_read_only=on")
+    try:
+        return PgDatabaseManager(conninfo, init_schema=False)
     except RuntimeError as exc:
         print(f"\n{exc}")
         raise SystemExit(1) from exc
@@ -226,6 +251,318 @@ def _apply_incremental_scan_schema(cfg, args, parser):
             finalize=bool(args.finalize))
         preflight["installed"] = db.incremental_scan_schema_installed()
         preflight["finalized"] = db.incremental_scan_schema_finalized()
+    finally:
+        db.close()
+    _print_json(preflight)
+    return 0
+
+
+def _windows_drive_device_target(drive):
+    """Resolve a DOS drive mapping without opening the mounted filesystem."""
+    if os.name != "nt":
+        return drive.casefold()
+    import ctypes
+
+    buffer = ctypes.create_unicode_buffer(32768)
+    result = ctypes.windll.kernel32.QueryDosDeviceW(
+        drive.rstrip("\\/"), buffer, len(buffer))
+    if not result:
+        raise OperationalError(
+            "[MIGRATION 015] A drive mapping could not be resolved; staging "
+            "location evidence is indeterminate")
+    targets = [item for item in buffer[:result].split("\0") if item]
+    if len(targets) != 1:
+        raise OperationalError(
+            "[MIGRATION 015] A drive has multiple device mappings; staging "
+            "location evidence is indeterminate")
+    target = targets[0].casefold()
+    # SUBST commonly returns ``\??\Z:\...``.  Treat every namespace alias
+    # as indeterminate rather than recursively resolving a path that may lead
+    # to LTFS.  Plain local and LTFS drive letters both resolve canonically
+    # through the device namespace; redirected network drives are not local.
+    if (not target.startswith("\\device\\")
+            or target.startswith(("\\device\\mup\\",
+                                  "\\device\\lanmanredirector\\"))):
+        raise OperationalError(
+            "[MIGRATION 015] A drive mapping is aliased or non-local; staging "
+            "location evidence is indeterminate")
+    return target
+
+
+def _assert_plain_local_directory(path):
+    """Reject aliases/reparse components without following any of them."""
+    if (path.startswith(("\\\\", "//"))
+            or path.casefold().startswith(("\\\\?\\", "\\\\.\\"))):
+        raise OperationalError(
+            "[MIGRATION 015] Staging must be a plain local drive path; aliases "
+            "and device/UNC paths are refused")
+    drive, tail = os.path.splitdrive(path)
+    if not drive or not tail.startswith(("\\", "/")):
+        raise OperationalError(
+            "[MIGRATION 015] Staging is not an absolute local drive path")
+
+    current = drive + os.sep
+    components = [part for part in tail.replace("/", "\\").split("\\")
+                  if part]
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    try:
+        for component in components:
+            current = os.path.join(current, component)
+            info = os.lstat(current)
+            if (not stat.S_ISDIR(info.st_mode)
+                    or getattr(info, "st_file_attributes", 0) & reparse_flag):
+                raise OperationalError(
+                    "[MIGRATION 015] Staging contains a non-directory or "
+                    "reparse component; evidence is indeterminate")
+    except OperationalError:
+        raise
+    except OSError as exc:
+        raise OperationalError(
+            "[MIGRATION 015] Staging path metadata is unreadable; evidence is "
+            "indeterminate") from exc
+    return drive
+
+
+def _inspect_container_format_staging(cfg, db, session_id, chunk_indexes):
+    """Prove the deterministic candidate staging paths are absent.
+
+    This inspects only the session's configured local staging root.  It rejects
+    an LTFS-drive match before any filesystem call and returns no path/name, so
+    the persisted evidence remains suitable for a public-code deployment.
+    """
+    session = db.get_remote_session(int(session_id))
+    if not session:
+        raise OperationalError(
+            f"[MIGRATION 015] Session {session_id} does not exist")
+    root_text = str(session.get("staging_dir") or "").strip()
+    if not root_text:
+        raise OperationalError(
+            "[MIGRATION 015] Session staging root is absent; evidence is "
+            "indeterminate")
+    root = os.path.abspath(root_text)
+    lto_text = str(getattr(cfg, "lto_drive", "") or "").strip()
+    if not lto_text:
+        raise OperationalError(
+            "[MIGRATION 015] LTFS drive configuration is absent; staging "
+            "separation cannot be proved")
+    lto_root = os.path.abspath(lto_text)
+    if (lto_root.startswith(("\\\\", "//"))
+            or lto_root.casefold().startswith(("\\\\?\\", "\\\\.\\"))):
+        raise OperationalError(
+            "[MIGRATION 015] LTFS drive configuration is aliased; staging "
+            "separation cannot be proved")
+    lto_drive = os.path.splitdrive(lto_root)[0]
+    if not lto_drive:
+        raise OperationalError(
+            "[MIGRATION 015] LTFS drive configuration is indeterminate")
+    if (root.startswith(("\\\\", "//"))
+            or root.casefold().startswith(("\\\\?\\", "\\\\.\\"))):
+        raise OperationalError(
+            "[MIGRATION 015] Staging must be a plain local drive path")
+    root_drive = os.path.splitdrive(root)[0]
+    if not root_drive:
+        raise OperationalError(
+            "[MIGRATION 015] Staging is not an absolute local drive path")
+
+    # Resolve and compare drive mappings before *any* lstat/scandir call.  A
+    # literal LTFS path or SUBST alias must be refused without opening it.
+    if (root_drive.casefold() == lto_drive.casefold()
+            or _windows_drive_device_target(root_drive)
+            == _windows_drive_device_target(lto_drive)):
+        raise OperationalError(
+            "[MIGRATION 015] Refusing staging inspection because the configured "
+            "session staging root is on the LTFS drive")
+    _assert_plain_local_directory(root)
+
+    try:
+        with os.scandir(root) as entries:
+            root_names = tuple(entry.name.casefold() for entry in entries)
+    except OSError as exc:
+        raise OperationalError(
+            "[MIGRATION 015] Session staging root is unreadable; evidence is "
+            "indeterminate") from exc
+
+    checked = sorted({int(index) for index in chunk_indexes})
+    candidate_names = set()
+    for chunk_index in checked:
+        candidate_names.update(name.casefold() for name in (
+            f"_fetch_s{int(session_id):04d}_{chunk_index:03d}",
+            f"_pack_s{int(session_id):04d}_{chunk_index:03d}",
+        ))
+    found = sum(name in candidate_names for name in root_names)
+
+    return {
+        "root_accessible": True,
+        "checked_chunk_indexes": checked,
+        "entry_count": found,
+        "unreadable_count": 0,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _run_container_format_schema_report(cfg, *, validate=False):
+    """Read-only migration-015 report/validation."""
+    db = _open_read_only_db(cfg)
+    try:
+        report = (db.validate_container_format_schema() if validate
+                  else db.container_format_schema_report())
+    finally:
+        db.close()
+    _print_json(report)
+    return 0
+
+
+def _apply_container_format_schema(cfg, args, parser):
+    """Guarded, explicit migration-015 entry point (Plan 2 Task 0.1)."""
+    if args.dry_run and args.execute:
+        parser.error(
+            "--apply-container-format-schema accepts only one of --dry-run "
+            "or --execute")
+    exception_session_id = args.stored_tar_exception_session_id
+    db = _open_read_only_db(cfg)
+    try:
+        preflight = db.container_format_schema_preflight(exception_session_id)
+        staging_evidence = None
+        if exception_session_id is not None:
+            exception = preflight.get("exception") or {}
+            boundary = exception.get("derived_boundary")
+            if boundary is not None:
+                indexes = [
+                    row["chunk_index"] for row in exception.get("chunks", [])
+                    if row["chunk_index"] >= boundary]
+                staging_evidence = _inspect_container_format_staging(
+                    cfg, db, exception_session_id, indexes)
+                if staging_evidence["entry_count"]:
+                    preflight["blocking"].append(
+                        "candidate chunks have deterministic fetch/pack staging "
+                        "evidence")
+                if staging_evidence["unreadable_count"]:
+                    preflight["blocking"].append(
+                        "candidate staging evidence is unreadable")
+    finally:
+        db.close()
+
+    preflight["requested"] = {
+        "execute": bool(args.execute),
+        "database": cfg.pg_dbname,
+        "stored_tar_exception_session_id": exception_session_id,
+        "expected_format_boundary": args.expected_format_boundary,
+        "format_approval_id": args.format_approval_id,
+    }
+    preflight["staging_evidence"] = staging_evidence
+
+    if not args.execute:
+        preflight["applied"] = []
+        preflight["note"] = (
+            "read-only preflight; execute requires --execute --yes and a "
+            "verified --backup-file")
+        _print_json(preflight)
+        return 0
+
+    if not args.yes:
+        parser.error("--apply-container-format-schema --execute requires --yes")
+    if not args.backup_file:
+        parser.error(
+            "--apply-container-format-schema --execute requires --backup-file "
+            "naming a PostgreSQL backup this tool can verify")
+    if preflight["blocking"]:
+        raise OperationalError(
+            "[MIGRATION 015] Refusing migration: "
+            + "; ".join(preflight["blocking"]))
+
+    if exception_session_id is None:
+        extras = (args.expected_format_boundary, args.format_approval_id,
+                  args.format_approval_reason)
+        if any(value is not None for value in extras):
+            parser.error(
+                "boundary/approval flags require "
+                "--stored-tar-exception-session-id")
+    else:
+        required = (args.expected_format_boundary, args.format_approval_id,
+                    args.format_approval_reason)
+        if any(value is None for value in required):
+            parser.error(
+                "an approved Stored TAR exception requires "
+                "--expected-format-boundary, --format-approval-id, and "
+                "--format-approval-reason")
+        derived = preflight["exception"]["derived_boundary"]
+        if int(args.expected_format_boundary) != int(derived):
+            raise OperationalError(
+                f"[MIGRATION 015] Expected boundary "
+                f"{args.expected_format_boundary} differs from the read-only "
+                f"derived boundary {derived}")
+        if staging_evidence is None:
+            raise OperationalError(
+                "[MIGRATION 015] Local staging evidence is absent")
+
+    holders = archiver_lock_status(_conninfo(cfg))
+    if holders:
+        raise OperationalError(
+            "[MIGRATION 015] Refusing while the archiver lock is held: "
+            f"{holders}")
+    processes = active_archive_processes()
+    if processes:
+        raise OperationalError(
+            "[MIGRATION 015] Refusing while archive/transfer processes are "
+            f"running ({len(processes)} detected)")
+    preflight["backup"] = verify_backup_receipt(cfg, args.backup_file)
+
+    # Pin the same cluster-wide lock used by production for the final evidence
+    # window. A worker starting after this point cannot acquire its run lock.
+    # The final DB classification and root-only staging scan are intentionally
+    # repeated under that lock immediately before the single SQL transaction.
+    db = _open_no_init_db(cfg)
+    try:
+        db.acquire_archiver_lock()
+        processes = active_archive_processes()
+        if processes:
+            raise OperationalError(
+                "[MIGRATION 015] Refusing after final liveness check "
+                f"({len(processes)} archive/transfer process(es) detected)")
+        locked_backup = verify_backup_receipt(cfg, args.backup_file)
+        if locked_backup["receipt_id"] != preflight["backup"]["receipt_id"]:
+            raise OperationalError(
+                "[MIGRATION 015] Backup receipt changed before locked apply")
+        processes = active_archive_processes()
+        if processes:
+            raise OperationalError(
+                "[MIGRATION 015] A transfer process appeared during final "
+                f"backup verification ({len(processes)} detected)")
+        final_preflight = db.container_format_schema_preflight(
+            exception_session_id, ignore_archiver_lock=True)
+        if final_preflight["blocking"]:
+            raise OperationalError(
+                "[MIGRATION 015] Final locked preflight refused migration: "
+                + "; ".join(final_preflight["blocking"]))
+
+        staging_evidence = None
+        if exception_session_id is not None:
+            final_exception = final_preflight["exception"]
+            final_boundary = final_exception["derived_boundary"]
+            if int(args.expected_format_boundary) != int(final_boundary):
+                raise OperationalError(
+                    "[MIGRATION 015] Evidence boundary changed before apply")
+            indexes = [
+                row["chunk_index"] for row in final_exception["chunks"]
+                if row["chunk_index"] >= final_boundary]
+            staging_evidence = _inspect_container_format_staging(
+                cfg, db, exception_session_id, indexes)
+            if (staging_evidence["entry_count"]
+                    or staging_evidence["unreadable_count"]):
+                raise OperationalError(
+                    "[MIGRATION 015] Final staging evidence is not empty and "
+                    "readable")
+
+        preflight["applied"] = db.apply_container_format_schema(
+            exception_session_id=exception_session_id,
+            expected_boundary=args.expected_format_boundary,
+            approval_id=args.format_approval_id,
+            approval_reason=args.format_approval_reason,
+            staging_evidence=staging_evidence,
+            require_archiver_lock=True)
+        preflight["validation"] = db.validate_container_format_schema()
+        preflight["final_locked_preflight"] = final_preflight
+        preflight["staging_evidence"] = staging_evidence
     finally:
         db.close()
     _print_json(preflight)
@@ -517,6 +854,26 @@ def _build_parser():
                         help="With --apply-incremental-scan-schema: also apply "
                              "the legacy membership audit and the final unique "
                              "constraints. Refuses on duplicate ordinals.")
+    parser.add_argument("--apply-container-format-schema", action="store_true",
+                        help="Migration 015. Read-only preflight unless "
+                             "--execute --yes --backup-file are supplied.")
+    parser.add_argument("--validate-container-format-schema",
+                        action="store_true",
+                        help="Fail-closed read-only validation of migration 015.")
+    parser.add_argument("--container-format-schema-report",
+                        action="store_true",
+                        help="Read-only migration-015 schema/format report.")
+    parser.add_argument("--stored-tar-exception-session-id", type=int,
+                        help="Individually approved legacy mixed-format session "
+                             "for the migration-015 evidence gate.")
+    parser.add_argument("--expected-format-boundary", type=int,
+                        help="Expected first Stored TAR chunk index; execute "
+                             "refuses if the evidence-derived value differs.")
+    parser.add_argument("--format-approval-id",
+                        help="Durable operator/review approval identifier for "
+                             "the legacy-session exception.")
+    parser.add_argument("--format-approval-reason",
+                        help="Durable explanation for the approved exception.")
     parser.add_argument("--backfill-directory-catalog", action="store_true",
                         help="Backfill directory catalog from legacy files_index.")
     parser.add_argument("--dry-run", action="store_true",
@@ -609,7 +966,19 @@ def _dispatch(parser, args):
 
     if args.backup_postgres:
         print(f"[DB BACKUP] Target: {cfg.db_display_ref}")
-        _print_json(create_verified_production_backup(cfg))
+        if active_archive_processes():
+            raise OperationalError(
+                "[DB BACKUP] Refusing while archive/transfer processes run")
+        lock_db = _open_no_init_db(cfg)
+        try:
+            lock_db.acquire_archiver_lock()
+            if active_archive_processes():
+                raise OperationalError(
+                    "[DB BACKUP] A transfer process appeared after the "
+                    "archiver lock was acquired")
+            _print_json(create_verified_production_backup(cfg))
+        finally:
+            lock_db.close()
         return 0
 
     if args.create_migrated_db:
@@ -640,6 +1009,15 @@ def _dispatch(parser, args):
 
     if args.apply_incremental_scan_schema:
         return _apply_incremental_scan_schema(cfg, args, parser)
+
+    if args.apply_container_format_schema:
+        return _apply_container_format_schema(cfg, args, parser)
+
+    if args.validate_container_format_schema:
+        return _run_container_format_schema_report(cfg, validate=True)
+
+    if args.container_format_schema_report:
+        return _run_container_format_schema_report(cfg, validate=False)
 
     if args.validate_directory_catalog:
         _print_json(validate_directory_catalog(_conninfo(cfg)))

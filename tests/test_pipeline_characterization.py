@@ -22,7 +22,7 @@ from unittest import mock
 from src import remote_orchestrator as ro
 from src import scan_frontier as sf
 from src.exit_codes import ExitCode
-from src.pipeline_types import StagedChunk
+from src.pipeline_types import ContainerFormat, StagedChunk
 from src.ready_queue import ReadyQueueLimits
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -113,7 +113,10 @@ class FakeStreamingDB(FakeFrontierCatalog):
         self.existing_paths_queries.append(list(paths))
         return set()
 
-    def append_remote_streaming_chunk(self, session_id, chunk_index, rows):
+    def append_remote_streaming_chunk(
+            self, session_id, chunk_index, rows, *,
+            stored_tar_write_enabled=False, reader_contract_version=None,
+            require_container_format_schema=False):
         self.calls.append("append_remote_streaming_chunk")
         rows = list(rows)
         self.appended.append((chunk_index, rows))
@@ -124,6 +127,9 @@ class FakeStreamingDB(FakeFrontierCatalog):
             "inserted_files": len(rows),
             "inserted_bytes": sum(int(r[3]) for r in rows),
         }
+
+    def get_chunk_packaging_format(self, session_id, chunk_index):
+        return ContainerFormat.ZIP
 
     # -- tape ------------------------------------------------------------
     def get_tape(self, label):
@@ -262,7 +268,9 @@ def build_streaming_orchestrator(db, *, prefetch_ahead=1, chunk_budget=4096,
         return StagedChunk(chunk_index=chunk_index,
                            fetch_dir=f"/tmp/_fetch_{chunk_index}",
                            pack_dir=f"/tmp/_pack_{chunk_index}",
-                           metadata=[], staged_bytes=1024)
+                           metadata=[], staged_bytes=1024,
+                           session_id=session_id,
+                           packaging_format=ContainerFormat.ZIP)
     orch._stage_chunk = _stage
     return orch
 
@@ -471,7 +479,9 @@ class ScannerPlannerCharacterizationTests(unittest.TestCase):
             return StagedChunk(chunk_index=chunk_index,
                                fetch_dir=f"/tmp/_fetch_{chunk_index}",
                                pack_dir=f"/tmp/_pack_{chunk_index}",
-                               metadata=[], staged_bytes=1024)
+                               metadata=[], staged_bytes=1024,
+                               session_id=session_id,
+                               packaging_format=ContainerFormat.ZIP)
         orch._stage_chunk = blocking_stage
 
         try:

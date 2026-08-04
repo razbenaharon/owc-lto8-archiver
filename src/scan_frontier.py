@@ -164,7 +164,9 @@ class RemoteScanCoordinator:
                  stop_event, budget_bytes, alloc_unit, padding_factor,
                  max_files, scanner_factory=None, on_budget_exceeded=None,
                  on_scan_error=None, on_chunk_published=None,
-                 publication_gate=None, on_finished=None):
+                 publication_gate=None, on_finished=None,
+                 stored_tar_write_enabled=False,
+                 stored_tar_reader_contract_version=None):
         self.db = db
         self.session_id = session_id
         self.scan_paths = list(scan_paths)
@@ -184,6 +186,9 @@ class RemoteScanCoordinator:
         #: renewed exploration queue behind the whole resumed backlog.
         self._publication_gate = publication_gate
         self._on_finished = on_finished
+        self._stored_tar_write_enabled = stored_tar_write_enabled is True
+        self._stored_tar_reader_contract_version = (
+            stored_tar_reader_contract_version)
 
     def _stopping(self):
         return CANCEL.is_set() or self.stop_event.is_set()
@@ -246,9 +251,15 @@ class RemoteScanCoordinator:
 
         chunk_index = state.next_chunk_index
         insert_started = time.monotonic()
+        gate_kwargs = {
+            "stored_tar_write_enabled": self._stored_tar_write_enabled,
+            "reader_contract_version":
+                self._stored_tar_reader_contract_version,
+            "require_container_format_schema": True,
+        }
         result = self.db.append_remote_streaming_chunk(
             self.session_id, chunk_index,
-            self._chunk_rows(chunk_index, chunk_files))
+            self._chunk_rows(chunk_index, chunk_files), **gate_kwargs)
         inserted_files = int(result.get('inserted_files', 0))
         inserted_bytes = int(result.get('inserted_bytes', 0))
         state.metrics.note_plan_insert(
@@ -643,7 +654,8 @@ class SegmentChunkPublisher:
 
     def __init__(self, *, db, session_id, archive_root, builder_factory,
                  legacy_session=False, publication_gate=None, on_sealed=None,
-                 budget_guard=None):
+                 budget_guard=None, stored_tar_write_enabled=False,
+                 stored_tar_reader_contract_version=None):
         self.db = db
         self.session_id = session_id
         self.archive_root = archive_root
@@ -660,6 +672,9 @@ class SegmentChunkPublisher:
         self._publication_gate = publication_gate
         self._on_sealed = on_sealed
         self._budget_guard = budget_guard
+        self._stored_tar_write_enabled = stored_tar_write_enabled is True
+        self._stored_tar_reader_contract_version = (
+            stored_tar_reader_contract_version)
         #: Set when a gate or the budget stopped publication mid-way, so the
         #: caller can stop claiming directories instead of spinning.
         self.halted = False
@@ -854,8 +869,14 @@ class SegmentChunkPublisher:
         """
         rows = [(chunk_index, path, os.path.basename(path), size)
                 for path, size in chunk_files]
+        gate_kwargs = {
+            "stored_tar_write_enabled": self._stored_tar_write_enabled,
+            "reader_contract_version":
+                self._stored_tar_reader_contract_version,
+            "require_container_format_schema": True,
+        }
         result = self.db.append_remote_streaming_chunk(
-            self.session_id, chunk_index, rows)
+            self.session_id, chunk_index, rows, **gate_kwargs)
         inserted = int(result.get("inserted_files", 0))
         inserted_bytes = int(result.get("inserted_bytes", 0))
         if inserted == 0:
@@ -919,7 +940,9 @@ class FrontierScanCoordinator:
                  legacy_session=False, publication_gate=None,
                  on_chunk_published=None, on_budget_exceeded=None,
                  on_scan_error=None, on_finished=None, ui=None,
-                 max_directories=None, owner_token=None):
+                 max_directories=None, owner_token=None,
+                 stored_tar_write_enabled=False,
+                 stored_tar_reader_contract_version=None):
         self.db = db
         self.session_id = session_id
         self.state = state
@@ -939,7 +962,10 @@ class FrontierScanCoordinator:
             db=db, session_id=session_id, archive_root=archive_root,
             builder_factory=builder_factory, legacy_session=legacy_session,
             publication_gate=publication_gate,
-            budget_guard=self._budget_guard, on_sealed=self._on_sealed)
+            budget_guard=self._budget_guard, on_sealed=self._on_sealed,
+            stored_tar_write_enabled=stored_tar_write_enabled,
+            stored_tar_reader_contract_version=(
+                stored_tar_reader_contract_version))
 
     def _stopping(self):
         return CANCEL.is_set() or self.stop_event.is_set()

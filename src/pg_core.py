@@ -4,6 +4,9 @@ Foundation shared by the method-group mixins (:mod:`src.pg_catalog`,
 :mod:`src.pg_sessions`, :mod:`src.pg_tapes`) that together form
 :class:`src.pg_db.PgDatabaseManager`.
 """
+import hashlib
+import json
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -129,6 +132,160 @@ class PgConnectionCore:
             with conn.cursor() as cur:
                 cur.execute(sql_path.read_text(encoding="utf-8"))
             conn.commit()
+
+    # ------------------------------------------------------------------
+    # Migration 015 - per-chunk/container packaging formats (Plan 2)
+    # ------------------------------------------------------------------
+
+    CONTAINER_FORMAT_MIGRATION = "015_postgres_container_formats.sql"
+
+    @classmethod
+    def container_format_migration_path(cls):
+        return (Path(PROJECT_ROOT) / "scripts" / "sql"
+                / cls.CONTAINER_FORMAT_MIGRATION)
+
+    @classmethod
+    def container_format_migration_checksum(cls):
+        """SHA-256 identity of the explicit migration file (read-only)."""
+        return hashlib.sha256(
+            cls.container_format_migration_path().read_bytes()).hexdigest()
+
+    def apply_container_format_schema(
+            self, *, exception_session_id=None, expected_boundary=None,
+            approval_id=None, approval_reason=None, staging_evidence=None,
+            require_archiver_lock=False):
+        """Atomically apply migration 015, optionally with one proved exception.
+
+        Migration 015 is never part of startup.  The normal call backfills every
+        pre-existing chunk as immutable ZIP.  The optional arguments are the
+        deliberately narrow operator-approved exception required for a legacy
+        mixed-format session: all five values must be present together, and the
+        SQL transaction independently re-runs the database evidence query before
+        assigning a never-started suffix directly to ``stored_tar``.
+
+        ``staging_evidence`` is produced by the guarded CLI immediately before
+        this call, while process/advisory-lock checks prove quiescence.  It never
+        contains a source filename or staging-root path.
+        """
+        supplied = (
+            exception_session_id, expected_boundary, approval_id,
+            approval_reason, staging_evidence)
+        if any(value is not None for value in supplied) and not all(
+                value is not None for value in supplied):
+            raise ValueError(
+                "container-format exception requires session, expected "
+                "boundary, approval id/reason, and staging evidence")
+        if exception_session_id is not None:
+            if int(exception_session_id) <= 0 or int(expected_boundary) < 0:
+                raise ValueError("invalid container-format exception identity")
+            approval_id = str(approval_id).strip()
+            approval_reason = str(approval_reason).strip()
+            if (not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", approval_id)
+                    or not approval_reason or len(approval_reason) > 512
+                    or any(not char.isprintable()
+                           for char in approval_reason)):
+                raise ValueError(
+                    "approval id/reason are blank, malformed, or too long")
+            self._validate_container_format_staging_evidence(staging_evidence)
+
+        reporter = getattr(self, "container_format_schema_report", None)
+        if callable(reporter):
+            report = reporter()
+            state = report.get("installation_state")
+            if state == "partial" or (report.get("metadata")
+                                       and not report.get("ready")):
+                raise RuntimeError(
+                    "[DB] Refusing to apply migration 015 over a partial or "
+                    "drifted installation: " + "; ".join(report["issues"]))
+
+        sql_path = self.container_format_migration_path()
+        checksum = self.container_format_migration_checksum()
+        settings = {
+            "lto.container_format_migration_checksum": checksum,
+            "lto.container_format_exception_session_id": (
+                "" if exception_session_id is None
+                else str(int(exception_session_id))),
+            "lto.container_format_expected_boundary": (
+                "" if expected_boundary is None
+                else str(int(expected_boundary))),
+            "lto.container_format_approval_id": (
+                "" if approval_id is None else str(approval_id).strip()),
+            "lto.container_format_approval_reason": (
+                "" if approval_reason is None else str(approval_reason).strip()),
+            "lto.container_format_staging_evidence": (
+                "" if staging_evidence is None else json.dumps(
+                    staging_evidence, sort_keys=True, separators=(",", ":"))),
+        }
+
+        def apply_on(conn):
+            # One transaction owns both authorization and every DDL/backfill
+            # statement.  When the guarded CLI holds the archiver lock, this is
+            # deliberately the *same PostgreSQL session*: losing that session
+            # loses both the lock and the migration transaction.
+            with conn.transaction():
+                if require_archiver_lock:
+                    owned = conn.execute(
+                        """SELECT EXISTS (
+                               SELECT 1 FROM pg_locks
+                               WHERE locktype='advisory' AND granted
+                                 AND pid=pg_backend_pid()
+                                 AND classid=%s AND objid=%s
+                                 AND objsubid=1) AS owned""",
+                        (self.ARCHIVER_LOCK_KEY >> 32,
+                         self.ARCHIVER_LOCK_KEY & 0xFFFFFFFF),
+                    ).fetchone()["owned"]
+                    if not owned:
+                        raise RuntimeError(
+                            "[DB] Migration 015 requires the current database "
+                            "session to own the archiver advisory lock")
+                for name, value in settings.items():
+                    conn.execute("SELECT set_config(%s, %s, true)",
+                                 (name, value))
+                with conn.cursor() as cur:
+                    cur.execute(sql_path.read_text(encoding="utf-8"))
+
+        if require_archiver_lock:
+            if self._lock_conn is None:
+                raise RuntimeError(
+                    "[DB] Migration 015 requires a pinned archiver lock")
+            apply_on(self._lock_conn)
+        else:
+            with self._pool.connection() as conn:
+                apply_on(conn)
+        return [self.CONTAINER_FORMAT_MIGRATION]
+
+    @staticmethod
+    def _validate_container_format_staging_evidence(evidence):
+        """Accept only a fresh, path-free local-staging attestation."""
+        expected_keys = {
+            "root_accessible", "checked_chunk_indexes", "entry_count",
+            "unreadable_count", "checked_at"}
+        if not isinstance(evidence, dict) or set(evidence) != expected_keys:
+            raise ValueError(
+                "staging evidence must contain only the approved aggregate "
+                "fields")
+        if evidence["root_accessible"] is not True:
+            raise ValueError("staging root was not proved accessible")
+        indexes = evidence["checked_chunk_indexes"]
+        if (not isinstance(indexes, list)
+                or any(isinstance(value, bool) or not isinstance(value, int)
+                       or value < 0 for value in indexes)
+                or indexes != sorted(set(indexes))):
+            raise ValueError("staging chunk indexes are not canonical")
+        for name in ("entry_count", "unreadable_count"):
+            value = evidence[name]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"staging evidence {name} is invalid")
+        try:
+            checked_at = datetime.fromisoformat(str(evidence["checked_at"]))
+            if checked_at.tzinfo is None:
+                raise ValueError
+            age = (datetime.now(timezone.utc)
+                   - checked_at.astimezone(timezone.utc)).total_seconds()
+        except (TypeError, ValueError) as exc:
+            raise ValueError("staging evidence timestamp is invalid") from exc
+        if age < -5 or age > 300:
+            raise ValueError("staging evidence is stale or from the future")
 
     # ------------------------------------------------------------------
     # Migration 014 — incremental scan frontier (Plan 1, Task 2.1)

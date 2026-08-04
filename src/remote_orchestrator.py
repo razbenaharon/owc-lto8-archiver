@@ -157,6 +157,7 @@ from .paths import (_LEGACY_PATH_LIMIT, _dir_tree_size,
                     _reserved_name_component, _volume_cluster_size,
                     _winsafe_extracted_rel)
 from .pipeline_types import ScanMetrics, StagedChunk, StreamState
+from .pg_containers import stored_tar_reader_contract_version
 from .ready_queue import ReadyQueue
 from .remote_pipeline import RemotePipelineCoordinator
 from .ram_telemetry import RamStageSampler
@@ -1190,6 +1191,10 @@ class RemoteOrchestrator:
             on_scan_error=_on_scan_error,
             publication_gate=pipeline.publication_gate,
             on_finished=pipeline.note_scanner_finished,
+            stored_tar_write_enabled=(getattr(
+                self.cfg, "stored_tar_write_enabled", False) is True),
+            stored_tar_reader_contract_version=(
+                stored_tar_reader_contract_version()),
         )
         pipeline.scan_coordinator = scan_coordinator
 

@@ -46,7 +46,7 @@ from .paths import (_LEGACY_PATH_LIMIT, _dir_tree_size,
                     _disambiguate_local_rel, _exceeds_legacy_path_limit,
                     _long, _remote_fetch_base_and_rel,
                     _reserved_name_component, _winsafe_extracted_rel)
-from .pipeline_types import ChunkStatus, StagedChunk
+from .pipeline_types import ChunkStatus, ContainerFormat, StagedChunk
 from .ram_telemetry import RamStageSampler
 from .remote_transport import _remote_tar_fetch
 from .runtime import (CANCEL, _fmt_eta, _phase, _progress_done, _progress_line,
@@ -171,6 +171,28 @@ class RemoteChunkStager:
     def _stage_chunk(self, session_id, chunk_index, chunk_files):
         """Fetch then pack one chunk. Returns a ready-descriptor or None."""
         self.host._producer_chunk = chunk_index
+        format_reader = getattr(
+            self.host.db, "get_chunk_packaging_format", None)
+        if not callable(format_reader):
+            raise RuntimeError(
+                "[STAGING] No durable chunk-format reader is available; "
+                "refusing to guess ZIP")
+        chunk_format = ContainerFormat(
+            format_reader(session_id, chunk_index))
+        if chunk_format is ContainerFormat.STORED_TAR:
+            recovery_guard = getattr(
+                self.host.db, "require_existing_stored_tar_recovery", None)
+            if not callable(recovery_guard):
+                raise RuntimeError(
+                    "[STAGING] Stored TAR chunk has no format-aware recovery "
+                    "reader; refusing to reinterpret it as ZIP")
+            # This deliberately does not inspect stored_tar_write_enabled:
+            # disabling NEW creation must not strand an existing immutable TAR.
+            recovery_guard(session_id, chunk_index)
+            raise RuntimeError(
+                "[STAGING] Stored TAR is durably assigned, but its direct "
+                "producer is not implemented until Plan 2 Phase 2; preserving "
+                "the chunk unchanged")
         # The session id is embedded so the on-tape root (basename(pack_dir),
         # see LTOBackup._run_locked) is unique per session — two sessions on the
         # same tape never collide on '_pack_NNN'. Resuming a session reuses the
@@ -252,6 +274,8 @@ class RemoteChunkStager:
                 ram_stats=ram_stats,
                 source_missing_files=source_missing_files,
                 skip_tape=True,
+                session_id=session_id,
+                packaging_format=chunk_format,
             )
 
         # --- PACK (small files -> ZIP, large files staged loose) ---
@@ -380,6 +404,8 @@ class RemoteChunkStager:
             ram_stats=ram_stats,
             source_missing_files=source_missing_files,
             skip_tape=False,
+            session_id=session_id,
+            packaging_format=chunk_format,
         )
 
     def _discard_desc(self, desc):
@@ -517,6 +543,8 @@ class RemoteChunkStager:
             ram_stats=payload.get("ram_stats") or {},
             source_missing_files=payload.get("source_missing_files") or [],
             skip_tape=bool(payload.get("skip_tape")),
+            session_id=session_id,
+            packaging_format=ContainerFormat.ZIP,
         )
         with self.host._staged_lock:
             self.host._staged_bytes += desc.staged_bytes

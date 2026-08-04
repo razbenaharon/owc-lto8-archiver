@@ -17,6 +17,7 @@ from .logsetup import get_logger
 from .ltfs import _ensure_lto_drive_ready, eject_tape_drive, note_tape_io_error
 from .ram_telemetry import RamStageSampler, TapeWriteProfiler
 from .reporting import append_backup_summary_row
+from .pipeline_types import validate_staged_chunk_writer_admission
 from .robocopy import (
     _parse_robocopy_summary, _run_robocopy_tuned, classify_robocopy_result,
     RobocopyVerdict)
@@ -80,6 +81,13 @@ class LTOBackup:
             tape_parent_dir=None, source_host='local', skipped_tracker=None,
             remote_session_id=None, remote_chunk_index=None,
             on_write_start=None):
+        if stage_stats is not None:
+            # A direct caller must fail on local/DB descriptor disagreement
+            # before Global LTFS ownership is acquired.  _run_locked repeats
+            # this for callers that deliberately enter below this wrapper.
+            validate_staged_chunk_writer_admission(
+                stage_stats, self.db,
+                expected_session_id=remote_session_id)
         print(f"[WARNING] {LTFS_WRITE_WARNING}")
         _acquire_tape_io_lock(f"backup write to {tape_drive}")
         try:
@@ -138,6 +146,13 @@ class LTOBackup:
             Empty for local/direct runs and for any producer that did not scan.
             """
             return dict(getattr(stage_stats, "scan_stats", None) or {})
+        if stage_stats is not None:
+            # Defense in depth for callers that bypass RemoteChunkWriter. This
+            # is deliberately before _ensure_lto_drive_ready: incomplete local
+            # TAR/sidecar state must cause zero tape interaction.
+            validate_staged_chunk_writer_admission(
+                stage_stats, self.db,
+                expected_session_id=remote_session_id)
         print(f"\n[BACKUP] Starting... Tape: {tape_label} | Drive: {tape_drive}")
         if not _ensure_lto_drive_ready(tape_drive, prefix="[BACKUP]"):
             raise RuntimeError("LTO drive is not ready for backup.")
