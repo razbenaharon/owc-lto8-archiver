@@ -92,8 +92,66 @@ def _dir_tree_size(path):
     return total
 
 
+def validate_remote_posix_relpath(path):
+    """Validate a remote POSIX relative path **without altering it**.
+
+    Plan 1, Task 3.3. Remote paths are Linux paths, and on Linux a backslash is
+    an ordinary filename character — ``a\\b`` is ONE file named ``a\\b``, not
+    ``a/b``. Anything that "normalizes" it into a separator turns two distinct
+    source files into one catalog key, and a restore then cannot tell them
+    apart.
+
+    This validator is byte/character-faithful: it checks the path is a usable
+    relative POSIX path and returns it **exactly as given**. It is the contract
+    for everything the incremental scanner produces.
+
+    Contrast :func:`_safe_remote_relpath`, which deliberately DOES rewrite
+    backslashes because it feeds Windows extraction, where a backslash is a
+    separator. Both behaviours are correct — for different questions — which is
+    why they are now two functions instead of one shared assumption.
+
+    Raises ``ValueError`` for an absolute path, a Windows drive path, an empty
+    path, or any ``.``/``..``/empty component.
+    """
+    text = path if isinstance(path, str) else str(path or '')
+    if not text:
+        raise ValueError("empty remote relative path")
+    if text.startswith('/') or re.match(r'^[A-Za-z]:[/\\]', text):
+        raise ValueError(f"remote relative path must not be absolute: {path!r}")
+    parts = text.split('/')
+    if any(part in ('', '.', '..') for part in parts):
+        raise ValueError(
+            f"remote relative path has an empty or traversal component: "
+            f"{path!r}")
+    return text
+
+
+def remote_path_is_legacy_safe(path):
+    """True when the legacy catalog canonicaliser would not alter this path.
+
+    ``src.pg_sessions._canonical_remote_path`` rewrites every backslash to a
+    forward slash, because that is what the existing catalog keys were built
+    with. It cannot be changed in place — session 37 alone holds millions of
+    rows canonicalised that way, and rewriting the rule would silently break
+    every lookup against them.
+
+    So instead, a path the legacy format cannot represent faithfully is
+    DETECTED, and the caller records it as an exceptional entry rather than
+    storing a mangled key. Rare in practice, and never silent when it happens.
+    """
+    text = path if isinstance(path, str) else str(path or '')
+    return '\\' not in text
+
+
 def _safe_remote_relpath(path):
-    """Return a tar-safe remote relative path using forward slashes."""
+    """Return a tar-safe remote relative path using forward slashes.
+
+    **Legacy compatibility path** (Plan 1, Task 3.3). It rewrites backslashes,
+    which is correct for its own job — mapping a remote name onto the Windows
+    filesystem an extraction writes to — but wrong as a general statement about
+    remote paths. New code that means "a faithful remote POSIX path" must call
+    :func:`validate_remote_posix_relpath` instead.
+    """
     rel = (path or '').replace('\\', '/')
     if rel.startswith('/') or re.match(r'^[A-Za-z]:/', rel):
         raise ValueError(f"unsafe relative path: {path}")

@@ -18,6 +18,7 @@ from src.config import ConfigManager
 from src.db import create_database_manager
 from src.logsetup import configure_file_logging, get_logger
 from src.pg_backup import create_database_backup
+from src.tape_reset import execute_reset
 
 
 _REMOVED_SQLITE_FLAGS = {
@@ -63,10 +64,41 @@ def _run_headless_remote_archive(argv):
     raise SystemExit(code)
 
 
+def _run_tape_reset(argv):
+    """Explicit destructive reset; deliberately unavailable from menus."""
+    import argparse
+    import json
+    parser = argparse.ArgumentParser(
+        prog="run.py tape-reset",
+        description="Destructively reset one mounted tape generation.")
+    parser.add_argument("--tape", required=True)
+    parser.add_argument("--impact-report", required=True)
+    parser.add_argument("--delete-catalog", action="store_true")
+    parser.add_argument("--yes", action="store_true")
+    parser.add_argument("--resume-operation")
+    args = parser.parse_args(argv)
+    cfg = ConfigManager()
+    configure_file_logging(cfg.backup_log_dir)
+    db = create_database_manager(cfg)
+    try:
+        result = execute_reset(
+            db, cfg, tape_label=args.tape,
+            impact_path=args.impact_report,
+            delete_catalog=args.delete_catalog, confirmed=args.yes,
+            resume_operation=args.resume_operation)
+        print(json.dumps(result, indent=2, default=str))
+    finally:
+        db.close()
+
+
 if __name__ == "__main__":
     try:
         if len(sys.argv) > 1 and sys.argv[1] == "remote-archive":
             _run_headless_remote_archive(sys.argv[2:])
+
+        if len(sys.argv) > 1 and sys.argv[1] == "tape-reset":
+            _run_tape_reset(sys.argv[2:])
+            raise SystemExit(0)
 
         if "--backup-db" in sys.argv:
             cfg = ConfigManager()

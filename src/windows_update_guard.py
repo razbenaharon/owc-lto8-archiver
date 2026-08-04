@@ -135,39 +135,233 @@ def _delete_value(root, path, name):
         pass
 
 
-def pending_reboot_reasons():
-    """Return a list of human-readable reasons Windows wants to restart now.
+# --- Reboot signal classification --------------------------------------------
+# Severity, not message text, is the decision mechanism. Before 2026-07-28 the
+# only lever was a boolean `include_soft`, wired to
+# `[WINDOWS_UPDATE] block_on_pending_reboot`. That conflated two unrelated
+# questions — "is this marker strong enough to block?" and "does the operator
+# want pending reboots to block at all?" — so the only way to stop a benign
+# PendingFileRenameOperations entry from blocking every write was to set
+# block_on_pending_reboot = false, which ALSO disabled blocking on SCCM, CBS and
+# Windows Update. The guard CLAUDE.md calls "the guard that holds" was switched
+# off to silence a stale rename queue. Severity fixes that: the rename marker is
+# warning-only by classification, so the operator flag can stay true.
+SEVERITY_CRITICAL = "critical"
+SEVERITY_WARNING = "warning"
 
-    A pending restart is the one state the pause cannot save us from: the
-    update is already staged, and Windows will take the restart at its next
-    opportunity regardless of the pause flag. The only safe move is to reboot
-    before starting a multi-hour tape write, not during one.
+# Typed reason codes. Callers and tests match on these, never on message text.
+REBOOT_WU_REQUIRED = "windows_update_reboot_required"
+REBOOT_WU_POST_REBOOT_REPORTING = "windows_update_post_reboot_reporting"
+REBOOT_CBS_PENDING = "cbs_reboot_pending"
+REBOOT_CBS_IN_PROGRESS = "cbs_reboot_in_progress"
+REBOOT_CBS_PACKAGES_PENDING = "cbs_packages_pending"
+REBOOT_COMPUTER_RENAME = "computer_rename_pending"
+REBOOT_DOMAIN_JOIN = "domain_join_pending"
+REBOOT_SCCM_PENDING = "sccm_reboot_pending"
+REBOOT_SCCM_HARD = "sccm_hard_reboot_pending"
+REBOOT_SCCM_INDETERMINATE = "sccm_state_unknown"
+REBOOT_FILE_RENAME = "pending_file_rename_operations"
+
+_SESSION_MANAGER_PATH = r"SYSTEM\CurrentControlSet\Control\Session Manager"
+_COMPUTERNAME_ACTIVE = (
+    r"SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName")
+_COMPUTERNAME_PENDING = (
+    r"SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName")
+_NETLOGON_PATH = r"SYSTEM\CurrentControlSet\Services\Netlogon"
+
+#: Key-existence markers that mean Windows has staged work only a restart
+#: completes. Each is (code, registry path, message).
+_CRITICAL_KEY_MARKERS = (
+    (REBOOT_WU_REQUIRED,
+     r"SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update"
+     r"\RebootRequired",
+     "Windows Update has staged an update and is waiting to restart"),
+    (REBOOT_WU_POST_REBOOT_REPORTING,
+     r"SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update"
+     r"\PostRebootReporting",
+     "Windows Update is waiting to report the result of a restart"),
+    (REBOOT_CBS_PENDING,
+     r"SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing"
+     r"\RebootPending",
+     "Component Based Servicing has a restart pending"),
+    (REBOOT_CBS_IN_PROGRESS,
+     r"SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing"
+     r"\RebootInProgress",
+     "Component Based Servicing reports a restart already in progress"),
+    (REBOOT_CBS_PACKAGES_PENDING,
+     r"SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing"
+     r"\PackagesPending",
+     "Component Based Servicing has packages waiting for a restart"),
+)
+
+
+class RebootSignal:
+    """One classified reason the host might be about to restart.
+
+    ``code`` is the stable identifier to branch on, ``source`` records where the
+    evidence came from (registry path or SCCM result field) so a diagnostic can
+    be traced back, and ``message`` is for humans only.
+    """
+
+    __slots__ = ("code", "severity", "source", "message")
+
+    def __init__(self, code, severity, source, message):
+        self.code = code
+        self.severity = severity
+        self.source = source
+        self.message = message
+
+    @property
+    def is_critical(self):
+        return self.severity == SEVERITY_CRITICAL
+
+    def as_dict(self):
+        return {"code": self.code, "severity": self.severity,
+                "source": self.source, "message": self.message}
+
+    def __repr__(self):
+        return f"RebootSignal({self.code}, {self.severity})"
+
+    def __eq__(self, other):
+        return (isinstance(other, RebootSignal)
+                and self.as_dict() == other.as_dict())
+
+    def __hash__(self):
+        return hash((self.code, self.severity, self.source, self.message))
+
+
+class RebootAssessment:
+    """The full classified picture, with the block/allow decision derived once.
+
+    ``blocking`` is true only when at least one CRITICAL signal is present. A
+    warning-only assessment is *not* discarded — it stays in ``warnings`` and is
+    logged by every caller, so a stale rename queue remains visible in
+    diagnostics without stopping a tape write.
+    """
+
+    __slots__ = ("signals", "sccm")
+
+    def __init__(self, signals, sccm=None):
+        self.signals = list(signals)
+        self.sccm = sccm
+
+    @property
+    def critical(self):
+        return [s for s in self.signals if s.is_critical]
+
+    @property
+    def warnings(self):
+        return [s for s in self.signals if not s.is_critical]
+
+    @property
+    def blocking(self):
+        """True when a real restart risk exists. Critical always wins."""
+        return bool(self.critical)
+
+    @property
+    def blocking_reasons(self):
+        return [s.message for s in self.critical]
+
+    @property
+    def warning_reasons(self):
+        return [s.message for s in self.warnings]
+
+    @property
+    def codes(self):
+        return [s.code for s in self.signals]
+
+    def reasons(self, include_warnings=True):
+        src = self.signals if include_warnings else self.critical
+        return [s.message for s in src]
+
+    def warning_summary(self):
+        """One line for the log when nothing blocks but something was seen."""
+        if not self.warnings:
+            return ""
+        return ("Pending reboot warning, non-blocking: "
+                + "; ".join(f"{s.message} [{s.code}]" for s in self.warnings)
+                + " — no critical reboot requirement was detected.")
+
+    def as_dict(self):
+        return {"blocking": self.blocking,
+                "critical": [s.as_dict() for s in self.critical],
+                "warnings": [s.as_dict() for s in self.warnings],
+                "sccm": self.sccm}
+
+
+def _key_exists(path):
+    if winreg is None:
+        return False
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path, 0, winreg.KEY_READ):
+            return True
+    except OSError:
+        return False
+
+
+def pending_reboot_signals():
+    """Classify every Windows-side pending-restart marker on this host.
+
+    Critical markers mean Windows has staged work that only a restart
+    completes. ``PendingFileRenameOperations`` is deliberately NOT one of them:
+    it is a list of file moves to apply *if* a restart happens and it never
+    causes one. Routine Edge and Defender updates leave entries there for days,
+    so treating it as "a restart is staged" is a permanent false positive that
+    no amount of waiting clears — which is exactly what happened here.
     """
     if winreg is None:
         return []
-    reasons = []
-    checks = (
-        (winreg.HKEY_LOCAL_MACHINE,
-         r"SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired",
-         "Windows Update has staged an update and is waiting to restart"),
-        (winreg.HKEY_LOCAL_MACHINE,
-         r"SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending",
-         "Component Based Servicing has a restart pending"),
-    )
-    for root, path, reason in checks:
-        try:
-            with winreg.OpenKey(root, path, 0, winreg.KEY_READ):
-                reasons.append(reason)
-        except OSError:
-            pass
+    signals = []
+
+    for code, path, message in _CRITICAL_KEY_MARKERS:
+        if _key_exists(path):
+            signals.append(RebootSignal(
+                code, SEVERITY_CRITICAL, f"HKLM\\{path}", message))
+
+    # A rename or domain join that has been written but not yet applied needs a
+    # restart to take effect, and the machine may be restarted to finish it.
+    active, _ = _read_value(
+        winreg.HKEY_LOCAL_MACHINE, _COMPUTERNAME_ACTIVE, "ComputerName")
+    target, _ = _read_value(
+        winreg.HKEY_LOCAL_MACHINE, _COMPUTERNAME_PENDING, "ComputerName")
+    if active and target and str(active).strip() != str(target).strip():
+        signals.append(RebootSignal(
+            REBOOT_COMPUTER_RENAME, SEVERITY_CRITICAL,
+            f"HKLM\\{_COMPUTERNAME_PENDING}",
+            f"A computer rename to '{target}' is pending a restart"))
+
+    for name in ("JoinDomain", "AvoidSpnSet"):
+        value, _ = _read_value(
+            winreg.HKEY_LOCAL_MACHINE, _NETLOGON_PATH, name)
+        if value:
+            signals.append(RebootSignal(
+                REBOOT_DOMAIN_JOIN, SEVERITY_CRITICAL,
+                f"HKLM\\{_NETLOGON_PATH}\\{name}",
+                "A domain-join operation is pending a restart"))
+            break
 
     renames, _ = _read_value(
-        winreg.HKEY_LOCAL_MACHINE,
-        r"SYSTEM\CurrentControlSet\Control\Session Manager",
+        winreg.HKEY_LOCAL_MACHINE, _SESSION_MANAGER_PATH,
         "PendingFileRenameOperations")
     if renames:
-        reasons.append("Files are queued to be renamed on the next restart")
-    return reasons
+        signals.append(RebootSignal(
+            REBOOT_FILE_RENAME, SEVERITY_WARNING,
+            f"HKLM\\{_SESSION_MANAGER_PATH}\\PendingFileRenameOperations",
+            "Files are queued to be renamed on the next restart"))
+    return signals
+
+
+def pending_reboot_reasons(include_soft=True):
+    """Human-readable Windows pending-restart reasons. Compatibility shim.
+
+    Retained for existing callers and diagnostics; the block/allow decision now
+    lives in :func:`assess_reboot_state`. ``include_soft=False`` drops the
+    warning-severity signals, which is what the old boolean meant.
+    """
+    signals = pending_reboot_signals()
+    if not include_soft:
+        signals = [s for s in signals if s.is_critical]
+    return [s.message for s in signals]
 
 
 def _sccm_query_client_sdk():
@@ -315,38 +509,75 @@ def sccm_reboot_status():
     return info
 
 
-def reboot_block_reasons(block_on_unknown=True):
-    """Every reason a new tape write must not start right now.
+def _sccm_signals(sccm, block_on_unknown):
+    """Turn the SCCM status dict into classified signals.
 
-    Unions the Windows pending-restart markers with the Configuration Manager
-    client's own intent. Returns ``(reasons, sccm)`` so callers can log the
-    structured SCCM state alongside the human-readable reasons.
+    Every SCCM signal is critical: the client stating restart intent is the
+    highest-confidence evidence available, and it is the control plane that
+    actually took the 2026-07-15 restart with 60 seconds of warning.
+    """
+    signals = []
+    if sccm.get("reboot_pending"):
+        detail = "Configuration Manager (SCCM) has a restart pending"
+        if sccm.get("in_grace_period"):
+            detail += " and the forced-restart grace period is running"
+        if sccm.get("deadline"):
+            detail += f" (deadline {sccm['deadline']})"
+        signals.append(RebootSignal(
+            REBOOT_SCCM_PENDING, SEVERITY_CRITICAL,
+            "CCM_ClientUtilities.DetermineIfRebootPending.RebootPending",
+            detail))
+    if sccm.get("hard_reboot_pending"):
+        signals.append(RebootSignal(
+            REBOOT_SCCM_HARD, SEVERITY_CRITICAL,
+            "CCM_ClientUtilities.DetermineIfRebootPending.IsHardRebootPending",
+            "SCCM reports a hard restart that cannot be deferred"))
+    if block_on_unknown and not sccm.get("determinate"):
+        # Fail closed, unchanged policy: unknown is never silently "safe".
+        signals.append(RebootSignal(
+            REBOOT_SCCM_INDETERMINATE, SEVERITY_CRITICAL,
+            "CCM_ClientUtilities.DetermineIfRebootPending",
+            "SCCM restart state could not be determined "
+            f"({sccm.get('error')}) — refusing to start a tape write blind"))
+    return signals
+
+
+def assess_reboot_state(block_on_unknown=True):
+    """Classify every restart indicator into a single :class:`RebootAssessment`.
+
+    This is the decision mechanism. Callers ask ``assessment.blocking`` rather
+    than inspecting message strings, so adding a marker or rewording a message
+    can never silently change whether a tape write is allowed to start.
 
     ``block_on_unknown`` is the difference between the two callers, and the
-    asymmetry is deliberate. At a tape-write boundary an indeterminate SCCM
-    answer must block: starting a multi-minute write while blind to the restart
-    state is the exact bet that lost ~126 GB on 2026-07-15, and the cost of
-    being wrong is one deferred chunk. The background sentinel passes False,
-    because there a transient WMI hiccup would stop a perfectly healthy run for
-    no reason — it polls again in 60s, and the pre-write gate still backstops it.
+    asymmetry is deliberate and unchanged. At a tape-write boundary an
+    indeterminate SCCM answer must block: starting a multi-minute write while
+    blind to the restart state is the exact bet that lost ~126 GB on
+    2026-07-15, and the cost of being wrong is one deferred chunk. The
+    background sentinel passes False, because there a transient WMI hiccup
+    would stop a perfectly healthy run for no reason — it polls again in 60s,
+    and the pre-write gate still backstops it.
     """
-    reasons = list(pending_reboot_reasons())
+    signals = list(pending_reboot_signals())
     sccm = sccm_reboot_status()
+    signals.extend(_sccm_signals(sccm, block_on_unknown))
+    return RebootAssessment(signals, sccm)
 
-    if sccm["reboot_pending"]:
-        detail = "Configuration Manager (SCCM) has a restart pending"
-        if sccm["in_grace_period"]:
-            detail += " and the forced-restart grace period is running"
-        if sccm["deadline"]:
-            detail += f" (deadline {sccm['deadline']})"
-        reasons.append(detail)
-    if sccm["hard_reboot_pending"]:
-        reasons.append("SCCM reports a hard restart that cannot be deferred")
-    if block_on_unknown and not sccm["determinate"]:
-        reasons.append(
-            "SCCM restart state could not be determined "
-            f"({sccm['error']}) — refusing to start a tape write blind")
-    return reasons, sccm
+
+def reboot_block_reasons(block_on_unknown=True, include_soft=None):
+    """Reasons a new tape write must not start. Compatibility wrapper.
+
+    Returns ``(blocking_reasons, sccm)``. Only CRITICAL signals appear — a
+    warning-only indicator such as ``PendingFileRenameOperations`` never blocks
+    on its own. ``include_soft`` is accepted and ignored: severity, not a
+    caller-supplied boolean, now decides what blocks. Use
+    :func:`assess_reboot_state` for the warnings too.
+    """
+    assessment = assess_reboot_state(block_on_unknown=block_on_unknown)
+    if assessment.warnings and not assessment.blocking:
+        get_logger().info("reboot_warning_non_blocking: %s",
+                          assessment.warning_summary())
+    return assessment.blocking_reasons, assessment.sccm
 
 
 def managed_update_policy():
@@ -439,10 +670,12 @@ class RebootSentinel:
     defended against.
     """
 
-    def __init__(self, stop_event, poll_seconds=60, on_detect=None):
+    def __init__(self, stop_event, poll_seconds=60, on_detect=None,
+                 include_soft=True):
         self.stop_event = stop_event
         self.poll_seconds = poll_seconds
         self.on_detect = on_detect
+        self.include_soft = include_soft
         self.triggered = False
         self._thread = None
         self._cancel = threading.Event()
@@ -451,9 +684,18 @@ class RebootSentinel:
         # block_on_unknown=False: a transient WMI failure must not stop a
         # healthy run. The pre-write gate refuses to start the next write while
         # the state is unknown, so nothing slips past on the path that matters.
-        reasons, _sccm = reboot_block_reasons(block_on_unknown=False)
-        if not reasons:
+        #
+        # Severity, not include_soft, decides. The sentinel used to trip within
+        # 60s on PendingFileRenameOperations unless the operator disabled the
+        # whole guard; now that marker is warning-only by classification, so it
+        # is logged and the run continues.
+        assessment = assess_reboot_state(block_on_unknown=False)
+        if not assessment.blocking:
+            if assessment.warnings:
+                get_logger().info("reboot_sentinel_warning_non_blocking: %s",
+                                  assessment.warning_summary())
             return False
+        reasons = assessment.blocking_reasons
         self.triggered = True
         message = ("[WU] A restart is now staged while the run is "
                    "active: " + "; ".join(reasons))
@@ -566,6 +808,23 @@ def ltfs_sync_mode_status(expect_seconds=300):
 # contains "ltfs" rather than pinning one spelling.
 _LTFS_PROCESS_MATCH = "ltfs"
 
+# ...but only ONE of those processes actually owns the mount: LtfsMain, which
+# performs the mount and emits the 61259 declaration. The others (LtfsManager,
+# LtfsMgmtSvc, LtfsAtMntSvc, LtfsGuiCancelShutdown) are services and GUI helpers
+# that outlive individual mounts.
+#
+# 2026-07-26: anchoring on the earliest *any* "ltfs" process broke a real run.
+# After a cartridge swap the LTFS services were restarted, but the GUI helper
+# LtfsGuiCancelShutdown survived from the previous day, so the mount window was
+# anchored ~28 h too early. The health check then swept in the OLD cartridge's
+# LOCATE faults and refused to write to a brand-new, provably clean tape.
+#
+# Preferring LtfsMain keeps the safety property intact: it starts before it
+# mounts the volume, so the anchor is still at or before the true mount, and the
+# evidence window can never be narrower than the mount itself. The broad match
+# stays as a fallback for SDE builds that name the mount process differently.
+_LTFS_MOUNT_PROCESS_MATCH = "ltfsmain"
+
 
 def ltfs_current_mount_status(expect_seconds=300):
     """Verify the *live* LTFS mount declared time@<expect_seconds>, and that the
@@ -599,6 +858,11 @@ def ltfs_current_mount_status(expect_seconds=300):
     # and the actual decision happen in Python so they are unit-testable.
     script = (
         "$ErrorActionPreference='Stop';"
+        "$m = Get-CimInstance Win32_Process "
+        f"-Filter \"Name LIKE '%{_LTFS_MOUNT_PROCESS_MATCH}%'\" "
+        "-ErrorAction SilentlyContinue |"
+        " Sort-Object CreationDate | Select-Object -First 1;"
+        "$mstart = if ($m) { $m.CreationDate.ToString('o') } else { '' };"
         "$p = Get-CimInstance Win32_Process "
         f"-Filter \"Name LIKE '%{_LTFS_PROCESS_MATCH}%'\" "
         "-ErrorAction SilentlyContinue |"
@@ -609,8 +873,8 @@ def ltfs_current_mount_status(expect_seconds=300):
         " Sort-Object TimeCreated -Descending | Select-Object -First 1;"
         "$etime = if ($e) { $e.TimeCreated.ToString('o') } else { '' };"
         "$emsg = if ($e) { ($e.Message -replace '\\s+',' ') } else { '' };"
-        "[pscustomobject]@{ProcStart=$pstart; EventTime=$etime; "
-        "EventMsg=$emsg} | ConvertTo-Json -Compress"
+        "[pscustomobject]@{MountProcStart=$mstart; ProcStart=$pstart; "
+        "EventTime=$etime; EventMsg=$emsg} | ConvertTo-Json -Compress"
     )
     try:
         proc = subprocess.run(
@@ -631,7 +895,10 @@ def ltfs_current_mount_status(expect_seconds=300):
         get_logger().warning("ltfs_current_mount_check_failed: %s", e)
         return info
 
-    proc_start = (data.get("ProcStart") or "").strip()
+    # Prefer the process that owns the mount; fall back to the broad match only
+    # when no LtfsMain-like process is running (differently-named SDE builds).
+    proc_start = ((data.get("MountProcStart") or "").strip()
+                  or (data.get("ProcStart") or "").strip())
     event_time = (data.get("EventTime") or "").strip()
     message = (data.get("EventMsg") or "").strip()
 
@@ -715,6 +982,14 @@ _LTFS_62173_FAULT_MARKERS = ("error on write", "error on read",
 _LTFS_HEALTH_EVENT_IDS = frozenset(
     set(_LTFS_FATAL_EVENTS) | set(_LTFS_DEGRADED_EVENTS) | {62173})
 
+# A physical LTFS format can complete without restarting LtfsMain. In that
+# case the process-start bound still includes faults from the generation that
+# was just erased. A format resets the health window only when IBM's own CSV
+# proves the complete new-generation sequence. Anything less remains fail-
+# closed, and any fault at/after the new mount boundary is still classified.
+_LTFS_FORMAT_EVIDENCE_IDS = frozenset({15013, 15024, 17228, 11031, 61223})
+_LTFS_FORMAT_WINDOW_SECONDS = 10 * 60
+
 # The authoritative source is IBM's own CSV trace, NOT the Windows "LTFS" event
 # log. Verified 2026-07-25: the Windows log contains **no 17267 events at all**
 # — the single most valuable early warning — and it had already rotated away
@@ -762,6 +1037,74 @@ def _classify_ltfs_health_rows(rows):
     return fatal, degraded
 
 
+def _latest_verified_format_boundary(rows):
+    """Return the latest proven post-format mount boundary, or ``None``.
+
+    ``rows`` are chronological normalised CSV rows with a private ``_when``
+    datetime. A reset requires, in order and within ten minutes:
+
+    * a newly reported volume UUID;
+    * ``Medium formatted successfully``;
+    * ``Volume Lock Status = 0x00``;
+    * ``Volume mounted successfully`` at fresh ``Gen = 1``.
+
+    A fatal/degraded health event or read-only declaration after the successful
+    format and before the mount invalidates that candidate. This deliberately
+    does not treat an ordinary remount, a bare Gen=1 line, or an incomplete
+    formatter attempt as a reset: those must continue to see the earlier fault.
+    """
+    latest_uuid = None
+    candidate = None
+    verified = None
+    for row in rows:
+        eid = row["id"]
+        when = row["_when"]
+        message = row["message"]
+        low = message.lower()
+
+        if eid == 15013 and "volume uuid is:" in low:
+            latest_uuid = when
+            continue
+
+        if eid == 15024 and "formatted successfully" in low:
+            uuid_recent = (latest_uuid is not None and
+                           0 <= (when - latest_uuid).total_seconds()
+                           <= _LTFS_FORMAT_WINDOW_SECONDS)
+            candidate = ({"uuid_at": latest_uuid, "formatted_at": when,
+                          "lock_at": None} if uuid_recent else None)
+            continue
+
+        if candidate is None:
+            continue
+        if (when - candidate["formatted_at"]).total_seconds() > \
+                _LTFS_FORMAT_WINDOW_SECONDS:
+            candidate = None
+            continue
+
+        fatal, degraded = _classify_ltfs_health_rows([row])
+        if fatal or degraded or (eid == 61223 and "read-only" in low):
+            candidate = None
+            continue
+
+        if eid == 17228 and "volume lock status" in low and "0x00" in low:
+            candidate["lock_at"] = when
+            continue
+
+        if (eid == 11031 and "volume mounted successfully" in low and
+                re.search(r"\bGen\s*=\s*1\b", message, re.I) and
+                candidate["lock_at"] is not None and
+                candidate["lock_at"] <= when):
+            verified = {
+                "uuid_at": candidate["uuid_at"],
+                "formatted_at": candidate["formatted_at"],
+                "lock_at": candidate["lock_at"],
+                "mounted_at": when,
+                "mounted_message": message,
+            }
+            candidate = None
+    return verified
+
+
 def ltfs_media_health(since_iso=None, log_path=None):
     """Report drive/medium faults the LTFS mount has logged.
 
@@ -777,7 +1120,8 @@ def ltfs_media_health(since_iso=None, log_path=None):
     """
     path = log_path or _LTFS_LOG_CSV_DEFAULT
     info = {"determinate": False, "ok": False, "fatal": [], "degraded": [],
-            "since": since_iso, "log_path": path, "error": None}
+            "since": since_iso, "effective_since": since_iso,
+            "post_format_reset": None, "log_path": path, "error": None}
 
     cutoff = None
     if since_iso:
@@ -806,7 +1150,8 @@ def ltfs_media_health(since_iso=None, log_path=None):
                     eid = int(rec[0])
                 except (TypeError, ValueError):
                     continue
-                if eid not in _LTFS_HEALTH_EVENT_IDS:
+                if eid not in (_LTFS_HEALTH_EVENT_IDS |
+                               _LTFS_FORMAT_EVIDENCE_IDS):
                     continue
                 when = _parse_ltfs_csv_time(rec[2])
                 if when is None:
@@ -814,15 +1159,35 @@ def ltfs_media_health(since_iso=None, log_path=None):
                 if cutoff is not None and when < cutoff:
                     continue
                 rows.append({"id": eid, "at": rec[2].strip(),
-                             "message": rec[6].strip()})
+                             "message": rec[6].strip(), "_when": when})
     except OSError as e:
         info["error"] = f"cannot read {path}: {e}"
         get_logger().warning("ltfs_media_health_check_failed: %s", info["error"])
         return info
 
+    reset = _latest_verified_format_boundary(rows)
+    effective_cutoff = cutoff
+    if reset and (effective_cutoff is None or
+                  reset["mounted_at"] > effective_cutoff):
+        effective_cutoff = reset["mounted_at"]
+        info["effective_since"] = reset["mounted_at"].isoformat()
+        info["post_format_reset"] = {
+            key: (value.isoformat() if hasattr(value, "isoformat") else value)
+            for key, value in reset.items()
+        }
+        get_logger().info(
+            "ltfs_media_health_post_format_reset: requested_since=%s "
+            "effective_since=%s", since_iso, info["effective_since"])
+
+    health_rows = [
+        {"id": row["id"], "at": row["at"], "message": row["message"]}
+        for row in rows
+        if row["id"] in _LTFS_HEALTH_EVENT_IDS and
+        (effective_cutoff is None or row["_when"] >= effective_cutoff)
+    ]
     # Newest first, so callers can report the latest event without re-sorting.
-    rows.reverse()
-    info["fatal"], info["degraded"] = _classify_ltfs_health_rows(rows)
+    health_rows.reverse()
+    info["fatal"], info["degraded"] = _classify_ltfs_health_rows(health_rows)
     info["determinate"] = True
     info["ok"] = not info["fatal"] and not info["degraded"]
     return info

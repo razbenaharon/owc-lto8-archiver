@@ -30,10 +30,12 @@ remain non-negotiable.
   strictly downward dependencies: `constants`/`pipeline_types` → `logsetup` →
   `runtime` → `paths` → `reporting`/`config`/`db` →
   `robocopy`/`remote_transport` → `ltfs` → `packer` → `scanning`/`planning` →
-  `backup`/`retriever` → `local_orchestrator`/`remote_orchestrator` →
+  `archive_artifacts` → `backup`/`retriever` →
+  `scan_frontier`/`remote_staging`/`remote_writer` → `remote_pipeline` →
+  `local_orchestrator`/`remote_orchestrator` →
   `orchestrators` (re-export facade) → `cli`; `src/db_inspector_qt.py` holds
   the GUI. The PostgreSQL layer is split the same way: `pg_bulk` → `pg_core`
-  → `pg_catalog`/`pg_sessions`/`pg_tapes` → `pg_db` (facade assembling
+  → `pg_catalog`/`pg_scan`/`pg_sessions`/`pg_tapes` → `pg_db` (facade assembling
   `PgDatabaseManager` from the mixins). Import the facades (`orchestrators`,
   `pg_db`) from application code; in tests, `mock.patch` targets must name the
   module a symbol is *used* in (e.g. `src.scanning._ssh_run`). Data files
@@ -49,10 +51,89 @@ remain non-negotiable.
   trace (`archiver.log`, via `src/logsetup.py`) also lives here: status lines
   and full exception tracebacks tee into it, console output unchanged. It is
   a debugging trace, not a statistics file — never parse it for reports.
+
 - `Framework & Drivers/` — installer assets and hardware documentation.
 - `scripts/sql/` — PostgreSQL schema/index/constraint migrations applied on
   startup by `PgDatabaseManager._init_schema`; `docker-compose.yml` runs the
   local database. Catalog rows are runtime data, not source.
+
+### The remote pipeline, after Plan 1
+
+`remote_orchestrator.py` used to be one 3,657-line class. It is now a **façade**
+over four modules, each owning one invariant. When you need to check whether a
+change is safe, this tells you which file to read:
+
+| module | owns | never does |
+| --- | --- | --- |
+| `scan_frontier.py` | the sole production scanner; discovery; sealing chunks | touch the tape |
+| `remote_staging.py` | SSH/tar fetch, retry classification, the staging watchdog, packing | touch the tape |
+| `remote_writer.py` | **the finite write group — the sole tape-writing entry path** | eject; retry into a failing drive; clear `backing` |
+| `remote_pipeline.py` | the single scheduling loop for BOTH session kinds | decide anything about the tape |
+
+**`remote_writer.py` is 351 lines and owns the complete finite write group.** It
+is the only place a remote pipeline copy enters the tape. Cartridge selection,
+announcement, and pre-run checks also exist in `remote_orchestrator.py`, so a
+review of all cartridge access must include both modules.
+
+Three rules the code now enforces rather than documents:
+
+- **No LTFS access outside a finite write group.** Not at startup, not while
+  waiting, not between group members, not at completion. Both loops announce the
+  target cartridge up front instead (it is verified once per group, under
+  ownership).
+- **The remote pipeline never ejects**, even with
+  `[HARDWARE] eject_after_session = true`. The setting still applies to the
+  attended local orchestrator.
+- **`backing` has no automatic retry.** `CHUNK_TRANSITIONS` allows only
+  `backing → done`; an unreadable chunk status now *stops the run* instead of
+  being treated as clear.
+
+Plan 1 is **COMPLETE AND ACTIVATED** (2026-08-03). Start here:
+`docs/plan1_handoff.md` — one page, what changes for an operator and what is
+still outstanding. Evidence and the task matrix: `docs/plan1_completion_gate.md`
+(§14 is the completion record). Every session was audited:
+`docs/session_health_report.md`.
+
+Current production state — verify, don't assume:
+
+- **The frontier scanner is the ONLY scanner a production run can build.**
+  `_run_streaming_session` constructs `FrontierScanCoordinator`; no module under
+  `src/` imports `build_legacy_scanner_factory` any more. There is deliberately
+  **no runtime fallback**: an unusable migration-014 schema stops the run
+  (`SAFETY_BLOCK` / `scan_frontier_unavailable`) rather than downgrading, because
+  a fallback is how two scanners end up on one frontier. Git history and the
+  verified backup are the rollback path.
+- Migration 014 is **applied and finalized** on
+  `lto_archive_directory_catalog_20260710_103359`. The persistent frontier
+  scanner is the sole production scanner. There is no legacy scan mode and no
+  incremental-scan feature flag.
+- **Known files are filtered before the chunk builder**, structurally. A durable
+  `remote_frontier_bootstraps` row identifies a migrated session; each of its
+  segments is reconciled once against the legacy snapshot (path AND size, one
+  set-based query per segment) and only genuinely new entries reach
+  `builder.add()`. Without a bootstrap row, only a definite empty snapshot is
+  treated as frontier-born; existing membership or any missing, exceptional, or
+  indeterminate probe fails toward reconciliation. A rediscovered file cannot
+  move a chunk boundary.
+- **Scan finality needs traversal evidence.** `scan_complete` is written only
+  when every scope reports final coverage. Catalog rows never establish it.
+- **Session 37** has a conservative frontier: 65 scopes and 65 roots queued
+  `pending`, nothing traversed, nothing marked complete (shadow-rehearsed
+  first, 12/12 invariants unchanged). Its 49 `done` chunks are on
+  **Tape_02** generation 1 (still active) — all 9 of its archive runs wrote
+  there, zero archive runs reference Tape_03, and `files_index` has zero rows
+  for Tape_03. Its `tape_label = Tape_03` is the NEXT target, not evidence of
+  where completed work resides. Tape_03 was reformatted twice and separately
+  received the 24 GiB Phase 5E synthetic pilot, so
+  `_verify_session_tape_generation` blocks a resume; do not bypass it.
+- **Session 36** is partial and **superseded by 37** (its chunks 1–10 are 100%
+  covered by plan 37; its `done` chunk 0 is unique and must be preserved). It
+  received **no intervention** by design — see the health report.
+- The scheduled tasks **`LTO-Archive-Resume`** and **`LTO-Archive-Watchdog`**
+  (10-minute repeating trigger) are **disabled**. The archiver cannot restart
+  itself. Re-enable with `Enable-ScheduledTask` when a run is authorised.
+- The operator-supervised tape rehearsal (`scripts/plan1_rehearsal.py` stage 3)
+  is **NOT RUN**.
 
 ## Build, Test, and Development Commands
 
@@ -77,6 +158,34 @@ after edits. Pure parsing, config, database, path-normalization, and reporting c
 **not** require real tape hardware — validate them directly where possible. For
 tape-related changes, reason carefully about hardware side effects and verify with a
 small staged dataset before a full remote archive run.
+
+### PostgreSQL tests need an explicit disposable server
+
+`python -m pytest -q` on its own is safe and complete except for the PostgreSQL
+suites, which **skip** (1312 passed, 149 skipped, 12 subtests passed; 2 warnings)
+because they refuse to guess a server. They used to fall back to
+`build_conninfo`'s defaults — `localhost:5432`,
+which is exactly where the **production** `lto_pg` container listens.
+`tests/pg_test_guard.py` now forbids that, fail-closed: no implicit defaults, no
+port 5432, no non-loopback host, and no server hosting `lto_archive`. A DSN that
+is set but unsafe **fails at collection**; it never degrades to a skip.
+
+```powershell
+docker run -d --name lto_pg_test -e POSTGRES_DB=postgres -e POSTGRES_USER=lto `
+  -e POSTGRES_PASSWORD=<pw> -p 127.0.0.1:15432:5432 `
+  --tmpfs /var/lib/postgresql/data:rw,size=2g --shm-size=1g postgres:17
+
+$env:LTO_TEST_PG_DSN = "postgresql://lto:<pw>@127.0.0.1:15432/postgres"
+$env:LTO_PG_SEALED_BATCH_IT = "1"
+python -m pytest tests/ -q            # 1461 passed, 0 skipped; 12 subtests passed
+
+docker rm -f lto_pg_test              # tmpfs: the server vanishes with it
+```
+
+Every test database is named `ltotest_<run-id>_…`; cleanup drops only names
+carrying the current run's marker, and `pytest_unconfigure` sweeps any that
+leaked. Port 55432 is blocked by a Windows excluded-port range on this host —
+15432 works.
 
 ## Logging & Reports
 
@@ -175,7 +284,14 @@ top-level Python entrypoint; internal code lives in `storage_map/lib/` and
   default 2 — never individual files) against the PostgreSQL catalog: one
   read-only aggregation of `files_index.original_path` prefixes
   (`webapp/coverage.py`), cached in `storage_map/logs/coverage_cache.json`
-  and refreshed only via the "Refresh DB coverage" button. Binds to
+  and refreshed only via the "Refresh DB coverage" button. It also serves a
+  **deletion ledger** (`storage_map/lib/deletions.py`, `GET /api/deletions`,
+  the "Reclaimed from servers" panel): the permanent record of server
+  directories deleted *after* their archive was verified on tape, each entry
+  carrying the verification numbers and a gzipped inventory of every removed
+  file. The module only records deletions — it never performs one. Rules,
+  permissions, and the deletion log live in
+  [docs/server_deletions.md](docs/server_deletions.md). Binds to
   `127.0.0.1:8765` (`web_port`/`match_depth`/`host_map`
   keys in `[STORAGE_MAP]`, all optional). The app is intentionally local-only
   and binds to `127.0.0.1`. `fastapi`/`uvicorn` are optional
@@ -211,6 +327,33 @@ hardware/manual verification if relevant, and any database/config changes. For
   it is printed as a `[WARNING]` (`LTFS_WRITE_WARNING`, defined in
   `src/constants.py`) at the start of every tape-write run and at remote-pipeline
   start.
+- **Retiring a cartridge is a status, not a number.** `tapes.status='full'`
+  (migration `011`, set via Database Management → 7 or the inspector's
+  *Mark Full / Re-activate*) is the only durable way to take a tape out of the
+  write rotation: `recalculate_tape_used_space` rewrites `used_space` from the
+  catalog on every mount, so editing byte counters to fake "full" is silently
+  undone at the next run. A marked tape reports zero available bytes from
+  `tape_budget_bytes` and is refused by both orchestrators before a write
+  starts. Tape_02 is marked this way — read-only at ~5 TB of 12 TB after its
+  PWE bit latched ([incident 010](docs/incidents/010-20260724-ltfs-write-perm-readonly.md)).
+- **A session row marked `active` is not proof that anything is running, and
+  the cleanup guard deliberately does not care.** `cleanup_unreferenced_remote_data`
+  refuses while *any* `remote_sessions.status='active'` row exists — a row is
+  treated as live until proven otherwise, so a crashed session blocks catalog
+  maintenance until a human resolves it. That refusal never softens. The way to
+  clear it is `inspect_db.py --reconcile-stale-sessions`
+  (`src/session_reconcile.py`), which proves staleness rather than assuming it:
+  it aborts entirely if any archiver lock holder or archiver process exists,
+  requires the session to have been silent for `--idle-seconds` (24h default),
+  refuses any session with a chunk left `fetching`/`packing`/`backing` (the
+  on-tape outcome is unknowable from the catalog), derives `completed` vs
+  `abandoned` from chunk state using the orchestrator's own rules, and updates
+  `WHERE status='active'` so a re-run is a no-op. Ambiguous cases are reported
+  and left alone. `--session-forensics` prints the same evidence read-only and
+  is safe during a live run.
+  Note `archiver_lock_status()` counts advisory locks **cluster-wide**, not per
+  database — deliberately conservative, but it means tests against a throwaway
+  DB must patch it or a live archiver on another database will block them.
 - **No Independent Write Verification.** Never add code that reads from the tape
   immediately after a write/copy operation just for verification purposes.
   Unnecessary reading right after writing causes wear and tear and damages the
@@ -295,6 +438,37 @@ hardware/manual verification if relevant, and any database/config changes. For
   - **The `RebootData` registry key's existence proves nothing** — verified
     2026-07-17: present but empty while SCCM reported no pending restart. Read
     its *values* (`RebootBy`, `HardReboot`), never its presence.
+- **Swapping cartridges: re-point the session, and never trust `Test-Path`.**
+  The first swap (2026-07-26, Tape_02 → Tape_03) broke on three things at once;
+  full detail in [incident 011](docs/incidents/011-20260726-tape-swap-blockers.md).
+  The checklist that falls out of it:
+  - **`Test-Path Z:\` returning True does not mean the drive is alive.** If the
+    drive re-enumerates on the SAS bus (`esas4hba` PHY link down/up, LTFS
+    `Device ... has been removed`), `LtfsMain` keeps the old mount point alive
+    on a dead handle. The tell is `Device is not ready (-21702)` repeating in
+    `LogFile.csv`, and `\\.\tape0` no longer existing while the drive is now
+    `\\.\tape1`. Fix: restart the LTFS services and kill the wedged `LtfsMain`.
+    Safe only when the stale volume is read-only with its sync thread already
+    dead — otherwise you are discarding a live index.
+  - **A resumed session writes to whatever `remote_sessions.tape_label` says**,
+    not to whatever is loaded. After a swap, `UPDATE remote_sessions SET
+    tape_label=...`. `_verify_mounted_cartridge()` now refuses to write on a
+    mismatch (fails closed), but it will not fix the row for you. Already-written
+    chunks keep their old tape — attribution is per-bundle on
+    `archive_bundles.tape_label` — so re-pointing is non-destructive.
+  - **A fresh cartridge is the cheapest drive-vs-media test there is.** When a
+    cartridge latches read-only with a PWE bit, load a new one and see whether it
+    also latches. Tape_03 mounted `Volume Lock Status = 0x00` and the separate
+    24 GiB Phase 5E synthetic pilot wrote normally on the same drive that was
+    under suspicion — which answered the question for free, without ITDT or a
+    cleaning cartridge. No Session 37 archive work was written to Tape_03.
+- **`Set-MpPreference -DisableRemovableDriveScanning $true` can silently
+  no-op.** It is policy-managed on this host: the call succeeds and the value
+  still reads `False` — the same trap as the Windows Update pause. The
+  `ExclusionPath` entry for the LTFS drive is what actually takes. Always read
+  the value back. This matters because on 2026-07-26 a background scanner (with
+  no `python.exe` or `robocopy` running) read Bundle zips off the tape for nine
+  hours, each read costing a 49-minute LOCATE timeout on a damaged cartridge.
 - **Verify LTFS `sync_type` from the mount, not the config file.** The two drift
   silently: an MSI reinstall of IBM Storage Archive SDE on 2026-07-16 13:52 reset
   `ltfs.conf.local` to its packaged contents (which is why that file is dated
@@ -304,3 +478,73 @@ hardware/manual verification if relevant, and any database/config changes. For
   start tape writes under anything but `time@5` — under `sync_type=unmount` the
   index is written only at unmount, so a forced restart loses every chunk since
   the mount, which is exactly how chunks 18-91 (~126 GB) died.
+
+### Critical operating baseline for Session 37 and future code changes
+
+These rules are non-negotiable and apply to all future work on this repository.
+
+#### During IDLE, do not touch LTFS
+
+After a write group finishes and ownership is released, the application must
+perform zero tape operations until the next finite group is ready. During idle,
+do not call readiness, read the tape label, access `Z:\`, run `os.listdir()` or
+`os.path.isdir()` on the LTFS root, invoke IBM LTFS helpers, run `vol`,
+`Test-Path`, `Get-Volume`, `Get-PSDrive`, or similar tape probes, run robocopy
+against the tape, eject, remount, format, or run `ltfsck`. Only passive log and
+telemetry observation is allowed.
+
+#### Write only in finite groups
+
+The required sequence is:
+
+```text
+prepare several chunks locally
+-> select one finite group
+-> acquire Global LTFS ownership once
+-> run readiness once
+-> verify the cartridge once
+-> write all selected chunks consecutively
+-> release ownership
+```
+
+Do not check readiness or read the label between chunks. Do not release
+ownership between chunks, and do not wait for future chunks while ownership is
+held. Every chunk keeps its own authoritative status. If a later chunk fails,
+earlier completed chunks remain completed, and unstarted packs remain reusable.
+
+#### On a hard tape failure, stop immediately
+
+For read-only, write-protect, servo, SCSI timeout, ownership loss, cartridge
+mismatch, LTFS instability, or hard robocopy failure: stop; do not retry or
+start another group; do not eject, remount, format, or run `ltfsck`; preserve
+packs, logs, and dumps; record the last successful chunk; and classify the
+outcome conservatively. No automatic recovery is allowed after a hard tape
+failure.
+
+#### After code changes, do not resume production immediately
+
+Use this progression:
+
+```text
+code change
+-> full offline tests
+-> isolated PostgreSQL tests
+-> small synthetic hardware pilot
+-> one bounded production group
+-> review
+-> broader Session 37 resume
+```
+
+Do not combine major refactoring, database changes, scheduling changes, a
+hardware pilot, and a full production resume into one step.
+
+Current production assumptions as of 2026-08-03:
+
+- Authoritative catalog: `lto_archive_directory_catalog_20260710_103359`.
+- Chunks 0-48 are done on Tape_02.
+- Chunks 49-112 are pending. `remote_sessions.tape_label = Tape_03` names their
+  next write target; it does not attribute any completed Session 37 work there.
+- Sealed batches and production observation remain disabled.
+- Tape_03 already contains the 24 GiB Phase 5E synthetic pilot data.
+- Do not resume Session 37 until code changes, tests, and a new bounded pilot
+  are reviewed.

@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from src.constants import PROJECT_ROOT
 os.chdir(PROJECT_ROOT)
 
+from src.cli_errors import OperationalError
 from src.config import ConfigManager
 from src.local_manifest_archive import (
     active_archive_processes,
@@ -37,6 +38,13 @@ from src.pg_backup import (
     verify_backup_file,
 )
 from src.pg_bulk import build_conninfo
+from src.session_reconcile import (
+    DEFAULT_IDLE_SECONDS,
+    format_report,
+    liveness_evidence,
+    reconcile_stale_remote_sessions,
+    session_forensics,
+)
 
 
 class _DbOverrideConfig:
@@ -102,15 +110,216 @@ def _open_db(cfg):
 def _require_maintenance_safe(cfg):
     holders = archiver_lock_status(_conninfo(cfg))
     if holders:
-        raise RuntimeError(
+        raise OperationalError(
             "[MANIFEST] Refusing maintenance while the archiver lock is held.")
     processes = active_archive_processes()
     if processes:
-        raise RuntimeError(
+        raise OperationalError(
             "[MANIFEST] Refusing maintenance while archive/transfer processes "
             f"are running: {processes}")
     return validate_archive_root(
         cfg.local_manifest_archive_root, (cfg.staging_dir,))
+
+
+def _run_all_session_health(cfg):
+    """READ-ONLY health classification across every session (Plan 1).
+
+    Opens no LTFS path, reads no tape, starts nothing, and writes no row.
+
+    ``init_schema=False`` is load-bearing, not a micro-optimisation: the default
+    ``PgDatabaseManager`` constructor APPLIES PENDING MIGRATIONS and commits
+    them. A command advertised as read-only that quietly migrates the catalog
+    would be a lie, and would make this report unusable as pre-change evidence —
+    the thing it exists to be. The liveness inputs are host-wide, so a run while
+    the archiver is active is reported rather than silently ignored.
+    """
+    from src.pg_db import PgDatabaseManager
+    from src.session_health import all_session_health
+
+    conninfo = _conninfo(cfg)
+    db = PgDatabaseManager(conninfo, init_schema=False)
+    try:
+        report = all_session_health(
+            db,
+            active_processes=active_archive_processes(),
+            lock_holders=archiver_lock_status(conninfo))
+    finally:
+        db.close()
+    report["database"] = cfg.pg_dbname
+    _print_json(report)
+    return 0
+
+
+def _apply_incremental_scan_schema(cfg, args, parser):
+    """Guarded entry point for migration 014 (Plan 1, Task 2.1).
+
+    Read-only by default. ``--dry-run`` (or neither flag) prints the preflight
+    and changes nothing; ``--execute --yes`` applies the BASE half, and adding
+    ``--finalize`` also applies the audit + final constraints.
+
+    Everything that could make this unsafe is checked BEFORE any DDL:
+
+    * the exact database identity is printed and must be confirmed, so a
+      migration cannot land on the wrong catalog;
+    * ``--backup-file`` must name a backup this tool can verify — a migration
+      whose only recovery path is "hope" is not a migration;
+    * no archiver process may hold the cluster advisory lock, because migrating
+      under a live run changes a session's schema mid-write;
+    * duplicate legacy plan ordinals are reported, and the finalize step will
+      REFUSE rather than resequence them.
+    """
+    db = _open_db(cfg)
+    try:
+        preflight = db.incremental_scan_schema_preflight()
+    finally:
+        db.close()
+    preflight["requested"] = {
+        "execute": bool(args.execute),
+        "finalize": bool(args.finalize),
+        "database": cfg.pg_dbname,
+    }
+
+    if not args.execute:
+        preflight["applied"] = []
+        preflight["note"] = (
+            "read-only preflight; re-run with --execute --yes "
+            "--backup-file <verified backup> to apply")
+        _print_json(preflight)
+        return 0
+
+    if not args.yes:
+        parser.error("--apply-incremental-scan-schema --execute requires --yes")
+    if not args.backup_file:
+        parser.error(
+            "--apply-incremental-scan-schema --execute requires --backup-file "
+            "naming a PostgreSQL backup this tool can verify")
+
+    holders = archiver_lock_status(_conninfo(cfg))
+    if holders:
+        raise OperationalError(
+            "[MIGRATION 014] Refusing to migrate while the archiver lock is "
+            f"held: {holders}. Stop the archive run first.")
+    processes = active_archive_processes()
+    if processes:
+        raise OperationalError(
+            "[MIGRATION 014] Refusing to migrate while archive/transfer "
+            f"processes are running: {processes}")
+    if preflight["archiver_lock_held"]:
+        raise OperationalError(
+            "[MIGRATION 014] The cluster advisory lock is held; refusing.")
+
+    preflight["backup"] = _verify_hot_backup(cfg, args.backup_file)
+
+    if args.finalize and preflight["duplicate_ordinal_groups"]:
+        raise OperationalError(
+            "[MIGRATION 014] Refusing to finalize: "
+            f"{preflight['duplicate_ordinal_groups']} duplicate "
+            "(plan_id, chunk_index, ordinal) group(s) exist in "
+            "remote_plan_files. They are NOT auto-resequenced — an ordinal "
+            "positions a file inside a chunk that may already be on tape. "
+            "Review them and decide per chunk. Sample: "
+            f"{preflight['duplicate_ordinal_sample']}")
+
+    db = _open_db(cfg)
+    try:
+        preflight["applied"] = db.apply_incremental_scan_schema(
+            finalize=bool(args.finalize))
+        preflight["installed"] = db.incremental_scan_schema_installed()
+        preflight["finalized"] = db.incremental_scan_schema_finalized()
+    finally:
+        db.close()
+    _print_json(preflight)
+    return 0
+
+
+def _run_frontier_bootstrap(cfg, args, parser):
+    """Dry-run / execute pair for the one-time frontier bootstrap (Task 4.2).
+
+    Dry run by default and always read-only: it validates the scope
+    configuration and the session's state and reports what would happen.
+    ``--execute --yes`` performs the migration, which traverses the source
+    read-only and creates persistent scope/directory/segment state.
+
+    It never rewrites a chunk, never changes the chunk format, and never
+    touches LTFS.
+    """
+    from src.frontier_bootstrap import FrontierBootstrap
+    from src.scan_frontier import build_frontier_scanner_factory
+    from src.skipped import SkippedFileTracker
+    from src.ui import ConsoleUI
+    import threading
+
+    if not args.session_id or len(args.session_id) != 1:
+        parser.error("--bootstrap-frontier requires exactly one --session-id")
+    session_id = args.session_id[0]
+
+    db = _open_db(cfg)
+    try:
+        bootstrap = FrontierBootstrap(
+            db=db, session_id=session_id,
+            scan_paths=cfg.remote_scan_paths,
+            archive_root=cfg.local_manifest_archive_root,
+            scanner_factory=build_frontier_scanner_factory(
+                remote_user=cfg.remote_user, remote_host=cfg.remote_host,
+                remote_password=cfg.remote_password,
+                skipped_tracker=SkippedFileTracker(), ui=ConsoleUI(),
+                timeout=cfg.ssh_command_timeout_seconds),
+            stop_event=threading.Event(), source_host=cfg.remote_host,
+            ui=ConsoleUI(),
+            # Real liveness evidence. Without these the bootstrap's
+            # quiescence gate would be told 'nothing is running' without
+            # anything having looked.
+            active_processes_probe=active_archive_processes,
+            lock_holders_probe=lambda: archiver_lock_status(_conninfo(cfg)))
+        if not args.execute:
+            report = bootstrap.dry_run()
+            report["note"] = ("dry run; nothing was created. Re-run with "
+                              "--execute --yes to perform the migration.")
+            _print_json(report)
+            return 0
+        if not args.yes:
+            parser.error("--bootstrap-frontier --execute requires --yes")
+        _print_json(bootstrap.execute(approved=True,
+                                      conservative=args.conservative))
+        return 0
+    finally:
+        db.close()
+
+
+def _run_session_frontier_report(cfg, args, parser):
+    """READ-ONLY frontier/membership report for one session (Task 4.1).
+
+    Creates no state, changes no row, and never touches LTFS. Liveness is
+    gathered here (the advisory lock and local archive processes) so the report
+    can say "a worker may still be running" instead of assuming it is not.
+    """
+    from src.startup_reconcile import session_frontier_report
+
+    if not args.session_id:
+        parser.error("--session-frontier-report requires --session-id")
+
+    try:
+        holders = archiver_lock_status(_conninfo(cfg))
+    except Exception:
+        holders = None                       # unknown, not "none"
+    try:
+        processes = active_archive_processes()
+    except Exception:
+        processes = None
+
+    db = _open_db(cfg)
+    try:
+        reports = [
+            session_frontier_report(
+                db, session_id,
+                archive_root=cfg.local_manifest_archive_root,
+                lock_holders=holders, active_processes=processes)
+            for session_id in args.session_id
+        ]
+    finally:
+        db.close()
+    _print_json({"database": cfg.pg_dbname, "reports": reports})
+    return 0
 
 
 def _verify_hot_backup(cfg, path):
@@ -123,16 +332,16 @@ def _verify_hot_backup(cfg, path):
 def _run_manifest_export(cfg, args):
     root = _require_maintenance_safe(cfg)
     if args.dry_run == args.execute:
-        raise RuntimeError(
+        raise OperationalError(
             "--export-small-file-manifests requires exactly one of --dry-run "
             "or --execute")
     if args.dry_run:
         _print_json(dry_run_export(_conninfo(cfg)))
         return 0
     if not args.yes:
-        raise RuntimeError("--execute requires --yes")
+        raise OperationalError("--execute requires --yes")
     if not args.hot_backup_path:
-        raise RuntimeError("--execute requires --hot-backup-path")
+        raise OperationalError("--execute requires --hot-backup-path")
     hot_backup = _verify_hot_backup(cfg, args.hot_backup_path)
     result = execute_export(
         _conninfo(cfg), root, args.hot_backup_path)
@@ -143,10 +352,10 @@ def _run_manifest_export(cfg, args):
 
 def _run_manifest_validate(cfg, args):
     if not args.heavy:
-        raise RuntimeError(
+        raise OperationalError(
             "--validate-local-manifest-export requires --heavy")
     if args.export_id is None:
-        raise RuntimeError("--export-id is required")
+        raise OperationalError("--export-id is required")
     _require_maintenance_safe(cfg)
     _print_json(validate_export(_conninfo(cfg), args.export_id))
     return 0
@@ -165,17 +374,17 @@ def _run_manifest_search(cfg, args):
 def _run_manifest_prune(cfg, args):
     _require_maintenance_safe(cfg)
     if args.export_id is None:
-        raise RuntimeError("--export-id is required")
+        raise OperationalError("--export-id is required")
     if args.dry_run == args.execute:
-        raise RuntimeError(
+        raise OperationalError(
             "--prune-exported-small-files requires exactly one of "
             "--dry-run or --execute")
     hot_backup = None
     if args.execute:
         if not args.yes:
-            raise RuntimeError("--execute requires --yes")
+            raise OperationalError("--execute requires --yes")
         if not args.hot_backup_path:
-            raise RuntimeError("--execute requires --hot-backup-path")
+            raise OperationalError("--execute requires --hot-backup-path")
         hot_backup = _verify_hot_backup(cfg, args.hot_backup_path)
     result = prune_export(
         _conninfo(cfg), args.export_id,
@@ -191,23 +400,34 @@ def _run_manifest_prune(cfg, args):
 def _run_legacy_cold_export(cfg, args):
     root = _require_maintenance_safe(cfg)
     if not args.execute or not args.yes:
-        raise RuntimeError(
+        raise OperationalError(
             "--export-legacy-cold-db requires --execute --yes")
     if not args.legacy_cold_dsn or not args.cold_backup_path:
-        raise RuntimeError(
+        raise OperationalError(
             "--legacy-cold-dsn and --cold-backup-path are required")
     _print_json(export_legacy_cold_database(
         args.legacy_cold_dsn, root, args.cold_backup_path))
     return 0
 
 
-def _cleanup_session_data(db, assume_yes):
+def _cleanup_session_data(db, assume_yes, cfg=None):
     try:
         summary = db.get_unreferenced_remote_data_summary()
         print("[DB] Unreferenced remote session data:")
         _print_json(summary)
         if summary['active_sessions']:
-            raise RuntimeError("Refusing cleanup while a remote session is active.")
+            # A row marked active is treated as live until proven otherwise —
+            # that refusal never softens. Print the liveness evidence beside it
+            # so the operator can tell a running archiver from a crashed
+            # session that nobody ever reaped.
+            if cfg is not None:
+                _print_json({"liveness": liveness_evidence(
+                    _conninfo(cfg), getattr(cfg, "backup_log_dir", None))})
+            raise OperationalError(
+                "[DB] Refusing cleanup while a remote session is active. "
+                "If nothing is running, --reconcile-stale-sessions --dry-run "
+                "shows whether those rows are stale and what they would "
+                "become.")
         if not summary['plans'] and not summary['snapshots']:
             print("[DB] Nothing to clean.")
             return 0
@@ -229,10 +449,10 @@ def _cleanup_session_data(db, assume_yes):
 def _run_backfill(db, args):
     try:
         if not args.dry_run and not args.execute:
-            raise RuntimeError(
+            raise OperationalError(
                 "--backfill-directory-catalog requires --dry-run or --execute")
         if args.dry_run and args.execute:
-            raise RuntimeError("Choose only one of --dry-run or --execute")
+            raise OperationalError("Choose only one of --dry-run or --execute")
         mode = "dry-run" if args.dry_run else "execute"
         print(f"[DB] Directory catalog backfill ({mode}) on target database...")
         result = db.backfill_directory_catalog_from_files_index(
@@ -268,6 +488,35 @@ def _build_parser():
                         help="Explicit DB name for --create-migrated-db.")
     parser.add_argument("--apply-directory-catalog-schema", action="store_true",
                         help="Apply scripts/sql/007 to the selected DB.")
+    parser.add_argument("--bootstrap-frontier", action="store_true",
+                        help="One-time migration of a session onto the "
+                             "incremental frontier. Dry run unless --execute "
+                             "--yes; traverses the source READ-ONLY and never "
+                             "rewrites a chunk.")
+    parser.add_argument("--all-session-health", action="store_true",
+                        help="READ-ONLY health classification for EVERY "
+                             "session. Creates no state, touches no LTFS.")
+    parser.add_argument("--conservative", action="store_true",
+                        help="With --bootstrap-frontier --execute: the "
+                             "STRUCTURE-ONLY migration. Creates scope rows "
+                             "and queues each root pending; lists no "
+                             "directory, imports no membership and never "
+                             "marks the scan complete. This is the correct "
+                             "shape for a session whose historical scan "
+                             "never finished.")
+    parser.add_argument("--session-frontier-report", action="store_true",
+                        help="READ-ONLY frontier/membership report for one or "
+                             "more sessions (--session-id). Creates no state "
+                             "and never touches LTFS.")
+    parser.add_argument("--apply-incremental-scan-schema", action="store_true",
+                        help="Migration 014 (incremental scan frontier). "
+                             "Read-only preflight unless --execute --yes "
+                             "--backup-file are all given; add --finalize for "
+                             "the audit + final constraints.")
+    parser.add_argument("--finalize", action="store_true",
+                        help="With --apply-incremental-scan-schema: also apply "
+                             "the legacy membership audit and the final unique "
+                             "constraints. Refuses on duplicate ordinals.")
     parser.add_argument("--backfill-directory-catalog", action="store_true",
                         help="Backfill directory catalog from legacy files_index.")
     parser.add_argument("--dry-run", action="store_true",
@@ -308,12 +557,45 @@ def _build_parser():
                         help="Result limit for local-manifest search.")
     parser.add_argument("--prune-batch-size", type=int, default=100000,
                         help="Maximum files_index rows committed per prune batch.")
+    parser.add_argument("--session-forensics", action="store_true",
+                        help="Read-only evidence for every active session.")
+    parser.add_argument("--reconcile-stale-sessions", action="store_true",
+                        help="Move provably-dead active sessions to a "
+                             "terminal status (needs --dry-run or --execute).")
+    parser.add_argument("--session-id", type=int, action="append",
+                        help="Limit reconciliation to this session id "
+                             "(repeatable).")
+    parser.add_argument("--idle-seconds", type=int,
+                        default=DEFAULT_IDLE_SECONDS,
+                        help="Silence required before a session may be "
+                             "called stale.")
     return parser
 
 
-def main(argv=None):
-    parser = _build_parser()
-    args = parser.parse_args(argv)
+def _run_session_forensics(cfg, args):
+    _print_json(session_forensics(
+        _conninfo(cfg), idle_seconds=args.idle_seconds,
+        log_dir=getattr(cfg, "backup_log_dir", None)))
+    return 0
+
+
+def _run_reconcile_sessions(cfg, args):
+    if args.dry_run == args.execute:
+        raise OperationalError(
+            "--reconcile-stale-sessions requires exactly one of --dry-run "
+            "or --execute")
+    if args.execute and not args.yes:
+        raise OperationalError("--execute requires --yes")
+    result = reconcile_stale_remote_sessions(
+        _conninfo(cfg), execute=args.execute,
+        idle_seconds=args.idle_seconds, session_ids=args.session_id,
+        log_dir=getattr(cfg, "backup_log_dir", None))
+    print(format_report(result))
+    _print_json(result)
+    return 0
+
+
+def _dispatch(parser, args):
     cfg = _config(args)
 
     if args.print_db_target:
@@ -347,6 +629,18 @@ def main(argv=None):
         })
         return 0
 
+    if args.all_session_health:
+        return _run_all_session_health(cfg)
+
+    if args.session_frontier_report:
+        return _run_session_frontier_report(cfg, args, parser)
+
+    if args.bootstrap_frontier:
+        return _run_frontier_bootstrap(cfg, args, parser)
+
+    if args.apply_incremental_scan_schema:
+        return _apply_incremental_scan_schema(cfg, args, parser)
+
     if args.validate_directory_catalog:
         _print_json(validate_directory_catalog(_conninfo(cfg)))
         return 0
@@ -359,8 +653,14 @@ def main(argv=None):
         _print_json(compare_databases(source, target))
         return 0
 
+    if args.session_forensics:
+        return _run_session_forensics(cfg, args)
+
+    if args.reconcile_stale_sessions:
+        return _run_reconcile_sessions(cfg, args)
+
     if args.cleanup_session_data:
-        return _cleanup_session_data(_open_db(cfg), assume_yes=args.yes)
+        return _cleanup_session_data(_open_db(cfg), assume_yes=args.yes, cfg=cfg)
 
     if args.backfill_directory_catalog:
         return _run_backfill(_open_db(cfg), args)
@@ -390,6 +690,25 @@ def main(argv=None):
         return run_qt_inspector(db, cfg.db_dsn, display_ref=cfg.db_display_ref)
     finally:
         db.close()
+
+
+def main(argv=None):
+    """Dispatch, turning deliberate refusals into one readable line.
+
+    Only :class:`OperationalError` is caught, and only here. It is raised
+    exclusively where a command decides *not* to do something — a held archiver
+    lock, a running transfer, a missing required flag. Every other exception
+    propagates untouched so its traceback still reaches the operator: catching
+    ``Exception`` here would swallow the ``KeyError`` from a renamed column and
+    report it as if the tool had refused on purpose.
+    """
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return _dispatch(parser, args)
+    except OperationalError as exc:
+        print(f"{exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

@@ -106,6 +106,8 @@ lives in the cartridge's MAM chip, so Tape_02 will still mount read-only
 afterwards. Cleaning is what makes it safe to trust the drive with the *next*
 cartridge, and it is why it must happen before any new media is committed.
 
-After this, the remaining decision for Tape_02 itself is unchanged: attempt
-`ltfsck` / SDE Check-Repair, or retire it read-only (the data is fully readable)
-and continue the remaining **73 GB** of session 37 on a new cartridge.
+Tape_02 was subsequently retired read-only; its data remains readable. Session
+37 now has 64 pending chunks, and their destination remains an operator
+decision. Its row names Tape_03 as the next target, but no Session 37 archive
+work has been written there. The earlier **73 GB** estimate is historical and
+must not be used as current capacity evidence.

@@ -2,6 +2,9 @@
 import hashlib
 import os
 
+from .cli_errors import OperationalError
+from .logsetup import get_logger
+from .pipeline_types import ChunkStatus
 from .pg_bulk import copy_rows
 from .pg_core import (_coerce_timestamp_kwargs, _now_utc, _row, _rows,
                       _valid_columns)
@@ -201,13 +204,16 @@ class PgSessionMixin:
         return conn.execute(
             """INSERT INTO remote_sessions
                (session_label, remote_host, remote_user, remote_path,
-                tape_label, staging_dir, created_at, status)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, 'active')
+                tape_label, tape_generation, staging_dir, created_at, status)
+               VALUES (%s, %s, %s, %s, %s,
+                       (SELECT current_generation FROM tapes
+                        WHERE volume_label=%s),
+                       %s, %s, 'active')
                ON CONFLICT (session_label) DO UPDATE
                    SET session_label = EXCLUDED.session_label
                RETURNING session_id""",
             (session_label, remote_host, remote_user, remote_path,
-             tape_label, staging_dir, now),
+             tape_label, tape_label, staging_dir, now),
         ).fetchone()["session_id"]
 
     def create_remote_session(self, session_label, remote_host, remote_user,
@@ -410,6 +416,24 @@ class PgSessionMixin:
                 raise RuntimeError(
                     f"[DB] Remote session {session_id} has no streaming plan")
 
+            # Plan 1 Task 2.4: a SEALED chunk's membership is immutable.
+            # Appending to one would change what an already-written (or
+            # about-to-be-written) tape chunk is supposed to contain, and the
+            # catalog would then describe bytes that are not there.
+            if self._column_exists_conn(conn, 'remote_chunks',
+                                        'membership_state'):
+                sealed = conn.execute(
+                    """SELECT membership_state FROM remote_chunks
+                       WHERE session_id=%s AND chunk_index=%s""",
+                    (session_id, int(chunk_index)),
+                ).fetchone()
+                if sealed and sealed["membership_state"] == 'sealed':
+                    raise RuntimeError(
+                        f"[DB] Chunk {int(chunk_index) + 1} of session "
+                        f"{session_id} is SEALED; refusing to append members. "
+                        "Its contents are fixed — a later append would change "
+                        "what a written chunk is recorded as containing.")
+
             existing = {
                 row["remote_path"]
                 for row in conn.execute(
@@ -494,6 +518,78 @@ class PgSessionMixin:
 
         return self._transaction(
             operation, f"append streaming remote chunk {chunk_index + 1}")
+
+    def seal_remote_chunk(self, session_id, chunk_index, *,
+                          expected_file_count, expected_bytes,
+                          scan_segment_id=None, first_scan_ordinal=None,
+                          last_scan_ordinal=None):
+        """Fix a chunk's membership, atomically, with what it should contain.
+
+        Plan 1, Task 2.4. Sealing records three things in ONE transaction:
+        the membership state, the expectation (how many files and how many
+        LOGICAL SOURCE bytes the chunk was planned from), and — when the chunk
+        came from the frontier — which ready segment range it consumed.
+
+        They must be atomic together. A chunk that is sealed without its
+        expectation cannot be checked against what was actually written, and a
+        chunk whose segment reference lands separately can be sealed against a
+        range the segment does not know it gave away.
+
+        Returns True when this call sealed it, False when it was already sealed
+        with the same expectation (idempotent under the ambiguous-commit retry).
+        """
+        now = _now_utc()
+
+        def operation(conn):
+            if not self._column_exists_conn(conn, 'remote_chunks',
+                                            'membership_state'):
+                raise RuntimeError(
+                    "[DB] Sealing requires migration 014 (remote_chunks has no "
+                    "membership_state column). Apply it explicitly first.")
+            current = conn.execute(
+                """SELECT membership_state, expected_file_count, expected_bytes
+                   FROM remote_chunks
+                   WHERE session_id=%s AND chunk_index=%s FOR UPDATE""",
+                (session_id, int(chunk_index)),
+            ).fetchone()
+            if current is None:
+                raise RuntimeError(
+                    f"[DB] Remote chunk not found: session {session_id}, "
+                    f"chunk {chunk_index}")
+            if current["membership_state"] == 'sealed':
+                same = (current["expected_file_count"] == int(expected_file_count)
+                        and current["expected_bytes"] == int(expected_bytes))
+                if same:
+                    return False
+                raise RuntimeError(
+                    f"[DB] Chunk {int(chunk_index) + 1} of session "
+                    f"{session_id} is already sealed with a DIFFERENT "
+                    f"expectation ({current['expected_file_count']} files / "
+                    f"{current['expected_bytes']} bytes). Refusing to re-seal.")
+
+            conn.execute(
+                """UPDATE remote_chunks
+                   SET membership_state='sealed', expected_file_count=%s,
+                       expected_bytes=%s, updated_at=%s
+                   WHERE session_id=%s AND chunk_index=%s""",
+                (int(expected_file_count), int(expected_bytes), now,
+                 session_id, int(chunk_index)),
+            )
+            if scan_segment_id is not None:
+                conn.execute(
+                    """INSERT INTO remote_chunk_scan_segments
+                       (session_id, chunk_index, scan_segment_id,
+                        first_scan_ordinal, last_scan_ordinal, created_at)
+                       VALUES (%s, %s, %s, %s, %s, %s)
+                       ON CONFLICT (scan_segment_id, first_scan_ordinal,
+                                    last_scan_ordinal) DO NOTHING""",
+                    (session_id, int(chunk_index), scan_segment_id,
+                     int(first_scan_ordinal), int(last_scan_ordinal), now),
+                )
+            return True
+
+        return self._transaction(
+            operation, f"seal chunk {int(chunk_index) + 1}")
 
     def _persist_remote_plan(self, conn, session_id, remote_host, remote_path,
                              rows, by_path, now):
@@ -747,20 +843,113 @@ class PgSessionMixin:
             "normalized manifest fetch-failure batch",
         )
 
-    def update_chunk_status(self, session_id, chunk_index, status):
+    def transition_chunk(self, session_id, chunk_index, to_status, *,
+                         expected_from=None, owner_token=None, attempt_id=None,
+                         error_msg=None, clear_error=False, validate=True):
+        """The ONE method that moves a chunk between persisted states.
+
+        Plan 1, Task 1.5. Before this, chunk status was written from half a
+        dozen call sites with bare strings, so "which transitions are legal"
+        existed only as a mental model — and the one transition that must never
+        happen automatically (out of ``backing``, where bytes may already be on
+        tape) was protected by convention rather than by code.
+
+        Arguments:
+          ``expected_from``  compare-and-swap predicate: a status or iterable of
+                             statuses the row must currently be in. ``None``
+                             means unconditional (the legacy behaviour, kept for
+                             the compatibility wrapper).
+          ``owner_token`` /
+          ``attempt_id``     validated against the row when those columns exist
+                             (migration 014). On a database without them a
+                             caller that supplies either is refused rather than
+                             silently unprotected — a claim you believe you hold
+                             but that is not enforced is worse than none.
+          ``error_msg`` /
+          ``clear_error``    written deliberately, never as a side effect. Pass
+                             ``clear_error=True`` to blank a stale message.
+          ``validate``       check :data:`~src.pipeline_types.CHUNK_TRANSITIONS`.
+
+        Returns True when the row moved, False when the compare-and-swap did not
+        match (someone else changed it first). Raises
+        :class:`~src.pipeline_types.ForbiddenTransition` for a transition the
+        matrix does not allow — the old state is preserved either way.
+        """
+        from .pipeline_types import (ChunkStatus, ForbiddenTransition,
+                                     assert_chunk_transition)
+
+        target = ChunkStatus(to_status).value if validate else str(to_status)
+        if expected_from is None:
+            expected = None
+        elif isinstance(expected_from, (str, ChunkStatus)):
+            expected = [ChunkStatus(expected_from).value]
+        else:
+            expected = [ChunkStatus(s).value for s in expected_from]
+        if validate and expected:
+            for source in expected:
+                assert_chunk_transition(source, target)
         now = _now_utc()
 
         def operation(conn):
+            if validate and not expected:
+                # No caller-supplied predicate: read the row's actual state and
+                # check the matrix against THAT, so a forbidden move (notably an
+                # automatic retry out of 'backing') is refused wherever it comes
+                # from, not only where the caller happened to know the source.
+                row = conn.execute(
+                    """SELECT status FROM remote_chunks
+                       WHERE session_id=%s AND chunk_index=%s FOR UPDATE""",
+                    (session_id, chunk_index),
+                ).fetchone()
+                if row is not None and row["status"] != target:
+                    assert_chunk_transition(row["status"], target)
+            has_owner = self._column_exists_conn(
+                conn, 'remote_chunks', 'owner_token')
+            if (owner_token is not None or attempt_id is not None) \
+                    and not has_owner:
+                raise RuntimeError(
+                    "[DB] A chunk claim was supplied, but this database has no "
+                    "owner_token/attempt_id columns (migration 014 is not "
+                    "applied). Refusing the transition rather than pretending "
+                    "the claim is enforced.")
+
+            sets = ["status=%s", "updated_at=%s"]
+            params = [target, now]
+            if clear_error:
+                sets.append("error_msg=NULL")
+            elif error_msg is not None:
+                sets.append("error_msg=%s")
+                params.append(error_msg)
+
+            where = ["session_id=%s", "chunk_index=%s"]
+            params.extend([session_id, chunk_index])
+            if expected:
+                where.append("status = ANY(%s)")
+                params.append(expected)
+            if owner_token is not None:
+                where.append("owner_token=%s")
+                params.append(owner_token)
+            if attempt_id is not None:
+                where.append("attempt_id=%s")
+                params.append(attempt_id)
+
             cur = conn.execute(
-                """UPDATE remote_chunks SET status=%s, updated_at=%s
-                   WHERE session_id=%s AND chunk_index=%s""",
-                (status, now, session_id, chunk_index),
+                f"UPDATE remote_chunks SET {', '.join(sets)} "
+                f"WHERE {' AND '.join(where)}",
+                params,
             )
-            self._require_updated(
-                cur,
-                f"[DB] Remote chunk not found: session {session_id}, chunk {chunk_index}",
-            )
-            if status == "done":
+            if cur.rowcount == 0:
+                if expected or owner_token is not None or attempt_id is not None:
+                    # A lost compare-and-swap is a legitimate outcome, not an
+                    # error: another worker (or a reconciliation) got there
+                    # first and the old state stands.
+                    return False
+                self._require_updated(
+                    cur,
+                    f"[DB] Remote chunk not found: session {session_id}, "
+                    f"chunk {chunk_index}",
+                )
+            if target == ChunkStatus.DONE.value:
                 conn.execute(
                     """DELETE FROM remote_file_state
                        WHERE session_id=%s AND plan_file_id IN (
@@ -770,9 +959,180 @@ class PgSessionMixin:
                        ) AND COALESCE(status,'') != 'source_missing'""",
                     (session_id, session_id, chunk_index),
                 )
+            return True
 
-        self._transaction(
-            operation, f"normalized chunk {chunk_index + 1} status update")
+        return self._transaction(
+            operation, f"chunk {chunk_index + 1} -> {target}")
+
+    #: Chunk states a stale-lease sweep may EVER return to the pool.
+    #:
+    #: 'backing' is deliberately absent and must stay absent. It means the
+    #: physical tape write began, so the bytes may be on the cartridge; a lease
+    #: timeout says nothing about that. Returning a 'backing' chunk to the pool
+    #: would let another worker re-fetch and re-write it — a double write onto
+    #: media that cannot be corrected in place (incident 010).
+    RECLAIMABLE_CHUNK_STATES = (ChunkStatus.FETCHING.value,
+                                ChunkStatus.PACKING.value)
+
+    def claim_chunk_for_staging(self, session_id, chunk_index, owner_token,
+                                attempt_id, lease_seconds=3600):
+        """Take exclusive PRE-WRITE ownership of a chunk (Plan 1, Task 3.1).
+
+        A compare-and-swap: the chunk must currently be re-drivable
+        (``pending`` / ``fetch_failed`` / ``backup_failed``) and hold no live
+        lease. Exactly one caller wins; the loser gets ``False`` and must pick
+        different work rather than assume it is free.
+
+        This claim covers **fetch and pack only**. The tape itself is guarded by
+        LTFS ownership, and duplicate *processes* by the cluster-wide archiver
+        advisory lock — three layers that protect different things, none of
+        which replaces the others.
+        """
+        now = _now_utc()
+
+        def operation(conn):
+            if not self._column_exists_conn(conn, 'remote_chunks',
+                                            'owner_token'):
+                raise RuntimeError(
+                    "[DB] Chunk claims require migration 014. Refusing to "
+                    "pretend a claim is enforced when the columns do not "
+                    "exist.")
+            cur = conn.execute(
+                """UPDATE remote_chunks
+                   SET status='fetching', owner_token=%s, attempt_id=%s,
+                       lease_expires_at=%s + make_interval(secs => %s),
+                       updated_at=%s
+                   WHERE session_id=%s AND chunk_index=%s
+                     AND status IN ('pending','fetch_failed','backup_failed')
+                     AND (owner_token IS NULL OR lease_expires_at < %s)""",
+                (owner_token, attempt_id, now, float(lease_seconds), now,
+                 session_id, int(chunk_index), now),
+            )
+            return cur.rowcount == 1
+
+        return self._transaction(
+            operation, f"claim chunk {int(chunk_index) + 1} for staging")
+
+    def renew_chunk_claim(self, session_id, chunk_index, owner_token,
+                          lease_seconds=3600):
+        """Extend a live claim. Fails if someone else now owns it."""
+        now = _now_utc()
+
+        def operation(conn):
+            cur = conn.execute(
+                """UPDATE remote_chunks
+                   SET lease_expires_at=%s + make_interval(secs => %s),
+                       updated_at=%s
+                   WHERE session_id=%s AND chunk_index=%s AND owner_token=%s
+                     AND status <> 'backing'""",
+                (now, float(lease_seconds), now, session_id, int(chunk_index),
+                 owner_token),
+            )
+            return cur.rowcount == 1
+
+        return self._transaction(
+            operation, f"renew claim on chunk {int(chunk_index) + 1}")
+
+    def release_chunk_claim(self, session_id, chunk_index, owner_token,
+                            to_status=None):
+        """Give a PRE-WRITE claim back. Never touches a 'backing' chunk.
+
+        ``to_status`` optionally returns the chunk to the pool (normally
+        ``pending``). Omit it to drop the lease while leaving the status alone
+        — used when the caller has already transitioned the chunk itself.
+        """
+        now = _now_utc()
+
+        def operation(conn):
+            sets = ["owner_token=NULL", "attempt_id=NULL",
+                    "lease_expires_at=NULL", "updated_at=%s"]
+            params = [now]
+            if to_status is not None:
+                sets.insert(0, "status=%s")
+                params.insert(0, str(to_status))
+            params.extend([session_id, int(chunk_index), owner_token])
+            cur = conn.execute(
+                f"""UPDATE remote_chunks SET {', '.join(sets)}
+                    WHERE session_id=%s AND chunk_index=%s AND owner_token=%s
+                      AND status <> 'backing'""",
+                params,
+            )
+            return cur.rowcount == 1
+
+        return self._transaction(
+            operation, f"release claim on chunk {int(chunk_index) + 1}")
+
+    def list_expired_chunk_claims(self, session_id):
+        """Chunks whose PRE-WRITE lease has lapsed. Read-only.
+
+        Deliberately **reports** rather than reclaims. A lapsed lease means
+        "nobody renewed this", not "no worker is running": the worker may be
+        alive on a wedged SSH call, or on another host. Startup reconciliation
+        (Task 3.2) matches this against process and staging evidence before
+        anything is returned to the pool.
+
+        A 'backing' chunk can never appear here — the SQL excludes it — because
+        no amount of elapsed time makes an ambiguous tape write safe to retry.
+        """
+        return self._run_read(
+            lambda conn: _rows(conn.execute(
+                """SELECT session_id, chunk_index, status, owner_token,
+                          attempt_id, lease_expires_at
+                   FROM remote_chunks
+                   WHERE session_id=%s AND owner_token IS NOT NULL
+                     AND lease_expires_at IS NOT NULL
+                     AND lease_expires_at < %s
+                     AND status = ANY(%s)
+                   ORDER BY chunk_index""",
+                (session_id, _now_utc(), list(self.RECLAIMABLE_CHUNK_STATES)),
+            ).fetchall()),
+            f"list_expired_chunk_claims({session_id})")
+
+    def reclaim_expired_chunk(self, session_id, chunk_index, owner_token,
+                              evidence):
+        """Return ONE provably-abandoned pre-write chunk to the pool.
+
+        ``evidence`` is required and recorded: the caller must have established
+        that the previous owner is gone (Task 3.2 matches PID + process
+        creation time + remote token). This method will not reclaim on elapsed
+        time alone, and the SQL refuses a 'backing' chunk outright even if a
+        caller asks.
+        """
+        if not evidence:
+            raise RuntimeError(
+                "[DB] Refusing to reclaim a chunk without process evidence. A "
+                "lapsed lease is not proof that the worker is gone.")
+        now = _now_utc()
+
+        def operation(conn):
+            cur = conn.execute(
+                """UPDATE remote_chunks
+                   SET status='pending', owner_token=NULL, attempt_id=NULL,
+                       lease_expires_at=NULL, error_msg=%s, updated_at=%s
+                   WHERE session_id=%s AND chunk_index=%s AND owner_token=%s
+                     AND status = ANY(%s)""",
+                (f"reclaimed after abandonment: {evidence}", now, session_id,
+                 int(chunk_index), owner_token,
+                 list(self.RECLAIMABLE_CHUNK_STATES)),
+            )
+            if cur.rowcount == 1:
+                get_logger().warning(
+                    "chunk_reclaimed: session=%s chunk=%s previous_owner=%s "
+                    "evidence=%s", session_id, int(chunk_index) + 1,
+                    owner_token, evidence)
+            return cur.rowcount == 1
+
+        return self._transaction(
+            operation, f"reclaim chunk {int(chunk_index) + 1}")
+
+    def update_chunk_status(self, session_id, chunk_index, status):
+        """Compatibility wrapper over :meth:`transition_chunk` (Task 1.5).
+
+        Unconditional and unvalidated, exactly as before, so no existing caller
+        changes behaviour while they migrate. New code should call
+        ``transition_chunk`` with an ``expected_from`` predicate.
+        """
+        self.transition_chunk(session_id, chunk_index, status, validate=False)
 
     def get_pending_chunks(self, session_id):
         rows = self._run_read(
@@ -837,6 +1197,131 @@ class PgSessionMixin:
             ).fetchall(),
             f"get_remote_existing_snapshot_paths({session_id})")
         return {row["remote_path"] for row in rows}
+
+    def session_has_snapshot_membership(self, session_id):
+        """Whether the session's snapshot already contains any file row.
+
+        This is a cheap existence probe, not a count. It is used only when no
+        durable bootstrap row exists: a definite empty snapshot proves that
+        reconciliation is unnecessary, while any membership could pre-date
+        the frontier and must be treated conservatively.
+        """
+        return self._run_read(
+            lambda conn: bool(conn.execute(
+                """SELECT EXISTS (
+                         SELECT 1
+                         FROM remote_sessions s
+                         JOIN remote_plans p ON p.plan_id=s.plan_id
+                         JOIN remote_snapshot_files sf
+                           ON sf.snapshot_id=p.snapshot_id
+                         WHERE s.session_id=%s
+                       ) AS has_membership""",
+                (session_id,),
+            ).fetchone()["has_membership"]),
+            f"session_has_snapshot_membership({session_id})")
+
+    def get_session_membership_summary(self, session_id):
+        """Read-only membership facts for a session (Plan 1, Task 4.1).
+
+        Reports what the PLAN says, from the plan rows themselves rather than
+        from the session's cached totals — the cached figures are the ones an
+        interrupted run can leave stale, and this report exists precisely to be
+        trusted when other numbers are not.
+        """
+        return self._run_read(
+            lambda conn: _row(conn.execute(
+                """SELECT COUNT(*)                       AS member_rows,
+                          COUNT(DISTINCT pf.chunk_index) AS distinct_chunks,
+                          MAX(pf.chunk_index)            AS max_chunk_index,
+                          COALESCE(SUM(sf.file_size_bytes), 0) AS member_bytes
+                   FROM remote_sessions s
+                   JOIN remote_plan_files pf ON pf.plan_id = s.plan_id
+                   JOIN remote_snapshot_files sf
+                        ON sf.snapshot_file_id = pf.snapshot_file_id
+                   WHERE s.session_id=%s""",
+                (session_id,),
+            ).fetchone()),
+            f"get_session_membership_summary({session_id})")
+
+    def get_chunk_state_counts(self, session_id):
+        """``{status: count}`` plus the highest chunk index. Read-only."""
+        rows = self._run_read(
+            lambda conn: conn.execute(
+                """SELECT status, COUNT(*) AS n, MAX(chunk_index) AS max_index
+                   FROM remote_chunks WHERE session_id=%s
+                   GROUP BY status ORDER BY status""",
+                (session_id,),
+            ).fetchall(),
+            f"get_chunk_state_counts({session_id})")
+        return [dict(row) for row in rows]
+
+    def list_remote_sessions(self):
+        """Every remote session, oldest first. Read-only.
+
+        The all-session health report discovers its subjects here rather than
+        from a list in code, so a session created after the report was written
+        is still audited.
+        """
+        return self._run_read(
+            lambda conn: conn.execute(
+                "SELECT * FROM remote_sessions ORDER BY session_id"
+            ).fetchall(),
+            "list remote sessions")
+
+    def session_tape_footprint(self, session_id):
+        """Which tapes this session ACTUALLY wrote to, with what. Read-only.
+
+        Derived from ``archive_runs`` and ``files_index``, not from
+        ``remote_sessions.tape_label`` — that column is the session's *next*
+        write target and says nothing about where finished chunks landed. The
+        two diverge routinely after a cartridge change, and reading the label as
+        if it were the footprint once produced a wrong conclusion that a
+        session's completed work had been destroyed.
+        """
+        return self._run_read(
+            lambda conn: conn.execute(
+                """SELECT r.tape_label,
+                          count(DISTINCT r.run_id)      AS runs,
+                          count(f.file_id)              AS stored_objects,
+                          coalesce(sum(f.file_size_bytes), 0) AS bytes,
+                          min(r.started_at)             AS first_run,
+                          max(r.started_at)             AS last_run
+                   FROM archive_runs r
+                   LEFT JOIN files_index f ON f.archive_run_id = r.run_id
+                   WHERE r.remote_session_id = %s
+                   GROUP BY r.tape_label
+                   ORDER BY r.tape_label""",
+                (session_id,),
+            ).fetchall(),
+            f"tape footprint for session {session_id}")
+
+    def find_sessions_sharing_plan(self, session_id):
+        """Other sessions on the SAME plan or snapshot. Read-only.
+
+        A shared plan means a decision about this session's membership is also
+        a decision about another's. Nothing may be reorganised until that is
+        understood, so the report surfaces it rather than leaving it implicit.
+        """
+        rows = self._run_read(
+            lambda conn: conn.execute(
+                """WITH me AS (
+                       SELECT s.session_id, s.plan_id, p.snapshot_id
+                       FROM remote_sessions s
+                       LEFT JOIN remote_plans p ON p.plan_id = s.plan_id
+                       WHERE s.session_id=%s
+                   )
+                   SELECT o.session_id, o.session_label, o.status,
+                          o.plan_id, p.snapshot_id
+                   FROM remote_sessions o
+                   LEFT JOIN remote_plans p ON p.plan_id = o.plan_id
+                   JOIN me ON (o.plan_id = me.plan_id
+                               OR p.snapshot_id = me.snapshot_id)
+                   WHERE o.session_id <> me.session_id
+                   ORDER BY o.session_id""",
+                (session_id,),
+            ).fetchall(),
+            f"find_sessions_sharing_plan({session_id})")
+        return [dict(row) for row in rows]
 
     def get_pending_remote_reserved_bytes(self, session_id):
         value = self._run_read(
@@ -955,8 +1440,10 @@ class PgSessionMixin:
     def cleanup_unreferenced_remote_data(self, compact=False):
         summary = self.get_unreferenced_remote_data_summary()
         if summary["active_sessions"]:
-            raise RuntimeError(
-                "[DB] Refusing cleanup while a remote session is active.")
+            raise OperationalError(
+                "[DB] Refusing cleanup while a remote session is active. "
+                "Run --reconcile-stale-sessions --dry-run to see whether the "
+                "active row is a live archiver or a stale crashed session.")
 
         def operation(conn):
             plan_files = conn.execute("""

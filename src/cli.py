@@ -3,7 +3,8 @@ import os
 from typing import TYPE_CHECKING
 
 from .config import ConfigManager
-from .constants import CONFIG_FILE
+from .constants import (CONFIG_FILE, TAPE_STATUS_ACTIVE, TAPE_STATUS_FULL,
+                        tape_is_full, tape_status_reason_suffix)
 from .db import _fmt_ts, create_database_manager
 from .exit_codes import (ExitCode, StopResult, REASON_BAD_CONFIG,
                          REASON_WINDOWS_REBOOT_PENDING,
@@ -17,7 +18,8 @@ from .retriever import LTORetriever
 from .robocopy import _prepare_robocopy_exclusion, _remove_robocopy_exclusion
 from .remote_transport import _cleanup_askpass_helpers
 from .runtime import _terminate_all_procs, install_cancel_handler, reset_cancel, uninstall_cancel_handler, unpin_current_process
-from .windows_update_guard import (managed_update_policy, pause_windows_updates,
+from .windows_update_guard import (assess_reboot_state, managed_update_policy,
+                                   pause_windows_updates,
                                    pending_reboot_reasons, print_guard_status,
                                    restore_stale_guard, resume_windows_updates)
 
@@ -38,11 +40,17 @@ def _start_windows_update_guard(cfg: ConfigManager):
     # Undo a pause a force-killed run left behind before installing a new one.
     restore_stale_guard()
 
-    reasons = pending_reboot_reasons()
-    if reasons:
+    # Severity decides. A warning-only indicator (a stale
+    # PendingFileRenameOperations queue) is reported but must not refuse to
+    # start the run — before 2026-07-28 it did, and silencing it meant turning
+    # the whole guard off.
+    assessment = assess_reboot_state(block_on_unknown=False)
+    if assessment.warnings:
+        print(f"\n[WU] {assessment.warning_summary()}")
+    if assessment.blocking:
         print("\n[WU] Windows has a restart pending:")
-        for reason in reasons:
-            print(f"  - {reason}")
+        for signal in assessment.critical:
+            print(f"  - {signal.message} [{signal.code}]")
         print("[WU] Pausing updates cannot cancel an already-staged restart. "
               "A restart during a tape write corrupts the LTFS index and "
               "loses every chunk written so far — this cost ~126 GB of "
@@ -215,7 +223,13 @@ def _print_tapes_table(db):
         cap_gb  = t['total_capacity']
         used_b  = t['used_space'] or 0
         used_gb = used_b / 1000**3
-        if cap_gb:
+        if tape_is_full(t.get('status')):
+            # A tape retired mid-capacity (read-only, damaged) is FULL for
+            # planning purposes; showing "5000/12288 GB" would invite a write
+            # that cannot land.
+            space_s = (f"FULL - {used_gb:.1f} GB written"
+                       f"{tape_status_reason_suffix(t)}")
+        elif cap_gb:
             pct     = min(used_gb / cap_gb, 1.0)
             filled  = round(pct * BAR_W)
             bar     = '█' * filled + '░' * (BAR_W - filled)
@@ -235,6 +249,7 @@ def _db_management_menu(db):
         print("  4. Set tape capacity (GB)")
         print("  5. Recalculate tape used space")
         print("  6. Wipe file records for tape (keep tape entry)")
+        print("  7. Mark tape FULL / re-activate")
         print("  0. Back")
         print("-" * 40)
         sub = input("Choose: ").strip()
@@ -338,6 +353,34 @@ def _db_management_menu(db):
             confirm = input(f"Type 'yes' to delete {count} file record(s) for '{label}' (tape entry kept): ").strip()
             if confirm.lower() == 'yes':
                 db.delete_files_for_tape(label)
+            else:
+                print("[ABORTED]")
+
+        elif sub == '7':
+            tapes = _print_tapes_table(db)
+            if not tapes:
+                continue
+            label = input("Enter volume label: ").strip()
+            tape_row = next((t for t in tapes if t['volume_label'] == label), None)
+            if tape_row is None:
+                print(f"[ERROR] Tape '{label}' not found.")
+                continue
+            if tape_is_full(tape_row.get('status')):
+                confirm = input(
+                    f"'{label}' is FULL. Type 'yes' to re-activate it for "
+                    "writing: ").strip()
+                if confirm.lower() == 'yes':
+                    db.set_tape_status(label, TAPE_STATUS_ACTIVE)
+                else:
+                    print("[ABORTED]")
+                continue
+            reason = input(
+                "Reason (e.g. 'read-only, PWE latched'; Enter to skip): ").strip()
+            confirm = input(
+                f"Type 'yes' to mark '{label}' FULL — no further writes will be "
+                "planned for it: ").strip()
+            if confirm.lower() == 'yes':
+                db.set_tape_status(label, TAPE_STATUS_FULL, reason)
             else:
                 print("[ABORTED]")
 

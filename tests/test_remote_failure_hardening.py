@@ -7,6 +7,7 @@ previous mount could approve a write, and a prior-run 'backing' chunk could be
 double-written. All tests are mock-only — no real tape, no real SSH, no
 production run.
 """
+import inspect
 import io
 import os
 import json
@@ -19,6 +20,7 @@ from unittest import mock
 
 from src import cli
 from src import remote_orchestrator as ro
+from src import remote_staging as rs
 from src import runtime as rt
 from src import status_file
 from src import windows_update_guard as wug
@@ -40,6 +42,7 @@ from src.exit_codes import (ExitCode, StopResult, REASON_NETWORK_RETRY_EXHAUSTED
                             CLASS_DNS_RESOLUTION_FAILURE,
                             CLASS_CONNECTION_TIMEOUT)
 from src.pipeline_types import StagedChunk
+from src.ready_queue import ReadyQueueLimits
 
 
 def _orch(**attrs):
@@ -52,6 +55,10 @@ def _orch(**attrs):
     orch._stop_result = None
     orch._last_fetch_failure = None
     orch.cfg = SimpleNamespace(backup_log_dir=None)
+    # Neutralised like the mount-mode and media-health checks: these cases
+    # exercise the other gate steps and must not read this host's real LTFS
+    # volume label. MountedCartridgeGuardTests covers the check itself.
+    orch._verify_mounted_cartridge = lambda _tape: None
     for key, value in attrs.items():
         setattr(orch, key, value)
     return orch
@@ -182,7 +189,7 @@ class FetchFailureStopResultTests(unittest.TestCase):
                      fetch_cores=None)
         dns = ("remote tar/ssh exit 255: ssh: Could not resolve hostname srv01: "
                "Name or service not known")
-        with mock.patch.object(ro, "_remote_tar_fetch",
+        with mock.patch.object(rs, "_remote_tar_fetch",
                                return_value=(False, dns)):
             with redirect_stdout(io.StringIO()):
                 ok, err = orch._fetch_one_batch("b", [(0, "rel", 0)], "d",
@@ -577,38 +584,78 @@ class SingleGateStructureTests(unittest.TestCase):
         self.src = inspect.getsource(ro.RemoteOrchestrator._run_session)
         self.stream = inspect.getsource(
             ro.RemoteOrchestrator._run_streaming_session)
-        self.write = inspect.getsource(ro.RemoteOrchestrator._write_chunk)
+        # Phase 4: authorization moved from the per-chunk _write_chunk to the
+        # group boundary. _write_chunk is now a single-chunk wrapper over
+        # _write_chunk_group, which owns the lock and the gate; the per-chunk
+        # body lives in _write_one_chunk_owned.
+        # Task 1.2: the write group moved to src.remote_writer. The
+        # orchestrator keeps a delegating façade method, so the STRUCTURE must
+        # be inspected where the behaviour now lives.
+        from src.remote_writer import RemoteChunkWriter
+        self.write = inspect.getsource(RemoteChunkWriter._write_chunk_group)
+        self.one = inspect.getsource(
+            RemoteChunkWriter._write_one_chunk_owned)
 
-    def test_every_write_goes_through_write_chunk(self):
-        self.assertIn("_write_chunk(", self.src)
-        self.assertIn("_write_chunk(", self.stream)
+    def test_every_write_goes_through_the_single_group_boundary(self):
+        # Task 1.3: BOTH session kinds now drain finite groups through
+        # RemotePipelineCoordinator, so neither loop writes to tape itself and
+        # the resume path's group-of-one bypass is gone.
+        from src.remote_pipeline import RemotePipelineCoordinator
+        for loop in (self.src, self.stream):
+            self.assertIn("_build_pipeline(", loop)
+            self.assertNotIn("_write_chunk(", loop)
+            self.assertNotIn("_write_chunk_group(", loop)
+        self.assertIn(
+            "_write_chunk_group(",
+            inspect.getsource(RemotePipelineCoordinator.run))
 
     def test_write_chunk_is_the_only_gate_caller_on_the_write_path(self):
-        # The loops must NOT call the gate directly — _write_chunk owns it.
+        # The loops must NOT call the gate directly — the group boundary owns it.
         self.assertNotIn("_pre_write_safety_gate", self.src)
         self.assertNotIn("_pre_write_safety_gate", self.stream)
         self.assertIn("_pre_write_safety_gate", self.write)
+        # And it must run exactly once per group, never per chunk.
+        self.assertNotIn("_pre_write_safety_gate", self.one)
+        self.assertEqual(self.write.count("_pre_write_safety_gate("), 1)
 
     def test_reboot_check_is_not_called_directly_in_the_loops(self):
         self.assertNotIn("_pre_tape_write_reboot_check", self.src)
         self.assertNotIn("_pre_tape_write_reboot_check", self.stream)
 
     def test_authorize_and_write_are_under_the_tape_lock(self):
-        # acquire -> gate -> writer launch -> release, all in _write_chunk.
+        # acquire -> gate -> per-chunk writer launch -> release, all in the
+        # group boundary. The writer itself launches inside
+        # _write_one_chunk_owned, which the group calls between gate and release.
         a = self.write.index("_acquire_tape_io_lock")
         g = self.write.index("_pre_write_safety_gate")
-        w = self.write.index(".run(")
-        r = self.write.index("_release_tape_io_lock")
+        w = self.write.index("_write_one_chunk_owned(")
+        r = self.write.rindex("_release_tape_io_lock")
         self.assertLess(a, g, "the tape lock must be held before authorizing")
         self.assertLess(g, w, "the gate must pass before the writer launches")
         self.assertLess(w, r, "the writer launches before the lock is released")
+        self.assertIn(".run(", self.one)
 
-    def test_status_flush_happens_after_the_lock_is_released(self):
-        # The 'done' commit + cleanup must be OUTSIDE the lock.
-        r = self.write.rindex("_release_tape_io_lock")
-        done = self.write.rindex("'done'")
-        self.assertLess(r, done,
-                        "the 'done' commit must happen after releasing the lock")
+    def test_per_chunk_body_never_acquires_or_releases_ownership(self):
+        """Phase 4: ownership spans the whole group, so the per-chunk body must
+        not touch the lock — that is what keeps readiness verified once."""
+        self.assertNotIn("_acquire_tape_io_lock", self.one)
+        self.assertNotIn("_release_tape_io_lock", self.one)
+
+    def test_done_commit_stays_inside_the_group_ownership_period(self):
+        """CHANGED IN PHASE 4, deliberately.
+
+        The 'done' commit + staging flush used to run after _write_chunk
+        released the lock. It now runs while the GROUP still owns LTFS: the
+        commit is PostgreSQL plus local staging cleanup and touches no tape,
+        and releasing between chunks would invalidate the readiness cache and
+        force the per-chunk probe this phase exists to remove. Ownership is
+        still released in the group's finally, before any wait for new work.
+        """
+        self.assertIn("'done'", self.one)
+        self.assertNotIn("_release_tape_io_lock", self.one)
+        # The group releases exactly once, in a finally.
+        self.assertEqual(self.write.count("_release_tape_io_lock()"), 1)
+        self.assertIn("finally:", self.write)
 
 
 class GatePrecedenceTests(unittest.TestCase):
@@ -723,6 +770,65 @@ class WriteChunkRaceTests(unittest.TestCase):
         orch._backup_writer = lambda cls=None: writer
         orch._cleanup_dir = lambda p: None
         return orch, statuses
+
+    def test_last_chunk_does_not_eject_by_default(self):
+        """2026-07-28: the remote orchestrator ejected after the final chunk.
+
+        `LtfsCmdEject` is mechanical and there is no software "load" for a tape
+        out of the slot, so a run finishing overnight stranded the drive until
+        somebody travelled to the lab — the exact outcome
+        docs/incidents/000-no-physical-intervention-policy.md forbids. It also
+        would have blocked the follow-up session for the roots plan 37 never
+        scanned. The default is now "leave the cartridge loaded".
+        """
+        writer = self._FakeWriter()
+        orch, _ = self._o(writer)
+        seen = {}
+        orch._backup_writer = lambda cls=None: (seen.__setitem__("cls", cls)
+                                                or writer)
+        # cfg has no eject_after_session key at all -> must fail SAFE.
+        self.assertFalse(orch._eject_after_session())
+        orch._write_chunk(7, _desc(0), "T", orch._eject_after_session(),
+                          threading.Event())
+        self.assertIs(seen["cls"], ro._NoEjectBackup,
+                      "the final chunk must use the no-eject writer by default")
+
+    def test_the_remote_pipeline_refuses_the_eject_even_when_configured(self):
+        """CHANGED IN PLAN 1 TASK 1.4, deliberately.
+
+        The remote pipeline runs unattended. A cartridge ejected with nobody at
+        the drive cannot be reloaded remotely — there is no software "load" for
+        a tape out of the slot — so the flag being on once is not a reason to
+        leave an unattended run one config edit away from a stranded drive. The
+        setting still applies to the attended local orchestrator.
+        """
+        writer = self._FakeWriter()
+        orch, _ = self._o(writer)
+        orch.cfg.eject_after_session = True
+        seen = {}
+        orch._backup_writer = lambda cls=None: (seen.__setitem__("cls", cls)
+                                                or writer)
+        self.assertFalse(orch._eject_after_session())
+        orch._write_chunk(7, _desc(0), "T", orch._eject_after_session(),
+                          threading.Event())
+        self.assertIs(seen["cls"], ro._NoEjectBackup,
+                      "the remote writer must never take the ejecting class")
+
+    def test_eject_flag_is_explicitly_false_when_configured_false(self):
+        orch, _ = self._o(self._FakeWriter())
+        orch.cfg.eject_after_session = False
+        self.assertFalse(orch._eject_after_session())
+
+    def test_non_final_chunks_never_eject(self):
+        """Unchanged behaviour: mid-session chunks always keep the tape loaded."""
+        writer = self._FakeWriter()
+        orch, _ = self._o(writer)
+        orch.cfg.eject_after_session = True   # even with the eject opted in
+        seen = {}
+        orch._backup_writer = lambda cls=None: (seen.__setitem__("cls", cls)
+                                                or writer)
+        orch._write_chunk(7, _desc(0), "T", False, threading.Event())
+        self.assertIs(seen["cls"], ro._NoEjectBackup)
 
     def test_recorded_stop_before_write_prevents_the_writer(self):
         writer = self._FakeWriter()
@@ -994,18 +1100,23 @@ class FinalChunkCancelTerminalTests(unittest.TestCase):
         orch._start_pipeline_heartbeat = lambda *a, **k: None
         orch._stage_chunk = lambda sid, ci, files: _desc(ci)
 
-        def fake_write(session_id, desc, tape_label, eject_after, stop_pipeline):
+        # Task 1.3: the resume path drains finite GROUPS through the single
+        # pipeline coordinator, so the interception point is the group writer.
+        def fake_write(session_id, descs, tape_label, eject_after, stop_pipeline):
             # The final write completes successfully; a cooperative cancel has
             # arrived — commit the chunk 'done' and record the user-stop.
             ro.CANCEL.set()
-            state["done"].add(desc.chunk_index)
-            orch._record_stop(StopResult(
-                exit_code=ExitCode.USER_STOP,
-                reason=REASON_USER_REQUESTED_STOP, resumable=True,
-                source="write", session_id=session_id,
-                chunk_index=desc.chunk_index))
+            for desc in descs:
+                state["done"].add(desc.chunk_index)
+                orch._record_stop(StopResult(
+                    exit_code=ExitCode.USER_STOP,
+                    reason=REASON_USER_REQUESTED_STOP, resumable=True,
+                    source="write", session_id=session_id,
+                    chunk_index=desc.chunk_index))
             return None
-        orch._write_chunk = fake_write
+        orch._write_chunk_group = fake_write
+        orch.ready_limits = ReadyQueueLimits(1, 1, 10 ** 12, 48)
+        orch._build_observation_worker = lambda: None
 
         with mock.patch.object(ro, "_ensure_lto_drive_ready", return_value=True), \
              mock.patch.object(ro, "RebootSentinel", _FakeSentinel), \

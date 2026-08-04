@@ -199,6 +199,27 @@ this state.
    cartridge will acquire the same PWE. A cleaning cartridge plus a review of the
    drive dumps (`ltfs_2026_0724_070741_*.dmp`) should precede committing new media.
 
+## Outcome (2026-07-26)
+
+Option 2 was initiated: Tape_02 was retired read-only and Session 37's next
+target was changed to Tape_03. No Session 37 archive work was ultimately written
+there: all 9 Session 37 `archive_runs` name Tape_02, zero `archive_runs` reference
+Tape_03, and `files_index` has zero Tape_03 rows. Tape_03 did receive the separate
+24 GiB Phase 5E synthetic pilot and was reformatted twice. The Tape_02 retirement
+is recorded in the catalog rather than kept in the operator's head —
+`tapes.status = 'full'` with
+`status_reason = 'read-only: PWE bit latched 2026-07-24 (incident 010); retired
+2026-07-26'` (schema: `scripts/sql/011_postgres_tape_status.sql`).
+
+`status` exists because the byte counters cannot express this. Tape_02 holds
+~5.0 TB of 12 TB, and `recalculate_tape_used_space` rewrites `used_space` from
+the catalog on every mount, so a hand-edited counter would be silently undone at
+the next run. With the flag set, `tape_budget_bytes` reports zero available
+bytes, both orchestrators refuse to start or continue a write on the tape, and
+the CLI/GUI show `FULL` instead of `5000/12288 GB` — which would otherwise
+invite a write that can never land. Clear it from Database Management → option 7
+if a cartridge is ever genuinely returned to service.
+
 ## Lesson
 
 A single unrecoverable write can permanently flip a cartridge to read-only. That

@@ -1,7 +1,9 @@
 import os
 import unittest
 
-from src.constants import LOCAL_TAPE_BUDGET_BYTES, tape_budget_bytes
+from src.constants import (LOCAL_TAPE_BUDGET_BYTES, TAPE_STATUS_ACTIVE,
+                           TAPE_STATUS_FULL, tape_budget_bytes, tape_is_full,
+                           tape_status_reason_suffix)
 from src.remote_transport import (
     _ASKPASS_HELPERS,
     _cleanup_askpass_helpers,
@@ -29,6 +31,36 @@ class TapeBudgetTests(unittest.TestCase):
         self.assertEqual(available, 0)
         capacity, _ = tape_budget_bytes(None, used_bytes=0)
         self.assertEqual(capacity, LOCAL_TAPE_BUDGET_BYTES)
+
+
+class TapeStatusTests(unittest.TestCase):
+    def test_tape_marked_full_has_no_available_bytes(self):
+        # Tape_02 was retired read-only with ~5 TB of 12 TB used: the counters
+        # say "room left", the status is what must win.
+        capacity, available = tape_budget_bytes(
+            12288, used_bytes=5 * 1000**4, status=TAPE_STATUS_FULL)
+        self.assertEqual(capacity, LOCAL_TAPE_BUDGET_BYTES)
+        self.assertEqual(available, 0)
+
+    def test_active_and_missing_status_are_inert(self):
+        # None covers a pre-011 database and unregistered tapes; the guard must
+        # not change planning for either.
+        expected = tape_budget_bytes(12288, used_bytes=1000**4)
+        for status in (None, "", TAPE_STATUS_ACTIVE, "ACTIVE"):
+            self.assertEqual(
+                tape_budget_bytes(12288, used_bytes=1000**4, status=status),
+                expected)
+
+    def test_tape_is_full_normalises_case_and_whitespace(self):
+        self.assertTrue(tape_is_full(" FULL "))
+        self.assertFalse(tape_is_full(None))
+
+    def test_status_reason_suffix(self):
+        self.assertEqual(
+            tape_status_reason_suffix({"status_reason": "read-only, PWE"}),
+            " (read-only, PWE)")
+        self.assertEqual(tape_status_reason_suffix({"status_reason": None}), "")
+        self.assertEqual(tape_status_reason_suffix(None), "")
 
 
 class AskpassHelperTests(unittest.TestCase):

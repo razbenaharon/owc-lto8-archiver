@@ -46,6 +46,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .constants import (TAPE_STATUS_ACTIVE, TAPE_STATUS_FULL, tape_is_full,
+                        tape_status_reason_suffix)
 from .db import _fmt_ts
 from .inspector_repository import InspectorRepository
 
@@ -941,25 +943,28 @@ class ManageWidget(QWidget):
         self.rename_btn = QPushButton("Rename")
         self.capacity_btn = QPushButton("Set Capacity")
         self.recalc_btn = QPushButton("Recalculate Used")
+        self.status_btn = QPushButton("Mark Full / Re-activate")
         self.wipe_btn = QPushButton("Wipe File Records")
         self.delete_tape_btn = QPushButton("Delete Tape")
         self.refresh_btn = QPushButton("Refresh")
         for button in (
                 self.rename_btn, self.capacity_btn, self.recalc_btn,
-                self.wipe_btn, self.delete_tape_btn, self.refresh_btn):
+                self.status_btn, self.wipe_btn, self.delete_tape_btn,
+                self.refresh_btn):
             controls.addWidget(button)
         controls.addStretch(1)
         layout.addLayout(controls)
-        self.tapes_table = QTableWidget(0, 7)
+        self.tapes_table = QTableWidget(0, 8)
         self.tapes_table.setHorizontalHeaderLabels([
             "ID", "Volume Label", "Initialized", "Capacity GB",
-            "Used", "Files", "Used %"])
+            "Used", "Files", "Used %", "Status"])
         self.tapes_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.tapes_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         layout.addWidget(self.tapes_table, 1)
         self.rename_btn.clicked.connect(self.rename_tape)
         self.capacity_btn.clicked.connect(self.set_capacity)
         self.recalc_btn.clicked.connect(self.recalculate_used)
+        self.status_btn.clicked.connect(self.toggle_tape_status)
         self.wipe_btn.clicked.connect(self.wipe_tape_files)
         self.delete_tape_btn.clicked.connect(self.delete_tape)
         self.refresh_btn.clicked.connect(self.refresh)
@@ -995,8 +1000,8 @@ class ManageWidget(QWidget):
 
     def _write_buttons(self):
         return (self.rename_btn, self.capacity_btn, self.recalc_btn,
-                self.wipe_btn, self.delete_tape_btn, self.refresh_btn,
-                self.delete_session_btn, self.cleanup_btn)
+                self.status_btn, self.wipe_btn, self.delete_tape_btn,
+                self.refresh_btn, self.delete_session_btn, self.cleanup_btn)
 
     def _run_db_task(self, fn, on_done=None):
         """Run a DB write in the thread pool with the write buttons disabled."""
@@ -1030,19 +1035,51 @@ class ManageWidget(QWidget):
 
     def refresh_tapes(self):
         tapes = self.db.list_tapes()
+        self._tape_status = {t["volume_label"]: t.get("status") for t in tapes}
         self.tapes_table.setRowCount(len(tapes))
         for row, tape in enumerate(tapes):
             label = tape["volume_label"]
             used = tape["used_space"] or 0
             cap = tape["total_capacity"] or 0
+            full = tape_is_full(tape.get("status"))
             pct = (used / (cap * 1024 ** 3) * 100) if cap else 0
             values = [
                 tape["tape_id"], label, _fmt_ts(tape["date_formatted"]),
                 cap or "", _fmt_bytes(used),
-                self.db.count_tape_file_records(label), f"{pct:.1f}%"]
+                self.db.count_tape_file_records(label),
+                "FULL" if full else f"{pct:.1f}%",
+                ("FULL" + tape_status_reason_suffix(tape)) if full
+                else TAPE_STATUS_ACTIVE]
             for col, value in enumerate(values):
                 self.tapes_table.setItem(row, col, QTableWidgetItem(str(value)))
         self.tapes_table.resizeColumnsToContents()
+
+    def toggle_tape_status(self):
+        label = self.selected_tape()
+        if not label:
+            return
+        if tape_is_full(getattr(self, "_tape_status", {}).get(label)):
+            if QMessageBox.question(
+                    self, "Re-activate Tape",
+                    f"{label} is marked FULL. Re-activate it for writing?"
+            ) != QMessageBox.StandardButton.Yes:
+                return
+            self._run_db_task(
+                lambda: self.db.set_tape_status(label, TAPE_STATUS_ACTIVE),
+                on_done=lambda _result: self.refresh())
+            return
+        if QMessageBox.question(
+                self, "Mark Tape Full",
+                f"Mark {label} FULL? No further writes will be planned for it."
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        reason, ok = QInputDialog.getText(
+            self, "Mark Tape Full", "Reason (optional):")
+        if not ok:
+            return
+        self._run_db_task(
+            lambda: self.db.set_tape_status(label, TAPE_STATUS_FULL, reason),
+            on_done=lambda _result: self.refresh())
 
     def rename_tape(self):
         label = self.selected_tape()

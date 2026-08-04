@@ -1,10 +1,31 @@
 """ConfigManager and .env loading."""
 import os
 import configparser
+import tempfile
+import warnings
 from urllib.parse import quote
 
-from .constants import BACKUP_LOG_DIR, CONFIG_FILE, PROJECT_ROOT
+from .constants import (BACKUP_LOG_DIR, CONFIG_FILE, LOCAL_STAGING_RESERVE_BYTES,
+                        PROJECT_ROOT)
 from .paths import _clean_config_path, _clean_remote_path, _config_list
+
+
+_incremental_scan_warning_emitted = False
+
+
+def _warn_ignored_incremental_scan(config):
+    """Warn once because the retired key must never imply runtime control."""
+    global _incremental_scan_warning_emitted
+    if (_incremental_scan_warning_emitted
+            or not config.has_option('REMOTE', 'incremental_scan')):
+        return
+    _incremental_scan_warning_emitted = True
+    warnings.warn(
+        "[REMOTE] incremental_scan is deprecated and ignored; the persistent "
+        "frontier scanner is the sole production scanner. Remove this key.",
+        UserWarning,
+        stacklevel=3,
+    )
 
 
 def _strip_quotes(value):
@@ -51,6 +72,7 @@ class ConfigManager:
             print("[CONFIG] Please review and edit it before running operations.")
 
         self.config.read(config_path, encoding='utf-8')
+        _warn_ignored_incremental_scan(self.config)
 
         # Secrets live in a gitignored .env next to the app, never in config.ini.
         self.env = _load_env_file(os.path.join(PROJECT_ROOT, '.env'))
@@ -94,12 +116,24 @@ class ConfigManager:
             'remote_path':      '',
             'remote_selected_paths': '',
             'confirm_before_backup': 'true',
+            'tape_label': '',
             'staging_fill_pct': '0.80',
-            'scan_mode': 'directories',
-            'remote_scan_depth': '2',
             'large_file_min_mb': '10',
-            'directory_chunk_max_gb': '50',
-            'directory_chunk_max_files': '100000',
+        }
+        self.config['PIPELINE'] = {
+            # Byte-bounded ready queue (Phase 4). Values are BYTES and describe
+            # files already prepared on the staging disk, never memory.
+            'min_ready_bytes_before_writer_start': str(20 * 1024**3),
+            'target_ready_bytes':                  str(40 * 1024**3),
+            'max_ready_bytes':                     str(80 * 1024**3),
+            'max_ready_chunks':                    '48',
+            # Phase 4.5. Local staging the ready queue must NEVER consume, so an
+            # active fetch + active pack + temp pack output + manifests/resume
+            # metadata + the existing reserve always have room. 0 => auto
+            # (2x chunk_cap + LOCAL_STAGING_RESERVE_BYTES). Validated against
+            # staging_max_gb before a run; a conflict falls back atomically to
+            # the documented default limits (never a silent single-value clamp).
+            'ready_queue_staging_reserve_bytes':   '0',
         }
         self.config['PERFORMANCE'] = {
             'pipeline_profile':      'tape_first_controlled',
@@ -153,6 +187,32 @@ class ConfigManager:
             'guard': 'true',
             'pause_days': '7',
             'block_on_pending_reboot': 'true',
+        }
+        self.config['FEATURES'] = {
+            # Phase 5 sealed tape-write batches. FAIL-CLOSED: default false, and
+            # the production runtime queries/mutates no batch table while false.
+            # Enabling it without the applied 012 schema must fail at startup.
+            'sealed_tape_write_batches_enabled': 'false',
+            # Phase 5C observation mode. Default false: no observer is
+            # constructed. When true the observer only COMPUTES and logs a shadow
+            # comparison; it never influences the writer and its failures cannot
+            # block production. Enabling it does NOT enable sealed batches.
+            'sealed_tape_write_batches_observation_enabled': 'false',
+        }
+        self.config['OBSERVATION'] = {
+            # Phase 5D bounded async observation (only used when observation mode
+            # is enabled). The writer thread only copies a snapshot and does one
+            # non-blocking enqueue; this worker does the DB read + observer + log.
+            'sealed_batch_observation_queue_max': '100',
+            'sealed_batch_observation_shutdown_timeout_seconds': '5',
+            'sealed_batch_observation_statement_timeout_seconds': '5',
+            # Local diagnostic JSONL. MUST NOT be inside the repo, the LTFS mount,
+            # a pack/staging dir, or the evidence tree (validated at build time).
+            'sealed_batch_observation_log_path': os.path.join(
+                tempfile.gettempdir(), 'lto8_observations',
+                'sealed_batch_observations.jsonl'),
+            'sealed_batch_observation_log_max_bytes': str(10 * 1024 * 1024),
+            'sealed_batch_observation_log_backups': '5',
         }
         with open(self.config_path, 'w', encoding='utf-8') as f:
             self.config.write(f)
@@ -253,6 +313,22 @@ class ConfigManager:
             'HARDWARE', 'ibm_eject_cmd',
             fallback=r'C:\Program Files\IBM\LTFS\LtfsCmdEject.exe'))
     @property
+    def eject_after_session(self):
+        """Whether a completed remote session physically ejects the cartridge.
+
+        Defaults to **False**, which is what the no-physical-intervention policy
+        has required all along: `LtfsCmdEject` is mechanical, and a cartridge
+        ejected with nobody at the drive cannot be reloaded remotely — there is
+        no software "load" for a tape sitting out of the slot. A run that
+        finishes overnight would strand the drive until someone travels to it.
+
+        The remote orchestrator ejected unconditionally after the last chunk,
+        which contradicted that policy; this flag makes the safe behaviour the
+        default and keeps the eject available for an operator who is standing
+        at the drive and wants the tape out.
+        """
+        return self._get_bool('HARDWARE', 'eject_after_session', False)
+    @property
     def zip_threshold_mb(self):
         return self._get_float('SETTINGS', 'zip_threshold_mb', 100)
     @property
@@ -313,25 +389,41 @@ class ConfigManager:
     @property
     def staging_fill_pct(self):
         return self._get_float('REMOTE', 'staging_fill_pct', 0.80)
-    @property
-    def remote_scan_mode(self):
-        return self.config.get(
-            'REMOTE', 'scan_mode', fallback='directories').strip().lower()
-    @property
-    def remote_scan_depth(self):
-        return self._get_int('REMOTE', 'remote_scan_depth', 2, minimum=0)
+    # ``scan_mode``, ``remote_scan_depth``, ``directory_chunk_max_gb`` and
+    # ``directory_chunk_max_files`` were removed by Plan 1 Task 1.6: the audit
+    # found no reader for any of them — they configured the dormant
+    # directory-first scanner that was never wired into the production
+    # new-session path. An existing config.ini may still contain the keys;
+    # configparser ignores keys nothing asks for, so no operator action is
+    # needed. Plan 1 Task 2.3's directory frontier introduces its own settings.
     @property
     def large_file_min_mb(self):
+        """Threshold above which a file is archived loose rather than packed.
+
+        Retained (unlike its directory-first siblings) because it is a real
+        archival policy figure, defaulting to the catalog's own
+        ``index_min_file_mb``, and Plans 2-3 size loose/stored-TAR behaviour on
+        it. It currently has no reader in the remote path.
+        """
         return self._get_float('REMOTE', 'large_file_min_mb',
                                self.index_min_file_mb)
     @property
-    def directory_chunk_max_gb(self):
-        return self._get_float('REMOTE', 'directory_chunk_max_gb',
-                               self.chunk_cap_gb)
-    @property
-    def directory_chunk_max_files(self):
-        return self._get_int('REMOTE', 'directory_chunk_max_files',
-                             self.chunk_max_files, minimum=1)
+    def remote_tape_label(self):
+        """The cartridge a NEW remote session should target (Plan 1 Task 1.4).
+
+        Blank by default. It exists so a fresh session can name its target
+        **without reading the drive**: the old flow auto-detected the label by
+        reading the mounted volume before anything else happened, which is a
+        device access outside a finite write group — exactly what Task 1.4
+        removes. When this is blank an interactive run prompts for the label;
+        a headless run without ``--resume`` still refuses to start, blank or
+        not, because a fresh session also needs the capacity confirmation.
+
+        A RESUMED session ignores this entirely and uses its persisted
+        label/generation, so editing config.ini can never re-point work that is
+        already planned against a cartridge.
+        """
+        return (self.config.get('REMOTE', 'tape_label', fallback='') or '').strip()
 
     # --- [PERFORMANCE] : continuous-streaming pipeline tuning -----------------
     @property
@@ -346,6 +438,123 @@ class ConfigManager:
     def chunk_max_files(self):
         return self._get_int('PERFORMANCE', 'chunk_max_files', 100000,
                              minimum=1)
+    # -- Phase 4 byte-bounded ready queue --------------------------------
+    _READY_QUEUE_DEFAULTS = {
+        'min_ready_bytes_before_writer_start': 20 * 1024**3,
+        'target_ready_bytes': 40 * 1024**3,
+        'max_ready_bytes': 80 * 1024**3,
+        'max_ready_chunks': 48,
+    }
+
+    def _ready_queue_raw(self, key):
+        return self._get_int('PIPELINE', key, self._READY_QUEUE_DEFAULTS[key],
+                             minimum=1)
+
+    @property
+    def ready_queue_limits(self):
+        """Validated :class:`~src.ready_queue.ReadyQueueLimits`.
+
+        Malformed individual values already degrade to the documented default
+        via ``_get_int``. If the *combination* is still inconsistent (e.g. min >
+        target), fall back to the full default set rather than running with an
+        ordering that would make the writer-start rules nonsensical — and say so
+        loudly, because a silently wrong threshold is how the drive ends up
+        idle again.
+        """
+        from .ready_queue import ReadyQueueLimits
+        values = {k: self._ready_queue_raw(k) for k in self._READY_QUEUE_DEFAULTS}
+        try:
+            return ReadyQueueLimits(
+                values['min_ready_bytes_before_writer_start'],
+                values['target_ready_bytes'],
+                values['max_ready_bytes'],
+                values['max_ready_chunks'])
+        except ValueError as e:
+            print(f"[CONFIG] Invalid [PIPELINE] ready-queue limits ({e}); "
+                  f"using defaults {self._READY_QUEUE_DEFAULTS}.")
+            d = self._READY_QUEUE_DEFAULTS
+            return ReadyQueueLimits(
+                d['min_ready_bytes_before_writer_start'],
+                d['target_ready_bytes'], d['max_ready_bytes'],
+                d['max_ready_chunks'])
+
+    @property
+    def ready_queue_staging_reserve_bytes(self):
+        """Local staging the ready queue must never consume (Phase 4.5).
+
+        ``0`` (the default) means *auto*: enough for one active fetch plus one
+        active pack (each up to ``chunk_cap``, which is the peak the capacity
+        gate already sizes on) plus the existing ``LOCAL_STAGING_RESERVE_BYTES``
+        headroom that also covers temp pack output, manifests and resume
+        metadata. This deliberately mirrors the ``need = 2 * physical_estimate``
+        figure in ``_await_staging_capacity`` so there is a single staging model,
+        not a second incompatible one."""
+        auto = 2 * int(self.chunk_cap_gb * 1024**3) + LOCAL_STAGING_RESERVE_BYTES
+        raw = self._get_int('PIPELINE', 'ready_queue_staging_reserve_bytes', 0,
+                            minimum=0)
+        return auto if raw == 0 else raw
+
+    @property
+    def max_unstaged_backlog_chunks(self):
+        """How far the scanner may run ahead of the stager (Plan 1 Task 1.3).
+
+        A **bound**, not a barrier. The pipeline re-derives the number of sealed
+        chunks that no worker has started staging from authoritative chunk
+        status on every scheduling decision, and pauses publication while that
+        number is at this limit. As soon as the stager takes one chunk,
+        exploration resumes — which is what stops a large resumed backlog from
+        indefinitely postponing renewed scanning, the failure mode the old
+        bounded hand-off queue had.
+
+        Raising it costs only planning rows; lowering it below a handful will
+        make the scanner wait on the (much slower) fetch/pack stage.
+        """
+        return self._get_int('PIPELINE', 'max_unstaged_backlog_chunks', 64,
+                             minimum=1)
+
+    def validated_ready_queue_limits(self):
+        """Ready-queue limits proven to leave room for fetch/pack (Phase 4.5).
+
+        The Phase-4 ``ready_queue_limits`` already validate internal ordering.
+        Here the *combination* with staging is checked: the queue's byte ceiling
+        plus the staging reserve must fit inside the effective staging budget, so
+        a large ``max_ready_bytes`` can never starve the producer's active
+        fetch+pack. On a conflict we fall back ATOMICALLY to the documented
+        default limit set (never clamp one value alone); if even the defaults
+        cannot fit, we fail closed so the run refuses to start rather than
+        deadlock the producer against the writer.
+
+        Returns ``(limits, reserve_bytes, effective_staging_bytes, source)``
+        where ``source`` is ``"configured"`` or ``"fallback_default"``.
+        """
+        from .ready_queue import ReadyQueueLimits
+        limits = self.ready_queue_limits
+        effective = int(self.staging_max_gb * 1024**3)
+        reserve = self.ready_queue_staging_reserve_bytes
+        if limits.max_bytes + reserve <= effective:
+            return limits, reserve, effective, "configured"
+
+        d = self._READY_QUEUE_DEFAULTS
+        defaults = ReadyQueueLimits(
+            d['min_ready_bytes_before_writer_start'], d['target_ready_bytes'],
+            d['max_ready_bytes'], d['max_ready_chunks'])
+        if defaults.max_bytes + reserve <= effective:
+            print(f"[CONFIG] [PIPELINE] max_ready_bytes "
+                  f"({limits.max_bytes / 1024**3:.0f} GiB) + staging reserve "
+                  f"({reserve / 1024**3:.0f} GiB) exceeds the effective staging "
+                  f"budget ({effective / 1024**3:.0f} GiB from staging_max_gb="
+                  f"{self.staging_max_gb:.0f}). Falling back atomically to the "
+                  f"documented default ready-queue limits.")
+            return defaults, reserve, effective, "fallback_default"
+
+        raise ValueError(
+            f"[PIPELINE] ready-queue limits cannot coexist with staging: even "
+            f"the default max_ready_bytes ({defaults.max_bytes / 1024**3:.0f} "
+            f"GiB) + reserve ({reserve / 1024**3:.0f} GiB) exceeds the effective "
+            f"staging budget ({effective / 1024**3:.0f} GiB). Increase "
+            f"staging_max_gb or reduce ready_queue_staging_reserve_bytes; "
+            f"refusing to run with a queue that would starve fetch/pack.")
+
     @property
     def prefetch_chunks_ahead(self):
         return max(1, int(self._get_float(
@@ -608,3 +817,60 @@ class ConfigManager:
     def windows_update_block_on_pending_reboot(self):
         return self._get_bool(
             'WINDOWS_UPDATE', 'block_on_pending_reboot', True)
+
+    @property
+    def sealed_tape_write_batches_enabled(self):
+        """Phase 5 sealed tape-write batches. Fail-closed default: False. While
+        False the production runtime touches no batch table. Enabling it without
+        the applied 012 schema must fail at startup (a later phase wires the
+        preflight; Phase 5B keeps the repository unused by production)."""
+        return self._get_bool(
+            'FEATURES', 'sealed_tape_write_batches_enabled', False)
+
+    @property
+    def sealed_tape_write_batches_observation_enabled(self):
+        """Phase 5C observation mode. Fail-closed default: False. When False no
+        observer is constructed. When True the observer only computes/logs a
+        shadow comparison and can never change production behaviour; an observer
+        failure never blocks the writer. Enabling it does not enable sealed
+        batches. Do not enable during Phase 5C."""
+        return self._get_bool(
+            'FEATURES', 'sealed_tape_write_batches_observation_enabled', False)
+
+    # --- [OBSERVATION] : Phase 5D bounded async observation -------------------
+    @property
+    def sealed_batch_observation_queue_max(self):
+        return self._get_int('OBSERVATION',
+                             'sealed_batch_observation_queue_max', 100,
+                             minimum=1)
+
+    @property
+    def sealed_batch_observation_shutdown_timeout_seconds(self):
+        return self._get_float(
+            'OBSERVATION',
+            'sealed_batch_observation_shutdown_timeout_seconds', 5.0)
+
+    @property
+    def sealed_batch_observation_statement_timeout_seconds(self):
+        return self._get_float(
+            'OBSERVATION',
+            'sealed_batch_observation_statement_timeout_seconds', 5.0)
+
+    @property
+    def sealed_batch_observation_log_path(self):
+        return _clean_config_path(self.config.get(
+            'OBSERVATION', 'sealed_batch_observation_log_path',
+            fallback=os.path.join(tempfile.gettempdir(), 'lto8_observations',
+                                  'sealed_batch_observations.jsonl')))
+
+    @property
+    def sealed_batch_observation_log_max_bytes(self):
+        return self._get_int('OBSERVATION',
+                             'sealed_batch_observation_log_max_bytes',
+                             10 * 1024 * 1024, minimum=4096)
+
+    @property
+    def sealed_batch_observation_log_backups(self):
+        return self._get_int('OBSERVATION',
+                             'sealed_batch_observation_log_backups', 5,
+                             minimum=0)

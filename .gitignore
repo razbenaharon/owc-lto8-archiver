@@ -19,9 +19,15 @@ restored/
 LOCAL_MANIFEST_ARCHIVE/
 backup_logs/
 storage_map_logs/
+# Everything here stays untracked. This repo is PUBLIC, and storage_map/logs/
+# holds real lab data: scan rawlogs, and under deletions/ the ledger plus
+# per-file inventories naming every archived file and its owner. The deletion
+# ledger is the durable record of what was removed from a server, so keep
+# backups of it off-repo (it cannot be regenerated once the data is gone).
 storage_map/logs/
 storage_map/index.html
 db_backups/
+tape_reset_audits/
 lto_archive*.db
 
 # Local config — contains host/user/paths. Use config.example.ini as template.

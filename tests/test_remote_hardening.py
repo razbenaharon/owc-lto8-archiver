@@ -8,13 +8,13 @@ from unittest import mock
 from src.constants import LOCAL_STAGING_RESERVE_BYTES
 from src.orchestrators import (
     ChunkPlanner,
-    DirectoryPlanUnit,
-    DirectoryUnitPlanner,
     RemoteOrchestrator,
-    RemoteScanner,
     StreamingChunkBuilder,
-    StreamingRemoteScanner,
 )
+# The legacy scanners are imported from their own module, not the public
+# facade: Plan 1 completion removed them from that facade so it cannot
+# advertise a class no production path may build.
+from src.scanning import RemoteScanner, StreamingRemoteScanner
 from src.pipeline_types import StagedChunk
 from src.remote_transport import (
     _ASKPASS_HELPERS,
@@ -117,6 +117,54 @@ class RemoteStagingSafetyTests(unittest.TestCase):
         self.assertEqual(orch.db.statuses, ["backup_failed"])
 
 
+class MountedCartridgeGuardTests(unittest.TestCase):
+    """The cartridge in the drive must be the one the session catalogs to.
+
+    2026-07-26: after Tape_02 was frozen read-only the operator loaded Tape_03
+    and resumed session 37. The session row still said ``Tape_02``, and nothing
+    compared it to the mounted volume — the run would have written the
+    remaining chunks to Tape_03 while recording every one of them under
+    Tape_02, pointing a future restore at the wrong (unwritable) cartridge.
+    """
+
+    def _orchestrator(self):
+        orch = RemoteOrchestrator.__new__(RemoteOrchestrator)
+        orch.cfg = SimpleNamespace(lto_drive="Z:\\")
+        orch.notifier = None
+        return orch
+
+    def test_matching_cartridge_passes(self):
+        orch = self._orchestrator()
+        with mock.patch("src.remote_orchestrator.get_volume_label",
+                        return_value="Tape_03"):
+            self.assertIsNone(orch._verify_mounted_cartridge("Tape_03"))
+
+    def test_wrong_cartridge_blocks(self):
+        orch = self._orchestrator()
+        with mock.patch("src.remote_orchestrator.get_volume_label",
+                        return_value="Tape_03"):
+            block = orch._verify_mounted_cartridge("Tape_02")
+        self.assertIsNotNone(block)
+        self.assertFalse(block.resumable)
+        self.assertIn("Tape_03", block.detailed_reason)
+        self.assertIn("Tape_02", block.detailed_reason)
+
+    def test_unlabelled_volume_fails_closed(self):
+        orch = self._orchestrator()
+        with mock.patch("src.remote_orchestrator.get_volume_label",
+                        return_value=""):
+            block = orch._verify_mounted_cartridge("Tape_03")
+        self.assertIsNotNone(block)
+
+    def test_unreadable_label_fails_closed(self):
+        """"We cannot tell which cartridge this is" must never mean "proceed"."""
+        orch = self._orchestrator()
+        with mock.patch("src.remote_orchestrator.get_volume_label",
+                        side_effect=OSError("drive busy")):
+            block = orch._verify_mounted_cartridge("Tape_03")
+        self.assertIsNotNone(block)
+
+
 class ChunkPlannerFootprintTests(unittest.TestCase):
     def test_small_files_round_up_to_allocation_clusters(self):
         # 20 one-byte files each allocate a full 4 KiB cluster, so a budget of
@@ -183,23 +231,6 @@ class StreamingChunkBuilderTests(unittest.TestCase):
         self.assertEqual(builder.flush(), [[("/f/c", 1)]])
 
 
-class DirectoryUnitPlannerTests(unittest.TestCase):
-    def test_keeps_whole_directory_when_under_thresholds(self):
-        unit = DirectoryPlanUnit("/root/project", 10, 100)
-        planner = DirectoryUnitPlanner(max_bytes=200, max_files=20)
-        self.assertEqual(planner.plan([unit]), [unit])
-
-    def test_descends_when_directory_exceeds_thresholds(self):
-        child_a = DirectoryPlanUnit("/root/project/a", 5, 50)
-        child_b = DirectoryPlanUnit("/root/project/b", 6, 60)
-        root = DirectoryPlanUnit(
-            "/root/project", 11, 110, children=[child_b, child_a])
-        planner = DirectoryUnitPlanner(max_bytes=75, max_files=10)
-        self.assertEqual(
-            [unit.original_dir_path for unit in planner.plan([root])],
-            ["/root/project/a", "/root/project/b"])
-
-
 class RemoteResumeChunkLimitTests(unittest.TestCase):
     def _orchestrator(self, allow_override=False):
         class FakeDB:
@@ -241,8 +272,8 @@ class FetchWatchdogTests(unittest.TestCase):
         orch = self._orchestrator()
         stop, abort = threading.Event(), threading.Event()
         plenty = SimpleNamespace(total=10**12, used=0, free=10**12)
-        with mock.patch("src.remote_orchestrator._dir_tree_size", return_value=300), \
-             mock.patch("src.remote_orchestrator.shutil.disk_usage",
+        with mock.patch("src.remote_staging._dir_tree_size", return_value=300), \
+             mock.patch("src.remote_staging.shutil.disk_usage",
                         return_value=plenty):
             orch._start_fetch_monitor(stop, abort, r"C:\stage\_fetch", 100)
             self.assertTrue(abort.wait(timeout=15),
@@ -254,8 +285,8 @@ class FetchWatchdogTests(unittest.TestCase):
         stop, abort = threading.Event(), threading.Event()
         low = SimpleNamespace(total=10**12, used=0,
                               free=LOCAL_STAGING_RESERVE_BYTES - 1)
-        with mock.patch("src.remote_orchestrator._dir_tree_size", return_value=10), \
-             mock.patch("src.remote_orchestrator.shutil.disk_usage",
+        with mock.patch("src.remote_staging._dir_tree_size", return_value=10), \
+             mock.patch("src.remote_staging.shutil.disk_usage",
                         return_value=low):
             orch._start_fetch_monitor(stop, abort, r"C:\stage\_fetch", 100)
             self.assertTrue(abort.wait(timeout=15),
@@ -266,8 +297,8 @@ class FetchWatchdogTests(unittest.TestCase):
         orch = self._orchestrator()
         stop, abort = threading.Event(), threading.Event()
         plenty = SimpleNamespace(total=10**12, used=0, free=10**12)
-        with mock.patch("src.remote_orchestrator._dir_tree_size", return_value=90), \
-             mock.patch("src.remote_orchestrator.shutil.disk_usage",
+        with mock.patch("src.remote_staging._dir_tree_size", return_value=90), \
+             mock.patch("src.remote_staging.shutil.disk_usage",
                         return_value=plenty):
             orch._start_fetch_monitor(stop, abort, r"C:\stage\_fetch", 100)
             self.assertFalse(abort.wait(timeout=3))
@@ -280,8 +311,8 @@ class FetchWatchdogTests(unittest.TestCase):
         orch.fetch_stall_timeout = 1
         stop, abort = threading.Event(), threading.Event()
         plenty = SimpleNamespace(total=10**12, used=0, free=10**12)
-        with mock.patch("src.remote_orchestrator._dir_tree_size", return_value=40), \
-             mock.patch("src.remote_orchestrator.shutil.disk_usage",
+        with mock.patch("src.remote_staging._dir_tree_size", return_value=40), \
+             mock.patch("src.remote_staging.shutil.disk_usage",
                         return_value=plenty):
             orch._start_fetch_monitor(stop, abort, r"C:\stage\_fetch", 100)
             self.assertTrue(abort.wait(timeout=15),
@@ -293,8 +324,8 @@ class FetchWatchdogTests(unittest.TestCase):
         orch.fetch_stall_timeout = 0
         stop, abort = threading.Event(), threading.Event()
         plenty = SimpleNamespace(total=10**12, used=0, free=10**12)
-        with mock.patch("src.remote_orchestrator._dir_tree_size", return_value=40), \
-             mock.patch("src.remote_orchestrator.shutil.disk_usage",
+        with mock.patch("src.remote_staging._dir_tree_size", return_value=40), \
+             mock.patch("src.remote_staging.shutil.disk_usage",
                         return_value=plenty):
             orch._start_fetch_monitor(stop, abort, r"C:\stage\_fetch", 100)
             self.assertFalse(abort.wait(timeout=3))

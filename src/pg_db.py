@@ -16,22 +16,26 @@ from .pg_catalog import PgCatalogMixin
 from .pg_core import (PgConnectionCore, PgRow, _as_utc, _coerce_timestamptz,
                       _coerce_timestamp_kwargs, _now_utc, _row, _rows,
                       _valid_columns)
+from .pg_scan import PgScanMixin, ScanFrontierError, SegmentRangeConflict
 from .pg_sessions import (PgSessionMixin, _canonical_remote_path,
                           _plan_fingerprint, _snapshot_fingerprint,
                           _streaming_fingerprint)
 from .pg_tapes import PgTapeMixin
+from .pg_tape_reset import PgTapeResetMixin
 
 # Everything historically importable from src.pg_db stays importable here.
 __all__ = [
     "PgDatabaseManager", "PgConnectionCore", "PgCatalogMixin",
-    "PgSessionMixin", "PgTapeMixin", "PgRow",
+    "PgScanMixin", "PgSessionMixin", "PgTapeMixin", "PgTapeResetMixin",
+    "PgRow", "ScanFrontierError", "SegmentRangeConflict",
     "_as_utc", "_canonical_remote_path", "_coerce_timestamp_kwargs",
     "_coerce_timestamptz", "_now_utc", "_plan_fingerprint", "_row", "_rows",
     "_snapshot_fingerprint", "_streaming_fingerprint", "_valid_columns",
 ]
 
 
-class PgDatabaseManager(PgCatalogMixin, PgSessionMixin, PgTapeMixin,
+class PgDatabaseManager(PgCatalogMixin, PgScanMixin, PgSessionMixin,
+                        PgTapeMixin, PgTapeResetMixin,
                         PgConnectionCore):
     """PostgreSQL-backed subset of the DatabaseManager API.
 

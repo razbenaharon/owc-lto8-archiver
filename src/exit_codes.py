@@ -58,7 +58,21 @@ REASON_LTFS_SYNC_MODE_NOT_TIME5 = "ltfs_sync_mode_not_time5"
 REASON_LTFS_MOUNT_UNVERIFIABLE = "ltfs_mount_unverifiable"
 REASON_LTFS_MEDIA_DEGRADED = "ltfs_media_degraded"
 REASON_UNEXPECTED_TAPE_OR_DB_STATE = "unexpected_tape_or_db_state"
+#: Authoritative cross-process LTFS ownership could not be acquired, so NO tape,
+#: mount, readiness, cartridge or robocopy operation was attempted. Nothing was
+#: written, so no chunk is ambiguous and the staged pack stays reusable.
+REASON_LTFS_OWNERSHIP_UNAVAILABLE = "ltfs_ownership_unavailable"
 REASON_AMBIGUOUS_ACTIVE_SESSIONS = "ambiguous_active_sessions"
+#: The sealed-batch feature flag was explicitly enabled, but the feature is not
+#: ready (schema not applied, checksum mismatch, or exact schema drift). Startup
+#: refuses BEFORE any worker thread rather than fall back to legacy behaviour
+#: after the operator opted in. No tape or batch operation was attempted.
+REASON_SEALED_BATCH_FEATURE_UNAVAILABLE = "sealed_batch_feature_unavailable"
+#: The sole production frontier scanner cannot rely on migration 014 because
+#: the schema is missing, unfinalized, or indeterminate. There is no legacy
+#: scan mode to select instead, so the run stops before scan, staging, or tape
+#: work starts.
+REASON_SCAN_FRONTIER_UNAVAILABLE = "scan_frontier_unavailable"
 # 30 — FATAL_CONFIG
 REASON_SSH_AUTHENTICATION_FAILED = "ssh_authentication_failed"
 REASON_SSH_PERMISSION_DENIED = "ssh_permission_denied"

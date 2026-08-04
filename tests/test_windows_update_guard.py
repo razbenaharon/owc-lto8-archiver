@@ -239,11 +239,21 @@ class ManagedPolicyTests(_GuardTestCase):
 class RebootSentinelTests(_GuardTestCase):
     """The sentinel is the only real guard on an admin-managed host."""
 
+    @staticmethod
+    def _critical(message="update staged"):
+        return [wug.RebootSignal(wug.REBOOT_CBS_PENDING, wug.SEVERITY_CRITICAL,
+                                 "HKLM\\CBS", message)]
+
+    @staticmethod
+    def _warning(message="renames queued"):
+        return [wug.RebootSignal(wug.REBOOT_FILE_RENAME, wug.SEVERITY_WARNING,
+                                 "HKLM\\SessionManager", message)]
+
     def test_sentinel_sets_stop_event_when_restart_is_staged(self):
         stop = wug.threading.Event()
         s = wug.RebootSentinel(stop, poll_seconds=0.01)
-        with mock.patch.object(wug, "pending_reboot_reasons",
-                               lambda: ["update staged"]):
+        with mock.patch.object(wug, "pending_reboot_signals",
+                               lambda: self._critical()):
             s.start()
             self.assertTrue(stop.wait(timeout=3),
                             "sentinel must ask the pipeline to stop")
@@ -253,7 +263,7 @@ class RebootSentinelTests(_GuardTestCase):
     def test_sentinel_stays_quiet_on_a_clean_host(self):
         stop = wug.threading.Event()
         s = wug.RebootSentinel(stop, poll_seconds=0.01)
-        with mock.patch.object(wug, "pending_reboot_reasons", lambda: []):
+        with mock.patch.object(wug, "pending_reboot_signals", lambda: []):
             s.start()
             self.assertFalse(stop.wait(timeout=0.5))
         s.stop()
@@ -263,8 +273,8 @@ class RebootSentinelTests(_GuardTestCase):
         stop = wug.threading.Event()
         seen = []
         s = wug.RebootSentinel(stop, poll_seconds=0.01, on_detect=seen.append)
-        with mock.patch.object(wug, "pending_reboot_reasons",
-                               lambda: ["staged"]):
+        with mock.patch.object(wug, "pending_reboot_signals",
+                               lambda: self._critical("staged")):
             s.start()
             stop.wait(timeout=3)
         s.stop()
@@ -273,7 +283,7 @@ class RebootSentinelTests(_GuardTestCase):
     def test_registry_error_never_kills_the_pipeline(self):
         stop = wug.threading.Event()
         s = wug.RebootSentinel(stop, poll_seconds=0.01)
-        with mock.patch.object(wug, "pending_reboot_reasons",
+        with mock.patch.object(wug, "pending_reboot_signals",
                                mock.Mock(side_effect=OSError("hive gone"))):
             s.start()
             self.assertFalse(stop.wait(timeout=0.4),
@@ -288,11 +298,119 @@ class RebootSentinelTests(_GuardTestCase):
             raise RuntimeError("notifier down")
 
         s = wug.RebootSentinel(stop, poll_seconds=0.01, on_detect=boom)
-        with mock.patch.object(wug, "pending_reboot_reasons",
-                               lambda: ["staged"]):
+        with mock.patch.object(wug, "pending_reboot_signals",
+                               lambda: self._critical("staged")):
             s.start()
             self.assertTrue(stop.wait(timeout=3))
         s.stop()
+
+    def test_warning_only_marker_never_trips_the_sentinel(self):
+        """2026-07-26: the sentinel tripped on a marker the start gate ignored.
+
+        With block_on_pending_reboot=false the start gate proceeded, then the
+        sentinel stopped the run 60s later on the same
+        PendingFileRenameOperations entry — so the run could never write a
+        chunk. Severity now settles it with no flag to keep in sync: the
+        marker is warning-only, so neither side blocks on it.
+        """
+        stop = wug.threading.Event()
+        s = wug.RebootSentinel(stop, poll_seconds=0.01)
+        with mock.patch.object(wug, "pending_reboot_signals",
+                               lambda: self._warning()), \
+             mock.patch.object(wug, "sccm_reboot_status",
+                               lambda: {"reboot_pending": False,
+                                        "hard_reboot_pending": False,
+                                        "in_grace_period": False,
+                                        "deadline": None, "determinate": True,
+                                        "error": None}):
+            s.start()
+            self.assertFalse(stop.wait(timeout=0.5))
+        s.stop()
+        self.assertFalse(s.triggered)
+
+
+class SoftRebootMarkerTests(unittest.TestCase):
+    """PendingFileRenameOperations is not a staged restart.
+
+    It lists file moves to apply *if* a restart happens and never causes one.
+    Edge and Defender updates leave entries there for days, so treating it as
+    a hard marker blocks the pipeline permanently. The hard markers must stay
+    unconditional.
+    """
+
+    def setUp(self):
+        self.hard_keys = set()
+
+        def fake_open(_root, path, *_a, **_kw):
+            if path in self.hard_keys:
+                return mock.MagicMock()
+            raise OSError("key absent")
+
+        self.renames = None
+
+        # Name-aware: a blanket "every value returns the rename list" stub would
+        # also make JoinDomain truthy and fabricate a domain-join signal.
+        def fake_read_value(_root, _path, name):
+            if name == "PendingFileRenameOperations":
+                return self.renames, REG_SZ
+            return None, None
+
+        patches = [
+            mock.patch.object(wug, "winreg", SimpleNamespace(
+                HKEY_LOCAL_MACHINE=0, REG_SZ=REG_SZ, REG_DWORD=REG_DWORD,
+                KEY_READ=0x20019, KEY_SET_VALUE=0x0002, OpenKey=fake_open)),
+            mock.patch.object(wug, "_read_value", fake_read_value),
+            mock.patch.object(wug, "sccm_reboot_status", lambda: dict(
+                installed=False, reboot_pending=False,
+                hard_reboot_pending=False, in_grace_period=False,
+                deadline=None, error=None, determinate=True,
+                registry_reboot_data=False)),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    CBS = (r"SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based "
+           r"Servicing\RebootPending")
+
+    def test_soft_marker_is_reported_by_default(self):
+        self.renames = ["\\??\\C:\\x"]
+        self.assertIn("Files are queued to be renamed on the next restart",
+                      wug.pending_reboot_reasons())
+
+    def test_soft_marker_is_dropped_when_excluded(self):
+        self.renames = ["\\??\\C:\\x"]
+        self.assertEqual(wug.pending_reboot_reasons(include_soft=False), [])
+
+    def test_soft_marker_is_classified_warning_not_critical(self):
+        """The classification, not the caller's flag, is what makes it safe."""
+        self.renames = ["\\??\\C:\\x"]
+        signals = wug.pending_reboot_signals()
+        self.assertEqual([s.code for s in signals], [wug.REBOOT_FILE_RENAME])
+        self.assertEqual(signals[0].severity, wug.SEVERITY_WARNING)
+        self.assertFalse(wug.assess_reboot_state(block_on_unknown=False).blocking)
+
+    def test_hard_marker_survives_the_exclusion(self):
+        """A critical marker must never be weakened by the soft-marker path."""
+        self.renames = ["\\??\\C:\\x"]
+        self.hard_keys.add(self.CBS)
+        reasons = wug.pending_reboot_reasons(include_soft=False)
+        self.assertEqual(
+            reasons, ["Component Based Servicing has a restart pending"])
+        # ...and the assessment blocks, with the warning still recorded.
+        a = wug.assess_reboot_state(block_on_unknown=False)
+        self.assertTrue(a.blocking)
+        self.assertEqual([s.code for s in a.warnings], [wug.REBOOT_FILE_RENAME])
+
+    def test_sccm_intent_survives_the_exclusion(self):
+        self.renames = ["\\??\\C:\\x"]
+        with mock.patch.object(wug, "sccm_reboot_status", lambda: dict(
+                installed=True, reboot_pending=True,
+                hard_reboot_pending=False, in_grace_period=False,
+                deadline=None, error=None, determinate=True,
+                registry_reboot_data=False)):
+            reasons, _ = wug.reboot_block_reasons(include_soft=False)
+        self.assertTrue(any("SCCM" in r for r in reasons), reasons)
 
 
 class CliWiringTests(unittest.TestCase):
@@ -314,22 +432,54 @@ class CliWiringTests(unittest.TestCase):
         self.assertTrue(proceed)
         self.assertFalse(applied)
 
+    @staticmethod
+    def _assessment(*signals):
+        return wug.RebootAssessment(list(signals), dict(determinate=True))
+
+    @staticmethod
+    def _crit(message="update staged"):
+        return wug.RebootSignal(wug.REBOOT_CBS_PENDING, wug.SEVERITY_CRITICAL,
+                                "HKLM\\CBS", message)
+
+    @staticmethod
+    def _warn(message="renames queued"):
+        return wug.RebootSignal(wug.REBOOT_FILE_RENAME, wug.SEVERITY_WARNING,
+                                "HKLM\\SessionManager", message)
+
     def test_pending_reboot_blocks_the_run(self):
         from src import cli
         with mock.patch.object(cli, "restore_stale_guard", lambda: False), \
-             mock.patch.object(cli, "pending_reboot_reasons",
-                               lambda: ["update staged"]), \
+             mock.patch.object(cli, "assess_reboot_state",
+                               lambda **_kw: self._assessment(self._crit())), \
              mock.patch.object(cli, "pause_windows_updates") as pause:
             proceed, applied = cli._start_windows_update_guard(self._cfg())
         self.assertFalse(proceed)
         self.assertFalse(applied)
         pause.assert_not_called()
 
+    def test_warning_only_marker_does_not_block_the_run(self):
+        """The 2026-07-26 false positive, at the start gate.
+
+        A stale rename queue must not refuse to start the run even with
+        block_on_pending_reboot=true — that combination is what forced the
+        operator to disable the guard entirely.
+        """
+        from src import cli
+        with mock.patch.object(cli, "restore_stale_guard", lambda: False), \
+             mock.patch.object(cli, "assess_reboot_state",
+                               lambda **_kw: self._assessment(self._warn())), \
+             mock.patch.object(cli, "pause_windows_updates", lambda d: True), \
+             mock.patch.object(cli, "print_guard_status", lambda *a: None), \
+             mock.patch.object(cli, "managed_update_policy", lambda: {}):
+            proceed, applied = cli._start_windows_update_guard(self._cfg())
+        self.assertTrue(proceed, "a warning-only marker must not block the run")
+        self.assertTrue(applied)
+
     def test_pending_reboot_override_proceeds_and_pauses(self):
         from src import cli
         with mock.patch.object(cli, "restore_stale_guard", lambda: False), \
-             mock.patch.object(cli, "pending_reboot_reasons",
-                               lambda: ["update staged"]), \
+             mock.patch.object(cli, "assess_reboot_state",
+                               lambda **_kw: self._assessment(self._crit())), \
              mock.patch.object(cli, "pause_windows_updates", lambda d: True):
             proceed, applied = cli._start_windows_update_guard(
                 self._cfg(windows_update_block_on_pending_reboot=False))
@@ -339,7 +489,7 @@ class CliWiringTests(unittest.TestCase):
     def test_clean_host_pauses_and_reports_applied(self):
         from src import cli
         with mock.patch.object(cli, "restore_stale_guard", lambda: False), \
-             mock.patch.object(cli, "pending_reboot_reasons", lambda: []), \
+             mock.patch.object(cli, "pending_reboot_reasons", lambda **_kw: []), \
              mock.patch.object(cli, "pause_windows_updates", lambda d: True):
             proceed, applied = cli._start_windows_update_guard(self._cfg())
         self.assertTrue(proceed)
@@ -351,7 +501,7 @@ class CliWiringTests(unittest.TestCase):
         calls = []
         with mock.patch.object(cli, "restore_stale_guard",
                                lambda: calls.append("restore")), \
-             mock.patch.object(cli, "pending_reboot_reasons", lambda: []), \
+             mock.patch.object(cli, "pending_reboot_reasons", lambda **_kw: []), \
              mock.patch.object(cli, "pause_windows_updates",
                                lambda d: calls.append("pause") or True):
             cli._start_windows_update_guard(self._cfg())
@@ -434,3 +584,150 @@ class LtfsMediaHealthTests(unittest.TestCase):
         self.assertFalse(health["determinate"])
         self.assertFalse(health["ok"])
         self.assertIn("cannot read", health["error"])
+
+    def test_complete_format_sequence_resets_pre_format_faults(self):
+        rows = [
+            ('11333', 'Error', '2026/08/02 11:56:22.189', '1', '2', 'Z',
+             'A cartridge with write-perm error is detected on DP.'),
+            ('62173', 'Information', '2026/08/02 12:52:57.233', '2', '2', 'Z',
+             'Error on readattribute: Invalid Field in CDB (-20501).'),
+            ('15013', 'Information', '2026/08/02 12:53:07.366', '2', '2', 'Z',
+             'Volume UUID is: 55e10b7b-49a9-4f2d-a7c7-7586af1ec6a4.'),
+            ('15024', 'Information', '2026/08/02 12:53:26.316', '2', '2', 'Z',
+             'Medium formatted successfully.'),
+            ('17228', 'Information', '2026/08/02 12:53:41.678', '1', '2', 'Z',
+             'Tape attribute: Volume Lock Status = 0x00.'),
+            ('11031', 'Information', '2026/08/02 12:53:41.679', '1', '2', 'Z',
+             'Volume mounted successfully. NO_BARCODE : Gen = 1 / drive.'),
+        ]
+        health = wug.ltfs_media_health(
+            since_iso='2026-08-02T11:55:34', log_path=self._log(rows))
+        self.assertTrue(health["ok"], health)
+        self.assertIsNotNone(health["post_format_reset"])
+        self.assertEqual(health["fatal"], [])
+        self.assertEqual(health["degraded"], [])
+
+    def test_incomplete_format_evidence_does_not_reset_faults(self):
+        rows = [
+            ('11333', 'Error', '2026/08/02 11:56:22.189', '1', '2', 'Z',
+             'A cartridge with write-perm error is detected on DP.'),
+            # Missing the new UUID: a bare success/mount must not erase history.
+            ('15024', 'Information', '2026/08/02 12:53:26.316', '2', '2', 'Z',
+             'Medium formatted successfully.'),
+            ('17228', 'Information', '2026/08/02 12:53:41.678', '1', '2', 'Z',
+             'Tape attribute: Volume Lock Status = 0x00.'),
+            ('11031', 'Information', '2026/08/02 12:53:41.679', '1', '2', 'Z',
+             'Volume mounted successfully. NO_BARCODE : Gen = 1 / drive.'),
+        ]
+        health = wug.ltfs_media_health(
+            since_iso='2026-08-02T11:55:34', log_path=self._log(rows))
+        self.assertFalse(health["ok"])
+        self.assertIsNone(health["post_format_reset"])
+        self.assertIn(11333, {e["id"] for e in health["fatal"]})
+
+    def test_fault_after_verified_format_still_blocks(self):
+        rows = [
+            ('11333', 'Error', '2026/08/02 11:56:22.189', '1', '2', 'Z',
+             'A cartridge with write-perm error is detected on DP.'),
+            ('15013', 'Information', '2026/08/02 12:53:07.366', '2', '2', 'Z',
+             'Volume UUID is: new-uuid.'),
+            ('15024', 'Information', '2026/08/02 12:53:26.316', '2', '2', 'Z',
+             'Medium formatted successfully.'),
+            ('17228', 'Information', '2026/08/02 12:53:41.678', '1', '2', 'Z',
+             'Tape attribute: Volume Lock Status = 0x00.'),
+            ('11031', 'Information', '2026/08/02 12:53:41.679', '1', '2', 'Z',
+             'Volume mounted successfully. NO_BARCODE : Gen = 1 / drive.'),
+            ('17267', 'Error', '2026/08/02 13:00:00.000', '1', '2', 'Z',
+             'Locate command returns write-perm error (-20301).'),
+        ]
+        health = wug.ltfs_media_health(
+            since_iso='2026-08-02T11:55:34', log_path=self._log(rows))
+        self.assertFalse(health["ok"])
+        self.assertIsNotNone(health["post_format_reset"])
+        self.assertIn(17267, {e["id"] for e in health["degraded"]})
+
+    def test_read_only_between_format_and_mount_invalidates_reset(self):
+        rows = [
+            ('11333', 'Error', '2026/08/02 11:56:22.189', '1', '2', 'Z',
+             'A cartridge with write-perm error is detected on DP.'),
+            ('15013', 'Information', '2026/08/02 12:53:07.366', '2', '2', 'Z',
+             'Volume UUID is: new-uuid.'),
+            ('15024', 'Information', '2026/08/02 12:53:26.316', '2', '2', 'Z',
+             'Medium formatted successfully.'),
+            ('61223', 'Error', '2026/08/02 12:53:30.000', '1', '2', 'Z',
+             'Medium is write protected. Mounting medium as read-only.'),
+            ('17228', 'Information', '2026/08/02 12:53:41.678', '1', '2', 'Z',
+             'Tape attribute: Volume Lock Status = 0x00.'),
+            ('11031', 'Information', '2026/08/02 12:53:41.679', '1', '2', 'Z',
+             'Volume mounted successfully. NO_BARCODE : Gen = 1 / drive.'),
+        ]
+        health = wug.ltfs_media_health(
+            since_iso='2026-08-02T11:55:34', log_path=self._log(rows))
+        self.assertFalse(health["ok"])
+        self.assertIsNone(health["post_format_reset"])
+        self.assertIn(11333, {e["id"] for e in health["fatal"]})
+
+
+class LtfsMountAnchorTests(unittest.TestCase):
+    """The mount window must be anchored to the process that owns the mount.
+
+    2026-07-26: after a cartridge swap the LTFS services were restarted but the
+    GUI helper ``LtfsGuiCancelShutdown`` survived from the previous day. The
+    anchor was "earliest process named *ltfs*", so the evidence window opened
+    ~28 h too early, swept in the OLD cartridge's LOCATE faults, and refused to
+    write to a brand-new, provably clean tape.
+    """
+
+    MOUNT_START = "2026-07-26T14:18:50.4401480+03:00"
+    STALE_HELPER_START = "2026-07-25T10:17:39.3542840+03:00"
+
+    def _patch_query(self, payload):
+        """Stand in for the single PowerShell round-trip."""
+        proc = mock.Mock(returncode=0, stdout=json.dumps(payload), stderr="")
+        p = mock.patch.object(wug.subprocess, "run", return_value=proc)
+        self.addCleanup(p.stop)
+        p.start()
+
+    def _payload(self, **over):
+        data = {
+            "MountProcStart": self.MOUNT_START,
+            "ProcStart": self.STALE_HELPER_START,
+            "EventTime": "2026-07-26T14:18:50.5588063+03:00",
+            "EventMsg": 'Sync type is "time", Sync time is 300 sec',
+        }
+        data.update(over)
+        return data
+
+    @mock.patch.object(wug.os, "name", "nt")
+    def test_anchors_on_the_mount_process_not_a_stale_helper(self):
+        self._patch_query(self._payload())
+        info = wug.ltfs_current_mount_status()
+        self.assertEqual(info["mount_started_at"], self.MOUNT_START)
+        self.assertNotEqual(info["mount_started_at"], self.STALE_HELPER_START)
+        self.assertTrue(info["determinate"])
+        self.assertTrue(info["ok"], info)
+
+    @mock.patch.object(wug.os, "name", "nt")
+    def test_falls_back_to_the_broad_match_when_no_mount_process(self):
+        """SDE builds that name the mount process differently still work."""
+        self._patch_query(self._payload(MountProcStart=""))
+        info = wug.ltfs_current_mount_status()
+        self.assertEqual(info["mount_started_at"], self.STALE_HELPER_START)
+        self.assertTrue(info["determinate"])
+
+    @mock.patch.object(wug.os, "name", "nt")
+    def test_no_ltfs_process_at_all_fails_closed(self):
+        self._patch_query(self._payload(MountProcStart="", ProcStart=""))
+        info = wug.ltfs_current_mount_status()
+        self.assertFalse(info["determinate"])
+        self.assertFalse(info["mount_identified"])
+        self.assertIsNone(info["mount_started_at"])
+
+    @mock.patch.object(wug.os, "name", "nt")
+    def test_declaration_predating_the_mount_process_fails_closed(self):
+        """A 61259 line from the previous mount must never approve this one."""
+        self._patch_query(self._payload(
+            EventTime="2026-07-25T10:14:37.6480000+03:00"))
+        info = wug.ltfs_current_mount_status()
+        self.assertFalse(info["bound_to_current"])
+        self.assertFalse(info["determinate"])
