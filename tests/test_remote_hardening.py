@@ -113,8 +113,8 @@ class RemoteStagingSafetyTests(unittest.TestCase):
                 ]
 
             def get_chunk_size_summary(self, session_id, chunk_index=None):
-                # planned counts every file; present excludes source_missing.
-                return {0: (2000, 1000, 2)}
+                raise AssertionError(
+                    "logical plan bytes are not tape-capacity authority")
 
             def get_chunk_packaging_format(self, session_id, chunk_index):
                 return ContainerFormat.ZIP
@@ -144,18 +144,18 @@ class RemoteStagingSafetyTests(unittest.TestCase):
             pack_dir=r"C:\stage\pack",
             fetch_dir=r"C:\stage\fetch",
             metadata=[{"is_packed": True}],
-            staged_bytes=0,
+            staged_bytes=2000,
             session_id=1,
             packaging_format=ContainerFormat.ZIP,
         )
         result = orch._write_chunk(1, desc, "T1", eject_after=False,
                                    stop_pipeline=_threading.Event())
-        # A chunk that does not fit is a re-fetchable safety block that leaves
-        # the chunk 'backup_failed' and does NOT transition it to 'backing'.
+        # A finite group that does not fit is rejected from actual staged bytes
+        # before ownership/status mutation and its reusable pack is preserved.
         self.assertIsNotNone(result)
         self.assertEqual(result.exit_code, ExitCode.SAFETY_BLOCK)
-        self.assertFalse(result.preserve_pack)
-        self.assertEqual(orch.db.statuses, ["backup_failed"])
+        self.assertTrue(result.preserve_pack)
+        self.assertEqual(orch.db.statuses, [])
 
 
 class MountedCartridgeGuardTests(unittest.TestCase):

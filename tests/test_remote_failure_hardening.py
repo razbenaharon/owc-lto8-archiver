@@ -993,6 +993,19 @@ class PostBackingFailureAmbiguityTests(unittest.TestCase):
         self.assertNotIn("pending", statuses)
         self.assertNotIn("done", statuses)
 
+    def test_started_writer_failure_records_container_ambiguity(self):
+        writer = WriteChunkRaceTests._FakeWriter(
+            start=True, raises=RuntimeError("writer disappeared"))
+        orch, _statuses = self._o(writer)
+        ambiguous = []
+        orch.db.mark_remote_chunk_write_ambiguous = (
+            lambda sid, ci: ambiguous.append((sid, ci)))
+        with redirect_stdout(io.StringIO()):
+            result = orch._write_chunk(
+                7, _desc(0), "T", False, threading.Event())
+        self.assertEqual(result.reason, REASON_AMBIGUOUS_BACKING_CHUNK)
+        self.assertEqual(ambiguous, [(7, 0)])
+
     def test_forced_kill_after_backing_returns_ambiguous_not_user_stop(self):
         # Requirement 1: a force-killed writer after write_started returns
         # 20/ambiguous_backing_chunk EVEN when CANCEL is set — never 40.
@@ -1068,6 +1081,51 @@ class PostBackingFailureAmbiguityTests(unittest.TestCase):
         orch._stage_chunk.assert_not_called()
         self.assertEqual(consulted, [(7, "backing")],
                          "resume only reads status; it does not reconcile")
+
+
+class CatalogCompletionStateTests(unittest.TestCase):
+    """Copy success is not chunk completion until every catalog commit lands."""
+
+    class _DB:
+        def __init__(self, fail_commit=False):
+            self.events = []
+            self.fail_commit = fail_commit
+        def mark_remote_chunk_catalog_committing(self, sid, ci):
+            self.events.append("committing")
+        def mark_remote_chunk_catalog_committed(self, sid, ci):
+            self.events.append("committed")
+            if self.fail_commit:
+                raise RuntimeError("commit marker failed")
+        def mark_remote_chunk_catalog_failed(self, sid, ci):
+            self.events.append("failed")
+
+    def test_success_marks_catalog_committed_after_body(self):
+        from src.backup import _remote_catalog_commit_state
+        db = self._DB()
+        with _remote_catalog_commit_state(db, 7, 3):
+            db.events.append("catalog_body")
+        self.assertEqual(
+            db.events, ["committing", "catalog_body", "committed"])
+
+    def test_partial_catalog_failure_is_durable_and_not_committed(self):
+        from src.backup import _remote_catalog_commit_state
+        db = self._DB()
+        with self.assertRaisesRegex(RuntimeError, "directory commit failed"):
+            with _remote_catalog_commit_state(db, 7, 3):
+                db.events.append("partial_file_commit")
+                raise RuntimeError("directory commit failed")
+        self.assertEqual(
+            db.events, ["committing", "partial_file_commit", "failed"])
+
+    def test_final_commit_marker_failure_is_recorded_failed(self):
+        from src.backup import _remote_catalog_commit_state
+        db = self._DB(fail_commit=True)
+        with self.assertRaisesRegex(RuntimeError, "commit marker failed"):
+            with _remote_catalog_commit_state(db, 7, 3):
+                db.events.append("catalog_body")
+        self.assertEqual(
+            db.events,
+            ["committing", "catalog_body", "committed", "failed"])
 
 
 class FinalChunkCancelTerminalTests(unittest.TestCase):

@@ -458,6 +458,40 @@ class GroupWriteSemanticsTests(unittest.TestCase):
         self.assertEqual(orch._readiness_checks, 1)
         self.assertEqual(orch._cartridge_verifications, 1)
 
+    def test_group_capacity_uses_cumulative_actual_staged_bytes_before_lock(self):
+        orch = self._orchestrator({})
+        descs = self._descs([0, 1, 2])
+        descs[0].staged_bytes = 11
+        descs[1].staged_bytes = 13
+        descs[2].staged_bytes = 17
+        seen = []
+        orch._ensure_remote_chunk_fits_tape = (
+            lambda label, actual, indices:
+                seen.append((label, actual, list(indices))) or False)
+
+        block = orch._write_chunk_group(
+            37, descs, "T", False, threading.Event())
+
+        self.assertEqual(seen, [("T", 41, [0, 1, 2])])
+        self.assertEqual(orch._ownership_acquisitions, 0)
+        self.assertEqual(self.written, [])
+        self.assertTrue(block.preserve_pack)
+
+    def test_smaller_logical_plan_cannot_admit_larger_staged_group(self):
+        orch = self._orchestrator({})
+        desc = self._descs([0])[0]
+        desc.staged_bytes = 101
+        # This obsolete logical estimate must never be consulted.
+        orch.db.get_chunk_size_summary.return_value = {0: (1, 1, 1)}
+        orch._ensure_remote_chunk_fits_tape = mock.Mock(return_value=False)
+
+        orch._write_chunk_group(
+            37, [desc], "T", False, threading.Event())
+
+        orch._ensure_remote_chunk_fits_tape.assert_called_once_with(
+            "T", 101, [0])
+        orch.db.get_chunk_size_summary.assert_not_called()
+
     def test_ownership_released_after_the_group(self):
         orch = self._orchestrator({})
         orch._write_chunk_group(37, self._descs([0, 1]), "T", False,

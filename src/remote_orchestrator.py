@@ -346,6 +346,7 @@ class RemoteOrchestrator:
             notifier=self.notifier,
             governor=self.governor,
             index_min_file_mb=self.cfg.index_min_file_mb,
+            index_packed_small_files=self.cfg.index_packed_small_files,
         )
 
     # ------------------------------------------------------------------
@@ -444,10 +445,10 @@ class RemoteOrchestrator:
         return self._writer()._write_one_chunk_owned(
             session_id, desc, tape_label, eject_after)
 
-    def _ensure_remote_chunk_fits_tape(self, tape_label, planned_bytes,
-                                       chunk_index):
+    def _ensure_remote_chunk_fits_tape(self, tape_label, staged_bytes,
+                                       chunk_indices):
         return self._writer()._ensure_remote_chunk_fits_tape(
-            tape_label, planned_bytes, chunk_index)
+            tape_label, staged_bytes, chunk_indices)
 
     # ------------------------------------------------------------------
     # Public entry point
