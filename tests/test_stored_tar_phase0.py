@@ -49,8 +49,8 @@ class FeatureGateTests(unittest.TestCase):
                 self.assertTrue(
                     self._config(value).stored_tar_write_enabled)
 
-    def test_reader_contract_is_deliberately_absent_in_phase_zero(self):
-        self.assertIsNone(stored_tar_reader_contract_version())
+    def test_phase_one_reader_contract_is_now_available(self):
+        self.assertEqual(stored_tar_reader_contract_version(), 1)
 
     def test_migration_015_is_not_a_startup_migration(self):
         self.assertNotIn(

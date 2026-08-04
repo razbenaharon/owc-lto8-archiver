@@ -13,7 +13,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 
 class SessionStatus(str, Enum):
@@ -192,6 +192,53 @@ class ArtifactRecord(TypedDict, total=False):
     tape_locator: Optional[str]
     artifact_size_bytes: Optional[int]
     readiness_state: str
+
+
+@dataclass(frozen=True)
+class StoredTarExpectedMember:
+    """One immutable plan/sidecar expectation for a Stored TAR member.
+
+    ``source_exception`` is evidence about a planned source entry that was not
+    archived.  Such a record may omit ``name`` because Plan 2 sidecars must not
+    invent a TAR member name for an absent source.  The TAR reader accepts only
+    the three explicit source outcomes that Plan 2 permits; it never infers one
+    from the TAR's contents.
+    """
+
+    name: Optional[str]
+    logical_size: int
+    ordinal: int
+    source_exception: Optional[FileTransferStatus] = None
+
+
+@dataclass(frozen=True)
+class StoredTarMember:
+    """Observed regular-file member returned by the strict streaming reader."""
+
+    name: str
+    normalized_name: str
+    logical_size: int
+    stored_size: int
+    ordinal: int
+    sparse: bool = False
+    sparse_extent_count: int = 0
+
+
+@dataclass(frozen=True)
+class StoredTarContainer:
+    """Successful full-container validation result.
+
+    ``archive_size`` includes the two end blocks and GNU ``-b 512`` zero
+    padding.  Content hashes are intentionally absent from this contract.
+    """
+
+    container_format: ContainerFormat
+    format_version: str
+    tar_dialect: str
+    members: Tuple[StoredTarMember, ...]
+    member_count: int
+    logical_bytes: int
+    archive_size: int
 
 
 #: Allowed chunk transitions. Anything not listed is refused and leaves the old

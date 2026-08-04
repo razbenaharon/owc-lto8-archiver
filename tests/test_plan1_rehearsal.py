@@ -375,7 +375,9 @@ class ProductionGateTests(unittest.TestCase):
         parser.read(os.path.join(root, "config.example.ini"), encoding="utf-8")
         self.assertFalse(parser.getboolean(
             "FEATURES", "stored_tar_write_enabled"))
-        self.assertIsNone(stored_tar_reader_contract_version())
+        # Plan 2 Phase 1 installs the dormant consumer contract.  The writer
+        # remains disabled by the feature gate asserted immediately above.
+        self.assertEqual(stored_tar_reader_contract_version(), 1)
         assignment = inspect.getsource(
             PgSessionMixin.append_remote_streaming_chunk)
         self.assertIn("if stored_tar_write_enabled", assignment)
