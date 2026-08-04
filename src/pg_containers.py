@@ -8,6 +8,11 @@ opens a tape path and never infers a format from a filename extension.
 from .pipeline_types import (ArtifactReadiness, ContainerFormat,
                              ContainerValidationState)
 from .pg_core import _row, _rows
+from .stored_tar_planning import (build_stored_tar_chunk_plan,
+                                  StoredTarChunkPlan,
+                                  StoredTarContainerPlan,
+                                  StoredTarPlanMember)
+from .tar_container import STORED_TAR_FORMAT_VERSION
 
 
 CONTAINER_FORMAT_SCHEMA_VERSION = 1
@@ -1163,6 +1168,229 @@ class PgContainerMixin:
                 (int(session_id), int(chunk_index)),
             ).fetchall()),
             f"get containers for session {session_id}, chunk {chunk_index}")
+
+    def _stored_tar_plan_schema_installed_conn(self, conn):
+        return (
+            self._column_exists_conn(
+                conn, "remote_chunks", "stored_tar_max_size_bytes")
+            and self._column_exists_conn(
+                conn, "archive_containers", "estimated_archive_bytes")
+            and self._table_exists_conn(conn, "archive_container_members"))
+
+    def stored_tar_plan_schema_installed(self):
+        return self._run_read(
+            self._stored_tar_plan_schema_installed_conn,
+            "stored TAR plan schema preflight")
+
+    def _read_stored_tar_chunk_plan_conn(self, conn, session_id, chunk_index):
+        chunk = conn.execute(
+            """SELECT stored_tar_max_size_bytes FROM remote_chunks
+               WHERE session_id=%s AND chunk_index=%s""",
+            (int(session_id), int(chunk_index)),
+        ).fetchone()
+        if chunk is None:
+            raise RuntimeError(
+                f"[DB] Remote chunk not found: session {session_id}, "
+                f"chunk {chunk_index}")
+        containers = [
+            StoredTarContainerPlan(
+                session_id=int(row["session_id"]),
+                chunk_index=int(row["chunk_index"]),
+                container_ordinal=int(row["container_ordinal"]),
+                container_name=row["container_name"],
+                expected_member_count=int(row["expected_member_count"]),
+                expected_logical_bytes=int(row["expected_logical_bytes"]),
+                estimated_archive_bytes=int(row["estimated_archive_bytes"] or 0),
+                max_size_bytes=int(chunk["stored_tar_max_size_bytes"] or 0),
+                container_format=ContainerFormat(row["container_format"]),
+                format_version=row["format_version"],
+                tar_dialect=row["tar_dialect"],
+                storage_class=row["storage_class"],
+            )
+            for row in conn.execute(
+                """SELECT * FROM archive_containers
+                   WHERE session_id=%s AND chunk_index=%s
+                     AND container_format='stored_tar'
+                   ORDER BY container_ordinal""",
+                (int(session_id), int(chunk_index)),
+            ).fetchall()
+        ]
+        members = [
+            StoredTarPlanMember(
+                manifest_id=int(row["plan_file_id"]),
+                plan_ordinal=int(row["plan_ordinal"]),
+                remote_path=row["remote_path"],
+                file_size_bytes=int(row["expected_logical_bytes"]),
+                storage_class=row["storage_class"],
+                container_ordinal=(
+                    None if row["container_ordinal"] is None
+                    else int(row["container_ordinal"])),
+                estimated_tar_bytes=int(row["estimated_tar_bytes"]),
+            )
+            for row in conn.execute(
+                """SELECT * FROM archive_container_members
+                   WHERE session_id=%s AND chunk_index=%s
+                   ORDER BY plan_ordinal""",
+                (int(session_id), int(chunk_index)),
+            ).fetchall()
+        ]
+        return StoredTarChunkPlan(
+            session_id=int(session_id),
+            chunk_index=int(chunk_index),
+            max_size_bytes=int(chunk["stored_tar_max_size_bytes"] or 0),
+            containers=tuple(containers),
+            members=tuple(members),
+        )
+
+    def get_stored_tar_chunk_plan(self, session_id, chunk_index):
+        def operation(conn):
+            if not self._stored_tar_plan_schema_installed_conn(conn):
+                raise RuntimeError(
+                    "[DB] Stored TAR plan schema is absent; apply migration 016")
+            return self._read_stored_tar_chunk_plan_conn(
+                conn, session_id, chunk_index)
+        return self._run_read(
+            operation,
+            f"get stored TAR plan for session {session_id}, chunk {chunk_index}")
+
+    def get_or_create_stored_tar_chunk_plan(
+            self, session_id, chunk_index, chunk_files, *,
+            loose_threshold_bytes, max_size_bytes):
+        """Persist the immutable Task-2.1 split before any TAR worker starts."""
+        chunk_files = list(chunk_files)
+
+        def operation(conn):
+            if not self._stored_tar_plan_schema_installed_conn(conn):
+                raise RuntimeError(
+                    "[DB] Stored TAR plan schema is absent; apply migration 016")
+            chunk = conn.execute(
+                """SELECT packaging_format, membership_state,
+                          stored_tar_max_size_bytes
+                   FROM remote_chunks
+                   WHERE session_id=%s AND chunk_index=%s
+                   FOR UPDATE""",
+                (int(session_id), int(chunk_index)),
+            ).fetchone()
+            if chunk is None:
+                raise RuntimeError(
+                    f"[DB] Remote chunk not found: session {session_id}, "
+                    f"chunk {chunk_index}")
+            if chunk["packaging_format"] != ContainerFormat.STORED_TAR.value:
+                raise RuntimeError(
+                    "[DB] Stored TAR plan requested for a non-TAR chunk")
+            if chunk["membership_state"] != "sealed":
+                raise RuntimeError(
+                    "[DB] Stored TAR planning requires a sealed chunk")
+
+            existing = conn.execute(
+                """SELECT count(*) AS n FROM archive_container_members
+                   WHERE session_id=%s AND chunk_index=%s""",
+                (int(session_id), int(chunk_index)),
+            ).fetchone()["n"]
+            if existing:
+                return self._read_stored_tar_chunk_plan_conn(
+                    conn, session_id, chunk_index)
+
+            resolved_cap = (
+                int(chunk["stored_tar_max_size_bytes"])
+                if chunk["stored_tar_max_size_bytes"] is not None
+                else int(max_size_bytes))
+            conn.execute(
+                """UPDATE remote_chunks
+                   SET stored_tar_max_size_bytes=COALESCE(
+                         stored_tar_max_size_bytes, %s)
+                   WHERE session_id=%s AND chunk_index=%s""",
+                (resolved_cap, int(session_id), int(chunk_index)),
+            )
+
+            plan = build_stored_tar_chunk_plan(
+                session_id, chunk_index, chunk_files,
+                loose_threshold_bytes=int(loose_threshold_bytes),
+                max_size_bytes=resolved_cap)
+            container_ids = {}
+            for container in plan.containers:
+                row = conn.execute(
+                    """INSERT INTO archive_containers
+                           (session_id, chunk_index, container_ordinal,
+                            container_format, format_version, tar_dialect,
+                            storage_class, container_name,
+                            expected_member_count, expected_logical_bytes,
+                            estimated_archive_bytes, validation_state,
+                            writer_state, catalog_state)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                               'planned','not_started','not_started')
+                       ON CONFLICT (session_id, chunk_index, container_ordinal)
+                       DO NOTHING
+                       RETURNING *""",
+                    (container.session_id, container.chunk_index,
+                     container.container_ordinal,
+                     container.container_format.value,
+                     STORED_TAR_FORMAT_VERSION, container.tar_dialect,
+                     container.storage_class, container.container_name,
+                     container.expected_member_count,
+                     container.expected_logical_bytes,
+                     container.estimated_archive_bytes),
+                ).fetchone()
+                if row is None:
+                    row = conn.execute(
+                        """SELECT * FROM archive_containers
+                           WHERE session_id=%s AND chunk_index=%s
+                             AND container_ordinal=%s FOR UPDATE""",
+                        (container.session_id, container.chunk_index,
+                         container.container_ordinal),
+                    ).fetchone()
+                    checks = {
+                        "container_format": container.container_format.value,
+                        "format_version": STORED_TAR_FORMAT_VERSION,
+                        "tar_dialect": container.tar_dialect,
+                        "storage_class": container.storage_class,
+                        "container_name": container.container_name,
+                        "expected_member_count":
+                            container.expected_member_count,
+                        "expected_logical_bytes":
+                            container.expected_logical_bytes,
+                        "estimated_archive_bytes":
+                            container.estimated_archive_bytes,
+                    }
+                    mismatch = [
+                        key for key, value in checks.items()
+                        if row[key] != value]
+                    if mismatch:
+                        raise RuntimeError(
+                            "existing Stored TAR container plan conflicts: "
+                            + ", ".join(mismatch))
+                container_ids[int(row["container_ordinal"])] = int(
+                    row["container_id"])
+
+            member_rows = []
+            for member in plan.members:
+                container_id = (
+                    None if member.container_ordinal is None
+                    else container_ids[int(member.container_ordinal)])
+                member_rows.append((
+                    plan.session_id, plan.chunk_index, member.manifest_id,
+                    member.plan_ordinal, member.storage_class, container_id,
+                    member.container_ordinal, member.remote_path,
+                    member.file_size_bytes, member.estimated_tar_bytes))
+            if member_rows:
+                with conn.cursor() as cur:
+                    cur.executemany(
+                        """INSERT INTO archive_container_members
+                               (session_id, chunk_index, plan_file_id,
+                                plan_ordinal, storage_class, container_id,
+                                container_ordinal, remote_path,
+                                expected_logical_bytes, estimated_tar_bytes)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                           ON CONFLICT DO NOTHING""",
+                        member_rows,
+                    )
+            return self._read_stored_tar_chunk_plan_conn(
+                conn, session_id, chunk_index)
+
+        return self._transaction(
+            operation,
+            f"persist stored TAR plan for session {session_id}, "
+            f"chunk {chunk_index}")
 
     def get_archive_artifacts(self, session_id, chunk_index):
         return self._run_read(

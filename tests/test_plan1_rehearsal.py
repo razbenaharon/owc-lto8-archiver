@@ -384,7 +384,8 @@ class ProductionGateTests(unittest.TestCase):
         with open(os.path.join(root, "src", "remote_staging.py"),
                   encoding="utf-8") as handle:
             staging = handle.read()
-        self.assertIn("producer is not implemented until Plan 2 Phase 2", staging)
+        self.assertIn("plan is persisted", staging)
+        self.assertIn("TAR production is outside Task 2.1", staging)
 
     def test_no_postgresql_pruning_happens_in_plan_1(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

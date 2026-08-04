@@ -189,10 +189,23 @@ class RemoteChunkStager:
             # This deliberately does not inspect stored_tar_write_enabled:
             # disabling NEW creation must not strand an existing immutable TAR.
             recovery_guard(session_id, chunk_index)
+            planner = getattr(
+                self.host.db, "get_or_create_stored_tar_chunk_plan", None)
+            if not callable(planner):
+                raise RuntimeError(
+                    "[STAGING] Stored TAR chunk has no persisted container-plan "
+                    "repository; refusing to start a producer")
+            planner(
+                session_id, chunk_index, chunk_files,
+                loose_threshold_bytes=int(
+                    self.host.cfg.zip_threshold_mb * 1024 * 1024),
+                max_size_bytes=int(
+                    self.host.cfg.stored_tar_max_size_gb * 1024**3),
+            )
             raise RuntimeError(
-                "[STAGING] Stored TAR is durably assigned, but its direct "
-                "producer is not implemented until Plan 2 Phase 2; preserving "
-                "the chunk unchanged")
+                "[STAGING] Stored TAR is durably assigned and its container "
+                "plan is persisted, but TAR production is outside Task 2.1; "
+                "preserving the chunk unchanged")
         # The session id is embedded so the on-tape root (basename(pack_dir),
         # see LTOBackup._run_locked) is unique per session — two sessions on the
         # same tape never collide on '_pack_NNN'. Resuming a session reuses the

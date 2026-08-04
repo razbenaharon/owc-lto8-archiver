@@ -98,6 +98,7 @@ class ConfigManager:
         self.config['SETTINGS'] = {
             'zip_threshold_mb': '100',
             'max_zip_size_gb':  '100',
+            'stored_tar_max_size_gb': '100',
         }
         self.config['CATALOG'] = {
             'index_min_file_mb': '10',
@@ -339,6 +340,10 @@ class ConfigManager:
     @property
     def max_zip_size_gb(self):
         return self._get_float('SETTINGS', 'max_zip_size_gb', 100)
+    @property
+    def stored_tar_max_size_gb(self):
+        return self._get_float(
+            'SETTINGS', 'stored_tar_max_size_gb', self.max_zip_size_gb)
     @property
     def index_min_file_mb(self):
         return self._get_float('CATALOG', 'index_min_file_mb', 10)
