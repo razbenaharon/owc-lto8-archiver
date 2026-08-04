@@ -1174,6 +1174,40 @@ class PgContainerMixin:
             ).fetchall()),
             f"get artifacts for session {session_id}, chunk {chunk_index}")
 
+    def find_container_restore_sidecars(self, container_ids, *, limit=100):
+        """Return local TAR sidecar identities for an explicit container set.
+
+        This is deliberately not a global per-file search.  It only narrows an
+        already selected restore route and returns locators as data; it never
+        opens either the local or tape locator.
+        """
+        ids = sorted({int(value) for value in container_ids
+                      if value is not None})
+        if not ids:
+            return []
+        limit = max(1, int(limit))
+        if len(ids) > limit:
+            raise ValueError(
+                f"restore sidecar selection exceeds {limit} containers")
+        return self._run_read(
+            lambda conn: _rows(conn.execute(
+                """SELECT a.artifact_id, a.container_id, a.artifact_kind,
+                          a.artifact_version, a.local_locator,
+                          a.tape_locator, a.artifact_size_bytes,
+                          a.readiness_state,
+                          c.container_format, c.format_version,
+                          c.tar_dialect, c.permanent_local_metadata_locator
+                   FROM archive_artifacts a
+                   JOIN archive_containers c
+                     ON c.container_id=a.container_id
+                   WHERE a.container_id = ANY(%s)
+                     AND a.artifact_kind='tar_sidecar'
+                     AND a.readiness_state='ready'
+                   ORDER BY a.container_id, a.artifact_id DESC""",
+                (ids,),
+            ).fetchall()),
+            f"find restore sidecars for {len(ids)} container(s)")
+
     def validate_staged_chunk_readiness(self, staged_chunk):
         """Match an identity-aware handoff to DB rows before LTFS ownership."""
         staged_chunk.assert_writer_ready()
