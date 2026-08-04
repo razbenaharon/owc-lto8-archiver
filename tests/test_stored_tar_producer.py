@@ -17,7 +17,9 @@ from src.archive_artifacts import (
     search_tar_sidecar,
     tar_sidecar_locator,
 )
-from src.pipeline_types import SourceDisposition, StoredTarSourceDiagnostic
+from src.pipeline_types import (
+    ContainerFormat, SourceDisposition, StoredTarSourceDiagnostic)
+from src.ready_queue import ReadyItem, ReadyQueue, ReadyQueueLimits
 from src.remote_staging import RemoteChunkStager
 from src.remote_transport import RemoteTarStoreResult
 from src.tar_container import (
@@ -240,6 +242,181 @@ class StoredTarStagerTests(unittest.TestCase):
             self.assertIsNotNone(db.validated)
             self.assertTrue(os.path.isfile(attempts[-1]))
             self.assertFalse(os.path.exists(os.path.join(pack, "one.tar")))
+
+    def test_tar_assigned_small_chunk_reaches_ready_queue_without_extraction(self):
+        with tempfile.TemporaryDirectory() as root:
+            pack = os.path.join(root, "_pack_s0002_003")
+            manifest_root = os.path.join(root, "manifest")
+            container_plan = SimpleNamespace(
+                session_id=2, chunk_index=3, container_ordinal=0,
+                container_name="container_000.tar",
+                expected_member_count=1, expected_logical_bytes=3,
+                estimated_archive_bytes=GNU_RECORD_SIZE,
+                max_size_bytes=GNU_RECORD_SIZE,
+                container_format=ContainerFormat.STORED_TAR,
+                format_version="stored-tar-v1",
+                tar_dialect="gnu-pax-sparse-v1",
+                storage_class="small_files")
+            member = SimpleNamespace(
+                manifest_id=11, plan_ordinal=0,
+                remote_path="/remote/small.txt", file_size_bytes=3,
+                storage_class="small_files", container_ordinal=0)
+            chunk_plan = SimpleNamespace(
+                containers=(container_plan,),
+                members=(member,),
+                small_members=(member,),
+                loose_members=(),
+                source_missing_members=())
+
+            class DB:
+                def __init__(self):
+                    self.container = {
+                        "container_id": 7, "session_id": 2, "chunk_index": 3,
+                        "container_ordinal": 0,
+                        "container_format": "stored_tar",
+                        "format_version": "stored-tar-v1",
+                        "tar_dialect": "gnu-pax-sparse-v1",
+                        "storage_class": "small_files",
+                        "container_name": "container_000.tar",
+                        "temporary_data_locator": None,
+                        "permanent_local_metadata_locator": None,
+                        "expected_member_count": 1,
+                        "expected_logical_bytes": 3,
+                        "observed_member_count": None,
+                        "observed_logical_bytes": None,
+                        "actual_artifact_bytes": None,
+                        "validation_state": "planned",
+                        "writer_state": "not_started",
+                        "catalog_state": "not_started",
+                        "owner_token": None,
+                        "validated_part_locator": None,
+                        "validation_summary": None,
+                    }
+                    self.artifacts = []
+                    self.statuses = []
+
+                def get_chunk_packaging_format(self, _session, _chunk):
+                    return "stored_tar"
+
+                def require_existing_stored_tar_recovery(self, _session, _chunk):
+                    return True
+
+                def get_or_create_stored_tar_chunk_plan(self, *args, **kwargs):
+                    return chunk_plan
+
+                def update_chunk_status(self, session, chunk, status):
+                    self.statuses.append((session, chunk, status))
+
+                def get_archive_containers(self, _session, _chunk):
+                    return [dict(self.container)]
+
+                def get_archive_artifacts(self, _session, _chunk):
+                    return [dict(item) for item in self.artifacts]
+
+                def claim_stored_tar_container_build(
+                        self, container_id, owner, part_path):
+                    self.container["owner_token"] = owner
+                    self.container["validated_part_locator"] = part_path
+                    self.container["validation_state"] = "building"
+                    return True
+
+                def mark_stored_tar_validated_part(
+                        self, container_id, owner, part_path, validation,
+                        diagnostics):
+                    self.container.update({
+                        "owner_token": owner,
+                        "validated_part_locator": part_path,
+                        "validation_state": "validated_part",
+                        "actual_artifact_bytes": validation.archive_size,
+                        "observed_member_count": validation.member_count,
+                        "observed_logical_bytes": validation.logical_bytes,
+                        "validation_summary": {
+                            "source_diagnostics": list(diagnostics or ())},
+                    })
+                    return True
+
+                def publish_stored_tar_pair(self, **values):
+                    self.container.update({
+                        "temporary_data_locator": values["temporary_data_locator"],
+                        "permanent_local_metadata_locator":
+                            values["sidecar_locator"],
+                        "actual_artifact_bytes": values["tar_size_bytes"],
+                        "observed_member_count": values["observed_member_count"],
+                        "observed_logical_bytes": values["observed_logical_bytes"],
+                        "validation_state": "ready",
+                        "owner_token": None,
+                    })
+                    artifact = {
+                        "artifact_id": 9, "session_id": 2, "chunk_index": 3,
+                        "container_id": 7,
+                        "artifact_kind": "tar_sidecar",
+                        "artifact_version": values["sidecar_version"],
+                        "local_locator": values["sidecar_locator"],
+                        "artifact_size_bytes": values["sidecar_size_bytes"],
+                        "readiness_state": "ready",
+                    }
+                    self.artifacts = [artifact]
+                    return {
+                        "container": dict(self.container),
+                        "artifact": dict(artifact),
+                    }
+
+            db = DB()
+            host = SimpleNamespace(
+                db=db, cfg=SimpleNamespace(
+                    zip_threshold_mb=10, stored_tar_max_size_gb=1,
+                    local_manifest_archive_root=manifest_root),
+                _producer_chunk=None, staging_dir=root, remote_path="/remote",
+                remote_user="u", remote_host="h", remote_password="",
+                ssh_cipher="", use_mbuffer=False, mbuffer_size="1G",
+                fetch_cores=None, fetch_transient_retries=0,
+                fetch_transient_retry_base=0, ram_sample_interval=0,
+                _try_resume_pack=lambda *_args: None,
+                _cleanup_dir=lambda path: shutil.rmtree(path, ignore_errors=True),
+                _staged_lock=threading.Lock(), _staged_bytes=0,
+                skipped_tracker=mock.Mock(),
+                _note_fetch_failure=lambda *args, **kwargs: None,
+                _fetch_backoff_delay=lambda *_args: 0)
+
+            def store(_user, _host, _base, paths, part, **_kwargs):
+                self.assertEqual(paths, ["small.txt"])
+                _write_tar(part, [("small.txt", b"abc")])
+                return RemoteTarStoreResult(
+                    True, part, os.path.getsize(part), 0, "")
+
+            with mock.patch(
+                    "src.remote_staging._remote_tar_fetch",
+                    side_effect=AssertionError(
+                        "small TAR path must not extract")), \
+                    mock.patch(
+                        "src.remote_staging.LTOPacker.run",
+                        side_effect=AssertionError(
+                            "small TAR path must not ZIP")), \
+                    mock.patch(
+                        "src.remote_staging._remote_tar_store",
+                        side_effect=store):
+                desc = RemoteChunkStager(host)._stage_chunk(
+                    2, 3, [{"manifest_id": 11,
+                            "remote_path": "/remote/small.txt",
+                            "file_size_bytes": 3, "status": "pending"}])
+
+            self.assertTrue(desc.assert_writer_ready())
+            extracted = []
+            for walk_root, _dirs, files in os.walk(root):
+                for name in files:
+                    if name == "small.txt":
+                        extracted.append(os.path.join(walk_root, name))
+            self.assertEqual(
+                extracted, [],
+                "TAR-assigned small file was materialized on disk")
+            self.assertTrue(os.path.isfile(os.path.join(pack, "container_000.tar")))
+            q = ReadyQueue(ReadyQueueLimits(
+                min_start_bytes=1, target_bytes=desc.prepared_bytes,
+                max_bytes=desc.prepared_bytes, max_chunks=1))
+            self.assertTrue(q.put(ReadyItem(
+                chunk_index=desc.chunk_index, pack_dir=desc.pack_dir,
+                prepared_bytes=desc.prepared_bytes, file_count=1, desc=desc)))
+            self.assertEqual(q.ready_chunks, 1)
 
 
 class StoredTarPairPublicationTests(unittest.TestCase):

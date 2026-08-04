@@ -824,7 +824,10 @@ class StagedChunk:
         if self.skip_tape:
             self._assert_skip_tape_contract()
         elif self.packaging_format is ContainerFormat.STORED_TAR:
-            self._assert_container_identity_contract(require_readable=False)
+            if self.containers or self.artifacts:
+                self._assert_container_identity_contract(require_readable=False)
+            else:
+                self._assert_loose_only_tar_contract(require_readable=False)
         elif self.containers or self.artifacts:
             # Historical ZIP descriptors intentionally have no migration-015
             # identity objects.  Once a ZIP descriptor does carry them, it is
@@ -1031,11 +1034,35 @@ class StagedChunk:
             self._assert_skip_tape_contract()
             return True
         if (self.packaging_format is ContainerFormat.STORED_TAR
+                and not (self.containers or self.artifacts)):
+            self._assert_loose_only_tar_contract(require_readable=True)
+        elif (self.packaging_format is ContainerFormat.STORED_TAR
                 or self.containers or self.artifacts):
             self._assert_container_identity_contract(require_readable=True)
         else:
             self._assert_queued_states()
         return True
+
+    def _assert_loose_only_tar_contract(self, *, require_readable):
+        if self.session_id is None:
+            raise ValueError("identified StagedChunk requires session_id")
+        if not self.metadata:
+            raise ValueError("Stored TAR chunk requires container records or loose files")
+        if any(item.get("is_packed") for item in self.metadata):
+            raise ValueError("packed Stored TAR metadata requires container records")
+        loose_paths = self._assert_file_records({}, require_readable)
+        expected = sum(int(item.get("file_size_bytes", 0) or 0)
+                       for item in self.metadata)
+        if int(self.staged_bytes) != expected:
+            raise ValueError(
+                f"staged byte total {self.staged_bytes} does not match "
+                f"loose-file total {expected}")
+        if require_readable:
+            declared = {
+                os.path.normcase(os.path.abspath(path)): int(size)
+                for path, size in loose_paths.items()}
+            _assert_exact_pack_inventory(self.pack_dir, declared)
+        self._assert_queued_states()
 
 
 def _readable_regular_file_size(path, label):

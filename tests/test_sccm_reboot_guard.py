@@ -408,6 +408,8 @@ class PackPreservationTests(unittest.TestCase):
         self.orch._staged_lock = threading.Lock()
         self.orch._staged_bytes = 1000
         self.orch.notifier = None
+        self.orch.db = SimpleNamespace(
+            get_chunk_packaging_format=lambda session_id, chunk_index: "zip")
 
         self.desc = StagedChunk(
             chunk_index=22,

@@ -2,6 +2,7 @@
 import configparser
 import inspect
 import os
+import shutil
 import tempfile
 import threading
 import unittest
@@ -333,18 +334,35 @@ class ProducerAndWriterGateTests(unittest.TestCase):
             RemoteChunkStager(host)._stage_chunk(37, 49, [])
 
     def test_existing_tar_does_not_consult_creation_flag_or_fall_back_to_zip(self):
-        db = mock.Mock()
-        db.get_chunk_packaging_format.return_value = ContainerFormat.STORED_TAR
-        db.require_existing_stored_tar_recovery.return_value = True
-        db.get_or_create_stored_tar_chunk_plan.return_value = object()
-        cfg = SimpleNamespace(zip_threshold_mb=10, stored_tar_max_size_gb=1)
-        host = SimpleNamespace(db=db, cfg=cfg, _producer_chunk=None)
-        with self.assertRaisesRegex(RuntimeError, "outside Task 2.1"):
-            RemoteChunkStager(host)._stage_chunk(37, 49, [])
+        with tempfile.TemporaryDirectory() as root:
+            db = mock.Mock()
+            db.get_chunk_packaging_format.return_value = ContainerFormat.STORED_TAR
+            db.require_existing_stored_tar_recovery.return_value = True
+            db.get_or_create_stored_tar_chunk_plan.return_value = SimpleNamespace(
+                source_missing_members=(
+                    SimpleNamespace(
+                        manifest_id=1, remote_path="/remote/missing.txt",
+                        file_size_bytes=7),
+                ),
+                small_members=(),
+                loose_members=(),
+                containers=(),
+            )
+            db.get_archive_artifacts.return_value = []
+            cfg = SimpleNamespace(
+                zip_threshold_mb=10, stored_tar_max_size_gb=1,
+                local_manifest_archive_root=os.path.join(root, "manifest"))
+            host = SimpleNamespace(
+                db=db, cfg=cfg, _producer_chunk=None, staging_dir=root,
+                ram_sample_interval=0, _try_resume_pack=lambda *_args: None,
+                _cleanup_dir=lambda path: shutil.rmtree(path, ignore_errors=True),
+                skipped_tracker=mock.Mock())
+            desc = RemoteChunkStager(host)._stage_chunk(37, 49, [])
+        self.assertTrue(desc.skip_tape)
+        self.assertEqual(desc.packaging_format, ContainerFormat.STORED_TAR)
         db.require_existing_stored_tar_recovery.assert_called_once_with(37, 49)
         db.get_or_create_stored_tar_chunk_plan.assert_called_once()
         self.assertFalse(hasattr(host, "stored_tar_write_enabled"))
-        self.assertFalse(db.update_chunk_status.called)
 
     def test_bad_descriptor_fails_before_ltfs_ownership(self):
         desc = SimpleNamespace(
