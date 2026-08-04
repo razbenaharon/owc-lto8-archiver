@@ -13,6 +13,7 @@ from dataclasses import asdict, is_dataclass
 from .pipeline_types import (ArtifactReadiness, ContainerFormat,
                              ContainerValidationState, SourceDisposition)
 from .pg_core import _row, _rows
+from .session_reconcile import classify_session37_format_boundary_category
 from .stored_tar_planning import (build_stored_tar_chunk_plan,
                                   StoredTarChunkPlan,
                                   StoredTarContainerPlan,
@@ -557,6 +558,40 @@ class PgContainerMixin:
                 "written_container_count",
                 "sealed_batch_written_count")))
         item["corroborating_evidence"] = item["immutable_zip"]
+        item["owner_lease_evidence"] = {
+            "has_owner": item.get("owner_token") is not None,
+            "has_lease": item.get("lease_expires_at") is not None,
+            "has_attempt": item.get("attempt_id") is not None,
+        }
+        item["membership_evidence"] = {
+            "membership_state": item.get("membership_state"),
+            "fixed_membership": item["fixed_membership"],
+            "member_count": item["member_count"],
+            "logical_bytes": item["logical_bytes"],
+            "first_ordinal": item.get("first_ordinal"),
+            "last_ordinal": item.get("last_ordinal"),
+            "expected_file_count": item.get("expected_file_count"),
+            "expected_bytes": item.get("expected_bytes"),
+        }
+        item["pack_resume_evidence"] = {
+            "file_state_count": item["file_state_count"],
+            "worker_attempt_count": item["worker_attempt_count"],
+            "sealed_batch_evidence_count": item["sealed_batch_evidence_count"],
+        }
+        item["container_evidence"] = {
+            "container_count": item["container_count"],
+            "artifact_count": item["artifact_count"],
+            "written_container_count": item["written_container_count"],
+            "sealed_batch_written_count": item["sealed_batch_written_count"],
+        }
+        item["writer_catalog_evidence"] = {
+            "catalog_file_count": item["catalog_file_count"],
+            "archive_run_count": item["archive_run_count"],
+            "directory_evidence_count": item["directory_evidence_count"],
+            "writer_started": bool(item.get("writer_started_at")),
+            "writer_completed": bool(item.get("writer_completed_at")),
+            "catalog_committed": bool(item.get("catalog_committed_at")),
+        }
         if item["immutable_zip"]:
             item["classification"] = "immutable_zip"
         elif item["eligible_stored_tar"]:
@@ -567,6 +602,16 @@ class PgContainerMixin:
         item["has_owner_evidence"] = item.get("owner_token") is not None
         item["has_lease_evidence"] = item.get("lease_expires_at") is not None
         item["has_attempt_evidence"] = item.get("attempt_id") is not None
+        item["category_rule"] = classify_session37_format_boundary_category(
+            item)
+        item["inferred_legacy_zip_format"] = {
+            "format": (
+                "zip"
+                if item["category_rule"].get("assigned_format") == "zip"
+                else None),
+            "confidence": item["category_rule"]["format_confidence"],
+            "blocker": item["category_rule"]["blocker"],
+        }
         for sensitive in (
                 "error_msg", "owner_token", "lease_expires_at", "attempt_id"):
             item.pop(sensitive, None)
@@ -615,6 +660,18 @@ class PgContainerMixin:
                 "c.packaging_format" if self._column_exists_conn(
                     conn, "remote_chunks", "packaging_format")
                 else "NULL::text")
+            writer_started_at = (
+                "c.writer_started_at" if self._column_exists_conn(
+                    conn, "remote_chunks", "writer_started_at")
+                else "NULL::timestamptz")
+            writer_completed_at = (
+                "c.writer_completed_at" if self._column_exists_conn(
+                    conn, "remote_chunks", "writer_completed_at")
+                else "NULL::timestamptz")
+            catalog_committed_at = (
+                "c.catalog_committed_at" if self._column_exists_conn(
+                    conn, "remote_chunks", "catalog_committed_at")
+                else "NULL::timestamptz")
 
             container_count = "0"
             written_container_count = "0"
@@ -668,6 +725,9 @@ class PgContainerMixin:
                                c.attempt_id, c.membership_state,
                                c.expected_file_count, c.expected_bytes,
                                {packaging_format} AS packaging_format,
+                               {writer_started_at} AS writer_started_at,
+                               {writer_completed_at} AS writer_completed_at,
+                               {catalog_committed_at} AS catalog_committed_at,
                                COALESCE(m.member_count,0) AS member_count,
                                COALESCE(m.distinct_ordinal_count,0)
                                    AS distinct_ordinal_count,

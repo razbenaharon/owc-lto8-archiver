@@ -2516,6 +2516,54 @@ class ContainerFormatMigrationTests(unittest.TestCase):
         self.assertTrue(self.db.require_existing_stored_tar_recovery(
             session_id, 49, reader_contract_version=1))
 
+    def test_session37_boundary_rehearsal_is_read_only(self):
+        """Gate 5.5: report the real shape without persisting the boundary."""
+        session_id = self._session(label="SESSION37_REHEARSAL_FIXTURE")
+        self.db.apply_directory_catalog_schema()
+        for chunk_index in range(113):
+            self._append(session_id, chunk_index)
+        self._catalog_chunks(session_id, range(6))
+        self._exec(
+            """UPDATE remote_chunks SET status='done', updated_at=now()
+               WHERE session_id=%s AND chunk_index<=48""", (session_id,))
+        self._exec(
+            """INSERT INTO directory_archive_bundles
+                   (source_host,original_dir_path,tape_label,archive_run_id,
+                    remote_session_id,chunk_index,stored_bundle_path,
+                    file_count,byte_count,small_file_count,small_file_bytes,
+                    large_file_count,large_file_bytes,backup_date,record_key)
+               SELECT 'fixture', '/fixture/legacy_' || g, 'FORMAT_TAPE', NULL,
+                      %s, NULL, 'legacy/' || g || '.zip', 1, 1, 1, 1, 0, 0,
+                      now(), decode(md5('rehearsal-' || g::text) ||
+                                    md5('rehearsal-' || g::text), 'hex')
+               FROM generate_series(1,134) AS g""", (session_id,))
+        self._ready_014()
+        before = dict(self._query(
+            "SELECT * FROM remote_sessions WHERE session_id=%s",
+            (session_id,))[0])
+
+        report = self.db.classify_format_boundary(session_id)
+
+        after = dict(self._query(
+            "SELECT * FROM remote_sessions WHERE session_id=%s",
+            (session_id,))[0])
+        self.assertEqual(after, before)
+        self.assertEqual(report["derived_boundary"], 49)
+        self.assertEqual(report["blocking"], [])
+        self.assertEqual(report["prefix_evidence_counts"], {
+            "corroborated": 6, "status_only": 43})
+        self.assertEqual(len(report["chunks"]), 113)
+        self.assertTrue(all(
+            row["classification"] == "immutable_zip"
+            and row["inferred_legacy_zip_format"]["format"] == "zip"
+            for row in report["chunks"][:49]))
+        self.assertTrue(all(
+            row["classification"] == "eligible_stored_tar_exception"
+            and row["category_rule"]["eligible_stored_tar_exception"]
+            for row in report["chunks"][49:]))
+        self.assertIsNone(self._query(
+            "SELECT to_regclass('remote_packaging_boundaries') AS r")[0]["r"])
+
     def test_contradictory_evidence_rolls_back_the_entire_migration(self):
         session_id = self._session(label="CONTRADICTORY_FIXTURE")
         self._append(session_id, 0)

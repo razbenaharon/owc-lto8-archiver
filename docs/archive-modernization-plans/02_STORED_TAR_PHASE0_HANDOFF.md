@@ -1,8 +1,8 @@
-# Plan 2 Phase 0 implementation handoff
+# Plan 2 implementation handoff
 
-Status date: 2026-08-04. This document records the implementation map and the
-deliberate operator-approved migration exception. The authoritative task list
-remains `02_STORED_TAR_IMPLEMENTATION.md`.
+Status date: 2026-08-04. Plan 2 Phases 0-4 are implemented through the final
+read-only Session 37 boundary rehearsal. The authoritative task list remains
+`02_STORED_TAR_IMPLEMENTATION.md`.
 
 ## Current-path map (Plan 2 execution step 1)
 
@@ -178,3 +178,52 @@ As required by the authoritative plan, validation deliberately uses path, size,
 ordinal, count, byte-total, structure, sidecar and restore/rebuild evidence, not
 file-content or TAR-content hashes. Residual risk remains: corruption that
 preserves paths, sizes and readable container structure is not detected.
+
+## Phase 4 / Gate 5.5 completion
+
+The final Plan 2 phase is report-only. `inspect_db.py` now exposes:
+
+```powershell
+python inspect_db.py --session37-boundary-rehearsal --db <isolated_restore>
+```
+
+The command opens PostgreSQL with `default_transaction_read_only=on`, defaults
+to session 37 unless `--session-id` is supplied, reads liveness/process evidence,
+and calls the same database classifier used by migration-015 preflight. It does
+not inspect local staging, touch LTFS, resume work, or persist the boundary.
+
+Each chunk report now includes the raw state and grouped evidence needed by the
+operator:
+
+- membership: `membership_state`, fixed-membership result, count, bytes, and
+  ordinal range.
+- owner/lease: whether owner, lease, or attempt evidence exists.
+- pack/resume: file-state rows, worker attempts, and sealed-batch evidence.
+- container: container/artifact rows and written-container evidence.
+- writer/catalog: file catalog, archive-run, directory, writer-start,
+  writer-complete, and catalog-commit evidence.
+- category rule: the exact Task-4.2 category, required action, assigned-format
+  inference, confidence, and blocker.
+- legacy ZIP inference: ZIP confidence and blocker for chunks that must remain
+  ZIP.
+
+The category logic is table-driven in
+`tests/test_session37_format_boundary.py`. It asserts every Task-4.2 rule and
+explicitly proves that status alone cannot authorize format conversion or
+identity reuse.
+
+The reduced rehearsal fixture in `tests/test_pg_integration.py` preserves the
+measured Session 37 shape: 113 chunks, 49 done, 64 pending, NULL membership
+columns, no owner/lease/attempt/error rows, only 6 done chunks with
+`files_index` evidence, 134 directory bundle rows with NULL `chunk_index`, and
+zero ambiguous `files_index.remote_chunk_index` rows. It verifies:
+
+- derived boundary is 49;
+- chunks 0-48 report ZIP, with 6 `corroborated` and 43 `status_only`;
+- chunks 49-112 report Stored TAR eligibility under the approved strict suffix
+  rule;
+- the `remote_sessions` row is unchanged;
+- no boundary table is created during rehearsal.
+
+Execute mode for persisting the boundary remains future Plan 3 work. The
+writer flag remains disabled by default: `stored_tar_write_enabled=false`.
