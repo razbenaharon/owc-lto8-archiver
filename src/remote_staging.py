@@ -31,6 +31,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime
 
 from .constants import LOCAL_STAGING_RESERVE_BYTES
@@ -84,6 +85,109 @@ def _fetch_watchdog_action(*, cur, last_growth_at, now, total_bytes,
         return 'overrun'
     if stall_timeout and (now - last_growth_at) >= stall_timeout:
         return 'stall'
+    return None
+
+
+@dataclass(frozen=True)
+class StagingReservation:
+    """Local staging bytes reserved before a producer is launched."""
+
+    packaging_format: ContainerFormat
+    needed_bytes: int
+    tar_stream_bytes: int = 0
+    sidecar_bytes: int = 0
+    loose_bytes: int = 0
+    pack_copy_bytes: int = 0
+
+
+def _sidecar_reserve_bytes(member_count, cfg):
+    fixed = int(getattr(cfg, "stored_tar_sidecar_fixed_reserve_bytes", 4096))
+    per_member = int(getattr(
+        cfg, "stored_tar_sidecar_member_reserve_bytes", 1024))
+    return max(0, fixed) + max(0, per_member) * max(0, int(member_count or 0))
+
+
+def stored_tar_staging_reservation(chunk_plan, host):
+    """Conservative peak footprint for direct Stored TAR staging.
+
+    Direct TAR never extracts its small-file members.  The reserve therefore
+    covers the aggregate unfinished/final TAR artifacts, permanent sidecar
+    temp+final files, the sidecar copy placed in the pack tree, loose large-file
+    fetch+pack coexistence, and the writer-visible pack copy.
+    """
+    tar_stream_bytes = sum(
+        int(item.estimated_archive_bytes) for item in chunk_plan.containers)
+    small_members = len(chunk_plan.small_members)
+    sidecar_final = _sidecar_reserve_bytes(small_members, host.cfg)
+    sidecar_bytes = 3 * sidecar_final
+    loose_logical = sum(
+        int(item.file_size_bytes) for item in chunk_plan.loose_members)
+    loose_count = len(chunk_plan.loose_members)
+    if loose_count:
+        loose_physical = host._physical_estimate(loose_logical, loose_count)
+    else:
+        loose_physical = 0
+    loose_bytes = 2 * loose_physical
+    pack_copy_bytes = tar_stream_bytes
+    return StagingReservation(
+        packaging_format=ContainerFormat.STORED_TAR,
+        needed_bytes=tar_stream_bytes + sidecar_bytes + loose_bytes
+        + pack_copy_bytes,
+        tar_stream_bytes=tar_stream_bytes,
+        sidecar_bytes=sidecar_bytes,
+        loose_bytes=loose_bytes,
+        pack_copy_bytes=pack_copy_bytes,
+    )
+
+
+def zip_staging_reservation(planned_bytes, planned_files, host):
+    need = 2 * host._physical_estimate(planned_bytes, planned_files)
+    return StagingReservation(
+        packaging_format=ContainerFormat.ZIP, needed_bytes=need)
+
+
+def _file_size_or_zero(path):
+    try:
+        return os.path.getsize(_long(path))
+    except OSError:
+        return 0
+
+
+def _staging_progress_snapshot(part_paths=(), loose_dirs=()):
+    parts = {
+        str(path): _file_size_or_zero(path)
+        for path in part_paths or ()
+        if path and os.path.isfile(_long(path))
+    }
+    loose = sum(_dir_tree_size(path) for path in loose_dirs or ()
+                if path and os.path.isdir(_long(path)))
+    return {"parts": parts, "loose_bytes": loose,
+            "total_bytes": sum(parts.values()) + loose}
+
+
+def _tar_progress_watchdog_action(
+        *, snapshot, previous_snapshot, part_last_growth, aggregate_last_growth,
+        now, total_bytes, abort_factor, stall_timeout, free_bytes,
+        reserve_bytes):
+    action = _fetch_watchdog_action(
+        cur=int(snapshot["total_bytes"]),
+        last_growth_at=aggregate_last_growth,
+        now=now,
+        total_bytes=total_bytes,
+        abort_factor=abort_factor,
+        stall_timeout=stall_timeout,
+        free_bytes=free_bytes,
+        reserve_bytes=reserve_bytes)
+    if action is not None:
+        return action
+    if not stall_timeout:
+        return None
+    previous_parts = (previous_snapshot or {}).get("parts", {})
+    for path, size in snapshot["parts"].items():
+        if size > int(previous_parts.get(path, -1)):
+            part_last_growth[path] = now
+        elif now - part_last_growth.get(path, now) >= stall_timeout:
+            return "part_stall"
     return None
 
 # Written inside a pack dir when a stop preserves it, and the only thing that
@@ -232,7 +336,8 @@ class RemoteChunkStager:
 
     def _build_stored_tar_container(
             self, session_id, chunk_index, container_plan, plan_members,
-            pack_dir, *, owner_token=None, abort_evt=None, crash_hook=None):
+            pack_dir, *, owner_token=None, abort_evt=None, crash_hook=None,
+            progress_part_paths=None, progress_lock=None):
         """Build and publish one Task-2.2/2.3/2.4 container pair.
 
         Task 2.5 routes TAR-assigned chunks here while ZIP chunks stay on the
@@ -281,6 +386,11 @@ class RemoteChunkStager:
             part_path = f"{final_tar}.{uuid.uuid4().hex[:12]}.part"
         claimed = self.host.db.claim_stored_tar_container_build(
             container_id, owner, part_path)
+        if progress_part_paths is not None:
+            lock = progress_lock or threading.Lock()
+            with lock:
+                if part_path not in progress_part_paths:
+                    progress_part_paths.append(part_path)
         claimed_state = (claimed.get("validation_state")
                          if isinstance(claimed, dict) else existing_state)
         attempt_id = (None if claimed_state == "ready"
@@ -490,7 +600,8 @@ class RemoteChunkStager:
 
     def _stage_stored_tar_chunk(
             self, session_id, chunk_index, chunk_files, chunk_plan,
-            fetch_dir, pack_dir, ram_stats, fetch_seconds, fetch_bytes):
+            fetch_dir, pack_dir, ram_stats, fetch_seconds, fetch_bytes,
+            abort_evt=None, progress_part_paths=None, progress_lock=None):
         self.host.db.update_chunk_status(
             session_id, chunk_index, ChunkStatus.PACKING.value)
         # Task 2.6 may have adopted a crash-published TAR/sidecar pair in this
@@ -526,7 +637,10 @@ class RemoteChunkStager:
             for container_plan in chunk_plan.containers:
                 members = members_by_container[int(container_plan.container_ordinal)]
                 publication = self._build_stored_tar_container(
-                    session_id, chunk_index, container_plan, members, pack_dir)
+                    session_id, chunk_index, container_plan, members, pack_dir,
+                    abort_evt=abort_evt,
+                    progress_part_paths=progress_part_paths,
+                    progress_lock=progress_lock)
                 container_row, artifact_row = (
                     self._stored_tar_rows_after_publication_by_ordinal(
                         session_id, chunk_index,
@@ -704,9 +818,94 @@ class RemoteChunkStager:
             if not CANCEL.is_set():
                 self.host.db.update_chunk_status(
                     session_id, chunk_index, ChunkStatus.FETCH_FAILED.value)
-            self.host._cleanup_dir(fetch_dir)
-            self.host._cleanup_dir(pack_dir)
+            if abort_evt is not None and abort_evt.is_set():
+                self.host._cleanup_dir(fetch_dir)
+            else:
+                self.host._cleanup_dir(fetch_dir)
+                self.host._cleanup_dir(pack_dir)
             raise
+
+    def _reservation_for_chunk(
+            self, planned_bytes, planned_files, *, session_id=None,
+            chunk_index=None, chunk_files=None):
+        packaging_format = ContainerFormat.ZIP
+        if session_id is not None and chunk_index is not None:
+            reader = getattr(self.host.db, "get_chunk_packaging_format", None)
+            if callable(reader):
+                packaging_format = ContainerFormat(
+                    reader(session_id, chunk_index))
+        if packaging_format is not ContainerFormat.STORED_TAR:
+            return zip_staging_reservation(
+                planned_bytes, planned_files, self.host)
+
+        if chunk_files is None:
+            chunk_files = self.host.db.get_chunk_files(session_id, chunk_index)
+        planner = getattr(
+            self.host.db, "get_or_create_stored_tar_chunk_plan", None)
+        if not callable(planner):
+            raise RuntimeError(
+                "[STAGING] Stored TAR chunk has no persisted container-plan "
+                "repository; refusing admission")
+        chunk_plan = planner(
+            session_id, chunk_index, chunk_files,
+            loose_threshold_bytes=int(
+                self.host.cfg.zip_threshold_mb * 1024 * 1024),
+            max_size_bytes=int(
+                self.host.cfg.stored_tar_max_size_gb * 1024**3),
+        )
+        return stored_tar_staging_reservation(chunk_plan, self.host)
+
+    def _await_staging_capacity(
+            self, planned_bytes, planned_files, stop_evt, ready_q=None,
+            session_id=None, chunk_index=None, chunk_files=None,
+            reservation=None):
+        """Block until a ZIP or TAR chunk fits the local staging envelope."""
+        if reservation is None:
+            reservation = self._reservation_for_chunk(
+                planned_bytes, planned_files, session_id=session_id,
+                chunk_index=chunk_index, chunk_files=chunk_files)
+        need = int(reservation.needed_bytes)
+        floor = LOCAL_STAGING_RESERVE_BYTES
+        warned = False
+        while not (CANCEL.is_set() or stop_evt.is_set()):
+            with self.host._staged_lock:
+                resident = self.host._staged_bytes
+            self.host._apply_staging_pressure(ready_q, resident, need)
+            try:
+                free = shutil.disk_usage(self.host.staging_dir).free
+            except OSError:
+                free = need + floor
+            governor = getattr(self.host, 'governor', None)
+            if governor:
+                if not warned:
+                    _status('PIPELINE',
+                            "Backpressure - waiting for RAM/staging/tape "
+                            "governor before fetching the next chunk.")
+                    warned = True
+                if not governor.wait_or_pause(
+                        "fetch", "start", needed_bytes=need,
+                        queued_bytes=resident, stop_evt=stop_evt):
+                    return
+            room_cap = (resident + need) <= self.host.staging_max_bytes
+            room_disk = (free - need) >= floor
+            if not room_disk:
+                raise RuntimeError(
+                    "Insufficient local staging space for remote chunk. "
+                    f"Need {need / 1024**3:.2f} GiB peak staging + "
+                    f"{floor / 1024**3:.0f} GiB reserve; current free on "
+                    f"'{self.host.staging_dir}': {free / 1024**3:.2f} GiB."
+                )
+            alone = (resident == 0)
+            if room_cap or alone:
+                return reservation
+            if not warned:
+                _status('PIPELINE',
+                        f"Backpressure - {resident / 1024**3:.0f} GB staged, "
+                        f"waiting for the tape to drain before fetching the next "
+                        f"chunk (cap {self.host.staging_max_bytes / 1024**3:.0f} GB).")
+                warned = True
+            time.sleep(2)
+        return reservation
 
     def _stage_chunk(self, session_id, chunk_index, chunk_files):
         """Fetch then pack one chunk. Returns a ready-descriptor or None."""
@@ -782,26 +981,45 @@ class RemoteChunkStager:
                     ChunkStatus.FETCHING.value)
             fetch_start = time.perf_counter()
             ram_stats = {}
+            reservation = stored_tar_staging_reservation(chunk_plan, self.host)
             governor = getattr(self.host, 'governor', None)
             if governor:
-                planned_bytes = sum(int(row['file_size_bytes'])
-                                    for row in chunk_files)
                 governor.wait_or_pause(
-                    "fetch", "start", needed_bytes=planned_bytes)
+                    "fetch", "start",
+                    needed_bytes=reservation.needed_bytes)
                 fetch_guard = governor.mark_fetch_active()
             else:
                 fetch_guard = None
+            fetch_stop = threading.Event()
+            fetch_abort = threading.Event()
+            progress_lock = threading.Lock()
+            progress_part_paths = []
+            self._start_fetch_monitor(
+                fetch_stop, fetch_abort, fetch_dir,
+                reservation.tar_stream_bytes + reservation.loose_bytes,
+                tar_part_paths=progress_part_paths,
+                tar_part_paths_lock=progress_lock,
+                label="STORED_TAR")
             with RamStageSampler(
                     "fetch", self.host.ram_sample_interval) as fetch_sampler:
-                if fetch_guard:
-                    with fetch_guard:
+                try:
+                    if fetch_guard:
+                        with fetch_guard:
+                            desc = self._stage_stored_tar_chunk(
+                                session_id, chunk_index, chunk_files, chunk_plan,
+                                fetch_dir, pack_dir, ram_stats, 0, 0,
+                                abort_evt=fetch_abort,
+                                progress_part_paths=progress_part_paths,
+                                progress_lock=progress_lock)
+                    else:
                         desc = self._stage_stored_tar_chunk(
                             session_id, chunk_index, chunk_files, chunk_plan,
-                            fetch_dir, pack_dir, ram_stats, 0, 0)
-                else:
-                    desc = self._stage_stored_tar_chunk(
-                        session_id, chunk_index, chunk_files, chunk_plan,
-                        fetch_dir, pack_dir, ram_stats, 0, 0)
+                            fetch_dir, pack_dir, ram_stats, 0, 0,
+                            abort_evt=fetch_abort,
+                            progress_part_paths=progress_part_paths,
+                            progress_lock=progress_lock)
+                finally:
+                    fetch_stop.set()
             ram_stats.update(fetch_sampler.as_details("fetch"))
             if desc is not None:
                 desc.fetch_seconds = time.perf_counter() - fetch_start
@@ -1710,7 +1928,9 @@ class RemoteChunkStager:
         finally:
             shutil.rmtree(_long(collide_root), ignore_errors=True)
 
-    def _start_fetch_monitor(self, stop_evt, abort_evt, fetch_dir, total_bytes):
+    def _start_fetch_monitor(
+            self, stop_evt, abort_evt, fetch_dir, total_bytes,
+            tar_part_paths=None, tar_part_paths_lock=None, label="FETCH"):
         """Live remote->PC throughput, plus a staging watchdog.
 
         Progress is the fetch dir's logical growth. The watchdog fires
@@ -1721,8 +1941,8 @@ class RemoteChunkStager:
         overrun past the warn threshold is reported loudly (the plan's sizes
         come from the scan, so a growing or sparse-expanded remote file shows
         up here first)."""
-        abort_factor = self.host.fetch_abort_factor
-        stall_timeout = self.host.fetch_stall_timeout
+        abort_factor = getattr(self.host, "fetch_abort_factor", 2.0)
+        stall_timeout = getattr(self.host, "fetch_stall_timeout", 600)
 
         def _alarm(msg):
             print(f"\n[FETCH][ALERT] {msg}")
@@ -1742,9 +1962,20 @@ class RemoteChunkStager:
             # bounded, resumable retry.
             max_seen = 0
             last_growth_at = time.time()
+            previous_snapshot = None
+            part_last_growth = {}
             while not stop_evt.wait(interval):
                 walk_start = time.time()
-                cur   = _dir_tree_size(fetch_dir)
+                if tar_part_paths is None:
+                    cur = _dir_tree_size(fetch_dir)
+                    snapshot = None
+                else:
+                    lock = tar_part_paths_lock or threading.Lock()
+                    with lock:
+                        parts = list(tar_part_paths)
+                    snapshot = _staging_progress_snapshot(
+                        parts, (fetch_dir,))
+                    cur = int(snapshot["total_bytes"])
                 now   = time.time()
                 # Rewalking a chunk with many small files is itself expensive;
                 # keep the scan overhead under ~10% of the monitor's cycle.
@@ -1779,11 +2010,23 @@ class RemoteChunkStager:
                     free = shutil.disk_usage(self.host.staging_dir).free
                 except OSError:
                     free = None
-                action = _fetch_watchdog_action(
-                    cur=cur, last_growth_at=last_growth_at, now=now,
-                    total_bytes=total_bytes, abort_factor=abort_factor,
-                    stall_timeout=stall_timeout, free_bytes=free,
-                    reserve_bytes=LOCAL_STAGING_RESERVE_BYTES)
+                if snapshot is None:
+                    action = _fetch_watchdog_action(
+                        cur=cur, last_growth_at=last_growth_at, now=now,
+                        total_bytes=total_bytes, abort_factor=abort_factor,
+                        stall_timeout=stall_timeout, free_bytes=free,
+                        reserve_bytes=LOCAL_STAGING_RESERVE_BYTES)
+                else:
+                    action = _tar_progress_watchdog_action(
+                        snapshot=snapshot,
+                        previous_snapshot=previous_snapshot,
+                        part_last_growth=part_last_growth,
+                        aggregate_last_growth=last_growth_at,
+                        now=now, total_bytes=total_bytes,
+                        abort_factor=abort_factor,
+                        stall_timeout=stall_timeout, free_bytes=free,
+                        reserve_bytes=LOCAL_STAGING_RESERVE_BYTES)
+                    previous_snapshot = snapshot
                 if action == 'diskfull':
                     _alarm(
                         f"aborting fetch: staging free space is down to "
@@ -1809,6 +2052,15 @@ class RemoteChunkStager:
                         f"({cur / 1024**3:.1f} GB) for {stall_timeout}s — the "
                         "remote stream is wedged (connected but delivering no "
                         "data). The chunk stays resumable and will be retried."
+                    )
+                    abort_evt.set()
+                    return
+                if action == 'part_stall':
+                    _alarm(
+                        f"aborting fetch: a Stored TAR .part stream has not "
+                        f"grown for {stall_timeout}s while sibling progress "
+                        "may still be occurring. The chunk stays unready and "
+                        "owned .part evidence is preserved."
                     )
                     abort_evt.set()
                     return

@@ -419,9 +419,10 @@ class RemoteOrchestrator:
         return self._stager()._fetch_collisions(
             session_id, collisions, fetch_dir, fetch_abort, *args, **kwargs)
 
-    def _start_fetch_monitor(self, stop_evt, abort_evt, fetch_dir, total_bytes):
+    def _start_fetch_monitor(self, stop_evt, abort_evt, fetch_dir, total_bytes,
+                             **kwargs):
         return self._stager()._start_fetch_monitor(
-            stop_evt, abort_evt, fetch_dir, total_bytes)
+            stop_evt, abort_evt, fetch_dir, total_bytes, **kwargs)
 
     def _cleanup_remote_staging_dirs(self):
         return self._stager()._cleanup_remote_staging_dirs()
@@ -1624,7 +1625,9 @@ class RemoteOrchestrator:
                           "may drain")
 
     def _await_staging_capacity(self, planned_bytes, planned_files, stop_evt,
-                                ready_q=None):
+                                ready_q=None, **kwargs):
+        return self._stager()._await_staging_capacity(
+            planned_bytes, planned_files, stop_evt, ready_q=ready_q, **kwargs)
         """Block until there is room to stage another chunk without breaching the
         staging cap or starving the disk. Accounts for the ~2x transient
         footprint while a chunk is packed (fetch_dir + pack_dir coexist),
