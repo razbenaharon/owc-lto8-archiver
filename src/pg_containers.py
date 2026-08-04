@@ -699,10 +699,78 @@ class PgContainerMixin:
                     "(SELECT count(*) FROM archive_runs ar "
                     "WHERE ar.remote_session_id=c.session_id "
                     "AND ar.remote_chunk_index=c.chunk_index)")
-            # The migration-007 chunk_index is not trustworthy remote
-            # provenance. Directory rows are reconciled globally through their
-            # archive_run_id and files_index after the boundary is derived.
             directory_evidence = "0"
+            directory_rows_sql = None
+            directory_resolution_sql = None
+            directory_attribution_sql = None
+            if directory_count == 3:
+                directory_rows_sql = """
+                    SELECT chunk_index AS declared_chunk_index, archive_run_id
+                    FROM directory_archive_stats
+                    WHERE remote_session_id=c.session_id
+                    UNION ALL
+                    SELECT chunk_index, archive_run_id
+                    FROM directory_archive_bundles
+                    WHERE remote_session_id=c.session_id
+                    UNION ALL
+                    SELECT chunk_index, archive_run_id
+                    FROM directory_tree_index
+                    WHERE remote_session_id=c.session_id"""
+                run_chunk = ("ar.remote_chunk_index" if has_run_chunk
+                             else "NULL::integer")
+                directory_resolution_sql = f"""
+                    SELECT d.*, ar.remote_session_id AS run_session_id,
+                           {run_chunk} AS run_chunk_index,
+                           fm.file_count, fm.bad_file_count,
+                           fm.minimum_chunk_index AS file_chunk_index,
+                           fm.maximum_chunk_index AS maximum_file_chunk_index
+                    FROM ({directory_rows_sql}) d
+                    LEFT JOIN archive_runs ar ON ar.run_id=d.archive_run_id
+                    LEFT JOIN LATERAL (
+                        SELECT count(*) AS file_count,
+                               count(*) FILTER (WHERE
+                                   fi.remote_session_id IS DISTINCT FROM
+                                       c.session_id
+                                   OR fi.remote_chunk_index IS NULL)
+                                   AS bad_file_count,
+                               min(fi.remote_chunk_index) AS minimum_chunk_index,
+                               max(fi.remote_chunk_index) AS maximum_chunk_index
+                        FROM files_index fi
+                        WHERE fi.archive_run_id=d.archive_run_id
+                    ) fm ON TRUE"""
+                directory_attribution_sql = """
+                    CASE
+                      WHEN r.declared_chunk_index IS NOT NULL
+                           AND EXISTS (
+                               SELECT 1 FROM remote_chunks rc
+                               WHERE rc.session_id=c.session_id
+                                 AND rc.chunk_index=r.declared_chunk_index)
+                        THEN r.declared_chunk_index
+                      WHEN r.run_session_id=c.session_id
+                           AND r.run_chunk_index IS NOT NULL
+                           AND EXISTS (
+                               SELECT 1 FROM remote_chunks rc
+                               WHERE rc.session_id=c.session_id
+                                 AND rc.chunk_index=r.run_chunk_index)
+                           AND COALESCE(r.bad_file_count,0)=0
+                           AND (COALESCE(r.file_count,0)=0
+                                OR (r.file_chunk_index=r.run_chunk_index
+                                    AND r.maximum_file_chunk_index=
+                                        r.run_chunk_index))
+                        THEN r.run_chunk_index
+                      WHEN COALESCE(r.file_count,0)>0
+                           AND COALESCE(r.bad_file_count,0)=0
+                           AND r.file_chunk_index=r.maximum_file_chunk_index
+                           AND EXISTS (
+                               SELECT 1 FROM remote_chunks rc
+                               WHERE rc.session_id=c.session_id
+                                 AND rc.chunk_index=r.file_chunk_index)
+                        THEN r.file_chunk_index
+                      ELSE NULL
+                    END"""
+                directory_evidence = f"""(
+                    SELECT count(*) FROM ({directory_resolution_sql}) r
+                    WHERE ({directory_attribution_sql})=c.chunk_index)"""
             batch_evidence = "0"
             batch_written = "0"
             if batch_count == 3:
@@ -778,6 +846,87 @@ class PgContainerMixin:
                         ORDER BY c.chunk_index"""
             raw = conn.execute(sql, (session_id,)).fetchall()
             chunks = [self._format_boundary_row(row) for row in raw]
+
+            directory_summary = {
+                "state": ("installed" if directory_count == 3
+                          else "absent" if directory_count == 0 else "partial"),
+                "row_count": 0,
+                "attributed_row_count": 0,
+                "unattributed_row_count": 0,
+                "suffix_blocker_count": 0,
+                "unattributed_blocker_count": 0,
+                "unattributed_disposition": "none",
+            }
+            if directory_count == 3:
+                # Rebind the same attribution query to a one-row session alias,
+                # so the report exposes legacy-unattributable rows rather than
+                # letting their per-chunk count look like proof of absence.
+                summary_sql = f"""
+                    WITH session_context AS (
+                        SELECT %s::bigint AS session_id
+                    ), directory_rows AS (
+                        SELECT d.chunk_index AS declared_chunk_index,
+                               d.archive_run_id
+                        FROM directory_archive_stats d, session_context c
+                        WHERE d.remote_session_id=c.session_id
+                        UNION ALL
+                        SELECT d.chunk_index, d.archive_run_id
+                        FROM directory_archive_bundles d, session_context c
+                        WHERE d.remote_session_id=c.session_id
+                        UNION ALL
+                        SELECT d.chunk_index, d.archive_run_id
+                        FROM directory_tree_index d, session_context c
+                        WHERE d.remote_session_id=c.session_id
+                    ), resolved AS (
+                        SELECT d.*, ar.remote_session_id AS run_session_id,
+                               {run_chunk} AS run_chunk_index,
+                               fm.file_count, fm.bad_file_count,
+                               fm.minimum_chunk_index AS file_chunk_index,
+                               fm.maximum_chunk_index
+                                   AS maximum_file_chunk_index
+                        FROM directory_rows d
+                        CROSS JOIN session_context c
+                        LEFT JOIN archive_runs ar
+                          ON ar.run_id=d.archive_run_id
+                        LEFT JOIN LATERAL (
+                            SELECT count(*) AS file_count,
+                                   count(*) FILTER (WHERE
+                                       fi.remote_session_id IS DISTINCT FROM
+                                           c.session_id
+                                       OR fi.remote_chunk_index IS NULL)
+                                       AS bad_file_count,
+                                   min(fi.remote_chunk_index)
+                                       AS minimum_chunk_index,
+                                   max(fi.remote_chunk_index)
+                                       AS maximum_chunk_index
+                            FROM files_index fi
+                            WHERE fi.archive_run_id=d.archive_run_id
+                        ) fm ON TRUE
+                    ), attributed AS (
+                        SELECT r.*, ({directory_attribution_sql})
+                            AS attributed_chunk_index
+                        FROM resolved r CROSS JOIN session_context c
+                    )
+                    SELECT count(*) AS row_count,
+                           count(*) FILTER (WHERE attributed_chunk_index
+                                                   IS NOT NULL)
+                               AS attributed_row_count,
+                           count(*) FILTER (WHERE attributed_chunk_index
+                                                   IS NULL)
+                               AS unattributed_row_count
+                    FROM attributed"""
+                summary_row = conn.execute(
+                    summary_sql, (session_id,)).fetchone()
+                directory_summary.update({
+                    "row_count": int(summary_row["row_count"]),
+                    "attributed_row_count": int(
+                        summary_row["attributed_row_count"]),
+                    "unattributed_row_count": int(
+                        summary_row["unattributed_row_count"]),
+                })
+                if directory_summary["unattributed_row_count"]:
+                    directory_summary["unattributed_disposition"] = (
+                        "reported_legacy_rows_without_tar_suffix_provenance")
 
             ambiguous_files = int(conn.execute(
                 """SELECT count(*) AS n FROM files_index fi
@@ -889,30 +1038,87 @@ class PgContainerMixin:
                             + ",".join(map(str, contradictory)))
 
                     if directory_count == 3:
-                        directory_sql = """
-                            SELECT count(*) AS n FROM (
-                                SELECT archive_run_id
-                                FROM directory_archive_stats
-                                WHERE remote_session_id=%s
+                        directory_sql = f"""
+                            WITH session_context AS (
+                                SELECT %s::bigint AS session_id
+                            ), directory_rows AS (
+                                SELECT d.chunk_index AS declared_chunk_index,
+                                       d.archive_run_id
+                                FROM directory_archive_stats d,
+                                     session_context c
+                                WHERE d.remote_session_id=c.session_id
                                 UNION ALL
-                                SELECT archive_run_id
-                                FROM directory_archive_bundles
-                                WHERE remote_session_id=%s
+                                SELECT d.chunk_index, d.archive_run_id
+                                FROM directory_archive_bundles d,
+                                     session_context c
+                                WHERE d.remote_session_id=c.session_id
                                 UNION ALL
-                                SELECT archive_run_id
-                                FROM directory_tree_index
-                                WHERE remote_session_id=%s
-                            ) d
-                            WHERE EXISTS (
-                                  SELECT 1 FROM files_index fi
-                                  WHERE fi.archive_run_id=d.archive_run_id
-                                    AND (fi.remote_session_id IS DISTINCT FROM %s
-                                         OR (fi.remote_chunk_index IS NOT NULL
-                                             AND fi.remote_chunk_index >= %s)))"""
-                        params = (session_id, session_id, session_id,
-                                  session_id, derived)
-                        ambiguous_directories = int(conn.execute(
-                            directory_sql, params).fetchone()["n"])
+                                SELECT d.chunk_index, d.archive_run_id
+                                FROM directory_tree_index d,
+                                     session_context c
+                                WHERE d.remote_session_id=c.session_id
+                            ), resolved AS (
+                                SELECT d.*,
+                                       ar.remote_session_id AS run_session_id,
+                                       {run_chunk} AS run_chunk_index,
+                                       fm.file_count, fm.bad_file_count,
+                                       fm.minimum_chunk_index
+                                           AS file_chunk_index,
+                                       fm.maximum_chunk_index
+                                           AS maximum_file_chunk_index
+                                FROM directory_rows d
+                                CROSS JOIN session_context c
+                                LEFT JOIN archive_runs ar
+                                  ON ar.run_id=d.archive_run_id
+                                LEFT JOIN LATERAL (
+                                    SELECT count(*) AS file_count,
+                                           count(*) FILTER (WHERE
+                                               fi.remote_session_id
+                                                   IS DISTINCT FROM c.session_id
+                                               OR fi.remote_chunk_index IS NULL)
+                                               AS bad_file_count,
+                                           min(fi.remote_chunk_index)
+                                               AS minimum_chunk_index,
+                                           max(fi.remote_chunk_index)
+                                               AS maximum_chunk_index
+                                    FROM files_index fi
+                                    WHERE fi.archive_run_id=d.archive_run_id
+                                ) fm ON TRUE
+                            ), attributed AS (
+                                SELECT r.*, ({directory_attribution_sql})
+                                    AS attributed_chunk_index
+                                FROM resolved r
+                                CROSS JOIN session_context c
+                            )
+                            SELECT count(*) AS n,
+                                   count(*) FILTER (WHERE
+                                       d.attributed_chunk_index IS NULL)
+                                       AS unattributed_n
+                            FROM attributed d,
+                                 session_context c
+                            WHERE d.attributed_chunk_index >= %s
+                               OR (d.declared_chunk_index IS NOT NULL AND
+                                   (d.attributed_chunk_index IS NULL
+                                    OR (d.run_chunk_index IS NOT NULL AND
+                                        d.run_chunk_index IS DISTINCT FROM
+                                            d.attributed_chunk_index)
+                                    OR (d.file_chunk_index IS NOT NULL AND
+                                        d.file_chunk_index IS DISTINCT FROM
+                                            d.attributed_chunk_index)))
+                               OR (d.run_session_id IS NOT NULL AND
+                                   d.run_session_id IS DISTINCT FROM
+                                       c.session_id)
+                               OR COALESCE(d.bad_file_count,0) <> 0
+                               OR d.file_chunk_index IS DISTINCT FROM
+                                  d.maximum_file_chunk_index"""
+                        directory_blockers = conn.execute(
+                            directory_sql, (session_id, derived)
+                        ).fetchone()
+                        ambiguous_directories = int(directory_blockers["n"])
+                        directory_summary["suffix_blocker_count"] = (
+                            ambiguous_directories)
+                        directory_summary["unattributed_blocker_count"] = int(
+                            directory_blockers["unattributed_n"])
                         if ambiguous_directories:
                             blocking.append(
                                 f"{ambiguous_directories} directory catalog "
@@ -944,6 +1150,7 @@ class PgContainerMixin:
                 "chunk_count": len(chunks),
                 "derived_boundary": derived,
                 "prefix_evidence_counts": prefix_evidence_counts,
+                "directory_evidence_summary": directory_summary,
                 "chunks": chunks,
                 "blocking": blocking,
             }

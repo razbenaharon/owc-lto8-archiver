@@ -2159,6 +2159,43 @@ class ContainerFormatMigrationTests(unittest.TestCase):
                WHERE session_id=%s AND chunk_index<=%s""",
             (session_id, last_index))
 
+    def _insert_direct_directory_evidence(self, session_id, chunk_index):
+        self._exec(
+            """INSERT INTO directory_archive_stats
+                   (source_host,original_dir_path,tape_label,remote_session_id,
+                    chunk_index,direct_file_count,direct_bytes,
+                    recursive_file_count,recursive_bytes,small_file_count,
+                    small_file_bytes,large_file_count,large_file_bytes,
+                    packed_bundle_count,backup_date,record_key)
+               VALUES ('fixture','/fixture/direct/stats','FORMAT_TAPE',%s,%s,
+                       0,0,0,0,0,0,0,0,0,now(),decode(
+                       repeat('11',32),'hex'))""",
+            (session_id, chunk_index))
+        self._exec(
+            """INSERT INTO directory_archive_bundles
+                   (source_host,original_dir_path,tape_label,remote_session_id,
+                    chunk_index,stored_bundle_path,file_count,byte_count,
+                    small_file_count,small_file_bytes,large_file_count,
+                    large_file_bytes,backup_date,record_key)
+               VALUES ('fixture','/fixture/direct/bundle','FORMAT_TAPE',%s,%s,
+                       'direct.zip',0,0,0,0,0,0,now(),decode(
+                       repeat('22',32),'hex'))""",
+            (session_id, chunk_index))
+        self._exec(
+            """INSERT INTO directory_tree_index
+                   (source_host,original_dir_path,dir_name,depth,tape_label,
+                    remote_session_id,chunk_index,direct_file_count,direct_bytes,
+                    recursive_file_count,recursive_bytes,
+                    direct_small_file_count,direct_small_file_bytes,
+                    recursive_small_file_count,recursive_small_file_bytes,
+                    direct_large_file_count,direct_large_file_bytes,
+                    recursive_large_file_count,recursive_large_file_bytes,
+                    backup_date,record_key)
+               VALUES ('fixture','/fixture/direct/tree','tree',0,'FORMAT_TAPE',
+                       %s,%s,0,0,0,0,0,0,0,0,0,0,0,0,now(),decode(
+                       repeat('33',32),'hex'))""",
+            (session_id, chunk_index))
+
     @staticmethod
     def _staging_evidence(indexes):
         from datetime import datetime, timezone
@@ -2398,6 +2435,16 @@ class ContainerFormatMigrationTests(unittest.TestCase):
         self.assertEqual(classification["blocking"], [])
         self.assertEqual(classification["prefix_evidence_counts"], {
             "corroborated": 6, "status_only": 43})
+        self.assertEqual(classification["directory_evidence_summary"], {
+            "state": "installed", "row_count": 134,
+            "attributed_row_count": 0, "unattributed_row_count": 134,
+            "suffix_blocker_count": 0, "unattributed_blocker_count": 0,
+            "unattributed_disposition":
+                "reported_legacy_rows_without_tar_suffix_provenance",
+        })
+        self.assertTrue(all(
+            row["directory_evidence_count"] == 0
+            for row in classification["chunks"][49:]))
 
         self.db.apply_container_format_schema(
             exception_session_id=session_id,
@@ -2467,6 +2514,12 @@ class ContainerFormatMigrationTests(unittest.TestCase):
                WHERE session_id=%s""", (session_id,))[0]["database_evidence"]
         self.assertEqual(boundary_evidence["corroborated_prefix_count"], 6)
         self.assertEqual(boundary_evidence["status_only_prefix_count"], 43)
+        self.assertEqual(boundary_evidence["directory_row_count"], 134)
+        self.assertEqual(
+            boundary_evidence["unattributed_directory_count"], 134)
+        self.assertEqual(
+            boundary_evidence["unattributed_directory_disposition"],
+            "reported_legacy_rows_without_tar_suffix_provenance")
 
         # Same approved application is a no-op: neither format nor immutable
         # audit evidence changes.
@@ -2652,6 +2705,37 @@ class ContainerFormatMigrationTests(unittest.TestCase):
         self.assertIsNone(self._query(
             "SELECT to_regclass('archive_containers') AS r")[0]["r"])
 
+    def test_all_migration007_tables_contribute_measured_chunk_evidence(self):
+        session_id = self._session(label="DIRECT_DIRECTORY_EVIDENCE")
+        self.db.apply_directory_catalog_schema()
+        self._append(session_id, 0)
+        self._append(session_id, 1)
+        self._exec(
+            """UPDATE remote_chunks SET status='done', updated_at=now()
+               WHERE session_id=%s AND chunk_index=0""", (session_id,))
+        self._insert_direct_directory_evidence(session_id, 1)
+        self._ready_014()
+
+        classification = self.db.classify_format_boundary(session_id)
+        suffix = classification["chunks"][1]
+        self.assertEqual(suffix["directory_evidence_count"], 3)
+        self.assertFalse(suffix["eligible_stored_tar"])
+        self.assertEqual(
+            classification["directory_evidence_summary"]["row_count"], 3)
+        self.assertEqual(
+            classification["directory_evidence_summary"]
+            ["attributed_row_count"], 3)
+        self.assertEqual(
+            classification["directory_evidence_summary"]
+            ["unattributed_row_count"], 0)
+        with self.assertRaisesRegex(Exception, "no evidence-proven"):
+            self.db.apply_container_format_schema(
+                exception_session_id=session_id, expected_boundary=1,
+                approval_id="direct-directory-evidence",
+                approval_reason=(
+                    "all three migration-007 tables must block the suffix"),
+                staging_evidence=self._staging_evidence([1]))
+
     def test_directory_row_proven_for_suffix_still_blocks_exception(self):
         session_id = self._session(label="DIRECTORY_SUFFIX_FIXTURE")
         self.db.apply_directory_catalog_schema()
@@ -2680,6 +2764,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
 
         classification = self.db.classify_format_boundary(session_id)
         self.assertEqual(classification["derived_boundary"], 1)
+        self.assertEqual(
+            classification["chunks"][2]["directory_evidence_count"], 1)
         self.assertTrue(any("TAR-suffix provenance" in item
                             for item in classification["blocking"]))
         with self.assertRaisesRegex(Exception, "TAR-suffix provenance"):

@@ -41,6 +41,7 @@ from src.pg_backup import (
     verify_backup_receipt,
 )
 from src.pg_bulk import build_conninfo, make_conninfo
+from src.remote_staging import inspect_resume_pack_marker
 from src.session_reconcile import (
     DEFAULT_IDLE_SECONDS,
     format_report,
@@ -323,12 +324,15 @@ def _assert_plain_local_directory(path):
     return drive
 
 
-def _inspect_container_format_staging(cfg, db, session_id, chunk_indexes):
-    """Prove the deterministic candidate staging paths are absent.
+def _inspect_container_format_staging(
+        cfg, db, session_id, chunk_indexes, *, strict=True,
+        include_details=False):
+    """Inspect deterministic candidate staging paths without changing them.
 
-    This inspects only the session's configured local staging root.  It rejects
-    an LTFS-drive match before any filesystem call and returns no path/name, so
-    the persisted evidence remains suitable for a public-code deployment.
+    Execute mode uses the five path-free aggregate fields as an attestation.
+    The read-only rehearsal additionally requests per-chunk marker/inventory
+    observations.  Missing or unreadable roots are ``unknown`` in that report;
+    strict execute mode still fails closed.
     """
     session = db.get_remote_session(int(session_id))
     if not session:
@@ -336,9 +340,21 @@ def _inspect_container_format_staging(cfg, db, session_id, chunk_indexes):
             f"[MIGRATION 015] Session {session_id} does not exist")
     root_text = str(session.get("staging_dir") or "").strip()
     if not root_text:
-        raise OperationalError(
-            "[MIGRATION 015] Session staging root is absent; evidence is "
-            "indeterminate")
+        if strict:
+            raise OperationalError(
+                "[MIGRATION 015] Session staging root is absent; evidence is "
+                "indeterminate")
+        return {
+            "root_accessible": False,
+            "root_state": "absent",
+            "evidence_state": "unknown",
+            "checked_chunk_indexes": sorted(
+                {int(index) for index in chunk_indexes}),
+            "entry_count": None,
+            "unreadable_count": None,
+            "chunks": [],
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
     root = os.path.abspath(root_text)
     lto_text = str(getattr(cfg, "lto_drive", "") or "").strip()
     if not lto_text:
@@ -372,32 +388,94 @@ def _inspect_container_format_staging(cfg, db, session_id, chunk_indexes):
         raise OperationalError(
             "[MIGRATION 015] Refusing staging inspection because the configured "
             "session staging root is on the LTFS drive")
-    _assert_plain_local_directory(root)
+    try:
+        _assert_plain_local_directory(root)
+    except OperationalError:
+        if strict:
+            raise
+        return {
+            "root_accessible": False,
+            "root_state": "unreadable",
+            "evidence_state": "unknown",
+            "checked_chunk_indexes": sorted(
+                {int(index) for index in chunk_indexes}),
+            "entry_count": None,
+            "unreadable_count": None,
+            "chunks": [],
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
 
     try:
         with os.scandir(root) as entries:
-            root_names = tuple(entry.name.casefold() for entry in entries)
+            root_entries = {entry.name.casefold(): entry for entry in entries}
     except OSError as exc:
-        raise OperationalError(
-            "[MIGRATION 015] Session staging root is unreadable; evidence is "
-            "indeterminate") from exc
+        if strict:
+            raise OperationalError(
+                "[MIGRATION 015] Session staging root is unreadable; evidence "
+                "is indeterminate") from exc
+        return {
+            "root_accessible": False,
+            "root_state": "unreadable",
+            "evidence_state": "unknown",
+            "checked_chunk_indexes": sorted(
+                {int(index) for index in chunk_indexes}),
+            "entry_count": None,
+            "unreadable_count": None,
+            "chunks": [],
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
 
     checked = sorted({int(index) for index in chunk_indexes})
-    candidate_names = set()
+    observations = []
+    found = 0
+    unreadable = 0
     for chunk_index in checked:
-        candidate_names.update(name.casefold() for name in (
-            f"_fetch_s{int(session_id):04d}_{chunk_index:03d}",
-            f"_pack_s{int(session_id):04d}_{chunk_index:03d}",
-        ))
-    found = sum(name in candidate_names for name in root_names)
+        fetch_name = f"_fetch_s{int(session_id):04d}_{chunk_index:03d}"
+        pack_name = f"_pack_s{int(session_id):04d}_{chunk_index:03d}"
+        fetch_present = fetch_name.casefold() in root_entries
+        pack_entry = root_entries.get(pack_name.casefold())
+        pack_present = pack_entry is not None
+        found += int(fetch_present) + int(pack_present)
+        marker = {
+            "marker_state": "unknown_pack_absent",
+            "inventory_state": "unknown",
+            "pack_file_count": None,
+            "packaging_format": None,
+        }
+        if pack_present:
+            try:
+                if not pack_entry.is_dir(follow_symlinks=False):
+                    marker["marker_state"] = "pack_directory_unreadable"
+                else:
+                    marker = inspect_resume_pack_marker(
+                        os.path.join(root, pack_entry.name),
+                        int(session_id), chunk_index)
+            except OSError:
+                marker["marker_state"] = "pack_directory_unreadable"
+            if marker["marker_state"] in (
+                    "unreadable", "pack_directory_unreadable"):
+                unreadable += 1
+        observations.append({
+            "chunk_index": chunk_index,
+            "fetch_entry_present": fetch_present,
+            "pack_entry_present": pack_present,
+            "resume_marker": marker,
+        })
 
-    return {
+    evidence = {
         "root_accessible": True,
         "checked_chunk_indexes": checked,
         "entry_count": found,
-        "unreadable_count": 0,
+        "unreadable_count": unreadable,
         "checked_at": datetime.now(timezone.utc).isoformat(),
     }
+    if include_details:
+        evidence.update({
+            "root_state": "accessible",
+            "evidence_state": "observed",
+            "chunks": observations,
+        })
+    return evidence
 
 
 def _run_container_format_schema_report(cfg, *, validate=False):
@@ -417,13 +495,21 @@ def _run_session37_boundary_rehearsal(cfg, args):
 
     The target is normally an isolated restored database selected with
     ``--db``.  This command opens PostgreSQL read-only, does not inspect local
-    staging or LTFS, and cannot persist the boundary.
+    staging (through the read-only resume-marker parser), never LTFS, and cannot
+    persist the boundary.
     """
     session_id = int(args.session_id[0] if args.session_id else 37)
     conninfo = _conninfo(cfg)
     db = _open_read_only_db(cfg)
     try:
         report = db.classify_format_boundary(session_id)
+        boundary = report.get("derived_boundary")
+        indexes = ([row["chunk_index"] for row in report.get("chunks", [])
+                    if boundary is not None
+                    and row["chunk_index"] >= boundary])
+        staging_report = _inspect_container_format_staging(
+            cfg, db, session_id, indexes, strict=False,
+            include_details=True)
     finally:
         db.close()
     _print_json({
@@ -435,6 +521,7 @@ def _run_session37_boundary_rehearsal(cfg, args):
         "stored_tar_write_enabled": bool(
             getattr(cfg, "stored_tar_write_enabled", False)),
         "boundary_report": report,
+        "staging_evidence": staging_report,
         "session37_row_unchanged_by_command": True,
     })
     return 0
@@ -447,6 +534,11 @@ def _apply_container_format_schema(cfg, args, parser):
             "--apply-container-format-schema accepts only one of --dry-run "
             "or --execute")
     exception_session_id = args.stored_tar_exception_session_id
+    if (args.execute and exception_session_id is not None
+            and getattr(cfg, "stored_tar_write_enabled", False) is not True):
+        raise OperationalError(
+            "[MIGRATION 015] Refusing Stored TAR boundary persistence while "
+            "stored_tar_write_enabled is false")
     db = _open_read_only_db(cfg)
     try:
         preflight = db.container_format_schema_preflight(exception_session_id)

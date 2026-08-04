@@ -108,7 +108,35 @@ class RestoreCollisionTests(unittest.TestCase):
         }
         self.assertIs(
             self.retriever._route_container_format(record),
+             ContainerFormat.STORED_TAR)
+
+    def test_bundle_persisted_format_precedes_legacy_is_packed_adapter(self):
+        sql = PgCatalogMixin._catalog_select(container_schema=True)
+        persisted = sql.index("WHEN b.container_format IS NOT NULL")
+        legacy = sql.index("WHEN f.is_packed AND b.bundle_id IS NOT NULL")
+        self.assertLess(persisted, legacy)
+        hydrated = PgCatalogMixin._hydrate_file_row({
+            "stored_path": "opaque/member", "original_path": "/srv/member",
+            "restore_container_format": "stored_tar",
+            "restore_container_id": None,
+            "restore_format_version": "stored-tar-v1",
+            "restore_tar_dialect": "gnu-pax-sparse-v1",
+            "tape_container_locator": "opaque.container",
+            "is_packed": True,
+        })
+        self.assertIs(
+            self.retriever._route_container_format(hydrated),
             ContainerFormat.STORED_TAR)
+
+    def test_legacy_no_format_bundle_falls_back_to_zip(self):
+        record = {
+            "container_format": None, "container_id": None,
+            "bundle_id": 9, "is_packed": True,
+            "tape_container_locator": "legacy/opaque.bundle",
+        }
+        self.assertIs(
+            self.retriever._route_container_format(record),
+            ContainerFormat.ZIP)
 
 
 class CanonicalBundleBaseTests(unittest.TestCase):
