@@ -151,14 +151,17 @@ class PgCatalogMixin:
                          r.started_at AS run_started_at,
                          c.container_id AS restore_container_id,
                          CASE
-                           WHEN c.container_id IS NOT NULL
+                           WHEN c.container_format IS NOT NULL
                              THEN c.container_format
+                           WHEN b.container_format IS NOT NULL
+                             THEN b.container_format
                            WHEN f.is_packed AND b.bundle_id IS NOT NULL
                              THEN 'zip'
                            ELSE NULL
                          END AS restore_container_format,
                          CASE
                            WHEN c.container_id IS NOT NULL THEN c.format_version
+                           WHEN b.container_format='zip' THEN 'legacy-zip-v1'
                            WHEN f.is_packed AND b.bundle_id IS NOT NULL
                              THEN 'legacy-zip-v1'
                            ELSE NULL

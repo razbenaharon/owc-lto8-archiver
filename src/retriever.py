@@ -151,7 +151,9 @@ class LTORetriever:
         is adapted explicitly to ZIP only when it has the historical bundle
         locator; extensions are never inspected.
         """
-        value = record.get("container_format")
+        value = (record.get("container_format")
+                 or record.get("restore_container_format")
+                 or record.get("bundle_container_format"))
         if value:
             try:
                 return ContainerFormat(value)
@@ -162,8 +164,12 @@ class LTORetriever:
             raise RuntimeError(
                 "[RESTORE] Linked container has no persisted format; refusing "
                 "to guess from packing state or filename")
+        # Legacy adapter only: schemas predating migration 015 genuinely have
+        # no durable format column.  A packed row linked to a historical bundle
+        # locator is ZIP; this branch must never override persisted metadata.
         if record.get("is_packed") is True and (
-                record.get("container_name")
+                record.get("bundle_id") is not None
+                or record.get("container_name")
                 or record.get("tape_container_locator")):
             return ContainerFormat.ZIP
         if record.get("is_packed") is False:

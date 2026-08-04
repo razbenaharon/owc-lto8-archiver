@@ -598,6 +598,9 @@ DECLARE
     ambiguous_file_count BIGINT;
     ambiguous_run_count  BIGINT;
     ambiguous_directory_count BIGINT := 0;
+    directory_row_count BIGINT := 0;
+    attributed_directory_count BIGINT := 0;
+    unattributed_directory_count BIGINT := 0;
 BEGIN
     IF exception_text IS NULL THEN
         IF expected_text IS NOT NULL OR approval_id_text IS NOT NULL
@@ -745,11 +748,107 @@ BEGIN
                          ('directory_archive_bundles'),
                          ('directory_tree_index')) AS wanted(name)
             WHERE to_regclass('public.' || wanted.name) IS NOT NULL;
-            -- Migration-007 chunk_index came from the historical local-chunk
-            -- field and is not remote provenance.  It is deliberately never
-            -- joined to a remote chunk here.  After the boundary is derived,
-            -- directory rows are reconciled only through archive_run_id plus
-            -- exact files_index remote provenance; anything else blocks.
+            IF optional_007_count NOT IN (0, 3) THEN
+                RAISE EXCEPTION
+                    'migration 007 is partially installed (% of 3 tables); evidence is indeterminate',
+                    optional_007_count;
+            END IF;
+            IF optional_007_count = 3 THEN
+                -- Attribute every migration-007 row that has trustworthy
+                -- remote provenance.  A direct chunk value wins only when it
+                -- names this session's real chunk.  Otherwise a run may resolve
+                -- through archive_runs.remote_chunk_index or through a single,
+                -- internally consistent files_index remote chunk.
+                DROP TABLE IF EXISTS pg_temp.plan2_directory_evidence;
+                EXECUTE $sql$
+                    CREATE TEMP TABLE plan2_directory_evidence ON COMMIT DROP AS
+                    WITH directory_rows AS (
+                        SELECT chunk_index AS declared_chunk_index,
+                               archive_run_id
+                        FROM directory_archive_stats
+                        WHERE remote_session_id=$1
+                        UNION ALL
+                        SELECT chunk_index, archive_run_id
+                        FROM directory_archive_bundles
+                        WHERE remote_session_id=$1
+                        UNION ALL
+                        SELECT chunk_index, archive_run_id
+                        FROM directory_tree_index
+                        WHERE remote_session_id=$1
+                    ), resolved AS (
+                        SELECT d.*,
+                               ar.remote_session_id AS run_session_id,
+                               ar.remote_chunk_index AS run_chunk_index,
+                               fm.file_count,
+                               fm.bad_file_count,
+                               fm.minimum_chunk_index AS file_chunk_index,
+                               fm.maximum_chunk_index AS maximum_file_chunk_index
+                        FROM directory_rows d
+                        LEFT JOIN archive_runs ar ON ar.run_id=d.archive_run_id
+                        LEFT JOIN LATERAL (
+                            SELECT count(*) AS file_count,
+                                   count(*) FILTER (WHERE
+                                       fi.remote_session_id IS DISTINCT FROM $1
+                                       OR fi.remote_chunk_index IS NULL)
+                                       AS bad_file_count,
+                                   min(fi.remote_chunk_index)
+                                       AS minimum_chunk_index,
+                                   max(fi.remote_chunk_index)
+                                       AS maximum_chunk_index
+                            FROM files_index fi
+                            WHERE fi.archive_run_id=d.archive_run_id
+                        ) fm ON TRUE
+                    )
+                    SELECT r.*,
+                           CASE
+                             WHEN r.declared_chunk_index IS NOT NULL
+                                  AND EXISTS (
+                                      SELECT 1 FROM remote_chunks c
+                                      WHERE c.session_id=$1
+                                        AND c.chunk_index=
+                                            r.declared_chunk_index)
+                               THEN r.declared_chunk_index
+                             WHEN r.run_session_id=$1
+                                  AND r.run_chunk_index IS NOT NULL
+                                  AND EXISTS (
+                                      SELECT 1 FROM remote_chunks c
+                                      WHERE c.session_id=$1
+                                        AND c.chunk_index=r.run_chunk_index)
+                                  AND COALESCE(r.bad_file_count,0)=0
+                                  AND (COALESCE(r.file_count,0)=0
+                                       OR (r.file_chunk_index=r.run_chunk_index
+                                           AND r.maximum_file_chunk_index=
+                                               r.run_chunk_index))
+                               THEN r.run_chunk_index
+                             WHEN COALESCE(r.file_count,0)>0
+                                  AND COALESCE(r.bad_file_count,0)=0
+                                  AND r.file_chunk_index=
+                                      r.maximum_file_chunk_index
+                                  AND EXISTS (
+                                      SELECT 1 FROM remote_chunks c
+                                      WHERE c.session_id=$1
+                                        AND c.chunk_index=r.file_chunk_index)
+                               THEN r.file_chunk_index
+                             ELSE NULL
+                           END AS attributed_chunk_index
+                    FROM resolved r
+                $sql$ USING exception_session;
+
+                UPDATE pg_temp.plan2_format_evidence e
+                SET directory_evidence_count=(
+                    SELECT count(*)
+                    FROM pg_temp.plan2_directory_evidence d
+                    WHERE d.attributed_chunk_index=e.chunk_index);
+
+                SELECT count(*),
+                       count(*) FILTER (
+                           WHERE attributed_chunk_index IS NOT NULL),
+                       count(*) FILTER (
+                           WHERE attributed_chunk_index IS NULL)
+                INTO directory_row_count, attributed_directory_count,
+                     unattributed_directory_count
+                FROM pg_temp.plan2_directory_evidence;
+            END IF;
 
             SELECT count(*) INTO optional_012_count
             FROM (VALUES ('tape_write_batches'),
@@ -898,34 +997,28 @@ BEGIN
             END IF;
 
             IF optional_007_count = 3 THEN
-                -- Migration-007's historical chunk_index is not remote
-                -- provenance.  Missing archive_run/files_index linkage is an
-                -- expected legacy gap and cannot grant TAR, so it does not
-                -- block the conservative ZIP prefix.  A linked file that does
-                -- positively place a directory row in the TAR suffix (or a
-                -- different session) remains contradictory and aborts.
-                EXECUTE $sql$
-                    SELECT count(*) FROM (
-                        SELECT d.archive_run_id
-                        FROM directory_archive_stats d
-                        WHERE d.remote_session_id=$1
-                        UNION ALL
-                        SELECT d.archive_run_id
-                        FROM directory_archive_bundles d
-                        WHERE d.remote_session_id=$1
-                        UNION ALL
-                        SELECT d.archive_run_id
-                        FROM directory_tree_index d
-                        WHERE d.remote_session_id=$1
-                    ) d
-                    WHERE EXISTS (
-                            SELECT 1 FROM files_index fi
-                            WHERE fi.archive_run_id=d.archive_run_id
-                              AND (fi.remote_session_id IS DISTINCT FROM $1
-                                   OR (fi.remote_chunk_index IS NOT NULL
-                                       AND fi.remote_chunk_index >= $2)))
-                $sql$ INTO ambiguous_directory_count
-                USING exception_session, derived_boundary;
+                -- Fully unattributable legacy rows (Session 37 has 134) are
+                -- retained and counted above, but do not pretend to prove
+                -- anything about the approved suffix.  Any direct or resolved
+                -- suffix placement, invalid direct identity, cross-session
+                -- run/file provenance, or disagreement between the available
+                -- provenance sources is a blocker.
+                SELECT count(*) INTO ambiguous_directory_count
+                FROM pg_temp.plan2_directory_evidence d
+                WHERE d.attributed_chunk_index >= derived_boundary
+                   OR (d.declared_chunk_index IS NOT NULL AND
+                       (d.attributed_chunk_index IS NULL
+                        OR (d.run_chunk_index IS NOT NULL AND
+                            d.run_chunk_index IS DISTINCT FROM
+                                d.attributed_chunk_index)
+                        OR (d.file_chunk_index IS NOT NULL AND
+                            d.file_chunk_index IS DISTINCT FROM
+                                d.attributed_chunk_index)))
+                   OR (d.run_session_id IS NOT NULL AND
+                       d.run_session_id IS DISTINCT FROM exception_session)
+                   OR COALESCE(d.bad_file_count,0) <> 0
+                   OR d.file_chunk_index IS DISTINCT FROM
+                      d.maximum_file_chunk_index;
                 IF ambiguous_directory_count <> 0 THEN
                     RAISE EXCEPTION
                         'session % has % directory catalog rows with contradictory TAR-suffix provenance',
@@ -1007,9 +1100,18 @@ BEGIN
                           FROM plan2_format_evidence
                           WHERE chunk_index < derived_boundary
                             AND NOT immutable_zip),
-                     'approved_stored_tar_count', (SELECT count(*)
-                         FROM plan2_format_evidence WHERE eligible_stored_tar),
-                     'first_stored_tar_chunk_index', derived_boundary,
+                      'approved_stored_tar_count', (SELECT count(*)
+                          FROM plan2_format_evidence WHERE eligible_stored_tar),
+                      'directory_row_count', directory_row_count,
+                      'attributed_directory_count',
+                          attributed_directory_count,
+                      'unattributed_directory_count',
+                          unattributed_directory_count,
+                      'unattributed_directory_disposition',
+                          CASE WHEN unattributed_directory_count > 0
+                               THEN 'reported_legacy_rows_without_tar_suffix_provenance'
+                               ELSE 'none' END,
+                      'first_stored_tar_chunk_index', derived_boundary,
                      'last_existing_chunk_index', maximum_index),
                  staging_evidence,
                  (staging_evidence->>'checked_at')::TIMESTAMPTZ);

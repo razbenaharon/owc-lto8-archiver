@@ -27,18 +27,16 @@ read-only Session 37 boundary rehearsal. The authoritative task list remains
 
 - `RemotePipelineCoordinator._run_stager` reads pending chunk membership in
   persisted ordinal order and calls `RemoteChunkStager._stage_chunk`.
-- The legacy ZIP route is remote GNU TAR to local extraction, followed by
-  `LTOPacker` ZIP/loose splitting. `is_packed=True` currently means ZIP
-  throughout packer, catalog and restore code.
-- `_resume_pack.json` version 1 proves an exact ZIP-pack inventory but has no
-  container/artifact identity. It stays ZIP-only in Phase 0. Phase 2 must add a
-  format-aware marker before a Stored TAR pack can be preserved or adopted.
-- Phase 0 reads the durable chunk format before trying a resume marker. A
-  `stored_tar` row is never sent through extraction/ZIP as a fallback. It is
-  refused with an explicit Phase-2-producer message after the independent
-  existing-artifact reader gate.
-- Startup reconciliation currently handles claims and scan-segment `.part`
-  artifacts, not TAR/sidecar pairs; that is Plan 2 Task 2.6.
+- The legacy ZIP route remains remote GNU TAR to local extraction followed by
+  `LTOPacker` ZIP/loose splitting. `is_packed` is retained only as the adapter
+  for genuinely pre-migration rows; persisted container format is authoritative.
+- `_resume_pack.json` version 1 records the packaging format, staged
+  container/artifact identities, and an exact path/size inventory. The shared
+  read-only parser validates marker identity and actual pack contents without
+  consuming the marker; production consumes it only after validation.
+- `stored_tar` chunks use the direct GNU TAR producer and never fall back to
+  extraction/ZIP. Startup reconciliation covers Stored TAR claims and
+  TAR/sidecar publication states.
 
 ### Finite writer and catalog
 
@@ -46,34 +44,29 @@ read-only Session 37 boundary rehearsal. The authoritative task list remains
   still owns one finite group under one LTFS ownership period. Phase 0 adds
   local descriptor/database-readiness validation before ownership; it does not
   add a readiness check between group members.
-- `LTOBackup` copies the pack directory without caring about file extensions,
-  but its catalog adapter assumes `is_packed` means ZIP. Phase 3 will replace
-  that assumption for TAR containers.
-- `archive_bundles` currently identifies legacy ZIPs only by tape label/path.
-  `archive_runs` currently permits same-day remote work to share a provenance
-  row. Migration 015 adds compatible nullable links and the new stable remote
-  run identity without renumbering either legacy table.
+- `LTOBackup` validates and catalogs explicit container/artifact identities;
+  actual staged artifact bytes drive admission/accounting. It does not infer TAR
+  from `is_packed` or a filename extension.
+- `archive_bundles.container_format` is backfilled for legacy ZIPs and linked to
+  `archive_containers` when an explicit container exists. Stable remote run
+  identity includes session, chunk, and tape generation without renumbering
+  either legacy table.
 - Directory-catalog remote provenance currently derives its chunk value from
   `local_chunk_index`. Legacy directory rows therefore cannot, by themselves,
   prove an exact remote chunk. The migration exception never guesses that link.
 
 ### Restore, lookup, accounting and cleanup
 
-- Every packed restore route in `LTORetriever` currently opens a ZIP based on
-  `files_index.is_packed`; it has no per-container format/version/generation
-  result. Phase 1 must route from migration-015 metadata before TAR production
-  can be implemented.
-- Directory restore can fall back to a newline-composite
-  `remote_sessions.remote_path`; Phase 1 must replace that with canonical source
-  roots.
-- Existing manifest lookup can open a `directory_archive_bundles.manifest_path`
-  that was rewritten to a tape locator. TAR sidecar lookup must use the distinct
-  permanent local artifact locator and must never follow a tape locator.
-- Tape accounting currently sums logical member bytes. Actual staged artifact
-  bytes become authoritative for admission/accounting in Phase 3.
-- Session/tape cleanup knows no container/artifact reachability. Migration 015
-  uses restrictive foreign keys so old cleanup fails safely until its explicit
-  Plan 2 adapter exists.
+- `PgCatalogMixin` returns persisted/backfilled format, version, generation,
+  container, member, sidecar, and locator metadata. `LTORetriever` routes from
+  that durable format; only rows that genuinely lack migration-015 metadata use
+  the legacy `is_packed` ZIP adapter.
+- Directory restore uses canonical source roots and mixed ZIP/TAR/loose routing.
+  TAR sidecars use the distinct permanent local artifact locator and never
+  follow a tape locator.
+- Tape admission/accounting uses actual staged artifact bytes. Cleanup includes
+  container/artifact reachability and remains protected by restrictive foreign
+  keys.
 
 The authoritative plan names public methods `RemoteChunkStager.stage_chunk`
 and `RemoteChunkWriter.write_chunk_group` / `write_one_chunk_owned`; the current
@@ -99,10 +92,12 @@ session/chunk literal:
    staging root with no deterministic fetch/pack path for any candidate.
 3. The migration locks the relevant tables and repeats the database evidence
    query in the assignment transaction. Every suffix chunk must be pending,
-   have exact contiguous fixed membership/ordinals, and have no owner, lease,
-   attempt, error, file-state, worker-attempt, container, artifact, sealed-batch,
-   catalog, run or directory evidence. This Stored TAR eligibility rule is
-   unchanged. A prefix chunk must be `done` with exact contiguous fixed
+    have exact contiguous fixed membership/ordinals, and have no owner, lease,
+    attempt, error, file-state, worker-attempt, container, artifact, sealed-batch,
+    catalog, run or measured attributable directory evidence. Fully
+    unattributable legacy directory rows are counted and reported explicitly;
+    they do not claim evidence about the TAR suffix. This Stored TAR eligibility
+    rule is unchanged. A prefix chunk must be `done` with exact contiguous fixed
    membership, but it no longer needs positive written/catalog corroboration to
    receive the conservative legacy ZIP default.
 4. The first assignment writes ZIP directly to the proved prefix and Stored TAR
@@ -155,16 +150,15 @@ does not soften suffix evidence, expected-boundary equality, provenance
 consistency, write-once formats, immutable audit rows, or the rule that a normal
 ZIP backfill permanently closes the exception.
 
-## Phase 0 safety state
+## Plan 2 safety state
 
 - `stored_tar_write_enabled` defaults to false in code and the example config.
 - A new Stored TAR assignment additionally requires migration schema version 1
-  and reader contract version 1. Phase 0 deliberately supplies no reader
-  contract, so enabling the flag early still fails closed.
+  and reader contract version 1. The reader contract is implemented; the false
+  writer flag remains the independent default-off creation gate.
 - Existing TAR recovery authorization does not depend on the creation flag;
-  reader compatibility remains mandatory. The Phase 0 stager then refuses at
-  the still-missing direct-producer boundary instead of reinterpreting TAR as
-  ZIP.
+  reader compatibility remains mandatory. Recovery uses the direct producer /
+  validated resume paths and never reinterprets TAR as ZIP.
 - ZIP-only `StagedChunk` callers remain valid. A non-empty TAR handoff requires
   database container/artifact identities, one ready sidecar per container,
   exact actual-byte accounting, matching database readiness and readable final
@@ -172,6 +166,9 @@ ZIP backfill permanently closes the exception.
 - Migration 015 is explicit-only and is not part of startup schema
   initialization. Report/preflight/validation commands construct
   `PgDatabaseManager(init_schema=False)`.
+- The execute path may persist a Stored TAR exception boundary only while
+  `stored_tar_write_enabled=true`. Read-only rehearsal/preflight and ordinary ZIP
+  backfill continue to work while the flag is false.
 - No code in Phase 0 reads a tape or performs post-write verification.
 
 As required by the authoritative plan, validation deliberately uses path, size,
@@ -189,8 +186,11 @@ python inspect_db.py --session37-boundary-rehearsal --db <isolated_restore>
 
 The command opens PostgreSQL with `default_transaction_read_only=on`, defaults
 to session 37 unless `--session-id` is supplied, reads liveness/process evidence,
-and calls the same database classifier used by migration-015 preflight. It does
-not inspect local staging, touch LTFS, resume work, or persist the boundary.
+calls the same database classifier used by migration-015 preflight, and inspects
+the configured local staging root through the shared read-only resume-marker
+parser. It reports marker identity and actual path/size inventory agreement. An
+absent or unreadable staging root is `unknown`, never proof of absence. It does
+not touch LTFS, consume a marker, resume work, or persist the boundary.
 
 Each chunk report now includes the raw state and grouped evidence needed by the
 operator:
@@ -198,7 +198,8 @@ operator:
 - membership: `membership_state`, fixed-membership result, count, bytes, and
   ordinal range.
 - owner/lease: whether owner, lease, or attempt evidence exists.
-- pack/resume: file-state rows, worker attempts, and sealed-batch evidence.
+- pack/resume: file-state rows, worker attempts, sealed-batch evidence, local
+  fetch/pack entry presence, resume-marker state, and actual inventory state.
 - container: container/artifact rows and written-container evidence.
 - writer/catalog: file catalog, archive-run, directory, writer-start,
   writer-complete, and catalog-commit evidence.
@@ -225,5 +226,6 @@ zero ambiguous `files_index.remote_chunk_index` rows. It verifies:
 - the `remote_sessions` row is unchanged;
 - no boundary table is created during rehearsal.
 
-Execute mode for persisting the boundary remains future Plan 3 work. The
-writer flag remains disabled by default: `stored_tar_write_enabled=false`.
+Execute mode exists but remains an explicit guarded operator action. Persisting
+the Session 37 boundary requires the writer flag to be deliberately enabled
+first; the default remains `stored_tar_write_enabled=false`.

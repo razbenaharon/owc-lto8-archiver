@@ -195,6 +195,106 @@ def _tar_progress_watchdog_action(
 # the pack is complete — a pack interrupted mid-write simply has no marker.
 _RESUME_MARKER = "_resume_pack.json"
 
+
+def _pack_inventory_readonly(pack_dir):
+    """Return the marker-excluded name/size inventory, or ``None`` unreadable.
+
+    This is deliberately path/size based.  Plan 2 does not use content hashes,
+    and callers must be able to inspect a preserved pack without changing it.
+    """
+    items = []
+    walk_errors = []
+
+    def onerror(exc):
+        walk_errors.append(exc)
+
+    try:
+        for root, _dirs, files in os.walk(pack_dir, onerror=onerror):
+            for name in files:
+                if name == _RESUME_MARKER:
+                    continue
+                full = os.path.join(root, name)
+                rel = os.path.relpath(full, pack_dir).replace("\\", "/")
+                items.append([rel, os.path.getsize(_long(full))])
+    except OSError:
+        return None
+    return None if walk_errors else sorted(items)
+
+
+def _read_resume_pack_marker(pack_dir, session_id, chunk_index):
+    """Parse and inventory-check one resume marker without modifying it."""
+    result = {
+        "marker_state": "unknown",
+        "inventory_state": "unknown",
+        "pack_file_count": None,
+        "packaging_format": None,
+    }
+    try:
+        os.stat(_long(pack_dir))
+    except FileNotFoundError:
+        result["marker_state"] = "pack_directory_absent"
+        return result, None
+    except OSError:
+        result["marker_state"] = "pack_directory_unreadable"
+        return result, None
+    if not os.path.isdir(_long(pack_dir)):
+        result["marker_state"] = "pack_directory_unreadable"
+        return result, None
+
+    actual = _pack_inventory_readonly(pack_dir)
+    if actual is None:
+        result["marker_state"] = "pack_directory_unreadable"
+        return result, None
+    result["pack_file_count"] = len(actual)
+    result["inventory_state"] = "readable"
+
+    marker = os.path.join(pack_dir, _RESUME_MARKER)
+    try:
+        with open(_long(marker), encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except FileNotFoundError:
+        result["marker_state"] = "absent"
+        return result, None
+    except (OSError, ValueError, TypeError):
+        result["marker_state"] = "unreadable"
+        return result, None
+
+    if not isinstance(payload, dict):
+        result["marker_state"] = "unreadable"
+        return result, None
+    result["packaging_format"] = payload.get(
+        "packaging_format", ContainerFormat.ZIP.value)
+    if (payload.get("version") != 1
+            or payload.get("chunk_index") != int(chunk_index)
+            or payload.get("session_id") != int(session_id)):
+        result["marker_state"] = "identity_mismatch"
+        return result, None
+
+    expected = payload.get("pack_inventory")
+    if not isinstance(expected, list):
+        result["marker_state"] = "unreadable"
+        return result, None
+    try:
+        expected = sorted([list(item) for item in expected])
+    except (TypeError, ValueError):
+        result["marker_state"] = "unreadable"
+        return result, None
+    if expected != actual:
+        result["marker_state"] = "inventory_mismatch"
+        result["inventory_state"] = "mismatch"
+        return result, None
+
+    result["marker_state"] = "valid"
+    result["inventory_state"] = "matched"
+    return result, payload
+
+
+def inspect_resume_pack_marker(pack_dir, session_id, chunk_index):
+    """Return path-free, read-only resume-marker and pack-content evidence."""
+    report, _payload = _read_resume_pack_marker(
+        pack_dir, session_id, chunk_index)
+    return report
+
 # Permanent fetch-failure signatures, checked FIRST. An auth/permission/host-key/
 # config failure is never a retryable network blip: retrying it just spins on an
 # unrecoverable error and — worse — could mask a real access problem behind a
@@ -1245,18 +1345,7 @@ class RemoteChunkStager:
 
     def _pack_inventory(self, pack_dir):
         """(name, size) for every file under pack_dir, sorted. The integrity basis."""
-        items = []
-        for root, _dirs, files in os.walk(pack_dir):
-            for name in files:
-                if name == _RESUME_MARKER:
-                    continue
-                full = os.path.join(root, name)
-                rel = os.path.relpath(full, pack_dir).replace("\\", "/")
-                try:
-                    items.append([rel, os.path.getsize(full)])
-                except OSError:
-                    return None
-        return sorted(items)
+        return _pack_inventory_readonly(pack_dir)
 
     def _preserve_desc(self, session_id, desc, why):
         """Keep a staged pack on disk so the resume can write it directly.
@@ -1362,23 +1451,27 @@ class RemoteChunkStager:
         heuristics.
         """
         marker = os.path.join(pack_dir, _RESUME_MARKER)
-        if not os.path.isfile(marker):
-            return None
-        try:
-            with open(marker, encoding="utf-8") as fh:
-                payload = json.load(fh)
-        except Exception:
+        marker_report, payload = _read_resume_pack_marker(
+            pack_dir, session_id, chunk_index)
+        if marker_report["marker_state"] in ("unreadable",
+                                               "pack_directory_unreadable"):
             get_logger().warning(
                 "resume marker for chunk %s is unreadable; re-fetching",
                 chunk_index + 1)
             return None
-
-        if (payload.get("version") != 1
-                or payload.get("chunk_index") != chunk_index
-                or payload.get("session_id") != session_id):
+        if marker_report["marker_state"] == "identity_mismatch":
             get_logger().warning(
                 "resume marker at %s does not match session %s chunk %s; "
                 "re-fetching", pack_dir, session_id, chunk_index + 1)
+            return None
+        if marker_report["marker_state"] == "inventory_mismatch":
+            get_logger().warning(
+                "preserved pack for chunk %s failed its integrity check "
+                "(inventory changed); re-fetching", chunk_index + 1)
+            print(f"[REMOTE] Preserved pack for chunk {chunk_index + 1} failed "
+                  f"its integrity check — re-fetching it.")
+            return None
+        if marker_report["marker_state"] != "valid" or payload is None:
             return None
 
         try:
@@ -1408,17 +1501,6 @@ class RemoteChunkStager:
                 "resume marker for chunk %s is %s but durable format is %s; "
                 "re-fetching", chunk_index + 1, marker_format.value,
                 durable_format.value)
-            return None
-
-        expected = payload.get("pack_inventory")
-        actual = self.host._pack_inventory(pack_dir)
-        if actual is None or [list(x) for x in expected or []] != [
-                list(x) for x in actual]:
-            get_logger().warning(
-                "preserved pack for chunk %s failed its integrity check "
-                "(inventory changed); re-fetching", chunk_index + 1)
-            print(f"[REMOTE] Preserved pack for chunk {chunk_index + 1} failed "
-                  f"its integrity check — re-fetching it.")
             return None
 
         # The marker authorizes reuse but is not archive payload.  Consume it
