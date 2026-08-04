@@ -3066,6 +3066,62 @@ class ContainerFormatMigrationTests(unittest.TestCase):
         self.assertEqual(
             artifact["local_locator"], "conflicting/sidecar.jsonl.zst")
 
+    def test_017_reconciliation_owner_reset_and_ready_block_are_cas_guarded(self):
+        session, _plan, container, part, owner, summary = (
+            self._validated_tar_publication_fixture())
+        adopted = self.db.reconcile_stored_tar_build_owner(
+            container["container_id"], owner, "validated_part",
+            "startup-reconciler")
+        self.assertEqual(adopted["owner_token"], "startup-reconciler")
+        with self.assertRaisesRegex(RuntimeError, "owner/state CAS failed"):
+            self.db.reconcile_stored_tar_build_owner(
+                container["container_id"], owner, "validated_part",
+                "racing-reconciler")
+        reset = self.db.reset_reconciled_stored_tar_build(
+            container["container_id"], "startup-reconciler",
+            "validated_part")
+        self.assertEqual(reset["validation_state"], "planned")
+        self.assertIsNone(reset["owner_token"])
+        self.assertIsNone(reset["validated_part_locator"])
+
+        ready_session = session
+        ready_container = container
+        ready_owner = "ready-after-reconcile"
+        self.db.claim_stored_tar_container_build(
+            ready_container["container_id"], ready_owner, part)
+        self.db.mark_stored_tar_validated_part(
+            ready_container["container_id"], ready_owner, part, summary,
+            [{"plan_ordinal": 1, "path": "missing.bin",
+              "disposition": "source_missing",
+              "evidence": "lstat_missing"}])
+        values = {
+            "container_id": ready_container["container_id"],
+            "owner_token": ready_owner,
+            "sidecar_locator": "tar_sidecars/reconcile/ready.jsonl.zst",
+            "sidecar_version": "tar-sidecar-v1",
+            "sidecar_size_bytes": 123,
+            "temporary_data_locator": os.path.join(
+                self.staging.name, "ready-container.tar"),
+            "tar_size_bytes": 262144,
+            "observed_member_count": 1,
+            "observed_logical_bytes": 3,
+            "disposition_counts": {
+                "archived": 1, "source_missing": 1,
+                "source_permission_denied": 0,
+                "source_unreadable": 0, "source_changed": 0,
+                "unresolved": 0,
+            },
+        }
+        self.db.publish_stored_tar_pair(**values)
+        blocked = self.db.block_stored_tar_container(
+            ready_container["container_id"], "ready", None)
+        self.assertEqual(blocked["validation_state"], "blocked")
+        artifacts = self.db.get_archive_artifacts(ready_session, 1)
+        self.assertEqual(artifacts[0]["readiness_state"], "blocked")
+        replay = self.db.block_stored_tar_container(
+            ready_container["container_id"], "ready", None)
+        self.assertEqual(replay["validation_state"], "blocked")
+
 
 if __name__ == "__main__":
     unittest.main()

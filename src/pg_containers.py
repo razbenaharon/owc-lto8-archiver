@@ -1590,6 +1590,126 @@ class PgContainerMixin:
         return self._transaction(
             operation, "restart Stored TAR build from source")
 
+    def reconcile_stored_tar_build_owner(
+            self, container_id, expected_owner_token, expected_state,
+            new_owner_token):
+        """CAS a pre-writer build to a reconciliation owner.
+
+        The caller must first prove that ``expected_owner_token`` is not live.
+        This method deliberately does not turn lease expiry into liveness
+        evidence; it only closes the race between that proof and adoption.
+        """
+        old = str(expected_owner_token or "").strip()
+        new = str(new_owner_token or "").strip()
+        state = str(expected_state or "")
+        if not old or not new or old == new:
+            raise ValueError("Stored TAR owner reconciliation needs two owners")
+        if state not in ("building", "validated_part"):
+            raise ValueError("Stored TAR owner reconciliation state is invalid")
+
+        def operation(conn):
+            row = conn.execute(
+                """UPDATE archive_containers
+                   SET owner_token=%s,
+                       lease_expires_at=now()+(3600 * interval '1 second'),
+                       updated_at=now()
+                   WHERE container_id=%s AND owner_token=%s
+                     AND validation_state=%s
+                     AND writer_state='not_started'
+                     AND catalog_state='not_started'
+                   RETURNING *""",
+                (new, int(container_id), old, state),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError(
+                    "Stored TAR reconciliation owner/state CAS failed")
+            return _row(row)
+        return self._transaction(operation, "reconcile Stored TAR build owner")
+
+    def reset_reconciled_stored_tar_build(
+            self, container_id, owner_token, expected_state):
+        """Return a proven-dead, unusable pre-writer build to ``planned``."""
+        token = str(owner_token or "").strip()
+        state = str(expected_state or "")
+        if not token or state not in ("building", "validated_part"):
+            raise ValueError("invalid Stored TAR reset identity")
+
+        def operation(conn):
+            ready = conn.execute(
+                """SELECT 1 FROM archive_artifacts
+                   WHERE container_id=%s AND artifact_kind='tar_sidecar'
+                     AND readiness_state='ready' LIMIT 1""",
+                (int(container_id),),
+            ).fetchone()
+            if ready is not None:
+                raise RuntimeError(
+                    "refusing to reset a build with a ready sidecar record")
+            row = conn.execute(
+                """UPDATE archive_containers
+                   SET validation_state='planned', owner_token=NULL,
+                       lease_expires_at=NULL, validated_part_locator=NULL,
+                       validation_summary=NULL, disposition_counts=NULL,
+                       observed_member_count=NULL,
+                       observed_logical_bytes=NULL,
+                       actual_artifact_bytes=NULL,
+                       temporary_data_locator=NULL,
+                       permanent_local_metadata_locator=NULL,
+                       validation_started_at=NULL, validated_at=NULL,
+                       updated_at=now()
+                   WHERE container_id=%s AND owner_token=%s
+                     AND validation_state=%s
+                     AND writer_state='not_started'
+                     AND catalog_state='not_started'
+                   RETURNING *""",
+                (int(container_id), token, state),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("Stored TAR reconciled-build reset CAS failed")
+            return _row(row)
+        return self._transaction(operation, "reset reconciled Stored TAR build")
+
+    def block_stored_tar_container(
+            self, container_id, expected_state, expected_owner_token=None):
+        """Durably fail closed on a proven local/DB artifact contradiction."""
+        state = str(expected_state or "")
+
+        def operation(conn):
+            current = conn.execute(
+                """SELECT * FROM archive_containers
+                   WHERE container_id=%s FOR UPDATE""",
+                (int(container_id),),
+            ).fetchone()
+            if current is None:
+                raise RuntimeError("Stored TAR container does not exist")
+            if current["validation_state"] == "blocked":
+                return _row(current)
+            if (current["validation_state"] != state
+                    or current["owner_token"] != expected_owner_token
+                    or current["writer_state"] != "not_started"
+                    or current["catalog_state"] != "not_started"):
+                raise RuntimeError("Stored TAR block owner/state CAS failed")
+            row = conn.execute(
+                """UPDATE archive_containers
+                   SET validation_state='blocked', owner_token=NULL,
+                       lease_expires_at=NULL, updated_at=now()
+                   WHERE container_id=%s AND validation_state=%s
+                     AND owner_token IS NOT DISTINCT FROM %s
+                     AND writer_state='not_started'
+                     AND catalog_state='not_started'
+                   RETURNING *""",
+                (int(container_id), state, expected_owner_token),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("Stored TAR block CAS failed")
+            conn.execute(
+                """UPDATE archive_artifacts
+                   SET readiness_state='blocked', updated_at=now()
+                   WHERE container_id=%s AND readiness_state <> 'blocked'""",
+                (int(container_id),),
+            )
+            return _row(row)
+        return self._transaction(operation, "block inconsistent Stored TAR")
+
     def publish_stored_tar_pair(
             self, *, container_id, owner_token, sidecar_locator,
             sidecar_version, sidecar_size_bytes, temporary_data_locator,

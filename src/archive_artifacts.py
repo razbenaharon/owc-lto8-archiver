@@ -940,6 +940,53 @@ def validate_tar_sidecar(path, plan_members, validation, source_diagnostics,
     return counts
 
 
+def read_tar_sidecar_diagnostics(path, *, session_id, chunk_index,
+                                 container_id, container_ordinal):
+    """Recover only the trusted source-exception evidence from a final sidecar.
+
+    This is intentionally not an inference from missing TAR members.  The
+    records are read from the already-published permanent sidecar and its
+    container identity is checked before the caller uses them to perform the
+    full plan/TAR/sidecar equivalence validation.
+    """
+    if str(path).endswith(".part"):
+        raise ArtifactError(
+            "refusing to recover diagnostics from an unpublished sidecar")
+    records = _read_sidecar_records(path)
+    if not records or records[0].get("record_type") != "header":
+        raise ArtifactError("TAR sidecar must begin with a header")
+    header = records[0]
+    expected_identity = {
+        "session_id": int(session_id),
+        "chunk_index": int(chunk_index),
+        "container_id": int(container_id),
+        "container_ordinal": int(container_ordinal),
+    }
+    mismatch = [
+        key for key, value in expected_identity.items()
+        if header.get(key) is None or int(header[key]) != value]
+    if (header.get("version") != TAR_SIDECAR_VERSION or mismatch):
+        raise ArtifactError(
+            "TAR sidecar header identity/version mismatch"
+            + (f": {', '.join(mismatch)}" if mismatch else ""))
+
+    diagnostics = []
+    for record in records[1:]:
+        if record.get("record_type") != "source_exception":
+            continue
+        try:
+            diagnostics.append(StoredTarSourceDiagnostic(
+                plan_ordinal=int(record["plan_ordinal"]),
+                path=str(record["diagnostic_path"]),
+                disposition=SourceDisposition(record["disposition"]),
+                evidence=str(record.get("evidence") or ""),
+            ))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ArtifactError(
+                "invalid source-exception evidence in TAR sidecar") from exc
+    return tuple(diagnostics)
+
+
 def _files_equal(left, right, chunk_size=1024 * 1024):
     try:
         if os.path.getsize(_long(left)) != os.path.getsize(_long(right)):
@@ -1127,6 +1174,7 @@ __all__ = [
     "find_orphan_parts",
     "is_ltfs_locator", "parse_jsonl_zst_artifact",
     "publish_no_clobber", "publish_stored_tar_pair",
+    "read_tar_sidecar_diagnostics",
     "resolve_local_metadata_locator", "resolve_locator",
     "search_tar_sidecar", "segment_locator", "tar_sidecar_locator",
     "validate_tar_sidecar",
