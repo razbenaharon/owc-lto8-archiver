@@ -17,6 +17,7 @@ import threading
 import unittest
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, TYPE_CHECKING, cast
 from unittest import mock
 
@@ -2169,12 +2170,14 @@ class ContainerFormatMigrationTests(unittest.TestCase):
             "checked_at": datetime.now(timezone.utc).isoformat(),
         }
 
-    def _stored_tar_planning_session(self, rows):
+    def _stored_tar_planning_session(self, rows, *, directory_catalog=False):
         session_id = self._session(label="TAR_PLAN_FIXTURE")
         self._append(session_id, 0, member_count=1)
         self.db.append_remote_streaming_chunk(session_id, 1, rows)
         self._catalog_done_prefix(session_id, 0)
         self._ready_014()
+        if directory_catalog:
+            self.db.apply_directory_catalog_schema()
         self.db.apply_container_format_schema(
             exception_session_id=session_id,
             expected_boundary=1,
@@ -2912,12 +2915,13 @@ class ContainerFormatMigrationTests(unittest.TestCase):
             "container format catalog-definition fingerprint drift",
             report["issues"])
 
-    def _validated_tar_publication_fixture(self):
+    def _validated_tar_publication_fixture(self, *, directory_catalog=False):
         rows = [
             (1, "/fixture/a.bin", "a.bin", 3),
             (1, "/fixture/missing.bin", "missing.bin", 5),
         ]
-        session_id = self._stored_tar_planning_session(rows)
+        session_id = self._stored_tar_planning_session(
+            rows, directory_catalog=directory_catalog)
         plan = self.db.get_or_create_stored_tar_chunk_plan(
             session_id, 1, self.db.get_chunk_files(session_id, 1),
             loose_threshold_bytes=100, max_size_bytes=512 * 512)
@@ -3121,6 +3125,117 @@ class ContainerFormatMigrationTests(unittest.TestCase):
         replay = self.db.block_stored_tar_container(
             ready_container["container_id"], "ready", None)
         self.assertEqual(replay["validation_state"], "blocked")
+
+    def test_phase3_tar_copy_catalog_provenance_and_actual_accounting(self):
+        session, _plan, container, _part, owner, _summary = (
+            self._validated_tar_publication_fixture(directory_catalog=True))
+        published = self.db.publish_stored_tar_pair(
+            container_id=container["container_id"], owner_token=owner,
+            sidecar_locator="tar_sidecars/phase3/c0.jsonl.zst",
+            sidecar_version="tar-sidecar-v1", sidecar_size_bytes=123,
+            temporary_data_locator=os.path.join(
+                self.staging.name, "phase3.tar"),
+            tar_size_bytes=262144, observed_member_count=1,
+            observed_logical_bytes=3,
+            disposition_counts={
+                "archived": 1, "source_missing": 1,
+                "source_permission_denied": 0, "source_unreadable": 0,
+                "source_changed": 0, "unresolved": 0})
+        container = published["container"]
+        artifact = published["artifact"]
+        staged = SimpleNamespace(
+            containers=[SimpleNamespace(
+                container_id=container["container_id"],
+                container_name=container["container_name"])],
+            artifacts=[SimpleNamespace(
+                artifact_id=artifact["artifact_id"],
+                staged_path=os.path.join(self.staging.name, "c0.jsonl.zst"))])
+
+        self.db.mark_remote_chunk_writer_started(
+            session, 1, "FORMAT_TAPE", "TROOT", staged)
+        writing = self.db.get_archive_containers(session, 1)[0]
+        self.assertEqual(writing["writer_state"], "writing")
+        self.assertIsNotNone(writing["writer_started_at"])
+
+        context = self.db.mark_remote_chunk_copy_succeeded(
+            session, 1, "FORMAT_TAPE", "TROOT", staged)
+        self.db.mark_remote_chunk_catalog_committing(session, 1)
+        packed = {
+            "file_name": "a.bin", "original_path": "/fixture/a.bin",
+            "canonical_source_path": "/fixture/a.bin",
+            "original_root_dir": self.staging.name,
+            "file_size_bytes": 3, "tape_label": "FORMAT_TAPE",
+            "source_host": "fixture", "is_packed": True,
+            "container_name": os.path.join("TROOT", container["container_name"]),
+            "stored_path": "a.bin", "catalog_policy": "index",
+            "manifest_name": "c0.jsonl.zst",
+            "manifest_format": "jsonl", "manifest_compression": "zstd",
+            "container_id": container["container_id"],
+            "container_format": "stored_tar",
+            "actual_artifact_bytes": 262144,
+            "remote_session_id": session, "remote_chunk_index": 1,
+            "tape_generation_id": context["tape_generation_id"],
+            "archive_run_id": context["archive_run_id"],
+        }
+        self.db.bulk_upsert_directory_catalog(
+            [packed], "FORMAT_TAPE", "fixture",
+            remote_session_id=session, remote_chunk_index=1,
+            tape_generation_id=context["tape_generation_id"],
+            archive_run_id=context["archive_run_id"], tape_root="")
+        # Simulate a process loss after the compatibility row was created but
+        # before its migration-015 container identity was linked. Reconciliation
+        # must adopt the stable row without writing tape again.
+        self._exec(
+            """INSERT INTO archive_bundles
+                   (tape_label, tape_path, container_format)
+               VALUES (%s,%s,'stored_tar') ON CONFLICT DO NOTHING""",
+            ("FORMAT_TAPE", packed["container_name"]))
+        self.db.bulk_upsert_files([packed], update_existing=False)
+        loose = dict(packed)
+        loose.update({
+            "file_name": "large.bin", "original_path": "/fixture/large.bin",
+            "canonical_source_path": "/fixture/large.bin",
+            "file_size_bytes": 50, "is_packed": False,
+            "container_name": None, "stored_path": "TROOT/large.bin",
+            "container_id": None, "container_format": None,
+            "actual_artifact_bytes": None,
+        })
+        self.db.bulk_upsert_files([loose], update_existing=False)
+        self.db.mark_remote_chunk_catalog_committed(session, 1)
+
+        container = self.db.get_archive_containers(session, 1)[0]
+        self.assertEqual(container["writer_state"], "copied")
+        self.assertEqual(container["catalog_state"], "committed")
+        run = self._query(
+            "SELECT * FROM archive_runs WHERE run_id=%s",
+            (context["archive_run_id"],))[0]
+        self.assertEqual(run["remote_session_id"], session)
+        self.assertEqual(run["remote_chunk_index"], 1)
+        self.assertEqual(run["tape_generation_id"],
+                         context["tape_generation_id"])
+        bundle = self._query(
+            "SELECT * FROM archive_bundles WHERE container_id=%s",
+            (container["container_id"],))[0]
+        self.assertEqual(bundle["container_format"], "stored_tar")
+        directory = self._query(
+            "SELECT * FROM directory_archive_bundles WHERE container_id=%s",
+            (container["container_id"],))[0]
+        self.assertEqual(directory["chunk_index"], 1)
+        self.assertEqual(directory["original_dir_path"], "/fixture")
+        self.assertEqual(directory["actual_artifact_bytes"], 262144)
+        self.assertEqual(
+            self.db.recalculate_tape_used_space("FORMAT_TAPE"),
+            1 + 262144 + 123 + 50)
+
+        # Idempotent replay cannot add a second run, bundle or byte.
+        self.db.bulk_upsert_directory_catalog(
+            [packed], "FORMAT_TAPE", "fixture",
+            remote_session_id=session, remote_chunk_index=1,
+            tape_generation_id=context["tape_generation_id"],
+            archive_run_id=context["archive_run_id"], tape_root="")
+        self.db.bulk_upsert_files([packed], update_existing=False)
+        self.assertEqual(self.db.recalculate_tape_used_space("FORMAT_TAPE"),
+                         1 + 262144 + 123 + 50)
 
 
 if __name__ == "__main__":

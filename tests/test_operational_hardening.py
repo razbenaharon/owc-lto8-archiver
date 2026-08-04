@@ -1,5 +1,6 @@
 import os
 import unittest
+from types import SimpleNamespace
 
 from src.constants import (LOCAL_TAPE_BUDGET_BYTES, TAPE_STATUS_ACTIVE,
                            TAPE_STATUS_FULL, tape_budget_bytes, tape_is_full,
@@ -9,6 +10,7 @@ from src.remote_transport import (
     _cleanup_askpass_helpers,
     _openssh_askpass_env,
 )
+from src.remote_writer import RemoteChunkWriter
 
 
 class TapeBudgetTests(unittest.TestCase):
@@ -31,6 +33,33 @@ class TapeBudgetTests(unittest.TestCase):
         self.assertEqual(available, 0)
         capacity, _ = tape_budget_bytes(None, used_bytes=0)
         self.assertEqual(capacity, LOCAL_TAPE_BUDGET_BYTES)
+
+    def test_remote_admission_counts_actual_sidecar_overhead(self):
+        class _DB:
+            def __init__(self):
+                self.recalculations = 0
+
+            def get_tape(self, tape_label):
+                return {
+                    "label": tape_label,
+                    "total_capacity": 1,
+                    "status": TAPE_STATUS_ACTIVE,
+                }
+
+            def recalculate_tape_used_space(self, tape_label):
+                self.recalculations += 1
+                return 999_999_900
+
+        db = _DB()
+        writer = RemoteChunkWriter(SimpleNamespace(db=db))
+
+        # The 100-byte logical TAR payload fits exactly. Its one-byte sidecar
+        # overhead makes the staged footprint inadmissible.
+        self.assertTrue(writer._ensure_remote_chunk_fits_tape(
+            "Tape_Test", 100, [4]))
+        self.assertFalse(writer._ensure_remote_chunk_fits_tape(
+            "Tape_Test", 101, [4]))
+        self.assertEqual(db.recalculations, 2)
 
 
 class TapeStatusTests(unittest.TestCase):

@@ -1174,6 +1174,236 @@ class PgContainerMixin:
             ).fetchall()),
             f"get containers for session {session_id}, chunk {chunk_index}")
 
+    @staticmethod
+    def _staged_container_locator(tape_root, item):
+        return os.path.join(str(tape_root), str(item.container_name))
+
+    @staticmethod
+    def _staged_artifact_locator(tape_root, item):
+        return os.path.join(str(tape_root), os.path.basename(item.staged_path))
+
+    def _remote_generation_identity_conn(self, conn, tape_label):
+        row = conn.execute(
+            """SELECT g.generation_id, g.generation
+               FROM tape_generations g
+               JOIN tapes t ON t.tape_id=g.tape_id
+               WHERE g.volume_label=%s AND g.state='active'
+                 AND g.generation=t.current_generation""",
+            (str(tape_label),),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(
+                f"[DB] No exact active tape generation for {tape_label!r}")
+        return row
+
+    def _ensure_remote_archive_run_conn(
+            self, conn, session_id, chunk_index, tape_label,
+            tape_generation_id, started_at=None, completed_at=None):
+        session = conn.execute(
+            """SELECT session_label FROM remote_sessions
+               WHERE session_id=%s""", (int(session_id),)).fetchone()
+        if session is None:
+            raise RuntimeError(f"[DB] Remote session not found: {session_id}")
+        run_label = (
+            f"{session['session_label']}:chunk-{int(chunk_index) + 1}:"
+            f"generation-{int(tape_generation_id)}")
+        conn.execute(
+            """INSERT INTO archive_runs
+                   (run_label, tape_label, session_kind, remote_session_id,
+                    remote_chunk_index, tape_generation_id,
+                    started_at, completed_at)
+               VALUES (%s,%s,'remote',%s,%s,%s,COALESCE(%s,now()),%s)
+               ON CONFLICT DO NOTHING""",
+            (run_label, str(tape_label), int(session_id), int(chunk_index),
+             int(tape_generation_id), started_at, completed_at),
+        )
+        row = conn.execute(
+            """SELECT * FROM archive_runs
+               WHERE remote_session_id=%s AND remote_chunk_index=%s
+                 AND tape_generation_id=%s""",
+            (int(session_id), int(chunk_index), int(tape_generation_id)),
+        ).fetchone()
+        if (row is None or row["tape_label"] != str(tape_label)
+                or row["session_kind"] != "remote"):
+            raise RuntimeError("remote archive-run identity conflict")
+        return row
+
+    def mark_remote_chunk_writer_started(
+            self, session_id, chunk_index, tape_label, tape_root, staged_chunk):
+        """Persist the writer boundary before Robocopy can be launched.
+
+        Migration 015 requires a writing container to carry an exact generation
+        and a locator.  The locator is therefore the *intended* destination at
+        this boundary; only ``writer_state='copied'`` is durable completion
+        evidence.
+        """
+        containers = list(getattr(staged_chunk, "containers", ()) or ())
+
+        def operation(conn):
+            generation = self._remote_generation_identity_conn(conn, tape_label)
+            conn.execute(
+                """UPDATE remote_chunks
+                   SET status='backing', writer_started_at=COALESCE(
+                         writer_started_at, now()), updated_at=now()
+                   WHERE session_id=%s AND chunk_index=%s""",
+                (int(session_id), int(chunk_index)),
+            )
+            for item in containers:
+                row = conn.execute(
+                    """UPDATE archive_containers
+                       SET tape_label=%s, tape_path=%s, tape_generation_id=%s,
+                           writer_state='writing',
+                           writer_started_at=COALESCE(writer_started_at,now()),
+                           updated_at=now()
+                       WHERE container_id=%s AND session_id=%s
+                         AND chunk_index=%s AND writer_state='not_started'
+                         AND catalog_state='not_started'
+                       RETURNING container_id""",
+                    (str(tape_label),
+                     self._staged_container_locator(tape_root, item),
+                     int(generation["generation_id"]), int(item.container_id),
+                     int(session_id), int(chunk_index)),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError(
+                        f"container {item.container_id} writer-start CAS failed")
+            return {"tape_generation_id": int(generation["generation_id"]),
+                    "tape_generation": int(generation["generation"])}
+        return self._transaction(operation, "mark remote chunk writer started")
+
+    def mark_remote_chunk_copy_succeeded(
+            self, session_id, chunk_index, tape_label, tape_root, staged_chunk,
+            *, started_at=None, completed_at=None):
+        """Persist robust Robocopy success and exact tape locators atomically."""
+        containers = list(getattr(staged_chunk, "containers", ()) or ())
+        artifacts = list(getattr(staged_chunk, "artifacts", ()) or ())
+
+        def operation(conn):
+            generation = self._remote_generation_identity_conn(conn, tape_label)
+            generation_id = int(generation["generation_id"])
+            for item in containers:
+                row = conn.execute(
+                    """UPDATE archive_containers
+                       SET tape_label=%s, tape_path=%s, tape_generation_id=%s,
+                           writer_state='copied',
+                           writer_started_at=COALESCE(writer_started_at,%s,now()),
+                           writer_completed_at=COALESCE(
+                               writer_completed_at,%s,now()), updated_at=now()
+                       WHERE container_id=%s AND session_id=%s
+                         AND chunk_index=%s
+                         AND writer_state IN ('writing','copied')
+                       RETURNING *""",
+                    (str(tape_label),
+                     self._staged_container_locator(tape_root, item),
+                     generation_id, started_at, completed_at,
+                     int(item.container_id), int(session_id), int(chunk_index)),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError(
+                        f"container {item.container_id} copy-success CAS failed")
+            for item in artifacts:
+                row = conn.execute(
+                    """UPDATE archive_artifacts
+                       SET tape_locator=%s,
+                           tape_published_at=COALESCE(tape_published_at,%s,now()),
+                           updated_at=now()
+                       WHERE artifact_id=%s AND session_id=%s
+                         AND chunk_index=%s AND readiness_state='ready'
+                       RETURNING artifact_id""",
+                    (self._staged_artifact_locator(tape_root, item),
+                     completed_at, int(item.artifact_id), int(session_id),
+                     int(chunk_index)),
+                ).fetchone()
+                if row is None:
+                    raise RuntimeError(
+                        f"artifact {item.artifact_id} tape-locator CAS failed")
+            conn.execute(
+                """UPDATE remote_chunks
+                   SET writer_started_at=COALESCE(writer_started_at,%s,now()),
+                       writer_completed_at=COALESCE(
+                           writer_completed_at,%s,now()), updated_at=now()
+                   WHERE session_id=%s AND chunk_index=%s""",
+                (started_at, completed_at, int(session_id), int(chunk_index)),
+            )
+            run = self._ensure_remote_archive_run_conn(
+                conn, session_id, chunk_index, tape_label, generation_id,
+                started_at=started_at, completed_at=completed_at)
+            return {"tape_generation_id": generation_id,
+                    "tape_generation": int(generation["generation"]),
+                    "archive_run_id": int(run["run_id"])}
+        return self._transaction(operation, "persist remote copy success")
+
+    def mark_remote_chunk_catalog_committing(self, session_id, chunk_index):
+        def operation(conn):
+            cur = conn.execute(
+                """UPDATE archive_containers
+                   SET catalog_state='committing', updated_at=now()
+                   WHERE session_id=%s AND chunk_index=%s
+                     AND writer_state='copied'
+                     AND catalog_state IN ('not_started','committing')""",
+                (int(session_id), int(chunk_index)),
+            )
+            return cur.rowcount
+        return self._transaction(operation, "start remote catalog commit")
+
+    def mark_remote_chunk_catalog_committed(self, session_id, chunk_index):
+        def operation(conn):
+            conn.execute(
+                """UPDATE archive_containers
+                   SET catalog_state='committed',
+                       catalog_committed_at=COALESCE(catalog_committed_at,now()),
+                       updated_at=now()
+                   WHERE session_id=%s AND chunk_index=%s
+                     AND writer_state='copied'
+                     AND catalog_state IN ('committing','committed')""",
+                (int(session_id), int(chunk_index)),
+            )
+            state = conn.execute(
+                """SELECT count(*) AS total,
+                          count(*) FILTER (
+                            WHERE writer_state='copied'
+                              AND catalog_state='committed') AS committed
+                   FROM archive_containers
+                   WHERE session_id=%s AND chunk_index=%s""",
+                (int(session_id), int(chunk_index)),
+            ).fetchone()
+            if int(state["total"] or 0) != int(state["committed"] or 0):
+                raise RuntimeError(
+                    "remote container catalog commit is incomplete")
+            conn.execute(
+                """UPDATE remote_chunks
+                   SET catalog_committed_at=COALESCE(
+                         catalog_committed_at,now()), updated_at=now()
+                   WHERE session_id=%s AND chunk_index=%s""",
+                (int(session_id), int(chunk_index)),
+            )
+            return True
+        return self._transaction(operation, "finish remote catalog commit")
+
+    def mark_remote_chunk_catalog_failed(self, session_id, chunk_index):
+        def operation(conn):
+            return conn.execute(
+                """UPDATE archive_containers
+                   SET catalog_state='failed', updated_at=now()
+                   WHERE session_id=%s AND chunk_index=%s
+                     AND writer_state='copied'
+                     AND catalog_state IN ('not_started','committing','failed')""",
+                (int(session_id), int(chunk_index)),
+            ).rowcount
+        return self._transaction(operation, "record remote catalog failure")
+
+    def mark_remote_chunk_write_ambiguous(self, session_id, chunk_index):
+        """Record a started write without durable copy-completion evidence."""
+        def operation(conn):
+            return conn.execute(
+                """UPDATE archive_containers
+                   SET writer_state='ambiguous', updated_at=now()
+                   WHERE session_id=%s AND chunk_index=%s
+                     AND writer_state IN ('writing','ambiguous')""",
+                (int(session_id), int(chunk_index)),
+            ).rowcount
+        return self._transaction(operation, "record ambiguous remote write")
+
     def _stored_tar_plan_schema_installed_conn(self, conn):
         return (
             self._column_exists_conn(

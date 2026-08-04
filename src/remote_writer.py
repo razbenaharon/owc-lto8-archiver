@@ -90,11 +90,25 @@ class RemoteChunkWriter:
         if not tape_descs:
             return None
 
-        group_started = time.time()
         first = tape_descs[0]
-        group_bytes = sum(int(getattr(d, 'prepared_bytes',
-                                      getattr(d, 'staged_bytes', 0)) or 0)
+        # Admit the finite group once from ACTUAL staged artifact bytes.  This
+        # DB-only check is before LTFS ownership and is never repeated against
+        # an unchanged available value between group members.
+        group_bytes = sum(int(getattr(d, 'staged_bytes', 0) or 0)
                           for d in tape_descs)
+        chunk_indices = [d.chunk_index for d in tape_descs]
+        if not self.host._ensure_remote_chunk_fits_tape(
+                tape_label, group_bytes, chunk_indices):
+            return self.host._record_stop(StopResult(
+                exit_code=ExitCode.SAFETY_BLOCK,
+                reason=REASON_UNEXPECTED_TAPE_OR_DB_STATE, resumable=False,
+                source="write", session_id=session_id,
+                chunk_index=first.chunk_index, preserve_pack=True,
+                detailed_reason=(
+                    "finite group actual staged artifacts do not fit the "
+                    "database tape safety budget")))
+
+        group_started = time.time()
         get_logger().info(
             "tape_write_group_start: chunks=%d indices=%s bytes=%d "
             "group_correlation_id=%s",
@@ -194,22 +208,9 @@ class RemoteChunkWriter:
         # passed for this group: no readiness probe, cartridge read or
         # LtfsCmdDrives call happens here or between chunks.
         try:
-            # (d) Fits-tape. A miss is re-fetchable — discard, do not preserve.
-            _, planned_bytes, _ = self.host.db.get_chunk_size_summary(
-                session_id, chunk_index).get(chunk_index, (0, 0, 0))
-            if not self.host._ensure_remote_chunk_fits_tape(
-                    tape_label, planned_bytes, chunk_index):
-                self.host.db.update_chunk_status(
-                    session_id, chunk_index,
-                ChunkStatus.BACKUP_FAILED.value)
-                return self.host._record_stop(StopResult(
-                    exit_code=ExitCode.SAFETY_BLOCK,
-                    reason=REASON_UNEXPECTED_TAPE_OR_DB_STATE, resumable=False,
-                    source="write", session_id=session_id,
-                    chunk_index=chunk_index, preserve_pack=False,
-                    detailed_reason="chunk does not fit the mounted tape"))
-
-            # (e) Launch the external writer. The chunk is moved to 'backing'
+            # Capacity was reserved cumulatively for the whole finite group
+            # before ownership. Launch the external writer without a per-chunk
+            # tape-budget recheck here.
             #     ONLY when the writer actually starts (via on_write_start), so
             #     'backing' means exactly "the tape write has physically begun".
             #     A failure BEFORE that (drive not ready, bad metadata) never set
@@ -256,6 +257,14 @@ class RemoteChunkWriter:
                     )
             except Exception as e:
                 if write_started['v']:
+                    if hasattr(self.host.db,
+                               'mark_remote_chunk_write_ambiguous'):
+                        try:
+                            self.host.db.mark_remote_chunk_write_ambiguous(
+                                session_id, chunk_index)
+                        except Exception:
+                            get_logger().exception(
+                                "could not persist ambiguous container state")
                     # ANY failure once the write has started — cancel or not,
                     # exception, non-zero robocopy, killed subprocess, LTFS/I/O
                     # error, DB-commit failure — is PHYSICALLY AMBIGUOUS: data
@@ -333,8 +342,9 @@ class RemoteChunkWriter:
                                 "chunk committed, stopping before any next"))
         return None
 
-    def _ensure_remote_chunk_fits_tape(self, tape_label, planned_bytes,
+    def _ensure_remote_chunk_fits_tape(self, tape_label, staged_bytes,
                                        chunk_index):
+        """Admit the selected finite group from cumulative staged bytes."""
         tape = self.host.db.get_tape(tape_label)
         if not tape:
             print(f"[DB] Tape '{tape_label}' is not registered.")
@@ -342,14 +352,18 @@ class RemoteChunkWriter:
         if tape_is_full(tape.get('status')):
             print(f"[TAPE] '{tape_label}' is marked FULL in the database"
                   f"{tape_status_reason_suffix(tape)}; refusing to write "
-                  f"remote chunk {chunk_index + 1}.")
+                  "the selected remote write group.")
             return False
         used_bytes = self.host.db.recalculate_tape_used_space(tape_label)
         _, available_bytes = tape_budget_bytes(
             tape['total_capacity'], used_bytes, status=tape.get('status'))
-        if planned_bytes > available_bytes:
-            print(f"[TAPE] Remote chunk {chunk_index + 1} does not fit on "
-                  f"'{tape_label}' ({planned_bytes / 1024**3:.2f} GiB needed, "
+        if staged_bytes > available_bytes:
+            indices = (list(chunk_index) if isinstance(
+                chunk_index, (list, tuple, set)) else [chunk_index])
+            display = ", ".join(str(int(i) + 1) for i in indices)
+            print(f"[TAPE] Remote finite group [{display}] does not fit on "
+                  f"'{tape_label}' ({staged_bytes / 1024**3:.2f} GiB actual "
+                  "staged artifacts needed, "
                   f"{max(0, available_bytes) / 1024**3:.2f} GiB available "
                   "under the DB safety budget).")
             return False

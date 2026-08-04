@@ -199,19 +199,73 @@ class PgTapeMixin:
                  volume_label),
             ).fetchone()
             manifest_bytes = int(row["used"] or 0)
-        if not self._table_exists_conn(conn, "directory_archive_bundles"):
+        has_containers = self._table_exists_conn(conn, "archive_containers")
+        if not has_containers:
+            if not self._table_exists_conn(conn, "directory_archive_bundles"):
+                row = conn.execute(
+                    """SELECT COALESCE(SUM(file_size_bytes), 0) AS used
+                       FROM files_index WHERE tape_label=%s""",
+                    (volume_label,),
+                ).fetchone()
+                return int(row["used"] or 0) + manifest_bytes
             row = conn.execute(
-                """SELECT COALESCE(SUM(file_size_bytes), 0) AS used
-                   FROM files_index
-                   WHERE tape_label=%s""",
+                """WITH bundle_paths AS (
+                       SELECT stored_bundle_path
+                       FROM directory_archive_bundles WHERE tape_label=%s
+                   ), legacy_file_bytes AS (
+                       SELECT COALESCE(SUM(f.file_size_bytes), 0) AS n
+                       FROM files_index f
+                       LEFT JOIN archive_bundles b ON b.bundle_id=f.bundle_id
+                       WHERE f.tape_label=%s AND NOT EXISTS (
+                           SELECT 1 FROM bundle_paths bp
+                           WHERE bp.stored_bundle_path=b.tape_path)
+                   ), directory_bundle_bytes AS (
+                       SELECT COALESCE(SUM(byte_count), 0) AS n
+                       FROM directory_archive_bundles WHERE tape_label=%s
+                   ) SELECT (SELECT n FROM legacy_file_bytes)
+                          +(SELECT n FROM directory_bundle_bytes) AS used""",
+                    (volume_label, volume_label, volume_label),
+                ).fetchone()
+            return int(row["used"] or 0) + manifest_bytes
+        container_bytes = 0
+        artifact_bytes = 0
+        if has_containers:
+            row = conn.execute(
+                """SELECT COALESCE(SUM(actual_artifact_bytes),0) AS used
+                   FROM archive_containers
+                   WHERE tape_label=%s AND writer_state='copied'""",
                 (volume_label,),
             ).fetchone()
-            return int(row["used"] or 0) + manifest_bytes
+            container_bytes = int(row["used"] or 0)
+            row = conn.execute(
+                """SELECT COALESCE(SUM(a.artifact_size_bytes),0) AS used
+                   FROM archive_artifacts a
+                   WHERE a.tape_locator IS NOT NULL
+                     AND EXISTS (
+                         SELECT 1 FROM archive_runs r
+                         WHERE r.remote_session_id=a.session_id
+                           AND r.remote_chunk_index=a.chunk_index
+                           AND r.tape_label=%s
+                           AND r.tape_generation_id IS NOT NULL)""",
+                (volume_label,),
+            ).fetchone()
+            artifact_bytes = int(row["used"] or 0)
+        if not self._table_exists_conn(conn, "directory_archive_bundles"):
+            row = conn.execute(
+                """SELECT COALESCE(SUM(f.file_size_bytes), 0) AS used
+                   FROM files_index f
+                   LEFT JOIN archive_bundles b ON b.bundle_id=f.bundle_id
+                   WHERE f.tape_label=%s
+                     AND (b.container_id IS NULL)""",
+                (volume_label,),
+            ).fetchone()
+            return (int(row["used"] or 0) + manifest_bytes
+                    + container_bytes + artifact_bytes)
         row = conn.execute(
             """WITH bundle_paths AS (
                    SELECT stored_bundle_path
                    FROM directory_archive_bundles
-                   WHERE tape_label=%s
+                   WHERE tape_label=%s AND container_id IS NULL
                ),
                legacy_file_bytes AS (
                    SELECT COALESCE(SUM(f.file_size_bytes), 0) AS n
@@ -219,22 +273,24 @@ class PgTapeMixin:
                    LEFT JOIN archive_bundles b
                      ON b.bundle_id=f.bundle_id
                    WHERE f.tape_label=%s
-                     AND NOT EXISTS (
+                      AND b.container_id IS NULL
+                      AND NOT EXISTS (
                          SELECT 1 FROM bundle_paths bp
                          WHERE bp.stored_bundle_path = b.tape_path
                      )
                ),
-               directory_bundle_bytes AS (
-                   SELECT COALESCE(SUM(byte_count), 0) AS n
-                   FROM directory_archive_bundles
-                   WHERE tape_label=%s
+                directory_bundle_bytes AS (
+                    SELECT COALESCE(SUM(byte_count), 0) AS n
+                    FROM directory_archive_bundles
+                    WHERE tape_label=%s AND container_id IS NULL
                )
                SELECT
                    (SELECT n FROM legacy_file_bytes)
                    + (SELECT n FROM directory_bundle_bytes) AS used""",
             (volume_label, volume_label, volume_label),
         ).fetchone()
-        return int(row["used"] or 0) + manifest_bytes
+        return (int(row["used"] or 0) + manifest_bytes
+                + container_bytes + artifact_bytes)
 
     def delete_tape(self, volume_label):
         def operation(conn):

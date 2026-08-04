@@ -45,7 +45,7 @@ from .exit_codes import (
 from .logsetup import get_logger
 from .archive_artifacts import (
     publish_stored_tar_pair, resolve_locator, tar_sidecar_locator)
-from .packer import LTOPacker
+from .packer import LTOPacker, StagingSpaceError
 from .paths import (_LEGACY_PATH_LIMIT, _dir_tree_size,
                      _disambiguate_local_rel, _exceeds_legacy_path_limit,
                      _long, _remote_fetch_base_and_rel,
@@ -545,6 +545,11 @@ class RemoteChunkStager:
         excluded = self._source_diagnostic_ordinals(
             getattr(publication, "source_diagnostics", ()))
         records = []
+        threshold_bytes = int(float(
+            getattr(self.host.cfg, 'index_min_file_mb', 10) or 10)
+                              * 1024 * 1024)
+        index_all = bool(getattr(
+            self.host.cfg, 'index_packed_small_files', False))
         for member in sorted(plan_members, key=lambda item: int(item.plan_ordinal)):
             if int(member.plan_ordinal) in excluded:
                 continue
@@ -556,7 +561,10 @@ class RemoteChunkStager:
                 "container_name": container_plan.container_name,
                 "stored_path": str(member.remote_path),
                 "canonical_source_path": str(member.remote_path),
-                "catalog_policy": "index",
+                "catalog_policy": (
+                    "index" if index_all
+                    or int(member.file_size_bytes) >= threshold_bytes
+                    else "manifest_only"),
                 "container_id": int(container_row["container_id"]),
                 "container_format": ContainerFormat.STORED_TAR.value,
                 "container_ordinal": int(container_plan.container_ordinal),

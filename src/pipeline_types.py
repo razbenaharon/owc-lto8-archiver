@@ -501,6 +501,9 @@ class FileRecord(TypedDict, total=False):
     artifact_id: Optional[int]
     artifact_kind: Optional[str]
     artifact_version: Optional[str]
+    actual_artifact_bytes: Optional[int]
+    tape_generation_id: Optional[int]
+    archive_run_id: Optional[int]
 
 
 class ScanMetrics:

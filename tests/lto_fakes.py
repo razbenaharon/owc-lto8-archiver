@@ -159,6 +159,16 @@ class TapeLockObserver:
     def held(self):
         return self.depth > 0
 
+    @property
+    def acquisition_count(self):
+        """Number of ownership periods, including recursive acquisitions."""
+        return sum(kind == "acquire" for kind, _, _ in self.events)
+
+    @property
+    def release_count(self):
+        """Number of completed ownership releases observed so far."""
+        return sum(kind == "release" for kind, _, _ in self.events)
+
     def reasons(self):
         return [r for kind, r, _ in self.events if kind == "acquire"]
 
@@ -178,7 +188,9 @@ class MinimalBackupDB:
 
     def __init__(self):
         self.file_commits = 0
+        self.directory_commits = 0
         self.recalc_calls = 0
+        self.container_events = []
 
     def tape_exists(self, tape_label):
         return True
@@ -187,6 +199,38 @@ class MinimalBackupDB:
         list(records)
         self.file_commits += 1
         return {"inserted": 1, "updated": 0, "skipped": 0}
+
+    def directory_catalog_schema_installed(self):
+        return True
+
+    def bulk_upsert_directory_catalog(self, records, *args, **kwargs):
+        list(records)
+        self.directory_commits += 1
+        return {"bundles": 1, "stats": 1, "tree_rows": 1}
+
+    def mark_remote_chunk_writer_started(self, session_id, chunk_index,
+                                         tape_label, tape_root, staged_chunk):
+        self.container_events.append(("writer_started", chunk_index))
+        return {"tape_generation_id": 1, "tape_generation": 1}
+
+    def mark_remote_chunk_copy_succeeded(self, session_id, chunk_index,
+                                         tape_label, tape_root, staged_chunk,
+                                         **kwargs):
+        self.container_events.append(("copy_succeeded", chunk_index))
+        return {"tape_generation_id": 1, "tape_generation": 1,
+                "archive_run_id": 1}
+
+    def mark_remote_chunk_catalog_committing(self, session_id, chunk_index):
+        self.container_events.append(("catalog_committing", chunk_index))
+
+    def mark_remote_chunk_catalog_committed(self, session_id, chunk_index):
+        self.container_events.append(("catalog_committed", chunk_index))
+
+    def mark_remote_chunk_catalog_failed(self, session_id, chunk_index):
+        self.container_events.append(("catalog_failed", chunk_index))
+
+    def mark_remote_chunk_write_ambiguous(self, session_id, chunk_index):
+        self.container_events.append(("writer_ambiguous", chunk_index))
 
     def recalculate_tape_used_space(self, tape_label):
         self.recalc_calls += 1
