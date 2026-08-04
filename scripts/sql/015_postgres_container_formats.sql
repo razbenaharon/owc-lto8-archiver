@@ -997,7 +997,7 @@ BEGIN
             END IF;
 
             IF optional_007_count = 3 THEN
-                -- Fully unattributable legacy rows (Session 37 has 134) are
+                -- Fully unattributable legacy rows are
                 -- retained and counted above, but do not pretend to prove
                 -- anything about the approved suffix.  Any direct or resolved
                 -- suffix placement, invalid direct identity, cross-session
