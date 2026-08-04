@@ -66,6 +66,22 @@ class FileTransferStatus(str, Enum):
     UNRESOLVED = "unresolved"
 
 
+class SourceDisposition(str, Enum):
+    """Observable disposition of one sealed Stored-TAR plan ordinal.
+
+    This is deliberately separate from ``remote_file_state.status``.  A TAR
+    sidecar describes what one immutable container attempt observed, while the
+    remote-file state machine describes the wider chunk workflow.
+    """
+
+    ARCHIVED = "archived"
+    SOURCE_MISSING = "source_missing"
+    SOURCE_PERMISSION_DENIED = "source_permission_denied"
+    SOURCE_UNREADABLE = "source_unreadable"
+    SOURCE_CHANGED = "source_changed"
+    UNRESOLVED = "unresolved"
+
+
 #: The subset legal on a database that has NOT applied migration 014.
 LEGACY_FILE_STATUSES = frozenset({
     FileTransferStatus.PENDING, FileTransferStatus.FETCHING,
@@ -174,6 +190,9 @@ class ContainerRecord(TypedDict, total=False):
     observed_member_count: Optional[int]
     observed_logical_bytes: Optional[int]
     actual_artifact_bytes: Optional[int]
+    validated_part_locator: Optional[str]
+    validation_summary: Optional[Dict[str, Any]]
+    disposition_counts: Optional[Dict[str, int]]
     validation_state: str
     writer_state: str
     catalog_state: str
@@ -239,6 +258,29 @@ class StoredTarContainer:
     member_count: int
     logical_bytes: int
     archive_size: int
+
+
+@dataclass(frozen=True)
+class StoredTarSourceDiagnostic:
+    """Machine-attributed source evidence captured by direct TAR transport."""
+
+    plan_ordinal: int
+    path: str
+    disposition: SourceDisposition
+    evidence: str
+
+
+@dataclass(frozen=True)
+class StoredTarValidationSummary:
+    """Owner-scoped proof that a still-unpublished TAR part matches its plan."""
+
+    container_ordinal: int
+    member_count: int
+    logical_bytes: int
+    archive_size: int
+    plan_ordinal_count: int
+    disposition_counts: Dict[str, int]
+    members: Tuple[StoredTarMember, ...]
 
 
 #: Allowed chunk transitions. Anything not listed is refused and leaves the old

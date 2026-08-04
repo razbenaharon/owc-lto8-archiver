@@ -6,9 +6,13 @@ import subprocess
 import tempfile
 import shlex
 import atexit
+import time
+from dataclasses import dataclass
+from typing import Optional, Tuple
 
 from .constants import PROJECT_ROOT
-from .paths import _safe_remote_relpath
+from .paths import _safe_remote_relpath, validate_remote_posix_relpath
+from .pipeline_types import SourceDisposition, StoredTarSourceDiagnostic
 from .runtime import CANCEL, _apply_proc_tuning, _kill_proc_tree, register_proc, unregister_proc
 
 
@@ -46,6 +50,395 @@ _SSH_STREAM_KEEPALIVE_OPTS = [
     '-o', 'ServerAliveCountMax=4',
     '-o', 'ConnectTimeout=30',
 ]
+
+_TAR_STORE_STDERR_LIMIT = 2 * 1024 * 1024
+_SOURCE_EXCEPTION_SUFFIXES = (
+    "Warning: Cannot stat: No such file or directory",
+    "Warning: Cannot open: Permission denied",
+    "Warning: Cannot open: Input/output error",
+    "Warning: Cannot read: Input/output error",
+)
+
+
+@dataclass(frozen=True)
+class RemoteTarStoreResult:
+    """One direct remote-TAR attempt, including explicit trust boundaries."""
+
+    ok: bool
+    part_path: str
+    archive_size: int
+    remote_exit_code: Optional[int]
+    stderr: str
+    diagnostics: Tuple[StoredTarSourceDiagnostic, ...] = ()
+    unresolved: Tuple[str, ...] = ()
+    transport_mode: str = "plain_tar"
+    tar_exit_verified: bool = True
+    cancelled: bool = False
+    error: str = ""
+
+
+def _stored_tar_command(remote_base):
+    """The pinned first-version producer dialect; paths arrive only on stdin."""
+    return (
+        f"LC_ALL=C tar -C {shlex.quote(str(remote_base))} -b 512 "
+        "--format=pax --sparse --sparse-version=1.0 --no-recursion "
+        "--ignore-failed-read -cf - --null -T -"
+    )
+
+
+def _mbuffer_pipefail_capable(remote_user, remote_host, *, password=''):
+    """Prove both tools exist and that bash propagates a failed producer."""
+    command = (
+        "command -v bash >/dev/null 2>&1 && "
+        "command -v mbuffer >/dev/null 2>&1 || exit 1; "
+        "bash -o pipefail -c 'false | true'; test $? -ne 0"
+    )
+    result = _ssh_run(
+        remote_user, remote_host, command, capture=True,
+        password=password, timeout=30)
+    return result.returncode == 0
+
+
+def _bounded_stderr_reader(pipe, chunks, state):
+    """Drain stderr without allowing a hostile diagnostic stream to grow RAM."""
+    kept = 0
+    try:
+        while True:
+            block = pipe.read(65536)
+            if not block:
+                break
+            room = _TAR_STORE_STDERR_LIMIT - kept
+            if room > 0:
+                chunks.append(block[:room])
+                kept += min(room, len(block))
+            if len(block) > room:
+                state["truncated"] = True
+    except OSError:
+        state["read_error"] = True
+
+
+def _feed_nul_pairs(pipe, pairs, state):
+    """Stream ordinal/path frames without materializing the complete file list."""
+    try:
+        for ordinal, path in pairs:
+            pipe.write(str(int(ordinal)).encode("ascii") + b"\0")
+            pipe.write(path.encode("utf-8", "strict") + b"\0")
+        pipe.close()
+    except (BrokenPipeError, OSError, UnicodeError) as exc:
+        state["error"] = str(exc)
+        try:
+            pipe.close()
+        except OSError:
+            pass
+
+
+def _feed_nul_paths(pipe, paths, state):
+    """Stream GNU TAR's exact NUL-delimited relative-name list."""
+    try:
+        for path in paths:
+            pipe.write(path.encode("utf-8", "strict") + b"\0")
+        pipe.close()
+    except (BrokenPipeError, OSError, UnicodeError) as exc:
+        state["error"] = str(exc)
+        try:
+            pipe.close()
+        except OSError:
+            pass
+
+
+def _iter_nul_fields(raw, chunk_size=65536):
+    pending = bytearray()
+    while True:
+        block = raw.read(chunk_size)
+        if not block:
+            break
+        pending.extend(block)
+        while True:
+            marker = pending.find(0)
+            if marker < 0:
+                break
+            yield bytes(pending[:marker])
+            del pending[:marker + 1]
+    if pending:
+        raise ValueError("truncated NUL-framed source-status output")
+
+
+def _source_status_command(remote_base):
+    """Machine-readable, filename-safe status probe used after TAR warnings."""
+    script = (
+        "while IFS= read -r -d '' ordinal && IFS= read -r -d '' path; do "
+        "target=\"./$path\"; "
+        "if [[ ! -e \"$target\" && ! -L \"$target\" ]]; "
+        "then status=source_missing; evidence=lstat_missing; "
+        "elif [[ ! -f \"$target\" ]]; then status=source_changed; evidence=not_regular; "
+        "elif [[ ! -r \"$target\" ]]; then status=source_permission_denied; evidence=not_readable; "
+        "elif ! dd if=\"$target\" of=/dev/null bs=1 count=1 2>/dev/null; "
+        "then status=source_unreadable; evidence=read_probe_failed; "
+        "else status=present; evidence=read_probe_ok; fi; "
+        "printf '%s\\0%s\\0%s\\0%s\\0' \"$ordinal\" \"$path\" "
+        "\"$status\" \"$evidence\"; done"
+    )
+    return (
+        f"cd {shlex.quote(str(remote_base))} && "
+        f"LC_ALL=C bash -c {shlex.quote(script)}"
+    )
+
+
+def _remote_source_status_probe(remote_user, remote_host, remote_base, members,
+                                *, password='', cipher='', fetch_cores=None,
+                                abort_evt=None):
+    """Return all non-present source observations using NUL-framed records."""
+    command = _source_status_command(remote_base)
+    ssh_cmd, ssh_env, error = _ssh_stream_command(
+        remote_user, remote_host, command, password=password, cipher=cipher)
+    if error:
+        return (), (error,)
+    output = tempfile.TemporaryFile(mode="w+b")
+    proc = None
+    stderr_chunks = []
+    stderr_state = {}
+    feed_state = {}
+    try:
+        proc = subprocess.Popen(
+            ssh_cmd, stdin=subprocess.PIPE, stdout=output,
+            stderr=subprocess.PIPE, env=ssh_env)
+        register_proc(proc)
+        _apply_proc_tuning(proc, affinity=fetch_cores, label='ssh-tar-status')
+        stderr_thread = threading.Thread(
+            target=_bounded_stderr_reader,
+            args=(proc.stderr, stderr_chunks, stderr_state), daemon=True)
+        stderr_thread.start()
+        feeder = threading.Thread(
+            target=_feed_nul_pairs, args=(proc.stdin, members, feed_state),
+            daemon=True)
+        feeder.start()
+        while proc.poll() is None:
+            if CANCEL.is_set() or (abort_evt is not None and abort_evt.is_set()):
+                _kill_proc_tree(proc)
+                break
+            time.sleep(0.05)
+        rc = proc.wait()
+        feeder.join(timeout=2)
+        stderr_thread.join(timeout=2)
+        if rc != 0 or feed_state.get("error") or stderr_state.get("truncated"):
+            detail = b''.join(stderr_chunks).decode(
+                'utf-8', errors='replace').strip()
+            return (), (f"source status probe failed (exit {rc}): {detail}",)
+
+        output.seek(0)
+        fields = iter(_iter_nul_fields(output))
+        observed = []
+        while True:
+            try:
+                ordinal_raw = next(fields)
+            except StopIteration:
+                break
+            try:
+                path_raw = next(fields)
+                status_raw = next(fields)
+                evidence_raw = next(fields)
+            except StopIteration as exc:
+                raise ValueError(
+                    "incomplete NUL-framed source-status record") from exc
+            ordinal = int(ordinal_raw.decode("ascii", "strict"))
+            path = path_raw.decode("utf-8", "strict")
+            status = status_raw.decode("ascii", "strict")
+            evidence = evidence_raw.decode("ascii", "strict")
+            if status == "present":
+                continue
+            try:
+                disposition = SourceDisposition(status)
+            except ValueError:
+                disposition = SourceDisposition.UNRESOLVED
+            observed.append(StoredTarSourceDiagnostic(
+                plan_ordinal=ordinal, path=path,
+                disposition=disposition, evidence=evidence))
+        return tuple(observed), ()
+    except (OSError, ValueError, UnicodeError) as exc:
+        if proc is not None:
+            _kill_proc_tree(proc)
+        return (), (f"source status probe failed: {exc}",)
+    finally:
+        unregister_proc(proc)
+        output.close()
+
+
+def _remote_tar_store(remote_user, remote_host, remote_base, rel_paths,
+                      local_part_path, *, plan_ordinals=None, password='',
+                      cipher='', use_mbuffer=False, mbuffer_size='2G',
+                      fetch_cores=None, abort_evt=None):
+    """Stream one GNU Stored TAR directly into a unique local ``.tar.part``.
+
+    The function performs one attempt.  Its caller owns bounded retry policy;
+    every retry must supply a new/truncated part and starts at byte zero.
+    """
+    paths = []
+    try:
+        for path in rel_paths:
+            paths.append(validate_remote_posix_relpath(path))
+    except ValueError as exc:
+        return RemoteTarStoreResult(
+            False, str(local_part_path), 0, None, "", error=str(exc))
+    ordinals = (list(range(len(paths))) if plan_ordinals is None
+                else [int(value) for value in plan_ordinals])
+    if len(ordinals) != len(paths) or len(set(ordinals)) != len(ordinals):
+        return RemoteTarStoreResult(
+            False, str(local_part_path), 0, None, "",
+            error="plan ordinals must be unique and match the path list")
+    pairs = tuple(zip(ordinals, paths))
+    part_path = os.path.abspath(str(local_part_path))
+    if not part_path.endswith('.part'):
+        return RemoteTarStoreResult(
+            False, part_path, 0, None, "",
+            error="direct TAR output must use a unique .part name")
+    if CANCEL.is_set():
+        return RemoteTarStoreResult(
+            False, part_path, 0, None, "", cancelled=True,
+            error="cancelled")
+    os.makedirs(os.path.dirname(part_path), exist_ok=True)
+
+    tar_core = _stored_tar_command(remote_base)
+    transport_mode = "plain_tar"
+    if use_mbuffer and _mbuffer_pipefail_capable(
+            remote_user, remote_host, password=password):
+        pipeline = f"{tar_core} | mbuffer -q -m {shlex.quote(mbuffer_size)}"
+        remote_cmd = f"bash -o pipefail -c {shlex.quote(pipeline)}"
+        transport_mode = "tar_mbuffer_pipefail"
+    else:
+        remote_cmd = tar_core
+    ssh_cmd, ssh_env, error = _ssh_stream_command(
+        remote_user, remote_host, remote_cmd, password=password, cipher=cipher)
+    if error:
+        return RemoteTarStoreResult(
+            False, part_path, 0, None, "", transport_mode=transport_mode,
+            error=error)
+
+    proc = None
+    stderr_chunks = []
+    stderr_state = {}
+    feed_state = {}
+    archive_size = 0
+    try:
+        # Exclusive creation means two build owners can never share a byte
+        # stream.  Popen writes stdout to the file descriptor directly, so TAR
+        # payload size cannot increase Python memory use.
+        with open(part_path, "xb") as output:
+            proc = subprocess.Popen(
+                ssh_cmd, stdin=subprocess.PIPE, stdout=output,
+                stderr=subprocess.PIPE, env=ssh_env)
+            register_proc(proc)
+            _apply_proc_tuning(proc, affinity=fetch_cores, label='ssh-tar-store')
+            stderr_thread = threading.Thread(
+                target=_bounded_stderr_reader,
+                args=(proc.stderr, stderr_chunks, stderr_state), daemon=True)
+            stderr_thread.start()
+            feeder = threading.Thread(
+                target=_feed_nul_paths,
+                args=(proc.stdin, paths, feed_state), daemon=True)
+            feeder.start()
+            while proc.poll() is None:
+                if CANCEL.is_set() or (
+                        abort_evt is not None and abort_evt.is_set()):
+                    _kill_proc_tree(proc)
+                    break
+                time.sleep(0.05)
+            rc = proc.wait()
+            feeder.join(timeout=2)
+            stderr_thread.join(timeout=2)
+            output.flush()
+            os.fsync(output.fileno())
+            archive_size = output.tell()
+        stderr_text = b''.join(stderr_chunks).decode(
+            'utf-8', errors='replace').strip()
+    except (FileExistsError, OSError) as exc:
+        if proc is not None:
+            _kill_proc_tree(proc)
+        return RemoteTarStoreResult(
+            False, part_path, archive_size, None, "",
+            transport_mode=transport_mode, error=str(exc))
+    finally:
+        unregister_proc(proc)
+
+    cancelled = CANCEL.is_set() or (
+        abort_evt is not None and abort_evt.is_set())
+    unresolved = []
+    diagnostics = ()
+    if stderr_state.get("truncated"):
+        unresolved.append("remote TAR stderr exceeded the bounded capture limit")
+    if stderr_state.get("read_error"):
+        unresolved.append("remote TAR stderr could not be read completely")
+    if feed_state.get("error") and not cancelled:
+        unresolved.append(f"remote TAR input failed: {feed_state['error']}")
+
+    diagnostic_groups = []
+    for line in stderr_text.splitlines():
+        if line.startswith('tar: '):
+            diagnostic_groups.append([line])
+        elif diagnostic_groups:
+            diagnostic_groups[-1].append(line)
+    diagnostic_texts = ['\n'.join(group) for group in diagnostic_groups]
+    known_exception_warning = any(
+        marker in stderr_text for marker in _SOURCE_EXCEPTION_SUFFIXES)
+    changed_warning = (
+        "file changed as we read it" in stderr_text
+        or "File shrank by" in stderr_text
+        or "file is on a different filesystem" in stderr_text)
+    known_markers = _SOURCE_EXCEPTION_SUFFIXES + (
+        "file changed as we read it", "File shrank by",
+        "file is on a different filesystem")
+    unknown_tar_warning = any(
+        not any(marker in group for marker in known_markers)
+        for group in diagnostic_texts)
+    if changed_warning:
+        unresolved.append("remote TAR observed source change while reading")
+    if unknown_tar_warning:
+        unresolved.append("unclassified remote TAR diagnostic")
+
+    if rc == 0 and known_exception_warning and not unresolved:
+        diagnostics, probe_unresolved = _remote_source_status_probe(
+            remote_user, remote_host, remote_base, pairs,
+            password=password, cipher=cipher, fetch_cores=fetch_cores,
+            abort_evt=abort_evt)
+        unresolved.extend(probe_unresolved)
+        explicit = [item for item in diagnostics if item.disposition in {
+            SourceDisposition.SOURCE_MISSING,
+            SourceDisposition.SOURCE_PERMISSION_DENIED,
+            SourceDisposition.SOURCE_UNREADABLE,
+        }]
+        non_exception = [item for item in diagnostics
+                         if item.disposition not in {
+                             SourceDisposition.SOURCE_MISSING,
+                             SourceDisposition.SOURCE_PERMISSION_DENIED,
+                             SourceDisposition.SOURCE_UNREADABLE}]
+        if non_exception:
+            unresolved.append(
+                "source status probe observed changed or unresolved members")
+        if not explicit:
+            unresolved.append(
+                "TAR reported an absent/unreadable input but the machine "
+                "status probe could not attribute it")
+        diagnostics = tuple(explicit)
+
+    if cancelled:
+        return RemoteTarStoreResult(
+            False, part_path, archive_size, rc, stderr_text,
+            diagnostics=diagnostics, unresolved=tuple(unresolved),
+            transport_mode=transport_mode, cancelled=True, error="cancelled")
+    if rc != 0:
+        return RemoteTarStoreResult(
+            False, part_path, archive_size, rc, stderr_text,
+            diagnostics=diagnostics, unresolved=tuple(unresolved),
+            transport_mode=transport_mode,
+            error=f"remote TAR/SSH exited with status {rc}")
+    if unresolved:
+        return RemoteTarStoreResult(
+            False, part_path, archive_size, rc, stderr_text,
+            diagnostics=diagnostics, unresolved=tuple(unresolved),
+            transport_mode=transport_mode,
+            error="remote TAR outcome is unresolved")
+    return RemoteTarStoreResult(
+        True, part_path, archive_size, rc, stderr_text,
+        diagnostics=diagnostics, transport_mode=transport_mode)
 
 
 _ASKPASS_HELPERS = set()
