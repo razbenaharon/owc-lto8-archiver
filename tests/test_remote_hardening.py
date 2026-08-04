@@ -1,4 +1,5 @@
 import os
+import io
 import tempfile
 import threading
 import unittest
@@ -15,11 +16,19 @@ from src.orchestrators import (
 # facade: Plan 1 completion removed them from that facade so it cannot
 # advertise a class no production path may build.
 from src.scanning import RemoteScanner, StreamingRemoteScanner
-from src.pipeline_types import ContainerFormat, StagedChunk
+from src.paths import remote_store_base_and_rel, validate_remote_posix_relpath
+from src.pipeline_types import (
+    ContainerFormat, SourceDisposition, StagedChunk,
+    StoredTarSourceDiagnostic,
+)
 from src.remote_transport import (
     _ASKPASS_HELPERS,
     _cleanup_askpass_helpers,
     _is_recoverable_remote_tar_warning,
+    _remote_source_status_probe,
+    _remote_tar_store,
+    _source_status_command,
+    _stored_tar_command,
     _openssh_askpass_env,
     _ssh_run,
     _ssh_stream_command,
@@ -383,6 +392,242 @@ class RemotePasswordSafetyTests(unittest.TestCase):
             "Warning: Cannot open: Input/output error"
         )
         self.assertFalse(_is_recoverable_remote_tar_warning(line))
+
+
+class _StoreInputSink:
+    def __init__(self):
+        self.data = bytearray()
+
+    def write(self, data):
+        self.data.extend(data)
+        return len(data)
+
+    def close(self):
+        pass
+
+
+class _StorePopen:
+    payload_chunks = 1
+    payload = b"tar-block"
+    stderr_payload = b""
+    exit_code = 0
+    last = None
+    remote_command = None
+
+    def __init__(self, command, *, stdin, stdout, stderr, env=None):
+        del stdin, stderr, env
+        self.command = command
+        self.stdin = _StoreInputSink()
+        self.stderr = io.BytesIO(type(self).stderr_payload)
+        self.pid = 2_000_000_000
+        self.returncode = type(self).exit_code
+        self.stdout_was_pipe = stdout == __import__('subprocess').PIPE
+        for _ in range(type(self).payload_chunks):
+            stdout.write(type(self).payload)
+        type(self).last = self
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        del timeout
+        return self.returncode
+
+
+class _BlockingStorePopen(_StorePopen):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.terminated = False
+        self.returncode = None
+
+    def poll(self):
+        return -15 if self.terminated else None
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.terminated = True
+
+    def wait(self, timeout=None):
+        del timeout
+        self.terminated = True
+        self.returncode = -15
+        return self.returncode
+
+
+class DirectStoredTarTransportTests(unittest.TestCase):
+    def setUp(self):
+        _StorePopen.payload_chunks = 1
+        _StorePopen.payload = b"tar-block"
+        _StorePopen.stderr_payload = b""
+        _StorePopen.exit_code = 0
+
+    def _store(self, root, paths, *, ordinals=None, use_mbuffer=False):
+        part = os.path.join(root, "container.tar.unique.part")
+        def stream_command(_user, _host, command, **_kwargs):
+            _StorePopen.remote_command = command
+            return ["ssh"], None, None
+        with mock.patch(
+                "src.remote_transport._ssh_stream_command",
+                side_effect=stream_command), \
+             mock.patch("src.remote_transport.subprocess.Popen", _StorePopen), \
+             mock.patch("src.remote_transport._apply_proc_tuning"):
+            result = _remote_tar_store(
+                "u", "h", "/remote base", paths, part,
+                plan_ordinals=ordinals, use_mbuffer=use_mbuffer)
+        return result, _StorePopen.last
+
+    def test_exact_pinned_dialect_and_no_filename_in_command(self):
+        command = _stored_tar_command("/base with ' quote")
+        self.assertEqual(
+            command,
+            "LC_ALL=C tar -C '/base with '\"'\"' quote' -b 512 "
+            "--format=pax --sparse --sparse-version=1.0 --no-recursion "
+            "--ignore-failed-read -cf - --null -T -")
+        for filename in ("space name", "tab\tname", "line\nname", "×§×•×‘×¥",
+                         r"literal\backslash", "-leading", "$(touch nope);&"):
+            self.assertNotIn(filename, command)
+
+    def test_special_names_are_nul_framed_on_stdin_unchanged(self):
+        paths = ["space name", "tab\tname", "line\nname", "×§×•×‘×¥",
+                 r"literal\backslash", "-leading", "$(echo bad);&"]
+        with tempfile.TemporaryDirectory() as root:
+            result, proc = self._store(root, paths, ordinals=range(10, 17))
+        self.assertTrue(result.ok, result.error)
+        expected = b"".join(path.encode("utf-8") + b"\0" for path in paths)
+        self.assertEqual(bytes(proc.stdin.data), expected)
+        for path in paths:
+            self.assertNotIn(path, " ".join(proc.command))
+
+    def test_absolute_traversal_empty_component_and_nul_are_rejected(self):
+        bad = ("/absolute", "../up", "a/../b", "a//b", "a/./b", "nul\0x")
+        for path in bad:
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    validate_remote_posix_relpath(path)
+
+    def test_store_base_mapping_preserves_literal_backslash_and_whitespace(self):
+        base, rel = remote_store_base_and_rel(
+            "/remote root/", "/remote root/tab\t trailing \\name ")
+        self.assertEqual(base, "/remote root")
+        self.assertEqual(rel, "tab\t trailing \\name ")
+
+    def test_machine_probe_command_has_no_filename_slot(self):
+        command = _source_status_command("/remote base")
+        self.assertIn("read -r -d", command)
+        self.assertIn("path; do", command)
+        self.assertIn('target="./$path"', command)
+        self.assertNotIn("%q", command)
+
+    def test_machine_probe_nul_frames_attribute_newline_and_backslash(self):
+        special = "line\nname\\literal"
+        _StorePopen.payload = (
+            b"7\0" + special.encode("utf-8")
+            + b"\0source_permission_denied\0not_readable\0")
+        with mock.patch(
+                "src.remote_transport._ssh_stream_command",
+                return_value=(["ssh"], None, None)), \
+             mock.patch("src.remote_transport.subprocess.Popen", _StorePopen), \
+             mock.patch("src.remote_transport._apply_proc_tuning"):
+            diagnostics, unresolved = _remote_source_status_probe(
+                "u", "h", "/base", ((7, special),))
+        self.assertEqual(unresolved, ())
+        self.assertEqual(
+            diagnostics,
+            (StoredTarSourceDiagnostic(
+                7, special, SourceDisposition.SOURCE_PERMISSION_DENIED,
+                "not_readable"),))
+        self.assertEqual(
+            bytes(_StorePopen.last.stdin.data),
+            b"7\0" + special.encode("utf-8") + b"\0")
+
+    def test_machine_attributed_special_name_exceptions_are_returned(self):
+        special = "odd\nname\\byte"
+        cases = (
+            (SourceDisposition.SOURCE_MISSING, "lstat_missing",
+             b"tar: diagnostic: Warning: Cannot stat: No such file or directory\n"),
+            (SourceDisposition.SOURCE_PERMISSION_DENIED, "not_readable",
+             b"tar: diagnostic: Warning: Cannot open: Permission denied\n"),
+            (SourceDisposition.SOURCE_UNREADABLE, "read_probe_failed",
+             b"tar: diagnostic: Warning: Cannot open: Input/output error\n"),
+        )
+        for disposition, evidence, stderr in cases:
+            with self.subTest(disposition=disposition), \
+                    tempfile.TemporaryDirectory() as root:
+                _StorePopen.stderr_payload = stderr
+                diagnostic = StoredTarSourceDiagnostic(
+                    4, special, disposition, evidence)
+                with mock.patch(
+                        "src.remote_transport._remote_source_status_probe",
+                        return_value=((diagnostic,), ())):
+                    result, _ = self._store(root, [special], ordinals=[4])
+                self.assertTrue(result.ok, result.error)
+                self.assertEqual(result.diagnostics, (diagnostic,))
+
+    def test_unassignable_diagnostic_is_unresolved(self):
+        _StorePopen.stderr_payload = b"tar: something entirely new\n"
+        with tempfile.TemporaryDirectory() as root:
+            result, _ = self._store(root, ["a"], ordinals=[0])
+        self.assertFalse(result.ok)
+        self.assertIn("unclassified", result.unresolved[0])
+
+    def test_unknown_warning_is_not_hidden_by_a_known_warning(self):
+        _StorePopen.stderr_payload = (
+            b"tar: a: Warning: Cannot stat: No such file or directory\n"
+            b"tar: second diagnostic has no classification\n")
+        with tempfile.TemporaryDirectory() as root:
+            result, _ = self._store(root, ["a"], ordinals=[0])
+        self.assertFalse(result.ok)
+        self.assertIn("unclassified", " ".join(result.unresolved))
+
+    def test_mbuffer_can_never_mask_tar_failure(self):
+        _StorePopen.exit_code = 2
+        with tempfile.TemporaryDirectory() as root, mock.patch(
+                "src.remote_transport._mbuffer_pipefail_capable",
+                return_value=True):
+            result, proc = self._store(
+                root, ["a"], ordinals=[0], use_mbuffer=True)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.remote_exit_code, 2)
+        self.assertEqual(result.transport_mode, "tar_mbuffer_pipefail")
+        self.assertIn("bash -o pipefail", _StorePopen.remote_command)
+
+    def test_stdout_goes_directly_to_file_with_bounded_python_memory(self):
+        _StorePopen.payload_chunks = 4096
+        _StorePopen.payload = bytes(65536)
+        with tempfile.TemporaryDirectory() as root:
+            result, proc = self._store(root, ["a"], ordinals=[0])
+            self.assertEqual(os.path.getsize(result.part_path), 256 * 1024 * 1024)
+        self.assertTrue(result.ok)
+        self.assertFalse(proc.stdout_was_pipe)
+
+    def test_transient_network_classification_remains_retryable(self):
+        from src.remote_staging import _is_transient_fetch_error
+        self.assertTrue(_is_transient_fetch_error(
+            "remote TAR/SSH exited with status 255: Connection reset by peer"))
+        self.assertFalse(_is_transient_fetch_error(
+            "Permission denied (publickey,password)"))
+
+    def test_shared_abort_cancels_registered_stream_and_leaves_part(self):
+        abort = threading.Event()
+        abort.set()  # models the first failed sibling signalling this worker
+        with tempfile.TemporaryDirectory() as root:
+            part = os.path.join(root, "cancelled.tar.unique.part")
+            with mock.patch(
+                    "src.remote_transport._ssh_stream_command",
+                    return_value=(["ssh"], None, None)), \
+                 mock.patch(
+                    "src.remote_transport.subprocess.Popen",
+                    _BlockingStorePopen), \
+                 mock.patch("src.remote_transport._apply_proc_tuning"):
+                result = _remote_tar_store(
+                    "u", "h", "/base", ["a"], part,
+                    plan_ordinals=[0], abort_evt=abort)
+            self.assertFalse(result.ok)
+            self.assertTrue(result.cancelled)
+            self.assertTrue(os.path.isfile(part))
+            self.assertFalse(os.path.exists(part[:-5]))
 
 
 class RemoteScannerTests(unittest.TestCase):

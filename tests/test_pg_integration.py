@@ -2912,6 +2912,160 @@ class ContainerFormatMigrationTests(unittest.TestCase):
             "container format catalog-definition fingerprint drift",
             report["issues"])
 
+    def _validated_tar_publication_fixture(self):
+        rows = [
+            (1, "/fixture/a.bin", "a.bin", 3),
+            (1, "/fixture/missing.bin", "missing.bin", 5),
+        ]
+        session_id = self._stored_tar_planning_session(rows)
+        plan = self.db.get_or_create_stored_tar_chunk_plan(
+            session_id, 1, self.db.get_chunk_files(session_id, 1),
+            loose_threshold_bytes=100, max_size_bytes=512 * 512)
+        container = self.db.get_archive_containers(session_id, 1)[0]
+        part = os.path.join(
+            self.staging.name, "container.tar.owner.part")
+        owner = "task-2-4-owner"
+        self.db.claim_stored_tar_container_build(
+            container["container_id"], owner, part)
+        summary = {
+            "container_ordinal": 0,
+            "member_count": 1,
+            "logical_bytes": 3,
+            "archive_size": 262144,
+            "plan_ordinal_count": 2,
+            "disposition_counts": {
+                "archived": 1, "source_missing": 1,
+                "source_permission_denied": 0, "source_unreadable": 0,
+                "source_changed": 0, "unresolved": 0,
+            },
+            "members": [],
+        }
+        diagnostics = [{
+            "plan_ordinal": 1, "path": "missing.bin",
+            "disposition": "source_missing", "evidence": "lstat_missing",
+        }]
+        self.db.mark_stored_tar_validated_part(
+            container["container_id"], owner, part, summary, diagnostics)
+        return session_id, plan, container, part, owner, summary
+
+    def test_017_two_build_owners_cannot_adopt_the_same_part(self):
+        rows = [(1, "/fixture/a.bin", "a.bin", 3)]
+        session_id = self._stored_tar_planning_session(rows)
+        self.db.get_or_create_stored_tar_chunk_plan(
+            session_id, 1, self.db.get_chunk_files(session_id, 1),
+            loose_threshold_bytes=100, max_size_bytes=512 * 512)
+        container = self.db.get_archive_containers(session_id, 1)[0]
+        part = os.path.join(self.staging.name, "same.tar.part")
+        first = self.db.claim_stored_tar_container_build(
+            container["container_id"], "owner-one", part)
+        self.assertEqual(first["owner_token"], "owner-one")
+        with self.assertRaisesRegex(RuntimeError, "another builder"):
+            self.db.claim_stored_tar_container_build(
+                container["container_id"], "owner-two", part)
+        replay = self.db.claim_stored_tar_container_build(
+            container["container_id"], "owner-one", part)
+        self.assertEqual(replay["validated_part_locator"], part)
+
+    def test_017_preserves_preexisting_ready_zip_container_contract(self):
+        session_id = self._session(label="READY_ZIP_BEFORE_017")
+        self._append(session_id, 0, member_count=1)
+        self._ready_014()
+        self.db.apply_container_format_schema()
+        created = self.db.create_archive_container({
+            "session_id": session_id, "chunk_index": 0,
+            "container_ordinal": 0, "container_format": "zip",
+            "format_version": "zip-v1", "tar_dialect": None,
+            "storage_class": "small_files", "container_name": "one.zip",
+            "expected_member_count": 1, "expected_logical_bytes": 1,
+            "observed_member_count": 1, "observed_logical_bytes": 1,
+            "actual_artifact_bytes": 10, "validation_state": "ready",
+        })
+        self.db.apply_stored_tar_plan_schema()
+        row = self.db.get_archive_containers(session_id, 0)[0]
+        self.assertEqual(row["container_id"], created["container_id"])
+        self.assertEqual(row["validation_state"], "ready")
+        self.assertIsNone(row["validation_summary"])
+        self.assertIsNone(row["disposition_counts"])
+
+    def test_017_validated_part_persists_no_final_or_ready_locator(self):
+        _session, _plan, container, part, owner, summary = (
+            self._validated_tar_publication_fixture())
+        row = self.db.get_archive_containers(
+            container["session_id"], container["chunk_index"])[0]
+        self.assertEqual(row["validation_state"], "validated_part")
+        self.assertEqual(row["validated_part_locator"], part)
+        self.assertIsNone(row["temporary_data_locator"])
+        self.assertIsNone(row["permanent_local_metadata_locator"])
+        self.assertEqual(row["validation_summary"]["member_count"], 1)
+        replay = self.db.mark_stored_tar_validated_part(
+            container["container_id"], owner, part, summary,
+            [{"plan_ordinal": 1, "path": "missing.bin",
+              "disposition": "source_missing", "evidence": "lstat_missing"}])
+        self.assertEqual(replay["validation_state"], "validated_part")
+
+    def test_017_pair_becomes_ready_in_one_owner_checked_transaction(self):
+        session, _plan, container, _part, owner, _summary = (
+            self._validated_tar_publication_fixture())
+        values = {
+            "container_id": container["container_id"],
+            "owner_token": owner,
+            "sidecar_locator": "tar_sidecars/s/c.jsonl.zst",
+            "sidecar_version": "tar-sidecar-v1",
+            "sidecar_size_bytes": 123,
+            "temporary_data_locator": os.path.join(
+                self.staging.name, "container.tar"),
+            "tar_size_bytes": 262144,
+            "observed_member_count": 1,
+            "observed_logical_bytes": 3,
+            "disposition_counts": {
+                "archived": 1, "source_missing": 1,
+                "source_permission_denied": 0, "source_unreadable": 0,
+                "source_changed": 0, "unresolved": 0,
+            },
+        }
+        published = self.db.publish_stored_tar_pair(**values)
+        self.assertEqual(
+            published["container"]["validation_state"], "ready")
+        self.assertEqual(
+            published["artifact"]["readiness_state"], "ready")
+        self.assertIsNone(published["container"]["owner_token"])
+        artifacts = self.db.get_archive_artifacts(session, 1)
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(artifacts[0]["local_locator"], values["sidecar_locator"])
+        replay = self.db.publish_stored_tar_pair(**{
+            **values, "owner_token": "recovery-owner"})
+        self.assertEqual(replay["container"]["validation_state"], "ready")
+
+    def test_017_conflicting_sidecar_rolls_back_the_pair(self):
+        session, _plan, container, _part, owner, _summary = (
+            self._validated_tar_publication_fixture())
+        self.db.create_archive_artifact({
+            "session_id": session, "chunk_index": 1,
+            "container_id": container["container_id"],
+            "artifact_kind": "tar_sidecar",
+            "artifact_version": "tar-sidecar-v1",
+            "local_locator": "conflicting/sidecar.jsonl.zst",
+        })
+        with self.assertRaisesRegex(RuntimeError, "conflicts on local_locator"):
+            self.db.publish_stored_tar_pair(
+                container_id=container["container_id"], owner_token=owner,
+                sidecar_locator="tar_sidecars/s/c.jsonl.zst",
+                sidecar_version="tar-sidecar-v1", sidecar_size_bytes=123,
+                temporary_data_locator=os.path.join(
+                    self.staging.name, "container.tar"),
+                tar_size_bytes=262144, observed_member_count=1,
+                observed_logical_bytes=3,
+                disposition_counts={
+                    "archived": 1, "source_missing": 1,
+                    "source_permission_denied": 0, "source_unreadable": 0,
+                    "source_changed": 0, "unresolved": 0})
+        row = self.db.get_archive_containers(session, 1)[0]
+        self.assertEqual(row["validation_state"], "validated_part")
+        artifact = self.db.get_archive_artifacts(session, 1)[0]
+        self.assertEqual(artifact["readiness_state"], "planned")
+        self.assertEqual(
+            artifact["local_locator"], "conflicting/sidecar.jsonl.zst")
+
 
 if __name__ == "__main__":
     unittest.main()

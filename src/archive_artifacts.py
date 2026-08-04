@@ -38,6 +38,7 @@ import io
 import json
 import os
 import posixpath
+import shutil
 import uuid
 from dataclasses import dataclass
 
@@ -48,13 +49,21 @@ except ImportError:                # pragma: no cover - requirements ships it
 
 from .logsetup import get_logger
 from .paths import _long
-from .tar_container import validate_tar_member_name
+from .pipeline_types import SourceDisposition, StoredTarSourceDiagnostic
+from .tar_container import (
+    STORED_TAR_DIALECT,
+    STORED_TAR_FORMAT_VERSION,
+    StoredTarError,
+    validate_stored_tar_part,
+    validate_tar_member_name,
+)
 
 #: Artifact format version. A reader refuses anything it does not know.
 ARTIFACT_VERSION = "scan-segment-v1"
 
 # Phase 1 establishes the consumer contract before any TAR producer is enabled.
-TAR_SIDECAR_VERSION = "stored-tar-sidecar-v1"
+TAR_SIDECAR_VERSION = "tar-sidecar-v1"
+TAR_SIDECAR_NAMESPACE = "tar_sidecars"
 MAX_TAR_SIDECAR_RECORDS = 1_000_000
 
 #: Namespaced subdirectory under the local manifest archive root. Keeping
@@ -82,6 +91,19 @@ class TarSidecarSearchResult:
     expected_members: tuple
     matches: tuple
     footer: dict
+
+
+@dataclass(frozen=True)
+class StoredTarPairPublication:
+    """Ready local data/metadata pair after the owner-checked DB commit."""
+
+    tar_path: str
+    sidecar_path: str
+    sidecar_locator: str
+    tar_size: int
+    sidecar_size: int
+    disposition_counts: dict
+    pack_sidecar_path: str = ""
 
 
 def _require_zstd():
@@ -175,11 +197,11 @@ def resolve_local_metadata_locator(archive_root, locator, *, tape_root=None,
 
 
 def _sidecar_source_path(header, record, member_name):
-    original = record.get("original_path") or record.get("source_path")
+    original = (record.get("canonical_source_path")
+                or record.get("original_path") or record.get("source_path"))
     if original:
-        return str(original).replace("\\", "/")
-    base = str(header.get("source_base_path") or "").replace(
-        "\\", "/").rstrip("/")
+        return str(original)
+    base = str(header.get("source_base_path") or "").rstrip("/")
     return f"{base}/{member_name}" if base else member_name
 
 
@@ -264,6 +286,9 @@ def search_tar_sidecar(path, *, directory=None, query=None, limit=10_000,
                 if kind == "source_exception" and source_exception is None:
                     source_exception = (record.get("disposition")
                                         or record.get("status"))
+                if kind == "source_exception" and member_name is not None:
+                    raise ArtifactError(
+                        "source-exception sidecar record invents a member name")
                 if member_name is not None:
                     try:
                         member_name = validate_tar_member_name(str(member_name))
@@ -274,7 +299,8 @@ def search_tar_sidecar(path, *, directory=None, query=None, limit=10_000,
                 try:
                     size = int(record.get(
                         "logical_size", record.get(
-                            "file_size_bytes", record.get("size"))))
+                            "expected_size", record.get(
+                                "file_size_bytes", record.get("size")))))
                     ordinal = int(record.get(
                         "ordinal", record.get(
                             "plan_ordinal", record.get("scan_ordinal"))))
@@ -304,7 +330,26 @@ def search_tar_sidecar(path, *, directory=None, query=None, limit=10_000,
                 }
                 expected.append(item)
                 if source_exception is not None:
+                    allowed_exceptions = {
+                        SourceDisposition.SOURCE_MISSING.value,
+                        SourceDisposition.SOURCE_PERMISSION_DENIED.value,
+                        SourceDisposition.SOURCE_UNREADABLE.value,
+                    }
+                    if str(source_exception) not in allowed_exceptions:
+                        raise ArtifactError(
+                            "TAR sidecar contains a blocking source disposition")
+                    source_path = _sidecar_source_path(
+                        header, record, member_name)
+                    if (not source_path or "\0" in source_path
+                            or any(part in (".", "..")
+                                   for part in source_path.split("/"))):
+                        raise ArtifactError(
+                            "unsafe source-exception path in TAR sidecar")
                     continue
+                observed_size = record.get("observed_archived_size")
+                if observed_size is not None and int(observed_size) != size:
+                    raise ArtifactError(
+                        "TAR sidecar expected/observed member size mismatch")
                 logical_bytes += size
                 original_path = _sidecar_source_path(
                     header, record, member_name)
@@ -314,11 +359,10 @@ def search_tar_sidecar(path, *, directory=None, query=None, limit=10_000,
                     raise ArtifactError(
                         f"unsafe canonical source path in TAR sidecar: "
                         f"{original_path!r}")
-                source_base = str(header.get("source_base_path") or "").replace(
-                    "\\", "/").rstrip("/")
+                source_base = str(header.get("source_base_path") or "").rstrip("/")
                 expected_source = (f"{source_base}/{member_name}"
-                                   if source_base else member_name)
-                if original_path != expected_source:
+                                   if source_base else None)
+                if expected_source is not None and original_path != expected_source:
                     raise ArtifactError(
                         "TAR sidecar source path disagrees with its canonical "
                         "source root/member name")
@@ -624,11 +668,464 @@ def find_orphan_parts(archive_root):
     return sorted(found)
 
 
+def publish_no_clobber(part_path, final_path):
+    """Atomically publish ``part_path`` without ever replacing ``final_path``.
+
+    ``os.replace`` is intentionally forbidden here: its successful race outcome
+    is data loss.  Windows rename is already no-clobber; elsewhere a same-volume
+    hard-link creation provides the atomic create-if-absent primitive.
+    """
+    part = os.path.abspath(str(part_path))
+    final = os.path.abspath(str(final_path))
+    if not os.path.isfile(_long(part)):
+        raise ArtifactError(f"publication part is missing: {part}")
+    os.makedirs(_long(os.path.dirname(final)), exist_ok=True)
+    try:
+        if os.name == "nt":
+            os.rename(_long(part), _long(final))
+        else:  # pragma: no cover - production is Windows; keeps tests portable
+            os.link(_long(part), _long(final))
+            os.unlink(_long(part))
+    except FileExistsError as exc:
+        raise ArtifactConflict(
+            f"refusing to overwrite published artifact: {final}") from exc
+    return final
+
+
+def tar_sidecar_locator(session_id, chunk_index, container_ordinal):
+    return posixpath.join(
+        TAR_SIDECAR_NAMESPACE,
+        f"session_{int(session_id):06d}",
+        f"chunk_{int(chunk_index):06d}",
+        f"container_{int(container_ordinal):04d}.jsonl.zst")
+
+
+def _record_value(record, *names, default=None):
+    if isinstance(record, dict):
+        for name in names:
+            if name in record:
+                return record[name]
+        return default
+    for name in names:
+        if hasattr(record, name):
+            return getattr(record, name)
+    return default
+
+
+def _coerce_sidecar_plan(plan_members, container_ordinal):
+    entries = []
+    ordinals = set()
+    names = set()
+    for raw in plan_members:
+        ordinal = int(_record_value(
+            raw, "plan_ordinal", "ordinal", "scan_ordinal"))
+        assigned = _record_value(
+            raw, "container_ordinal", default=container_ordinal)
+        if assigned is None or int(assigned) != int(container_ordinal):
+            raise ArtifactError(
+                f"plan ordinal {ordinal} belongs to another container")
+        name = _record_value(raw, "member_name", "name", "remote_path")
+        size = _record_value(
+            raw, "expected_size", "expected_logical_bytes", "logical_size",
+            "file_size_bytes", "size")
+        canonical = _record_value(
+            raw, "canonical_source_path", "source_path", "original_path",
+            default=name)
+        if name is None or size is None or canonical is None:
+            raise ArtifactError("sidecar plan entry lacks name/size/source path")
+        name = validate_tar_member_name(str(name))
+        canonical = str(canonical)
+        if "\0" in canonical or any(
+                component in (".", "..")
+                for component in canonical.split("/")):
+            raise ArtifactError(
+                f"unsafe canonical source path: {canonical!r}")
+        if ordinal in ordinals:
+            raise ArtifactError(f"duplicate plan ordinal {ordinal}")
+        if name in names:
+            raise ArtifactError(f"duplicate planned member {name!r}")
+        ordinals.add(ordinal)
+        names.add(name)
+        entries.append({
+            "plan_ordinal": ordinal,
+            "member_name": name,
+            "canonical_source_path": canonical,
+            "expected_size": int(size),
+            "container_ordinal": int(container_ordinal),
+        })
+    entries.sort(key=lambda item: item["plan_ordinal"])
+    return tuple(entries)
+
+
+def _coerce_sidecar_diagnostics(source_diagnostics):
+    result = {}
+    for raw in source_diagnostics or ():
+        if isinstance(raw, StoredTarSourceDiagnostic):
+            item = raw
+        else:
+            try:
+                item = StoredTarSourceDiagnostic(
+                    plan_ordinal=int(_record_value(
+                        raw, "plan_ordinal", "ordinal")),
+                    path=str(_record_value(raw, "path", "member_name", "name")),
+                    disposition=SourceDisposition(_record_value(
+                        raw, "disposition", "status")),
+                    evidence=str(_record_value(raw, "evidence", default="")),
+                )
+            except (TypeError, ValueError) as exc:
+                raise ArtifactError("invalid source diagnostic") from exc
+        if item.plan_ordinal in result:
+            raise ArtifactError(
+                f"duplicate source diagnostic ordinal {item.plan_ordinal}")
+        result[item.plan_ordinal] = item
+    return result
+
+
+def _sidecar_records(plan, validation, diagnostics, *, session_id,
+                     chunk_index, container_id, container_ordinal,
+                     tar_size):
+    members = {item.ordinal: item for item in validation.members}
+    records = [{
+        "record_type": "header",
+        "version": TAR_SIDECAR_VERSION,
+        "session_id": int(session_id),
+        "chunk_index": int(chunk_index),
+        "container_id": int(container_id),
+        "container_ordinal": int(container_ordinal),
+        "format_version": STORED_TAR_FORMAT_VERSION,
+        "tar_dialect": STORED_TAR_DIALECT,
+        "tar_size_bytes": int(tar_size),
+        "plan_ordinal_count": len(plan),
+    }]
+    logical_bytes = 0
+    disposition_counts = {item.value: 0 for item in SourceDisposition}
+    for expected in plan:
+        ordinal = expected["plan_ordinal"]
+        diagnostic = diagnostics.get(ordinal)
+        member = members.get(ordinal)
+        identity = {
+            "session_id": int(session_id),
+            "chunk_index": int(chunk_index),
+            "container_id": int(container_id),
+            "container_ordinal": int(container_ordinal),
+            "plan_ordinal": ordinal,
+            "ordinal": ordinal,
+            "canonical_source_path": expected["canonical_source_path"],
+            "expected_size": expected["expected_size"],
+            "logical_size": expected["expected_size"],
+        }
+        if diagnostic is not None:
+            if member is not None:
+                raise ArtifactError(
+                    f"ordinal {ordinal} is both archived and a source exception")
+            if diagnostic.path != expected["member_name"]:
+                raise ArtifactError(
+                    f"source diagnostic path mismatch at ordinal {ordinal}")
+            if diagnostic.disposition not in {
+                    SourceDisposition.SOURCE_MISSING,
+                    SourceDisposition.SOURCE_PERMISSION_DENIED,
+                    SourceDisposition.SOURCE_UNREADABLE}:
+                raise ArtifactError(
+                    f"{diagnostic.disposition.value} blocks sidecar readiness")
+            records.append({
+                "record_type": "source_exception",
+                **identity,
+                "disposition": diagnostic.disposition.value,
+                "source_exception": diagnostic.disposition.value,
+                "evidence": diagnostic.evidence,
+                "diagnostic_path": diagnostic.path,
+            })
+            disposition_counts[diagnostic.disposition.value] += 1
+            continue
+        if member is None:
+            raise ArtifactError(
+                f"plan ordinal {ordinal} has neither TAR member nor diagnostic")
+        if (member.name != expected["member_name"]
+                or member.logical_size != expected["expected_size"]):
+            disposition_counts[SourceDisposition.SOURCE_CHANGED.value] += 1
+            raise ArtifactError(
+                f"source_changed at plan ordinal {ordinal}; TAR is rejected")
+        records.append({
+            "record_type": "member",
+            **identity,
+            "member_name": member.name,
+            "observed_archived_size": member.logical_size,
+            "stored_size": member.stored_size,
+            "disposition": SourceDisposition.ARCHIVED.value,
+            "sparse": bool(member.sparse),
+            "sparse_extent_count": int(member.sparse_extent_count),
+        })
+        disposition_counts[SourceDisposition.ARCHIVED.value] += 1
+        logical_bytes += member.logical_size
+    if sum(disposition_counts.values()) != len(plan):
+        raise ArtifactError("sidecar records do not account for every plan ordinal")
+    records.append({
+        "record_type": "footer",
+        "plan_ordinal_count": len(plan),
+        "member_count": validation.member_count,
+        "logical_bytes": logical_bytes,
+        "tar_size_bytes": int(tar_size),
+        "disposition_counts": disposition_counts,
+    })
+    return records, disposition_counts
+
+
+def _write_tar_sidecar_part(part_path, records):
+    _require_zstd()
+    os.makedirs(_long(os.path.dirname(part_path)), exist_ok=True)
+    raw = open(_long(part_path), "xb")
+    compressed = None
+    try:
+        compressed = zstd.ZstdCompressor().stream_writer(raw, closefd=False)
+        text = io.TextIOWrapper(compressed, encoding="utf-8", newline="\n")
+        try:
+            for record in records:
+                text.write(json.dumps(
+                    record, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":")))
+                text.write("\n")
+            text.flush()
+            text.detach()
+            compressed.close()
+            raw.flush()
+            os.fsync(raw.fileno())
+        finally:
+            if compressed is not None and not compressed.closed:
+                compressed.close()
+    finally:
+        raw.close()
+    return os.path.getsize(_long(part_path))
+
+
+def _read_sidecar_records(path, *, allow_part=False):
+    _require_zstd()
+    if str(path).endswith(".part") and not allow_part:
+        raise ArtifactError("refusing to read an unpublished TAR sidecar .part")
+    records = []
+    try:
+        with open(_long(path), "rb") as raw:
+            reader = zstd.ZstdDecompressor().stream_reader(raw)
+            text = io.TextIOWrapper(reader, encoding="utf-8")
+            try:
+                for line_number, line in enumerate(text, 1):
+                    if not line.strip():
+                        continue
+                    try:
+                        records.append(json.loads(line))
+                    except json.JSONDecodeError as exc:
+                        raise ArtifactError(
+                            f"invalid TAR sidecar JSON at line {line_number}") \
+                            from exc
+            finally:
+                text.close()
+    except (OSError, zstd.ZstdError) as exc:
+        raise ArtifactError(f"cannot read TAR sidecar {path!r}") from exc
+    return records
+
+
+def validate_tar_sidecar(path, plan_members, validation, source_diagnostics,
+                         *, session_id, chunk_index, container_id,
+                         container_ordinal, tar_size, allow_part=False):
+    """Prove a complete sidecar is exactly equivalent to plan + TAR parse."""
+    plan = _coerce_sidecar_plan(plan_members, container_ordinal)
+    diagnostics = _coerce_sidecar_diagnostics(source_diagnostics)
+    expected, counts = _sidecar_records(
+        plan, validation, diagnostics, session_id=session_id,
+        chunk_index=chunk_index, container_id=container_id,
+        container_ordinal=container_ordinal, tar_size=tar_size)
+    actual = _read_sidecar_records(path, allow_part=allow_part)
+    if actual != expected:
+        raise ArtifactError("TAR sidecar is not equivalent to its plan/TAR")
+    return counts
+
+
+def _files_equal(left, right, chunk_size=1024 * 1024):
+    try:
+        if os.path.getsize(_long(left)) != os.path.getsize(_long(right)):
+            return False
+        with open(_long(left), "rb") as one, open(_long(right), "rb") as two:
+            while True:
+                a = one.read(chunk_size)
+                b = two.read(chunk_size)
+                if a != b:
+                    return False
+                if not a:
+                    return True
+    except OSError:
+        return False
+
+
+def _copy_ready_sidecar_to_pack(sidecar_path, pack_dir):
+    if not pack_dir:
+        return ""
+    os.makedirs(_long(pack_dir), exist_ok=True)
+    final = os.path.join(pack_dir, os.path.basename(sidecar_path))
+    if os.path.exists(_long(final)):
+        if not _files_equal(sidecar_path, final):
+            raise ArtifactConflict(
+                f"pack sidecar conflicts with permanent copy: {final}")
+        return final
+    part = f"{final}.{uuid.uuid4().hex[:12]}.part"
+    try:
+        with open(_long(sidecar_path), "rb") as source, \
+                open(_long(part), "xb") as target:
+            shutil.copyfileobj(source, target, 1024 * 1024)
+            target.flush()
+            os.fsync(target.fileno())
+        try:
+            publish_no_clobber(part, final)
+        except ArtifactConflict:
+            if not _files_equal(sidecar_path, final):
+                raise
+            os.remove(_long(part))
+    except Exception:
+        # The authoritative permanent sidecar is never removed by pack cleanup
+        # or by a failed co-location attempt.
+        try:
+            os.remove(_long(part))
+        except OSError:
+            pass
+        raise
+    return final
+
+
+def publish_stored_tar_pair(
+        archive_root, tar_part_path, final_tar_path, plan_members,
+        source_diagnostics, *, validation=None, session_id, chunk_index,
+        container_id, container_ordinal, owner_token, db, pack_dir=None,
+        crash_hook=None):
+    """Sidecar-first filesystem publication followed by one paired DB CAS."""
+    hook = crash_hook or (lambda _stage: None)
+    archive_root = os.path.abspath(str(archive_root))
+    tar_part_path = os.path.abspath(str(tar_part_path))
+    final_tar_path = os.path.abspath(str(final_tar_path))
+    sidecar_locator = tar_sidecar_locator(
+        session_id, chunk_index, container_ordinal)
+    sidecar_path = resolve_locator(archive_root, sidecar_locator)
+    sidecar_existed = os.path.isfile(_long(sidecar_path))
+    tar_final_existed = os.path.isfile(_long(final_tar_path))
+
+    diagnostics = tuple(source_diagnostics or ())
+    # A final TAR without its sidecar has already crossed the ordering boundary.
+    # Reconstruct metadata only for an all-present exact plan, never from an
+    # exception set whose sole trusted durable copy should have been the sidecar.
+    if tar_final_existed and not sidecar_existed and diagnostics:
+        raise ArtifactError(
+            "final TAR has no sidecar and source exceptions existed; refuse "
+            "to infer or reconstruct exception evidence")
+
+    validation_source = (
+        tar_part_path if os.path.isfile(_long(tar_part_path))
+        else final_tar_path)
+    if not os.path.isfile(_long(validation_source)):
+        raise ArtifactError("neither validated TAR part nor final TAR exists")
+    try:
+        current_validation = validate_stored_tar_part(
+            validation_source, plan_members,
+            container_ordinal=container_ordinal,
+            source_diagnostics=diagnostics,
+            require_part=validation_source.endswith(".part"))
+    except StoredTarError as exc:
+        raise ArtifactError(f"Stored TAR revalidation failed: {exc}") from exc
+    if validation is not None and current_validation != validation:
+        raise ArtifactError("Stored TAR validation summary changed before publish")
+    validation = current_validation
+    tar_size = validation.archive_size
+
+    if sidecar_existed:
+        counts = validate_tar_sidecar(
+            sidecar_path, plan_members, validation, diagnostics,
+            session_id=session_id, chunk_index=chunk_index,
+            container_id=container_id, container_ordinal=container_ordinal,
+            tar_size=tar_size)
+    else:
+        plan = _coerce_sidecar_plan(plan_members, container_ordinal)
+        diag_map = _coerce_sidecar_diagnostics(diagnostics)
+        records, counts = _sidecar_records(
+            plan, validation, diag_map, session_id=session_id,
+            chunk_index=chunk_index, container_id=container_id,
+            container_ordinal=container_ordinal, tar_size=tar_size)
+        sidecar_part = f"{sidecar_path}.{uuid.uuid4().hex[:12]}.part"
+        _write_tar_sidecar_part(sidecar_part, records)
+        validate_tar_sidecar(
+            sidecar_part, plan_members, validation, diagnostics,
+            session_id=session_id, chunk_index=chunk_index,
+            container_id=container_id, container_ordinal=container_ordinal,
+            tar_size=tar_size, allow_part=True)
+        hook("after_sidecar_validation")
+        try:
+            publish_no_clobber(sidecar_part, sidecar_path)
+        except ArtifactConflict:
+            validate_tar_sidecar(
+                sidecar_path, plan_members, validation, diagnostics,
+                session_id=session_id, chunk_index=chunk_index,
+                container_id=container_id, container_ordinal=container_ordinal,
+                tar_size=tar_size)
+            try:
+                os.remove(_long(sidecar_part))
+            except OSError:
+                pass
+        hook("after_sidecar_publication")
+
+    # The permanent sidecar exists and is fully equivalent before the data name
+    # can become final.  A racing existing final is reused only after a bounded
+    # byte-for-byte comparison and a fresh semantic parse.
+    if os.path.isfile(_long(final_tar_path)):
+        if os.path.isfile(_long(tar_part_path)):
+            if not _files_equal(tar_part_path, final_tar_path):
+                raise ArtifactConflict(
+                    "same-name final TAR conflicts with the validated part")
+        validate_stored_tar_part(
+            final_tar_path, plan_members, container_ordinal=container_ordinal,
+            source_diagnostics=diagnostics, require_part=False)
+    else:
+        try:
+            publish_no_clobber(tar_part_path, final_tar_path)
+        except ArtifactConflict:
+            if not _files_equal(tar_part_path, final_tar_path):
+                raise
+            validate_stored_tar_part(
+                final_tar_path, plan_members,
+                container_ordinal=container_ordinal,
+                source_diagnostics=diagnostics, require_part=False)
+            try:
+                os.remove(_long(tar_part_path))
+            except OSError:
+                pass
+        hook("after_tar_publication")
+
+    sidecar_size = os.path.getsize(_long(sidecar_path))
+    pack_sidecar_path = _copy_ready_sidecar_to_pack(sidecar_path, pack_dir)
+    hook("before_paired_db_commit")
+    row = db.publish_stored_tar_pair(
+        container_id=int(container_id), owner_token=str(owner_token),
+        sidecar_locator=sidecar_locator,
+        sidecar_version=TAR_SIDECAR_VERSION,
+        sidecar_size_bytes=sidecar_size,
+        temporary_data_locator=final_tar_path,
+        tar_size_bytes=tar_size,
+        observed_member_count=validation.member_count,
+        observed_logical_bytes=validation.logical_bytes,
+        disposition_counts=counts,
+    )
+    if not row:
+        raise ArtifactError("owner-checked paired TAR publication was refused")
+    hook("after_paired_db_commit")
+    return StoredTarPairPublication(
+        tar_path=final_tar_path, sidecar_path=sidecar_path,
+        sidecar_locator=sidecar_locator, tar_size=tar_size,
+        sidecar_size=sidecar_size, disposition_counts=dict(counts),
+        pack_sidecar_path=pack_sidecar_path)
+
+
 __all__ = [
     "ARTIFACT_NAMESPACE", "ARTIFACT_VERSION", "TAR_SIDECAR_VERSION",
     "ArtifactConflict", "ArtifactError", "JsonlZstArtifactWriter",
-    "TarSidecarSearchResult", "artifact_root", "find_orphan_parts",
+    "StoredTarPairPublication", "TarSidecarSearchResult", "artifact_root",
+    "find_orphan_parts",
     "is_ltfs_locator", "parse_jsonl_zst_artifact",
+    "publish_no_clobber", "publish_stored_tar_pair",
     "resolve_local_metadata_locator", "resolve_locator",
-    "search_tar_sidecar", "segment_locator",
+    "search_tar_sidecar", "segment_locator", "tar_sidecar_locator",
+    "validate_tar_sidecar",
 ]

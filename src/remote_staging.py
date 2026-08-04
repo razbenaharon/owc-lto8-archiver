@@ -29,6 +29,7 @@ import random
 import shutil
 import threading
 import time
+import uuid
 from collections import defaultdict
 from datetime import datetime
 
@@ -41,14 +42,18 @@ from .exit_codes import (
     REASON_MISSING_NONINTERACTIVE_CREDENTIAL, REASON_SSH_AUTHENTICATION_FAILED,
     REASON_SSH_HOST_KEY_MISMATCH, REASON_SSH_PERMISSION_DENIED)
 from .logsetup import get_logger
+from .archive_artifacts import (
+    publish_stored_tar_pair, resolve_locator, tar_sidecar_locator)
 from .packer import LTOPacker
 from .paths import (_LEGACY_PATH_LIMIT, _dir_tree_size,
-                    _disambiguate_local_rel, _exceeds_legacy_path_limit,
-                    _long, _remote_fetch_base_and_rel,
+                     _disambiguate_local_rel, _exceeds_legacy_path_limit,
+                     _long, _remote_fetch_base_and_rel,
+                     remote_store_base_and_rel,
                     _reserved_name_component, _winsafe_extracted_rel)
 from .pipeline_types import ChunkStatus, ContainerFormat, StagedChunk
 from .ram_telemetry import RamStageSampler
-from .remote_transport import _remote_tar_fetch
+from .remote_transport import _remote_tar_fetch, _remote_tar_store
+from .tar_container import validate_stored_tar_part
 from .runtime import (CANCEL, _fmt_eta, _phase, _progress_done, _progress_line,
                       _status)
 from .telegram_notify import send_best_effort
@@ -168,6 +173,150 @@ class RemoteChunkStager:
         #: The RemoteOrchestrator façade that owns session state and config.
         self.host = host
 
+    def _build_stored_tar_container(
+            self, session_id, chunk_index, container_plan, plan_members,
+            pack_dir, *, owner_token=None, abort_evt=None, crash_hook=None):
+        """Build and publish one Task-2.2/2.3/2.4 container pair.
+
+        Task 2.5 will route TAR-assigned chunks here.  Keeping this entry point
+        dormant today preserves the feature gate and the existing ZIP path.
+        """
+        owner = str(owner_token or uuid.uuid4().hex)
+        members = sorted(plan_members, key=lambda item: int(item.plan_ordinal))
+        remote_bases = []
+        sidecar_plan = []
+        for item in members:
+            base, rel = remote_store_base_and_rel(
+                self.host.remote_path, item.remote_path)
+            remote_bases.append(base)
+            sidecar_plan.append({
+                "member_name": rel,
+                "canonical_source_path": item.remote_path,
+                "expected_size": int(item.file_size_bytes),
+                "plan_ordinal": int(item.plan_ordinal),
+                "container_ordinal": int(container_plan.container_ordinal),
+            })
+        if not sidecar_plan:
+            raise RuntimeError("Stored TAR container plan is empty")
+        if len(set(remote_bases)) != 1:
+            raise RuntimeError(
+                "Stored TAR container members do not share one remote base")
+
+        os.makedirs(_long(pack_dir), exist_ok=True)
+        final_tar = os.path.join(pack_dir, container_plan.container_name)
+        container_rows = self.host.db.get_archive_containers(
+            session_id, chunk_index)
+        container_row = next(
+            (row for row in container_rows
+             if int(row["container_ordinal"])
+             == int(container_plan.container_ordinal)), None)
+        if container_row is None:
+            raise RuntimeError("Stored TAR container identity is absent")
+        container_id = int(container_row["container_id"])
+        existing_owner = container_row.get("owner_token")
+        existing_part = container_row.get("validated_part_locator")
+        if (existing_part and container_row.get("validation_state") in (
+                "building", "validated_part", "ready")
+                and (existing_owner in (None, owner))):
+            part_path = existing_part
+        else:
+            part_path = f"{final_tar}.{uuid.uuid4().hex[:12]}.part"
+        self.host.db.claim_stored_tar_container_build(
+            container_id, owner, part_path)
+
+        existing_state = container_row.get("validation_state")
+        if existing_state in ("validated_part", "ready"):
+            summary = container_row.get("validation_summary") or {}
+            diagnostics = tuple(summary.get("source_diagnostics") or ())
+            sidecar_path = resolve_locator(
+                self.host.cfg.local_manifest_archive_root,
+                tar_sidecar_locator(
+                    session_id, chunk_index,
+                    container_plan.container_ordinal))
+            if (existing_state == "validated_part" and diagnostics
+                    and os.path.isfile(_long(final_tar))
+                    and not os.path.isfile(_long(sidecar_path))):
+                # The only durable exception evidence should have preceded the
+                # final TAR.  Preserve the anomalous local data as evidence,
+                # reset only under the still-current pre-writer owner, and
+                # recapture source outcomes instead of inventing them.
+                quarantine = (
+                    f"{final_tar}.{uuid.uuid4().hex[:12]}.unready")
+                os.rename(_long(final_tar), _long(quarantine))
+                part_path = f"{final_tar}.{uuid.uuid4().hex[:12]}.part"
+                self.host.db.restart_stored_tar_build_from_source(
+                    container_id, owner, part_path)
+                existing_state = "building"
+            else:
+                return publish_stored_tar_pair(
+                    self.host.cfg.local_manifest_archive_root,
+                    part_path, final_tar, sidecar_plan, diagnostics,
+                    validation=None, session_id=session_id,
+                    chunk_index=chunk_index, container_id=container_id,
+                    container_ordinal=container_plan.container_ordinal,
+                    owner_token=owner, db=self.host.db, pack_dir=pack_dir,
+                    crash_hook=crash_hook)
+
+        retries = max(0, int(getattr(
+            self.host, "fetch_transient_retries", 0)))
+        retry_base = float(getattr(
+            self.host, "fetch_transient_retry_base", 5.0))
+        result = None
+        for attempt in range(retries + 1):
+            if attempt or (existing_state == "building"
+                           and os.path.exists(_long(part_path))):
+                # Ownership was established before the first byte.  A transient
+                # retry discards only that owner's unpublished partial stream and
+                # restarts at byte zero.
+                try:
+                    os.remove(_long(part_path))
+                except FileNotFoundError:
+                    pass
+            result = _remote_tar_store(
+                self.host.remote_user, self.host.remote_host, remote_bases[0],
+                [item["member_name"] for item in sidecar_plan], part_path,
+                plan_ordinals=[item["plan_ordinal"] for item in sidecar_plan],
+                password=self.host.remote_password, cipher=self.host.ssh_cipher,
+                use_mbuffer=self.host.use_mbuffer,
+                mbuffer_size=self.host.mbuffer_size,
+                fetch_cores=self.host.fetch_cores, abort_evt=abort_evt)
+            if result.ok:
+                break
+            detail = "\n".join(filter(None, (result.error, result.stderr)))
+            if (attempt >= retries or result.cancelled
+                    or not _is_transient_fetch_error(detail)):
+                self.host._note_fetch_failure(detail)
+                raise RuntimeError(f"direct Stored TAR stream failed: {detail}")
+            delay = self.host._fetch_backoff_delay(attempt, retry_base)
+            self.host._note_fetch_failure(
+                detail, retry_attempt=attempt + 1,
+                next_retry_delay=delay)
+            if abort_evt is not None and abort_evt.wait(delay):
+                raise RuntimeError("direct Stored TAR stream cancelled")
+            if CANCEL.is_set():
+                raise RuntimeError("direct Stored TAR stream cancelled")
+        assert result is not None and result.ok
+
+        validation = validate_stored_tar_part(
+            part_path, sidecar_plan,
+            container_ordinal=container_plan.container_ordinal,
+            source_diagnostics=result.diagnostics,
+            tar_dialect=container_plan.tar_dialect,
+            format_version=container_plan.format_version)
+        self.host.db.mark_stored_tar_validated_part(
+            container_id, owner, part_path, validation,
+            result.diagnostics)
+        if crash_hook is not None:
+            crash_hook("after_validated_part_state")
+        return publish_stored_tar_pair(
+            self.host.cfg.local_manifest_archive_root,
+            part_path, final_tar, sidecar_plan, result.diagnostics,
+            validation=validation, session_id=session_id,
+            chunk_index=chunk_index, container_id=container_id,
+            container_ordinal=container_plan.container_ordinal,
+            owner_token=owner, db=self.host.db, pack_dir=pack_dir,
+            crash_hook=crash_hook)
+
     def _stage_chunk(self, session_id, chunk_index, chunk_files):
         """Fetch then pack one chunk. Returns a ready-descriptor or None."""
         self.host._producer_chunk = chunk_index
@@ -203,8 +352,11 @@ class RemoteChunkStager:
                     self.host.cfg.stored_tar_max_size_gb * 1024**3),
             )
             raise RuntimeError(
-                "[STAGING] Stored TAR is durably assigned and its container "
-                "plan is persisted, but TAR production is outside Task 2.1; "
+                "[STAGING] Stored TAR plan is persisted and production is "
+                "implemented behind the "
+                "disabled gate; TAR production is outside Task 2.1 "
+                "activation and "
+                "Task 2.5 is not activated; "
                 "preserving the chunk unchanged")
         # The session id is embedded so the on-tape root (basename(pack_dir),
         # see LTOBackup._run_locked) is unique per session — two sessions on the

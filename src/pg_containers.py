@@ -5,8 +5,13 @@ PostgreSQL concern modules.  It owns the one authoritative new-chunk format
 assignment seam and the identities handed from staging to the writer.  It never
 opens a tape path and never infers a format from a filename extension.
 """
+import json
+import os
+import posixpath
+from dataclasses import asdict, is_dataclass
+
 from .pipeline_types import (ArtifactReadiness, ContainerFormat,
-                             ContainerValidationState)
+                             ContainerValidationState, SourceDisposition)
 from .pg_core import _row, _rows
 from .stored_tar_planning import (build_stored_tar_chunk_plan,
                                   StoredTarChunkPlan,
@@ -1175,6 +1180,12 @@ class PgContainerMixin:
                 conn, "remote_chunks", "stored_tar_max_size_bytes")
             and self._column_exists_conn(
                 conn, "archive_containers", "estimated_archive_bytes")
+            and self._column_exists_conn(
+                conn, "archive_containers", "validated_part_locator")
+            and self._column_exists_conn(
+                conn, "archive_containers", "validation_summary")
+            and self._column_exists_conn(
+                conn, "archive_containers", "disposition_counts")
             and self._table_exists_conn(conn, "archive_container_members"))
 
     def stored_tar_plan_schema_installed(self):
@@ -1246,7 +1257,8 @@ class PgContainerMixin:
         def operation(conn):
             if not self._stored_tar_plan_schema_installed_conn(conn):
                 raise RuntimeError(
-                    "[DB] Stored TAR plan schema is absent; apply migration 016")
+                    "[DB] Stored TAR plan/publication schema is absent; apply "
+                    "migrations 016 and 017")
             return self._read_stored_tar_chunk_plan_conn(
                 conn, session_id, chunk_index)
         return self._run_read(
@@ -1262,7 +1274,8 @@ class PgContainerMixin:
         def operation(conn):
             if not self._stored_tar_plan_schema_installed_conn(conn):
                 raise RuntimeError(
-                    "[DB] Stored TAR plan schema is absent; apply migration 016")
+                    "[DB] Stored TAR plan/publication schema is absent; apply "
+                    "migrations 016 and 017")
             chunk = conn.execute(
                 """SELECT packaging_format, membership_state,
                           stored_tar_max_size_bytes
@@ -1401,6 +1414,329 @@ class PgContainerMixin:
                 (int(session_id), int(chunk_index)),
             ).fetchall()),
             f"get artifacts for session {session_id}, chunk {chunk_index}")
+
+    # ------------------------------------------------------------------
+    # Tasks 2.2-2.4: owner-scoped build and paired readiness publication
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _stored_tar_json(value):
+        if is_dataclass(value):
+            value = asdict(value)
+
+        def encode(item):
+            return getattr(item, "value", str(item))
+        return json.dumps(
+            value, default=encode, sort_keys=True, separators=(",", ":"))
+
+    def claim_stored_tar_container_build(
+            self, container_id, owner_token, part_locator, *,
+            lease_seconds=3600):
+        """Claim one unique part before launching SSH; never steal an owner."""
+        token = str(owner_token or "").strip()
+        part = str(part_locator or "")
+        if not token:
+            raise ValueError("Stored TAR build owner token is required")
+        if not part.lower().endswith(".part"):
+            raise ValueError("Stored TAR build locator must name a .part")
+        lease_seconds = max(1, int(lease_seconds))
+
+        def operation(conn):
+            row = conn.execute(
+                """SELECT * FROM archive_containers
+                   WHERE container_id=%s FOR UPDATE""",
+                (int(container_id),),
+            ).fetchone()
+            if row is None or row["container_format"] != "stored_tar":
+                raise RuntimeError("Stored TAR container does not exist")
+            if row["writer_state"] != "not_started":
+                raise RuntimeError("Stored TAR build cannot begin after writer start")
+            state = row["validation_state"]
+            if state == "ready":
+                return _row(row)
+            if row["owner_token"] not in (None, token):
+                raise RuntimeError("Stored TAR container is owned by another builder")
+            existing_part = row.get("validated_part_locator")
+            if state in ("building", "validated_part"):
+                if row["owner_token"] != token or existing_part != part:
+                    raise RuntimeError(
+                        "Stored TAR build identity conflicts with its existing part")
+                return _row(row)
+            if state != "planned":
+                raise RuntimeError(
+                    f"Stored TAR container is not buildable from state {state!r}")
+            row = conn.execute(
+                """UPDATE archive_containers
+                   SET validation_state='building', owner_token=%s,
+                       validated_part_locator=%s,
+                       lease_expires_at=now()+(%s * interval '1 second'),
+                       validation_started_at=COALESCE(validation_started_at, now()),
+                       updated_at=now()
+                   WHERE container_id=%s AND validation_state='planned'
+                     AND owner_token IS NULL
+                   RETURNING *""",
+                (token, part, lease_seconds, int(container_id)),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("Stored TAR build claim lost its owner race")
+            return _row(row)
+        return self._transaction(operation, "claim Stored TAR container build")
+
+    def mark_stored_tar_validated_part(
+            self, container_id, owner_token, part_locator, validation_summary,
+            source_diagnostics=()):
+        """Persist only unpublished-part proof; no final locator becomes ready."""
+        token = str(owner_token or "").strip()
+        part = str(part_locator or "")
+        if not token or not part.lower().endswith(".part"):
+            raise ValueError("validated Stored TAR part requires owner and .part")
+        summary = (asdict(validation_summary) if is_dataclass(validation_summary)
+                   else dict(validation_summary))
+        summary["source_diagnostics"] = [
+            asdict(item) if is_dataclass(item) else dict(item)
+            for item in (source_diagnostics or ())]
+        try:
+            observed_count = int(summary["member_count"])
+            observed_bytes = int(summary["logical_bytes"])
+            artifact_bytes = int(summary["archive_size"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid Stored TAR validation summary") from exc
+        payload = self._stored_tar_json(summary)
+
+        def operation(conn):
+            row = conn.execute(
+                """SELECT * FROM archive_containers
+                   WHERE container_id=%s FOR UPDATE""",
+                (int(container_id),),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("Stored TAR container does not exist")
+            if row["owner_token"] != token:
+                raise RuntimeError("Stored TAR validation owner check failed")
+            if row["validated_part_locator"] != part:
+                raise RuntimeError("Stored TAR validated part identity changed")
+            if row["validation_state"] == "validated_part":
+                if (row["observed_member_count"] != observed_count
+                        or row["observed_logical_bytes"] != observed_bytes
+                        or row["actual_artifact_bytes"] != artifact_bytes
+                        or row["validation_summary"] != json.loads(payload)):
+                    raise RuntimeError(
+                        "Stored TAR validated-part replay is not equivalent")
+                return _row(row)
+            if row["validation_state"] != "building":
+                raise RuntimeError("Stored TAR container is not being built")
+            row = conn.execute(
+                """UPDATE archive_containers
+                   SET observed_member_count=%s, observed_logical_bytes=%s,
+                       actual_artifact_bytes=%s,
+                       validation_summary=%s::jsonb,
+                       validation_state='validated_part', validated_at=now(),
+                       updated_at=now()
+                   WHERE container_id=%s AND owner_token=%s
+                     AND validation_state='building'
+                   RETURNING *""",
+                (observed_count, observed_bytes, artifact_bytes, payload,
+                 int(container_id), token),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("Stored TAR validated-part CAS failed")
+            return _row(row)
+        return self._transaction(operation, "mark Stored TAR validated part")
+
+    def restart_stored_tar_build_from_source(
+            self, container_id, owner_token, new_part_locator):
+        """Owner-proven pre-writer reset when exception evidence was lost."""
+        token = str(owner_token or "").strip()
+        part = str(new_part_locator or "")
+        if not token or not part.lower().endswith(".part"):
+            raise ValueError("source rebuild requires owner and a new .part")
+
+        def operation(conn):
+            row = conn.execute(
+                """SELECT * FROM archive_containers
+                   WHERE container_id=%s FOR UPDATE""",
+                (int(container_id),),
+            ).fetchone()
+            if (row is None or row["owner_token"] != token
+                    or row["writer_state"] != "not_started"
+                    or row["catalog_state"] != "not_started"
+                    or row["validation_state"] not in (
+                        "building", "validated_part")):
+                raise RuntimeError(
+                    "Stored TAR source rebuild lacks proven pre-writer ownership")
+            ready_sidecar = conn.execute(
+                """SELECT 1 FROM archive_artifacts
+                   WHERE container_id=%s AND artifact_kind='tar_sidecar'
+                     AND readiness_state='ready' LIMIT 1""",
+                (int(container_id),),
+            ).fetchone()
+            if ready_sidecar is not None:
+                raise RuntimeError(
+                    "Stored TAR source rebuild refused after sidecar readiness")
+            row = conn.execute(
+                """UPDATE archive_containers
+                   SET validated_part_locator=%s, validation_summary=NULL,
+                       disposition_counts=NULL, observed_member_count=NULL,
+                       observed_logical_bytes=NULL, actual_artifact_bytes=NULL,
+                       temporary_data_locator=NULL,
+                       permanent_local_metadata_locator=NULL,
+                       validation_state='building', validated_at=NULL,
+                       updated_at=now()
+                   WHERE container_id=%s AND owner_token=%s
+                   RETURNING *""",
+                (part, int(container_id), token),
+            ).fetchone()
+            return _row(row)
+        return self._transaction(
+            operation, "restart Stored TAR build from source")
+
+    def publish_stored_tar_pair(
+            self, *, container_id, owner_token, sidecar_locator,
+            sidecar_version, sidecar_size_bytes, temporary_data_locator,
+            tar_size_bytes, observed_member_count, observed_logical_bytes,
+            disposition_counts):
+        """Make TAR + permanent sidecar writer-visible in one owner-checked tx."""
+        token = str(owner_token or "").strip()
+        sidecar_locator = str(sidecar_locator or "")
+        data_locator = str(temporary_data_locator or "")
+        if (not token or not sidecar_locator
+                or sidecar_locator.lower().endswith(".part")
+                or not data_locator or data_locator.lower().endswith(".part")):
+            raise ValueError("paired TAR publication requires final locators")
+        if (sidecar_locator.startswith(("/", "\\"))
+                or (len(sidecar_locator) >= 2
+                    and sidecar_locator[1] == ":")
+                or any(part in ("", ".", "..")
+                       for part in sidecar_locator.split("/"))
+                or posixpath.normpath(sidecar_locator) != sidecar_locator):
+            raise ValueError("TAR sidecar locator must be safe and root-relative")
+        if not os.path.isabs(data_locator):
+            raise ValueError("temporary TAR data locator must be a local absolute path")
+        if int(sidecar_size_bytes) <= 0 or int(tar_size_bytes) <= 0:
+            raise ValueError("paired TAR artifact sizes must be positive")
+        counts = dict(disposition_counts)
+        required_dispositions = {item.value for item in SourceDisposition}
+        if set(counts) != required_dispositions:
+            raise ValueError("Stored TAR disposition aggregate has unknown/missing keys")
+        try:
+            counts = {key: int(value) for key, value in counts.items()}
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Stored TAR disposition counts must be integers") from exc
+        if any(value < 0 for value in counts.values()):
+            raise ValueError("Stored TAR disposition counts cannot be negative")
+        if counts[SourceDisposition.ARCHIVED.value] != int(
+                observed_member_count):
+            raise ValueError("archived disposition count disagrees with TAR members")
+        if counts[SourceDisposition.SOURCE_CHANGED.value] \
+                or counts[SourceDisposition.UNRESOLVED.value]:
+            raise ValueError("blocked Stored TAR dispositions cannot become ready")
+        counts_payload = self._stored_tar_json(counts)
+
+        def operation(conn):
+            container = conn.execute(
+                """SELECT * FROM archive_containers
+                   WHERE container_id=%s FOR UPDATE""",
+                (int(container_id),),
+            ).fetchone()
+            if container is None or container["container_format"] != "stored_tar":
+                raise RuntimeError("Stored TAR container does not exist")
+
+            artifact = conn.execute(
+                """SELECT * FROM archive_artifacts
+                   WHERE container_id=%s AND artifact_kind='tar_sidecar'
+                     AND artifact_version=%s FOR UPDATE""",
+                (int(container_id), str(sidecar_version)),
+            ).fetchone()
+            if container["validation_state"] == "ready":
+                checks = {
+                    "temporary_data_locator": data_locator,
+                    "permanent_local_metadata_locator": sidecar_locator,
+                    "actual_artifact_bytes": int(tar_size_bytes),
+                    "observed_member_count": int(observed_member_count),
+                    "observed_logical_bytes": int(observed_logical_bytes),
+                    "disposition_counts": json.loads(counts_payload),
+                }
+                mismatch = [key for key, value in checks.items()
+                            if container[key] != value]
+                if (mismatch or artifact is None
+                        or artifact["local_locator"] != sidecar_locator
+                        or artifact["artifact_size_bytes"] != int(
+                            sidecar_size_bytes)
+                        or artifact["readiness_state"] != "ready"):
+                    raise RuntimeError(
+                        "ready Stored TAR pair conflicts with adoption request")
+                return {"container": _row(container), "artifact": _row(artifact)}
+
+            if (container["validation_state"] != "validated_part"
+                    or container["owner_token"] != token):
+                raise RuntimeError("Stored TAR paired publication owner check failed")
+            if sum(counts.values()) != int(container["expected_member_count"]):
+                raise RuntimeError(
+                    "Stored TAR disposition aggregate does not cover its plan")
+            if (container["actual_artifact_bytes"] != int(tar_size_bytes)
+                    or container["observed_member_count"] != int(
+                        observed_member_count)
+                    or container["observed_logical_bytes"] != int(
+                        observed_logical_bytes)):
+                raise RuntimeError(
+                    "Stored TAR filesystem pair disagrees with validated part")
+
+            if artifact is None:
+                artifact = conn.execute(
+                    """INSERT INTO archive_artifacts
+                           (session_id, chunk_index, container_id,
+                            artifact_kind, artifact_version, local_locator,
+                            artifact_size_bytes, readiness_state,
+                            publication_started_at, published_at)
+                       VALUES (%s,%s,%s,'tar_sidecar',%s,%s,%s,'ready',now(),now())
+                       RETURNING *""",
+                    (container["session_id"], container["chunk_index"],
+                     int(container_id), str(sidecar_version), sidecar_locator,
+                     int(sidecar_size_bytes)),
+                ).fetchone()
+            else:
+                if artifact["readiness_state"] not in (
+                        "planned", "writing", "validated"):
+                    raise RuntimeError(
+                        "existing TAR sidecar artifact is not publishable")
+                for key, value in {
+                        "local_locator": sidecar_locator,
+                        "artifact_size_bytes": int(sidecar_size_bytes)}.items():
+                    if artifact[key] not in (None, value):
+                        raise RuntimeError(
+                            f"existing TAR sidecar conflicts on {key}")
+                artifact = conn.execute(
+                    """UPDATE archive_artifacts
+                       SET local_locator=%s, artifact_size_bytes=%s,
+                           readiness_state='ready',
+                           publication_started_at=COALESCE(
+                               publication_started_at, now()),
+                           published_at=now(), updated_at=now()
+                       WHERE artifact_id=%s RETURNING *""",
+                    (sidecar_locator, int(sidecar_size_bytes),
+                     artifact["artifact_id"]),
+                ).fetchone()
+
+            container = conn.execute(
+                """UPDATE archive_containers
+                   SET temporary_data_locator=%s,
+                       permanent_local_metadata_locator=%s,
+                       actual_artifact_bytes=%s,
+                       observed_member_count=%s, observed_logical_bytes=%s,
+                       disposition_counts=%s::jsonb,
+                       validation_state='ready', owner_token=NULL,
+                       lease_expires_at=NULL, updated_at=now()
+                   WHERE container_id=%s AND owner_token=%s
+                     AND validation_state='validated_part'
+                   RETURNING *""",
+                (data_locator, sidecar_locator, int(tar_size_bytes),
+                 int(observed_member_count), int(observed_logical_bytes),
+                 counts_payload, int(container_id), token),
+            ).fetchone()
+            if container is None:
+                raise RuntimeError("Stored TAR paired readiness CAS failed")
+            return {"container": _row(container), "artifact": _row(artifact)}
+        return self._transaction(operation, "publish ready Stored TAR pair")
 
     def find_container_restore_sidecars(self, container_ids, *, limit=100):
         """Return local TAR sidecar identities for an explicit container set.

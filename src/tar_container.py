@@ -16,9 +16,12 @@ from typing import BinaryIO, Iterable, Mapping, Optional
 from .pipeline_types import (
     ContainerFormat,
     FileTransferStatus,
+    SourceDisposition,
     StoredTarContainer,
     StoredTarExpectedMember,
     StoredTarMember,
+    StoredTarSourceDiagnostic,
+    StoredTarValidationSummary,
 )
 
 
@@ -637,6 +640,137 @@ def validate_stored_tar(source, expected_members: Iterable, *,
     return StoredTarReader(
         source, tar_dialect=tar_dialect,
         format_version=format_version).validate(
-            expected_members,
-            expected_member_count=expected_member_count,
-            expected_logical_bytes=expected_logical_bytes)
+        expected_members,
+        expected_member_count=expected_member_count,
+        expected_logical_bytes=expected_logical_bytes)
+
+
+def _coerce_source_diagnostic(record):
+    if isinstance(record, StoredTarSourceDiagnostic):
+        return record
+    try:
+        disposition = SourceDisposition(_mapping_value(
+            record, "disposition", "status"))
+        return StoredTarSourceDiagnostic(
+            plan_ordinal=int(_mapping_value(
+                record, "plan_ordinal", "ordinal")),
+            path=str(_mapping_value(record, "path", "member_name", "name")),
+            disposition=disposition,
+            evidence=str(_mapping_value(record, "evidence", default="")),
+        )
+    except (TypeError, ValueError) as exc:
+        raise StoredTarError("invalid Stored TAR source diagnostic") from exc
+
+
+def validate_stored_tar_part(source, plan_members: Iterable, *,
+                             container_ordinal: int,
+                             source_diagnostics=(), tar_dialect=STORED_TAR_DIALECT,
+                             format_version=STORED_TAR_FORMAT_VERSION,
+                             require_part=True):
+    """Reopen and validate a still-unpublished TAR part against its sealed plan.
+
+    Only machine-attributed absent-source outcomes may subtract a plan ordinal.
+    Unknown, changed, duplicate, or path-mismatched evidence fails closed.
+    """
+    if not isinstance(source, (str, bytes, os.PathLike)):
+        raise StoredTarError("Stored TAR part validation requires a file path")
+    part_path = os.fspath(source)
+    if require_part and not str(part_path).endswith(".part"):
+        raise StoredTarError("Stored TAR validation requires an unpublished .part")
+
+    ordinal = int(container_ordinal)
+    plan = []
+    plan_by_ordinal = {}
+    for record in plan_members:
+        item_ordinal = int(_mapping_value(
+            record, "plan_ordinal", "ordinal", "scan_ordinal"))
+        item_container = _mapping_value(record, "container_ordinal", default=ordinal)
+        if item_container is None or int(item_container) != ordinal:
+            raise StoredTarError(
+                f"plan ordinal {item_ordinal} belongs to a different container")
+        name = _mapping_value(record, "member_name", "name", "remote_path")
+        size = _mapping_value(
+            record, "expected_size", "expected_logical_bytes",
+            "logical_size", "file_size_bytes", "size")
+        if name is None or size is None:
+            raise StoredTarError("Stored TAR plan member lacks name or size")
+        if item_ordinal in plan_by_ordinal:
+            raise StoredTarError(
+                f"duplicate plan ordinal {item_ordinal} in container plan")
+        expected = StoredTarExpectedMember(
+            name=str(name), logical_size=int(size), ordinal=item_ordinal)
+        plan.append(expected)
+        plan_by_ordinal[item_ordinal] = expected
+    plan.sort(key=lambda item: item.ordinal)
+
+    diagnostics = {}
+    allowed = {
+        SourceDisposition.SOURCE_MISSING,
+        SourceDisposition.SOURCE_PERMISSION_DENIED,
+        SourceDisposition.SOURCE_UNREADABLE,
+    }
+    status_map = {
+        SourceDisposition.SOURCE_MISSING: FileTransferStatus.SOURCE_MISSING,
+        SourceDisposition.SOURCE_PERMISSION_DENIED:
+            FileTransferStatus.SOURCE_PERMISSION_DENIED,
+        SourceDisposition.SOURCE_UNREADABLE: FileTransferStatus.SOURCE_UNREADABLE,
+    }
+    for raw in source_diagnostics or ():
+        diagnostic = _coerce_source_diagnostic(raw)
+        if diagnostic.disposition not in allowed:
+            raise StoredTarError(
+                f"source diagnostic for ordinal {diagnostic.plan_ordinal} is "
+                f"{diagnostic.disposition.value}; readiness is blocked")
+        expected = plan_by_ordinal.get(diagnostic.plan_ordinal)
+        if expected is None:
+            raise StoredTarError(
+                f"source diagnostic names unknown ordinal "
+                f"{diagnostic.plan_ordinal}")
+        if diagnostic.path != expected.name:
+            raise StoredTarError(
+                f"source diagnostic path disagrees at ordinal "
+                f"{diagnostic.plan_ordinal}")
+        if diagnostic.plan_ordinal in diagnostics:
+            raise StoredTarError(
+                f"duplicate source diagnostic for ordinal "
+                f"{diagnostic.plan_ordinal}")
+        diagnostics[diagnostic.plan_ordinal] = diagnostic
+
+    expectations = [
+        replace(item, source_exception=(
+            status_map[diagnostics[item.ordinal].disposition]
+            if item.ordinal in diagnostics else None))
+        for item in plan
+    ]
+    present = [item for item in expectations if item.source_exception is None]
+    expected_count = len(present)
+    expected_bytes = sum(item.logical_size for item in present)
+
+    # ``validate_stored_tar`` opens the named part afresh.  The transport's
+    # writable handle is therefore necessarily closed before parsing begins.
+    parsed = validate_stored_tar(
+        part_path, expectations, tar_dialect=tar_dialect,
+        format_version=format_version,
+        expected_member_count=expected_count,
+        expected_logical_bytes=expected_bytes)
+    try:
+        actual_size = os.path.getsize(part_path)
+    except OSError as exc:
+        raise StoredTarError("validated TAR part disappeared after parse") from exc
+    if actual_size != parsed.archive_size:
+        raise StoredTarError(
+            "TAR parser byte count disagrees with the completed part size")
+
+    counts = {item.value: 0 for item in SourceDisposition}
+    counts[SourceDisposition.ARCHIVED.value] = parsed.member_count
+    for diagnostic in diagnostics.values():
+        counts[diagnostic.disposition.value] += 1
+    if sum(counts.values()) != len(plan):
+        raise StoredTarError("plan/diagnostic ordinal accounting mismatch")
+    return StoredTarValidationSummary(
+        container_ordinal=ordinal,
+        member_count=parsed.member_count,
+        logical_bytes=parsed.logical_bytes,
+        archive_size=parsed.archive_size,
+        plan_ordinal_count=len(plan), disposition_counts=counts,
+        members=parsed.members)
