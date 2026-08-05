@@ -524,6 +524,21 @@ class ConfigManager:
         return self._get_int('PIPELINE', 'max_unstaged_backlog_chunks', 64,
                              minimum=1)
 
+    @property
+    def max_write_groups_per_run(self):
+        """Stop a run after this many committed write groups. 0 = unbounded.
+
+        The runbook requires that the next finite group never starts by
+        itself, and there was no way to express that: a run drained every
+        ready chunk. Setting this to 1 makes a bounded group self-terminating,
+        which is safer than letting it continue and stopping it by hand -- the
+        limit is checked AFTER a group commits and BEFORE the next is
+        selected, so the run always ends on a chunk boundary with the LTFS
+        index synced and the session resumable.
+        """
+        return self._get_int('PIPELINE', 'max_write_groups_per_run', 0,
+                             minimum=0)
+
     def validated_ready_queue_limits(self):
         """Ready-queue limits proven to leave room for fetch/pack (Phase 4.5).
 

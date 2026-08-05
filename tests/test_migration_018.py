@@ -1210,13 +1210,25 @@ class StoredTarPlanSchemaCommandTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "missing or drifted"):
             self.db.validate_stored_tar_plan_schema()
 
-    def test_apply_refuses_without_the_archiver_lock(self):
+    def test_apply_refuses_without_a_pinned_archiver_lock(self):
         self._apply_015()
-        with self.assertRaisesRegex(RuntimeError, "archiver advisory lock"):
+        with self.assertRaisesRegex(RuntimeError, "pinned archiver lock"):
             self.db.apply_stored_tar_plan_schema(require_archiver_lock=True)
         # The refusal must leave nothing behind.
         self.assertEqual(
             self.db.stored_tar_plan_schema_report()["objects_present"], 0)
+
+    def test_apply_succeeds_on_the_pinned_lock_connection(self):
+        # Regression: the DDL must run on the SAME session that owns the
+        # advisory lock. Taking a pooled connection made the in-SQL assertion
+        # compare a different backend pid and refuse a genuinely held lock.
+        self._apply_015()
+        self.db.acquire_archiver_lock()
+        self.assertEqual(
+            self.db.apply_stored_tar_plan_schema(require_archiver_lock=True),
+            ["016_postgres_stored_tar_plans.sql",
+             "017_postgres_stored_tar_publication.sql"])
+        self.assertTrue(self.db.validate_stored_tar_plan_schema()["ready"])
 
     def test_apply_is_idempotent(self):
         self._apply_015()

@@ -407,7 +407,8 @@ class PgConnectionCore:
             self.STORED_TAR_PUBLICATION_MIGRATION,
         )
         paths = self.stored_tar_plan_migration_paths()
-        with self._pool.connection() as conn:
+
+        def apply_on(conn):
             with conn.transaction():
                 if require_archiver_lock:
                     owned = conn.execute(
@@ -427,6 +428,20 @@ class PgConnectionCore:
                 with conn.cursor() as cur:
                     for path in paths:
                         cur.execute(path.read_text(encoding="utf-8"))
+
+        # The advisory lock lives on ONE pinned connection. Taking a fresh
+        # pooled connection here would run the assertion against a different
+        # backend pid and fail even while the lock is genuinely held, so the
+        # DDL must land on the lock-holding session itself (as migration 018
+        # does).
+        if require_archiver_lock:
+            if self._lock_conn is None:
+                raise RuntimeError(
+                    "[DB] Migrations 016/017 require a pinned archiver lock")
+            apply_on(self._lock_conn)
+        else:
+            with self._pool.connection() as conn:
+                apply_on(conn)
         return list(migrations)
 
     @classmethod

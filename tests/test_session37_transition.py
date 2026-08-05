@@ -178,5 +178,81 @@ class RenderingTests(unittest.TestCase):
         self.assertIsInstance(data["blockers"], list)
 
 
+class PersistSessionTransitionCliGuardTests(unittest.TestCase):
+    """`--persist-session-transition` must refuse before it can persist.
+
+    Local-only: the proposal builder is stubbed, so nothing opens PostgreSQL
+    or LTFS. These cover the refusals that stand between an operator and an
+    irreversible boundary.
+    """
+
+    @staticmethod
+    def _proposal(blockers=()):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            existing_chunk_count=113, last_legacy_planned_chunk=112,
+            first_manifest_first_chunk=113, frontier_generation=0,
+            blockers=tuple(blockers))
+
+    def _args(self, **overrides):
+        from types import SimpleNamespace
+        base = dict(dry_run=False, execute=True, yes=True, session_id=[37],
+                    approval_identity="op", evidence_locator="ev",
+                    backup_file="fixture.dump")
+        base.update(overrides)
+        return SimpleNamespace(**base)
+
+    def _run(self, args, blockers=()):
+        from unittest import mock
+        import inspect_db
+
+        with mock.patch("src.session_transition.build_transition_proposal",
+                        return_value=self._proposal(blockers)), \
+                mock.patch.object(inspect_db, "_open_read_only_db"), \
+                mock.patch.object(inspect_db, "_open_no_init_db") as opened, \
+                mock.patch.object(inspect_db, "archiver_lock_status",
+                                  return_value=[]), \
+                mock.patch.object(inspect_db, "active_archive_processes",
+                                  return_value=[]), \
+                mock.patch.object(inspect_db, "verify_backup_receipt",
+                                  return_value={"receipt_id": "r"}):
+            parser = mock.Mock()
+            parser.error.side_effect = SystemExit(2)
+            inspect_db._persist_session_transition(
+                mock.Mock(pg_dbname="db"), args, parser)
+            return opened.return_value
+
+    def test_blocked_proposal_is_refused(self):
+        from src.cli_errors import OperationalError
+        with self.assertRaisesRegex(OperationalError, "blocked proposal"):
+            self._run(self._args(), blockers=("uncovered scope",))
+
+    def test_execute_requires_yes(self):
+        with self.assertRaises(SystemExit):
+            self._run(self._args(yes=False))
+
+    def test_execute_requires_approval_identity(self):
+        with self.assertRaises(SystemExit):
+            self._run(self._args(approval_identity=None))
+
+    def test_execute_requires_evidence_locator(self):
+        with self.assertRaises(SystemExit):
+            self._run(self._args(evidence_locator=None))
+
+    def test_execute_requires_a_verifiable_backup(self):
+        with self.assertRaises(SystemExit):
+            self._run(self._args(backup_file=None))
+
+    def test_preflight_without_execute_persists_nothing(self):
+        db = self._run(self._args(execute=False))
+        db.persist_session_transition.assert_not_called()
+
+    def test_execute_activates_under_the_archiver_lock(self):
+        db = self._run(self._args())
+        db.acquire_archiver_lock.assert_called_once()
+        _, kwargs = db.persist_session_transition.call_args
+        self.assertEqual(kwargs["state"], "active")
+
+
 if __name__ == "__main__":                   # pragma: no cover
     unittest.main()

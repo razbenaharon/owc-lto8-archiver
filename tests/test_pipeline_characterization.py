@@ -921,5 +921,81 @@ class DataBoundaryCharacterizationTests(unittest.TestCase):
                             f"LTORetriever.{name} moved")
 
 
+class BoundedWriteGroupRunTests(unittest.TestCase):
+    """`max_write_groups_per_run` must end the run ON a chunk boundary.
+
+    The runbook requires that the next finite group never starts by itself.
+    The limit is checked after a group commits and before the next is
+    selected, so the writer is never interrupted mid-group.
+    """
+
+    def _coordinator(self, groups, *, max_write_groups):
+        from src.remote_pipeline import RemotePipelineCoordinator
+
+        written = []
+
+        def wait_for_group(stop_event=None, poll=0.5, timeout=None):
+            if not groups:
+                return [], "producer_closed_empty"
+            indexes = groups.pop(0)
+            return ([SimpleNamespace(chunk_index=i, prepared_bytes=1,
+                                     desc=SimpleNamespace(chunk_index=i))
+                     for i in indexes], "max_ready_chunks_reached")
+
+        ready_q = mock.MagicMock()
+        ready_q.wait_for_group.side_effect = wait_for_group
+        ready_q.ready_chunks = 0
+
+        host = SimpleNamespace(
+            db=FakeStreamingDB(pending=[]),
+            _write_chunk_group=lambda *a, **k: (
+                written.append(a[1]) or None))
+
+        coordinator = RemotePipelineCoordinator(
+            host=host, session_id=37, tape_label="T", ready_q=ready_q,
+            stop_event=threading.Event(), metrics=mock.MagicMock(),
+            max_write_groups=max_write_groups)
+        coordinator._observe_start = lambda items, reason: (None, None, 0.0)
+        coordinator._observe_finish = lambda *a, **k: None
+        coordinator._run_stager = lambda: None
+        coordinator._scanner_done.set()
+        return coordinator, written
+
+    def test_a_limit_of_one_stops_after_the_first_group(self):
+        coordinator, written = self._coordinator(
+            [[49], [50], [51]], max_write_groups=1)
+        coordinator.run()
+        self.assertEqual(coordinator.outcome.groups_written, [(49,)])
+        self.assertEqual(coordinator.outcome.completed_chunks, 1)
+        self.assertEqual(
+            coordinator.outcome.stopped_reason, "max_write_groups_reached")
+        self.assertEqual(len(written), 1, "a second group was written")
+
+    def test_zero_means_unbounded(self):
+        coordinator, written = self._coordinator(
+            [[49], [50]], max_write_groups=0)
+        coordinator.run()
+        self.assertEqual(
+            coordinator.outcome.groups_written, [(49,), (50,)])
+        self.assertIsNone(coordinator.outcome.stopped_reason)
+
+    def test_the_limit_never_truncates_a_group_in_progress(self):
+        # A group of three chunks still writes all three; the bound applies
+        # between groups, never inside one.
+        coordinator, written = self._coordinator(
+            [[49, 50, 51], [52]], max_write_groups=1)
+        coordinator.run()
+        self.assertEqual(coordinator.outcome.groups_written, [(49, 50, 51)])
+        self.assertEqual(coordinator.outcome.completed_chunks, 3)
+        self.assertEqual(len(written), 1)
+
+    def test_config_default_is_unbounded(self):
+        from src.config import ConfigManager
+
+        self.assertEqual(
+            ConfigManager.max_write_groups_per_run.fget(
+                SimpleNamespace(_get_int=lambda *a, **k: a[2])), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

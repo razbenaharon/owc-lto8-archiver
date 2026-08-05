@@ -1015,6 +1015,7 @@ class RemoteOrchestrator:
             observation_worker=self._build_observation_worker(),
             writer_path=writer_path,
             scan_complete=scan_complete,
+            max_write_groups=getattr(self.cfg, 'max_write_groups_per_run', 0),
         )
 
     def _run_streaming_session(self, session_id):

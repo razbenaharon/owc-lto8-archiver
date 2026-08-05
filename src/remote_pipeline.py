@@ -63,6 +63,8 @@ class PipelineOutcome:
     failed: bool = False
     scanner_finished: bool = False
     groups_written: List[tuple] = field(default_factory=list)
+    #: Set when a bounded run ended itself at a group boundary.
+    stopped_reason: Optional[str] = None
 
 
 class RemotePipelineCoordinator:
@@ -77,7 +79,8 @@ class RemotePipelineCoordinator:
     def __init__(self, *, host, session_id, tape_label, ready_q, stop_event,
                  metrics, scan_coordinator=None, backlog_limit=64,
                  poll_seconds=DEFAULT_POLL_SECONDS, observation_worker=None,
-                 writer_path="pipeline", scan_complete=False):
+                 writer_path="pipeline", scan_complete=False,
+                 max_write_groups=0):
         self.host = host
         self.session_id = session_id
         self.tape_label = tape_label
@@ -90,6 +93,10 @@ class RemotePipelineCoordinator:
         self.observation_worker = observation_worker
         self.writer_path = writer_path
         self.scan_complete = scan_complete
+        #: Stop after this many successfully committed write groups; 0 means
+        #: drain normally. A bounded run uses this rather than a mid-run kill,
+        #: so the stop always lands on a chunk boundary.
+        self.max_write_groups = max(0, int(max_write_groups or 0))
 
         #: Chunks this process has already picked up for staging. Purely
         #: in-process de-duplication on top of authoritative status — never a
@@ -328,6 +335,24 @@ class RemotePipelineCoordinator:
                     for item in items:
                         self.ready_q.mark_written(item)
                     outcome.completed_chunks += len(items)
+                    # A bounded run stops after N successful groups instead of
+                    # draining every ready chunk.  The runbook requires that
+                    # the next group never starts automatically, and the stop
+                    # lands here -- AFTER a group committed and BEFORE the next
+                    # is selected -- which is exactly a chunk boundary, so LTFS
+                    # has synced and the session stays resumable.
+                    if (self.max_write_groups
+                            and len(outcome.groups_written)
+                            >= self.max_write_groups):
+                        _status('TAPE',
+                                f"Bounded run: {self.max_write_groups} write "
+                                "group(s) completed; stopping instead of "
+                                "starting another.")
+                        get_logger().info(
+                            "bounded_run_group_limit_reached: groups=%d",
+                            len(outcome.groups_written))
+                        outcome.stopped_reason = "max_write_groups_reached"
+                        break
                     continue
 
                 self._settle_aborted_group(items, stop_block)

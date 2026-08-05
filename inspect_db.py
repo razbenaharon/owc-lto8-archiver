@@ -524,6 +524,107 @@ def _run_manifest_directory_catalog_schema_report(cfg, *, validate=False):
     return 0
 
 
+def _persist_session_transition(cfg, args, parser):
+    """Guarded Plan 3 Task 3.1 execute mode: persist one planning boundary.
+
+    Same operator contract as the migration commands. The proposal is rebuilt
+    read-only for the preflight, and ``persist_session_transition`` re-derives
+    the audit again inside its own transaction, so a boundary approved against
+    evidence that moved in between is refused rather than persisted.
+    """
+    from src.session_transition import build_transition_proposal
+
+    if args.dry_run and args.execute:
+        parser.error(
+            "--persist-session-transition accepts only one of --dry-run or "
+            "--execute")
+    session_id = int(args.session_id[0] if args.session_id else 37)
+
+    db = _open_read_only_db(cfg)
+    try:
+        proposal = build_transition_proposal(db, session_id)
+    finally:
+        db.close()
+    blockers = list(getattr(proposal, "blockers", ()) or ())
+    preflight = {
+        "database": cfg.pg_dbname,
+        "session_id": session_id,
+        "proposal": {
+            "existing_chunk_count": proposal.existing_chunk_count,
+            "last_legacy_planned_chunk": proposal.last_legacy_planned_chunk,
+            "first_manifest_first_chunk": proposal.first_manifest_first_chunk,
+            "frontier_generation": proposal.frontier_generation,
+        },
+        "blockers": blockers,
+        "requested": {"execute": bool(args.execute)},
+    }
+
+    if not args.execute:
+        preflight["note"] = (
+            "read-only preflight; execute requires --execute --yes, "
+            "--approval-identity, --evidence-locator and a verified "
+            "--backup-file")
+        _print_json(preflight)
+        return 0
+
+    if not args.yes:
+        parser.error("--persist-session-transition --execute requires --yes")
+    for flag in ("approval_identity", "evidence_locator"):
+        if not getattr(args, flag, None):
+            parser.error(
+                "--persist-session-transition --execute requires "
+                f"--{flag.replace('_', '-')}")
+    if not args.backup_file:
+        parser.error(
+            "--persist-session-transition --execute requires --backup-file "
+            "naming a PostgreSQL backup this tool can verify")
+    if blockers:
+        raise OperationalError(
+            "[TRANSITION] Refusing to activate a blocked proposal: "
+            + "; ".join(blockers))
+
+    holders = archiver_lock_status(_conninfo(cfg))
+    if holders:
+        raise OperationalError(
+            f"[TRANSITION] Refusing while the archiver lock is held: {holders}")
+    processes = active_archive_processes()
+    if processes:
+        raise OperationalError(
+            "[TRANSITION] Refusing while archive/transfer processes are "
+            f"running ({len(processes)} detected)")
+    preflight["backup"] = verify_backup_receipt(cfg, args.backup_file)
+
+    db = _open_no_init_db(cfg)
+    try:
+        db.acquire_archiver_lock()
+        processes = active_archive_processes()
+        if processes:
+            raise OperationalError(
+                "[TRANSITION] Refusing after final liveness check "
+                f"({len(processes)} archive/transfer process(es) detected)")
+        locked_backup = verify_backup_receipt(cfg, args.backup_file)
+        if locked_backup["receipt_id"] != preflight["backup"]["receipt_id"]:
+            raise OperationalError(
+                "[TRANSITION] Backup receipt changed before locked apply")
+
+        locked_proposal = build_transition_proposal(db, session_id)
+        locked_blockers = list(
+            getattr(locked_proposal, "blockers", ()) or ())
+        if locked_blockers:
+            raise OperationalError(
+                "[TRANSITION] Final locked preflight refused: "
+                + "; ".join(locked_blockers))
+        preflight["result"] = db.persist_session_transition(
+            session_id, proposal=locked_proposal,
+            approval_identity=args.approval_identity,
+            evidence_locator=args.evidence_locator,
+            state="active")
+    finally:
+        db.close()
+    _print_json(preflight)
+    return 0
+
+
 def _apply_stored_tar_plan_schema(cfg, args, parser):
     """Guarded, explicit migrations 016+017 entry point (Plan 2 Tasks 2.1-2.4).
 
@@ -1195,6 +1296,19 @@ def _build_parser():
     parser.add_argument("--container-format-schema-report",
                         action="store_true",
                         help="Read-only migration-015 schema/format report.")
+    parser.add_argument("--persist-session-transition", action="store_true",
+                        help="Plan 3 Task 3.1 execute mode: persist one "
+                             "legacy_db -> manifest planning boundary through "
+                             "draft/rehearsed/approved/active. Read-only "
+                             "preflight unless --execute --yes "
+                             "--approval-identity --evidence-locator "
+                             "--backup-file are supplied.")
+    parser.add_argument("--approval-identity",
+                        help="Operator approval identity recorded on the "
+                             "persisted transition.")
+    parser.add_argument("--evidence-locator",
+                        help="Locator of the evidence report the transition "
+                             "was rehearsed against.")
     parser.add_argument("--apply-stored-tar-plan-schema",
                         action="store_true",
                         help="Migrations 016+017, applied together in one "
@@ -1389,6 +1503,9 @@ def _dispatch(parser, args):
 
     if args.container_format_schema_report:
         return _run_container_format_schema_report(cfg, validate=False)
+
+    if args.persist_session_transition:
+        return _persist_session_transition(cfg, args, parser)
 
     if args.apply_stored_tar_plan_schema:
         return _apply_stored_tar_plan_schema(cfg, args, parser)
