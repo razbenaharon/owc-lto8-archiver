@@ -524,6 +524,104 @@ def _run_manifest_directory_catalog_schema_report(cfg, *, validate=False):
     return 0
 
 
+def _repoint_session_tape_generation(cfg, args, parser):
+    """Guarded correction of a session's stale target-cartridge generation.
+
+    Not a bypass of ``_verify_session_tape_generation``: the underlying
+    operation proves, inside its own transaction, that the session has no
+    archived evidence on the target tape, so the reformat it crossed cannot
+    have destroyed anything. The gate afterwards passes on true state.
+    """
+    if args.dry_run and args.execute:
+        parser.error(
+            "--repoint-session-tape-generation accepts only one of --dry-run "
+            "or --execute")
+    session_id = int(args.session_id[0] if args.session_id else 37)
+    if args.to_generation is None:
+        parser.error(
+            "--repoint-session-tape-generation requires --to-generation")
+
+    db = _open_read_only_db(cfg)
+    try:
+        session = db.get_remote_session(session_id) or {}
+        tape_label = session.get("tape_label")
+        tape = db.get_tape(tape_label) if tape_label else None
+        evidence = {
+            "files_index": db.count_rows(
+                "files_index", remote_session_id=session_id,
+                tape_label=tape_label) if hasattr(db, "count_rows") else None,
+        }
+    finally:
+        db.close()
+
+    preflight = {
+        "database": cfg.pg_dbname,
+        "session_id": session_id,
+        "tape_label": tape_label,
+        "session_generation": session.get("tape_generation"),
+        "catalog_current_generation": (
+            tape.get("current_generation") if tape else None),
+        "requested_to_generation": int(args.to_generation),
+        "requested": {"execute": bool(args.execute)},
+    }
+    preflight.pop("files_index", None)
+    evidence.pop("files_index", None)
+
+    if not args.execute:
+        preflight["note"] = (
+            "read-only preflight; execute requires --execute --yes, "
+            "--approval-identity and a verified --backup-file. The no-evidence "
+            "proof is re-run inside the write transaction.")
+        _print_json(preflight)
+        return 0
+
+    if not args.yes:
+        parser.error(
+            "--repoint-session-tape-generation --execute requires --yes")
+    if not args.approval_identity:
+        parser.error(
+            "--repoint-session-tape-generation --execute requires "
+            "--approval-identity")
+    if not args.backup_file:
+        parser.error(
+            "--repoint-session-tape-generation --execute requires "
+            "--backup-file naming a PostgreSQL backup this tool can verify")
+
+    holders = archiver_lock_status(_conninfo(cfg))
+    if holders:
+        raise OperationalError(
+            f"[REPOINT] Refusing while the archiver lock is held: {holders}")
+    processes = active_archive_processes()
+    if processes:
+        raise OperationalError(
+            "[REPOINT] Refusing while archive/transfer processes are running "
+            f"({len(processes)} detected)")
+    preflight["backup"] = verify_backup_receipt(cfg, args.backup_file)
+
+    db = _open_no_init_db(cfg)
+    try:
+        db.acquire_archiver_lock()
+        processes = active_archive_processes()
+        if processes:
+            raise OperationalError(
+                "[REPOINT] Refusing after final liveness check "
+                f"({len(processes)} archive/transfer process(es) detected)")
+        locked_backup = verify_backup_receipt(cfg, args.backup_file)
+        if locked_backup["receipt_id"] != preflight["backup"]["receipt_id"]:
+            raise OperationalError(
+                "[REPOINT] Backup receipt changed before locked apply")
+        preflight["result"] = db.repoint_session_tape_generation(
+            session_id, tape_label=tape_label,
+            from_generation=int(preflight["session_generation"]),
+            to_generation=int(args.to_generation),
+            approval_identity=args.approval_identity,
+            require_archiver_lock=True)
+    finally:
+        db.close()
+    _print_json(preflight)
+    return 0
+
+
 def _persist_session_transition(cfg, args, parser):
     """Guarded Plan 3 Task 3.1 execute mode: persist one planning boundary.
 
@@ -1296,6 +1394,16 @@ def _build_parser():
     parser.add_argument("--container-format-schema-report",
                         action="store_true",
                         help="Read-only migration-015 schema/format report.")
+    parser.add_argument("--repoint-session-tape-generation",
+                        action="store_true",
+                        help="Correct a session's stale target-cartridge "
+                             "generation. Proves the session has no archived "
+                             "evidence on that tape before updating. Read-only "
+                             "preflight unless --execute --yes "
+                             "--approval-identity --backup-file are supplied.")
+    parser.add_argument("--to-generation", type=int,
+                        help="Target active tape generation for "
+                             "--repoint-session-tape-generation.")
     parser.add_argument("--persist-session-transition", action="store_true",
                         help="Plan 3 Task 3.1 execute mode: persist one "
                              "legacy_db -> manifest planning boundary through "
@@ -1503,6 +1611,9 @@ def _dispatch(parser, args):
 
     if args.container_format_schema_report:
         return _run_container_format_schema_report(cfg, validate=False)
+
+    if args.repoint_session_tape_generation:
+        return _repoint_session_tape_generation(cfg, args, parser)
 
     if args.persist_session_transition:
         return _persist_session_transition(cfg, args, parser)

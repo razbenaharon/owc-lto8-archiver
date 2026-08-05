@@ -647,3 +647,91 @@ class TransitionPersistenceTests(_DirectoryCatalogFixture, unittest.TestCase):
                 """UPDATE remote_chunks SET packaging_format='stored_tar'
                    WHERE session_id=%s AND chunk_index=2""",
                 (self.session_id,))
+
+
+@unittest.skipUnless(_pg_available(), SKIP_REASON)
+class RepointSessionTapeGenerationTests(_DirectoryCatalogFixture,
+                                        unittest.TestCase):
+    """Re-pointing a stale target generation must PROVE it is safe.
+
+    This is the alternative to bypassing ``_verify_session_tape_generation``.
+    It may only move a pointer for a session that wrote nothing to the tape;
+    the moment any archived evidence exists there, a reformat could have
+    destroyed it and only a human may decide.
+    """
+
+    def _retire_and_reformat(self, label="T_B", to_generation=3):
+        """Give the tape a newer active generation than the session holds."""
+        self._exec(
+            "UPDATE tape_generations SET state='retired', retired_at=now() "
+            "WHERE volume_label=%s", (label,))
+        self._exec(
+            """INSERT INTO tape_generations
+                   (tape_id,volume_label,generation,state,formatted_at)
+               SELECT t.tape_id,%s,%s,'active',now()
+               FROM tapes t WHERE t.volume_label=%s""",
+            (label, to_generation, label))
+        self._exec("UPDATE tapes SET current_generation=%s "
+                   "WHERE volume_label=%s", (to_generation, label))
+        self._exec(
+            "UPDATE remote_sessions SET tape_label=%s, tape_generation=1 "
+            "WHERE session_id=%s", (label, self.session_id))
+
+    def _repoint(self, **overrides):
+        kwargs = dict(tape_label="T_B", from_generation=1, to_generation=3,
+                      approval_identity="operator")
+        kwargs.update(overrides)
+        return self.db.repoint_session_tape_generation(
+            self.session_id, **kwargs)
+
+    def _generation(self):
+        return self._query(
+            "SELECT tape_generation FROM remote_sessions WHERE session_id=%s",
+            (self.session_id,))[0]["tape_generation"]
+
+    def test_repoints_a_session_with_no_evidence_on_the_tape(self):
+        self._retire_and_reformat()
+        result = self._repoint()
+        self.assertEqual(result["from_generation"], 1)
+        self.assertEqual(result["to_generation"], 3)
+        self.assertEqual(result["rows_updated"], 1)
+        self.assertTrue(
+            all(v == 0
+                for v in result["evidence_on_target_tape"].values()),
+            result["evidence_on_target_tape"])
+        self.assertEqual(self._generation(), 3)
+
+    def test_refuses_when_the_session_has_evidence_on_that_tape(self):
+        self._retire_and_reformat()
+        self._exec(
+            """INSERT INTO archive_runs (run_label,tape_label,session_kind,
+                   remote_session_id,started_at)
+               VALUES ('evidence-run','T_B','remote',%s,now())""",
+            (self.session_id,))
+        with self.assertRaisesRegex(RuntimeError, "HAS archived evidence"):
+            self._repoint()
+        self.assertEqual(self._generation(), 1, "generation moved anyway")
+
+    def test_refuses_a_wrong_source_generation(self):
+        self._retire_and_reformat()
+        with self.assertRaisesRegex(RuntimeError, "not the expected"):
+            self._repoint(from_generation=2)
+        self.assertEqual(self._generation(), 1)
+
+    def test_refuses_a_target_that_is_not_the_active_generation(self):
+        self._retire_and_reformat()
+        with self.assertRaisesRegex(RuntimeError, "current generation is"):
+            self._repoint(to_generation=2)
+        self.assertEqual(self._generation(), 1)
+
+    def test_refuses_a_tape_the_session_does_not_target(self):
+        self._retire_and_reformat()
+        with self.assertRaisesRegex(RuntimeError, "not 'T_A'"):
+            self._repoint(tape_label="T_A")
+        self.assertEqual(self._generation(), 1)
+
+    def test_refuses_without_a_pinned_archiver_lock(self):
+        self._retire_and_reformat()
+        with self.assertRaisesRegex(RuntimeError, "pinned archiver lock"):
+            self._repoint(require_archiver_lock=True)
+        self.assertEqual(self._generation(), 1)

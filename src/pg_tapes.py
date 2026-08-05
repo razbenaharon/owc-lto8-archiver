@@ -140,6 +140,149 @@ class PgTapeMixin:
                 "SELECT * FROM tapes ORDER BY date_formatted DESC"
             ).fetchall())
 
+    def repoint_session_tape_generation(
+            self, session_id, *, tape_label, from_generation, to_generation,
+            approval_identity, require_archiver_lock=False):
+        """Move a session's target cartridge generation forward, with proof.
+
+        This is NOT a bypass of ``_verify_session_tape_generation``. That gate
+        refuses when a session's persisted generation no longer matches the
+        catalog, because the cartridge may have been reformatted under work
+        the session already wrote. This corrects the *stale pointer* instead,
+        and only after proving inside the transaction that the session has no
+        archived evidence whatsoever on the target tape -- so there is nothing
+        a reformat could have destroyed and nothing to misattribute. The gate
+        then passes on true state.
+
+        Every precondition is re-checked inside one transaction: the session
+        row and both generations are locked and re-read, the target generation
+        must be the tape's live ``active`` row, and the evidence proof is
+        re-run. Any mismatch raises and nothing is written.
+        """
+        def operation(conn):
+            if require_archiver_lock:
+                owned = conn.execute(
+                    """SELECT EXISTS (
+                           SELECT 1 FROM pg_locks
+                           WHERE locktype='advisory' AND granted
+                             AND pid=pg_backend_pid()
+                             AND classid=%s AND objid=%s AND objsubid=1
+                       ) AS owned""",
+                    (self.ARCHIVER_LOCK_KEY >> 32,
+                     self.ARCHIVER_LOCK_KEY & 0xFFFFFFFF),
+                ).fetchone()["owned"]
+                if not owned:
+                    raise RuntimeError(
+                        "[DB] Refusing to re-point a session generation "
+                        "without the archiver advisory lock on this session")
+
+            session = conn.execute(
+                """SELECT session_id, tape_label, tape_generation, status
+                   FROM remote_sessions WHERE session_id=%s FOR UPDATE""",
+                (session_id,)).fetchone()
+            if session is None:
+                raise RuntimeError(f"[DB] session {session_id} does not exist")
+            if session["tape_label"] != tape_label:
+                raise RuntimeError(
+                    f"[DB] session {session_id} targets "
+                    f"{session['tape_label']!r}, not {tape_label!r}; refusing")
+            if int(session["tape_generation"]) != int(from_generation):
+                raise RuntimeError(
+                    f"[DB] session {session_id} generation is "
+                    f"{session['tape_generation']}, not the expected "
+                    f"{from_generation}; refusing to re-point stale evidence")
+
+            tape = conn.execute(
+                "SELECT tape_id, current_generation FROM tapes "
+                "WHERE volume_label=%s FOR UPDATE", (tape_label,)).fetchone()
+            if tape is None:
+                raise RuntimeError(f"[DB] tape {tape_label!r} is not registered")
+            if int(tape["current_generation"]) != int(to_generation):
+                raise RuntimeError(
+                    f"[DB] tape {tape_label!r} current generation is "
+                    f"{tape['current_generation']}, not {to_generation}")
+
+            generation = conn.execute(
+                """SELECT generation_id, generation, state FROM tape_generations
+                   WHERE volume_label=%s AND generation=%s""",
+                (tape_label, int(to_generation))).fetchone()
+            if generation is None or generation["state"] != "active":
+                raise RuntimeError(
+                    f"[DB] {tape_label!r} generation {to_generation} is not an "
+                    "active generation row; refusing")
+
+            # The proof. A session with ANY archived output on this tape could
+            # have had it destroyed by the reformat, and moving the pointer
+            # would silently attribute surviving rows to a generation that
+            # never held them. Every source of on-tape evidence is counted.
+            evidence = {
+                "files_index": conn.execute(
+                    "SELECT count(*) AS n FROM files_index "
+                    "WHERE remote_session_id=%s AND tape_label=%s",
+                    (session_id, tape_label)).fetchone()["n"],
+                "archive_runs": conn.execute(
+                    "SELECT count(*) AS n FROM archive_runs "
+                    "WHERE remote_session_id=%s AND tape_label=%s",
+                    (session_id, tape_label)).fetchone()["n"],
+                "archive_bundles": conn.execute(
+                    """SELECT count(*) AS n FROM archive_bundles b
+                       WHERE b.tape_label=%s AND b.bundle_id IN (
+                           SELECT bundle_id FROM files_index
+                           WHERE remote_session_id=%s AND bundle_id IS NOT NULL)""",
+                    (tape_label, session_id)).fetchone()["n"],
+            }
+            if self._table_exists_conn(conn, "directory_archive_bundles"):
+                evidence["directory_archive_bundles"] = conn.execute(
+                    "SELECT count(*) AS n FROM directory_archive_bundles "
+                    "WHERE remote_session_id=%s AND tape_label=%s",
+                    (session_id, tape_label)).fetchone()["n"]
+            if self._table_exists_conn(conn, "archive_containers"):
+                evidence["archive_containers"] = conn.execute(
+                    """SELECT count(*) AS n FROM archive_containers c
+                       WHERE c.session_id=%s AND EXISTS (
+                           SELECT 1 FROM archive_runs r
+                           WHERE r.remote_session_id=c.session_id
+                             AND r.tape_label=%s)""",
+                    (session_id, tape_label)).fetchone()["n"]
+
+            witnessed = {k: int(v) for k, v in evidence.items() if int(v)}
+            if witnessed:
+                raise RuntimeError(
+                    f"[DB] session {session_id} HAS archived evidence on "
+                    f"{tape_label!r} ({witnessed}); a reformat may have "
+                    "destroyed it. Refusing to re-point -- this needs a human, "
+                    "not a generation bump")
+
+            updated = conn.execute(
+                """UPDATE remote_sessions SET tape_generation=%s
+                   WHERE session_id=%s AND tape_generation=%s""",
+                (int(to_generation), session_id, int(from_generation))).rowcount
+            if updated != 1:
+                raise RuntimeError(
+                    f"[DB] expected to update exactly 1 session row, got "
+                    f"{updated}; rolling back")
+            return {
+                "session_id": session_id, "tape_label": tape_label,
+                "from_generation": int(from_generation),
+                "to_generation": int(to_generation),
+                "generation_id": int(generation["generation_id"]),
+                "approval_identity": str(approval_identity),
+                "evidence_on_target_tape": {k: int(v)
+                                            for k, v in evidence.items()},
+                "rows_updated": updated,
+            }
+
+        if require_archiver_lock:
+            if self._lock_conn is None:
+                raise RuntimeError(
+                    "[DB] Re-pointing a session generation requires a pinned "
+                    "archiver lock")
+            with self._lock_conn.transaction():
+                return operation(self._lock_conn)
+        with self._pool.connection() as conn:
+            with conn.transaction():
+                return operation(conn)
+
     def replace_formatted_tape(self, volume_label, capacity_gb=None,
                                previous_labels=None):
         raise RuntimeError(
