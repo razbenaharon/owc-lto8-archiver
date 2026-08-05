@@ -34,7 +34,7 @@ extending an applied one.
 | 4.1 restore routing | `PgDirectoryCatalogMixin.find_directory_restore_parts` | `tests/test_directory_catalog_pg.py` |
 | 4.2 + 4.3 rebuild/compare | `src/catalog_rebuild.py` | `tests/test_catalog_rebuild.py` |
 
-Suite: **1,654 at baseline → 1,892 passing, 0 failed.**
+Suite: **1,654 at baseline → 1,940 passing, 0 failed.**
 
 ## Blocked: the LTFS mount (2026-08-05)
 
@@ -64,6 +64,67 @@ catalog and was used for the isolated rehearsal.
 - **Task 3.4** - no synthetic pilot, no bounded production group.
 - Approvals A, B and C - see above.
 - The independent adversarial review of the whole plan.
+
+## The isolated rehearsal (2026-08-05)
+
+A production copy (`..._20260803_151701.dump`) was restored into
+`rehearsal_s37_20260805` on the disposable server and taken through
+014 -> 015-with-exception -> 016 -> 017 -> 018. It reproduced the target
+architecture exactly:
+
+```
+chunks 0-48    zip        done     legacy_db
+chunks 49-112  stored_tar pending  legacy_db
+boundary       first manifest chunk = 113, active
+formats_filled: 0   plan_source_backfilled: 0
+```
+
+It also found four defects that would otherwise have reached production.
+
+### Chunks 108 and 109 were NOT never-started
+
+Each carried **200,000 `remote_file_state` rows with status `fetched`** - work
+staged during the run that halted on the 2026-07-31 Tape_03 servo freeze. They
+are `status='pending'` in `remote_chunks`, and have zero `files_index`, zero
+directory rows, zero worker attempts, no owner or lease and no container, so
+nothing reached tape. But "fetched" contradicts the never-started suffix the
+approved exception requires.
+
+An earlier claim in this document's history that "chunks 49-112 are provably
+never-started" was **wrong for these two**: the check had covered `files_index`,
+the directory tables and `remote_worker_attempts`, but not `remote_file_state`.
+
+`PgSessionMixin.clear_abandoned_fetch_state()` retires that state. It exports
+every row to a local `abandoned-fetch-state-v1` artifact, parses it back, and
+only then deletes - in one transaction, so the deletion is reversible from the
+artifact. It refuses any chunk showing real archive evidence (status other than
+pending, an owner or lease, catalog rows, worker attempts, or a container).
+Membership rows are never touched: this is fetch working state, not the
+`remote_plan_files`/`remote_snapshot_files` membership Plan 4 owns.
+
+### Migration 015 clause 5 assumed one run == one chunk
+
+The directory guard blocked on 2,731 rows because it fired whenever a run's
+catalog rows spanned several chunk indexes. This writer archives a finite
+**group** per run - run 765 covers chunks 0-9 - so min<>max is the normal
+shape. It now blocks only when such a range **reaches the approved suffix**,
+which would be genuine evidence a suffix chunk had started.
+
+### `persist_session_transition` had two defects
+
+It inserted straight to `active`, but the schema only accepts an INSERT as
+`draft` and walks `draft -> rehearsed -> approved -> active` one step at a
+time. It also never consulted the proposal's blockers, so a blocked proposal
+would have activated. Both are fixed and tested.
+
+### Limitation: the dump predates the frontier bootstrap
+
+The dump was taken at 15:17 local; session 37's frontier bootstrap row was
+created at 15:32. The restored copy therefore has **no scan scopes and no
+bootstrap**, so the proposal correctly reports a blocker there. Activation was
+validated only after synthetically clearing that blocker. **A real Approval B
+needs a fresh dump**, which is currently impossible - see the LTFS blocker
+above.
 
 ## Findings that changed the plan
 

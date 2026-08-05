@@ -2563,6 +2563,36 @@ class ContainerFormatMigrationTests(unittest.TestCase):
                 Exception, "without trustworthy remote chunk provenance"):
             self._apply_exception(session_id)
 
+    # -- migration 015 directory-provenance evidence -----------------------
+    #
+    # The isolated rehearsal (2026-08-05) showed clause 5 firing on 2,731 rows
+    # because it assumed one archive run == one chunk. This writer archives a
+    # finite GROUP per run, so a run covering chunks 0..9 legitimately has
+    # min<>max. The clause now blocks only when such a range REACHES the
+    # approved suffix, which would be genuine evidence a suffix chunk started.
+
+    def test_a_multi_chunk_group_in_the_prefix_is_not_contradictory(self):
+        session_id = self._exception_session_with_runs(boundary=3)
+        run_id = self._archive_run(session_id)
+        # One run, several prefix chunks: the normal finite-group shape.
+        self._catalog_chunks(session_id, [0, 1, 2], archive_run_id=run_id)
+        self._insert_direct_directory_evidence(session_id, None)
+        self._apply_exception(session_id, boundary=3)
+        self.assertEqual(self._query(
+            """SELECT packaging_format FROM remote_chunks
+               WHERE session_id=%s AND chunk_index=3""",
+            (session_id,))[0]["packaging_format"], "stored_tar")
+
+    def test_a_file_range_reaching_the_suffix_still_blocks(self):
+        session_id = self._exception_session_with_runs(boundary=3)
+        run_id = self._archive_run(session_id)
+        # This run's catalog rows reach INTO the approved suffix: real
+        # evidence a suffix chunk was started, and it must still refuse.
+        self._catalog_chunks(session_id, [0, 1, 2, 3], archive_run_id=run_id)
+        self._insert_direct_directory_evidence(session_id, None)
+        with self.assertRaises(Exception):
+            self._apply_exception(session_id, boundary=3)
+
     def test_015_is_explicit_and_requires_finalized_014(self):
         self.assertFalse(self.db.container_format_schema_installed())
         with self.assertRaisesRegex(Exception, "requires migrations 013 and 014"):

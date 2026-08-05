@@ -1191,6 +1191,15 @@ class PgDirectoryCatalogMixin:
         self._require_manifest_directory_catalog_schema()
         now = _now_utc()
 
+        # A proposal that reported blockers is not an approvable proposal. The
+        # blockers are the whole point of building one, so persisting past them
+        # would make the report decorative.
+        blockers = tuple(getattr(proposal, "blockers", ()) or ())
+        if blockers and state == "active":
+            raise RuntimeError(
+                "[DB] refusing to activate a transition whose proposal "
+                "reported blockers: " + "; ".join(blockers))
+
         def operation(conn):
             conn.execute("SELECT session_id FROM remote_sessions "
                          "WHERE session_id=%s FOR UPDATE", (session_id,))
@@ -1248,24 +1257,54 @@ class PgDirectoryCatalogMixin:
                     "first_chunk_after_transition":
                         int(proposal.first_manifest_first_chunk)})
 
+            # The schema's state machine is draft -> rehearsed -> approved ->
+            # active, one step at a time, and a transition may only be INSERTed
+            # as 'draft'. Walking it here rather than inserting the end state
+            # keeps the audit trail honest: every epoch records that it was
+            # drafted, rehearsed and approved before it became active.
             row = conn.execute(
                 """INSERT INTO remote_session_plan_transitions
                        (session_id, transition_epoch, state,
                         prior_plan_source, new_plan_source,
                         last_chunk_before_transition,
                         first_chunk_after_transition,
-                        scan_frontier_generation, evidence_report_locator,
-                        approval_identity, approved_at, created_at, updated_at)
-                   VALUES (%s,%s,%s,'legacy_db','manifest',%s,%s,%s,%s,%s,%s,
-                           %s,%s)
+                        created_at, updated_at)
+                   VALUES (%s,%s,'draft','legacy_db','manifest',%s,%s,%s,%s)
                    RETURNING transition_id""",
-                (session_id, int(epoch), state,
+                (session_id, int(epoch),
                  int(proposal.last_legacy_planned_chunk),
                  int(proposal.first_manifest_first_chunk),
-                 int(proposal.frontier_generation), str(evidence_locator),
-                 str(approval_identity), now, now, now)).fetchone()
-            return {"created": True, "transition_id": int(row["transition_id"]),
-                    "epoch": int(epoch),
+                 now, now)).fetchone()
+            transition_id = int(row["transition_id"])
+
+            ladder = ("rehearsed", "approved", "active")
+            if state not in ladder:
+                raise RuntimeError(
+                    f"[DB] unsupported target transition state {state!r}")
+            for step in ladder[:ladder.index(state) + 1]:
+                if step == "rehearsed":
+                    conn.execute(
+                        """UPDATE remote_session_plan_transitions
+                           SET state='rehearsed', scan_frontier_generation=%s,
+                               evidence_report_locator=%s, updated_at=%s
+                           WHERE transition_id=%s""",
+                        (int(proposal.frontier_generation),
+                         str(evidence_locator), now, transition_id))
+                elif step == "approved":
+                    conn.execute(
+                        """UPDATE remote_session_plan_transitions
+                           SET state='approved', approval_identity=%s,
+                               approved_at=%s, updated_at=%s
+                           WHERE transition_id=%s""",
+                        (str(approval_identity), now, now, transition_id))
+                else:
+                    conn.execute(
+                        """UPDATE remote_session_plan_transitions
+                           SET state='active', updated_at=%s
+                           WHERE transition_id=%s""",
+                        (now, transition_id))
+            return {"created": True, "transition_id": transition_id,
+                    "state": state, "epoch": int(epoch),
                     "plan_source_backfilled": int(backfilled),
                     "formats_filled": int(formats),
                     "first_chunk_after_transition":

@@ -779,6 +779,179 @@ class PgSessionMixin:
                 )
         return plan_id
 
+    @classmethod
+    def _export_fetch_state(cls, archive_root, session_id, chunk_indexes,
+                            rows):
+        """Write the rows to a local artifact and parse it back before use.
+
+        Returns the root-relative locator. Refuses to continue if the artifact
+        does not read back with exactly the rows that went into it - an
+        unverified export would make the deletion irreversible in practice
+        while looking reversible.
+        """
+        from .archive_artifacts import (Plan3ArtifactWriter,
+                                        read_plan3_artifact)
+
+        if not archive_root:
+            raise RuntimeError(
+                "[DB] clearing fetch state needs a local metadata root to "
+                "export the rows to first; configure "
+                "[LOCAL_MANIFEST_ARCHIVE] root")
+        locator = cls._abandoned_fetch_state_locator(session_id,
+                                                     chunk_indexes)
+        header = {
+            "session_id": int(session_id),
+            "chunk_indexes": list(chunk_indexes),
+            "reason": "fetch state of chunks staged but never written",
+        }
+        writer = Plan3ArtifactWriter(
+            archive_root, locator, version="abandoned-fetch-state-v1",
+            header=header, size_field="file_size_bytes", ordinal_field=None,
+            path_field="remote_path", require_unique_paths=False)
+        with writer:
+            for row in rows:
+                writer.add({
+                    "plan_file_id": row["plan_file_id"],
+                    "chunk_index": row["chunk_index"],
+                    "remote_path": row["remote_path"],
+                    "file_size_bytes": int(row["file_size_bytes"]),
+                    "status": row["status"],
+                    "local_rel_path": row["local_rel_path"],
+                    "error_msg": row["error_msg"],
+                    "updated_at": (row["updated_at"].isoformat()
+                                   if row["updated_at"] else None),
+                })
+        published = writer.publish()
+        _h, read_back, _t = read_plan3_artifact(
+            archive_root, published.locator,
+            expected_version="abandoned-fetch-state-v1")
+        if len(read_back) != len(rows):
+            raise RuntimeError(
+                f"[DB] fetch-state export is incomplete ({len(read_back)} of "
+                f"{len(rows)} rows); refusing to delete anything")
+        get_logger().info(
+            "abandoned_fetch_state_exported: session=%s chunks=%s rows=%d "
+            "locator=%s", session_id, chunk_indexes, len(rows),
+            published.locator)
+        return published.locator
+
+    @staticmethod
+    def _abandoned_fetch_state_locator(session_id, chunk_indexes):
+        span = f"{min(chunk_indexes):06d}_{max(chunk_indexes):06d}"
+        stamp = _now_utc().strftime("%Y%m%dT%H%M%SZ")
+        return (f"abandoned_fetch_state/session_{int(session_id):06d}/"
+                f"chunks_{span}.{stamp}.jsonl.zst")
+
+    def clear_abandoned_fetch_state(self, session_id, chunk_indexes, *,
+                                    archive_root=None, dry_run=True):
+        """Retire the fetch state of chunks that were staged but never written.
+
+        A run that fetched a chunk and then stopped leaves ~200,000
+        ``remote_file_state`` rows saying ``fetched``. Those rows are **working
+        state for a resume**, not archival evidence: the chunk's membership
+        lives in ``remote_plan_files``/``remote_snapshot_files`` and is not
+        touched here. But they do contradict "this chunk was never started",
+        which is what migration 015's approved-suffix evidence asks.
+
+        Three things make this safe to do rather than merely possible:
+
+        1. **It refuses any chunk that shows real archive evidence** - a
+           ``files_index`` row, a container, an archive run, a worker attempt,
+           an owner token or a lease, or a status other than ``pending``. If a
+           chunk might have reached tape, its state is not "abandoned".
+        2. **Every row is exported to a local artifact first**, parsed back,
+           and only then deleted - in the same transaction. The deletion is
+           reversible from the artifact.
+        3. **It is dry-run by default.**
+        """
+        wanted = sorted({int(index) for index in chunk_indexes})
+        if not wanted:
+            raise RuntimeError("[DB] no chunk indexes were named")
+
+        def operation(conn):
+            blockers = {}
+            for chunk_index in wanted:
+                row = conn.execute(
+                    """SELECT c.status, c.owner_token, c.lease_expires_at,
+                              (SELECT count(*) FROM files_index fi
+                                WHERE fi.remote_session_id=c.session_id
+                                  AND fi.remote_chunk_index=c.chunk_index)
+                                  AS catalog_rows,
+                              (SELECT count(*) FROM remote_worker_attempts wa
+                                WHERE wa.session_id=c.session_id
+                                  AND wa.chunk_index=c.chunk_index)
+                                  AS attempts
+                       FROM remote_chunks c
+                       WHERE c.session_id=%s AND c.chunk_index=%s
+                       FOR UPDATE OF c""",
+                    (session_id, chunk_index)).fetchone()
+                if row is None:
+                    blockers[chunk_index] = "chunk does not exist"
+                    continue
+                reasons = []
+                if row["status"] != "pending":
+                    reasons.append(f"status is {row['status']!r}, not pending")
+                if row["owner_token"] or row["lease_expires_at"]:
+                    reasons.append("chunk is owned or leased")
+                if int(row["catalog_rows"]):
+                    reasons.append(
+                        f"{row['catalog_rows']} files_index rows exist")
+                if int(row["attempts"]):
+                    reasons.append(
+                        f"{row['attempts']} worker attempts exist")
+                if self._table_exists_conn(conn, "archive_containers"):
+                    containers = conn.execute(
+                        """SELECT count(*) AS n FROM archive_containers
+                           WHERE session_id=%s AND chunk_index=%s""",
+                        (session_id, chunk_index)).fetchone()["n"]
+                    if int(containers):
+                        reasons.append(f"{containers} containers exist")
+                if reasons:
+                    blockers[chunk_index] = "; ".join(reasons)
+            if blockers:
+                raise RuntimeError(
+                    "[DB] refusing to clear fetch state; these chunks show "
+                    "real archive evidence and are not abandoned: "
+                    + "; ".join(f"chunk {k}: {v}"
+                                for k, v in sorted(blockers.items())))
+
+            rows = _rows(conn.execute(
+                """SELECT s.plan_file_id, s.status, s.local_rel_path,
+                          s.error_msg, s.updated_at, pf.chunk_index,
+                          sf.remote_path, sf.file_size_bytes
+                   FROM remote_file_state s
+                   JOIN remote_plan_files pf
+                     ON pf.plan_file_id=s.plan_file_id
+                   JOIN remote_snapshot_files sf
+                     ON sf.snapshot_file_id=pf.snapshot_file_id
+                   WHERE s.session_id=%s AND pf.chunk_index = ANY(%s)
+                   ORDER BY pf.chunk_index, pf.ordinal""",
+                (session_id, wanted)).fetchall())
+
+            by_chunk = {}
+            for row in rows:
+                by_chunk[row["chunk_index"]] = (
+                    by_chunk.get(row["chunk_index"], 0) + 1)
+            report = {"chunks": wanted, "rows": len(rows),
+                      "by_chunk": by_chunk, "dry_run": bool(dry_run),
+                      "artifact": None, "deleted": 0}
+            if dry_run or not rows:
+                return report
+
+            report["artifact"] = self._export_fetch_state(
+                archive_root, session_id, wanted, rows)
+            report["deleted"] = conn.execute(
+                """DELETE FROM remote_file_state s
+                   USING remote_plan_files pf
+                   WHERE s.plan_file_id=pf.plan_file_id
+                     AND s.session_id=%s AND pf.chunk_index = ANY(%s)""",
+                (session_id, wanted)).rowcount
+            return report
+
+        return self._transaction(
+            operation,
+            f"clear abandoned fetch state for session {session_id}")
+
     def iter_legacy_chunk_membership(self, session_id, chunk_index,
                                      *, batch_size=10_000):
         """Stream one legacy chunk's membership in chunk-local ordinal order.

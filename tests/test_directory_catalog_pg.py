@@ -551,3 +551,99 @@ class RestoreRoutingTests(_DirectoryCatalogFixture, unittest.TestCase):
                                    .find_directory_restore_parts)
         for token in ("open(", "robocopy", "LtfsCmd", "lto_drive"):
             self.assertNotIn(token, source, token)
+
+
+@unittest.skipUnless(_pg_available(), SKIP_REASON)
+class TransitionPersistenceTests(_DirectoryCatalogFixture, unittest.TestCase):
+    """Task 3.1 execute mode: the boundary is persisted, or refused."""
+
+    def _proposal(self, **over):
+        from src.session_transition import build_transition_proposal
+        proposal = build_transition_proposal(self.db, self.session_id)
+        if over:
+            import dataclasses
+            proposal = dataclasses.replace(proposal, **over)
+        return proposal
+
+    def test_a_blocked_proposal_is_never_activated(self):
+        proposal = self._proposal(blockers=("something is wrong",))
+        with self.assertRaisesRegex(Exception, "reported blockers"):
+            self.db.persist_session_transition(
+                self.session_id, proposal=proposal,
+                approval_identity="test", evidence_locator="e.txt")
+        self.assertIsNone(self.db.active_manifest_boundary(self.session_id))
+
+    def test_the_state_ladder_is_walked_not_skipped(self):
+        """The schema only accepts an INSERT as 'draft'."""
+        result = self.db.persist_session_transition(
+            self.session_id, proposal=self._proposal(blockers=()),
+            approval_identity="test", evidence_locator="e.txt")
+        self.assertTrue(result["created"])
+        self.assertEqual(result["state"], "active")
+        row = self._query(
+            """SELECT state, prior_plan_source, new_plan_source,
+                      approval_identity, scan_frontier_generation
+               FROM remote_session_plan_transitions
+               WHERE session_id=%s""", (self.session_id,))[0]
+        self.assertEqual(row["state"], "active")
+        self.assertEqual(row["prior_plan_source"], "legacy_db")
+        self.assertEqual(row["new_plan_source"], "manifest")
+        self.assertEqual(row["approval_identity"], "test")
+
+    def test_the_boundary_reads_back_as_the_active_epoch(self):
+        proposal = self._proposal(blockers=())
+        self.db.persist_session_transition(
+            self.session_id, proposal=proposal,
+            approval_identity="test", evidence_locator="e.txt")
+        self.assertEqual(self.db.active_manifest_boundary(self.session_id),
+                         proposal.first_manifest_first_chunk)
+
+    def test_persisting_twice_is_idempotent(self):
+        proposal = self._proposal(blockers=())
+        first = self.db.persist_session_transition(
+            self.session_id, proposal=proposal,
+            approval_identity="test", evidence_locator="e.txt")
+        second = self.db.persist_session_transition(
+            self.session_id, proposal=proposal,
+            approval_identity="test", evidence_locator="e.txt")
+        self.assertTrue(first["created"])
+        self.assertFalse(second["created"])
+        self.assertEqual(len(self._query(
+            "SELECT 1 FROM remote_session_plan_transitions WHERE session_id=%s",
+            (self.session_id,))), 1)
+
+    def test_a_stale_proposal_is_refused(self):
+        """Evidence that changed since the proposal was built is not approval."""
+        import dataclasses
+        proposal = dataclasses.replace(self._proposal(blockers=()),
+                                       existing_chunk_count=999)
+        with self.assertRaisesRegex(Exception, "changed since the proposal"):
+            self.db.persist_session_transition(
+                self.session_id, proposal=proposal,
+                approval_identity="test", evidence_locator="e.txt")
+
+    def test_assigned_packaging_formats_survive_the_transition(self):
+        before = {r["chunk_index"]: r["packaging_format"] for r in self._query(
+            """SELECT chunk_index, packaging_format FROM remote_chunks
+               WHERE session_id=%s ORDER BY chunk_index""", (self.session_id,))}
+        result = self.db.persist_session_transition(
+            self.session_id, proposal=self._proposal(blockers=()),
+            approval_identity="test", evidence_locator="e.txt")
+        after = {r["chunk_index"]: r["packaging_format"] for r in self._query(
+            """SELECT chunk_index, packaging_format FROM remote_chunks
+               WHERE session_id=%s ORDER BY chunk_index""", (self.session_id,))}
+        self.assertEqual(before, after)
+        self.assertEqual(result["formats_filled"], 0)
+
+    def test_the_schema_itself_makes_packaging_format_write_once(self):
+        """Stronger than the code guard: migration 015 refuses ANY change.
+
+        persist_session_transition only fills NULL formats, but even a direct
+        UPDATE cannot rewrite an assigned one - so an approved Stored-TAR
+        suffix is safe from every path, not just the one we control.
+        """
+        with self.assertRaisesRegex(Exception, "write-once"):
+            self._exec(
+                """UPDATE remote_chunks SET packaging_format='stored_tar'
+                   WHERE session_id=%s AND chunk_index=2""",
+                (self.session_id,))

@@ -1057,8 +1057,16 @@ BEGIN
                    OR (d.run_session_id IS NOT NULL AND
                        d.run_session_id IS DISTINCT FROM exception_session)
                    OR COALESCE(d.bad_file_count,0) <> 0
-                   OR d.file_chunk_index IS DISTINCT FROM
-                      d.maximum_file_chunk_index;
+                   -- A run's catalog rows spanning SEVERAL chunk indexes is
+                   -- the normal shape here: the writer archives one finite
+                   -- GROUP of chunks per run, so a run that wrote chunks
+                   -- 0..9 legitimately has min<>max.  Treating that as
+                   -- contradictory condemns every multi-chunk group ever
+                   -- written.  What actually matters for the approved suffix
+                   -- is whether any such range REACHES it - that would be
+                   -- real evidence a suffix chunk had been started, and it
+                   -- still blocks.
+                   OR d.maximum_file_chunk_index >= derived_boundary;
                 IF ambiguous_directory_count <> 0 THEN
                     RAISE EXCEPTION
                         'session % has % directory catalog rows with contradictory TAR-suffix provenance',
