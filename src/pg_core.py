@@ -259,19 +259,174 @@ class PgConnectionCore:
                 apply_on(conn)
         return [self.CONTAINER_FORMAT_MIGRATION]
 
-    def apply_stored_tar_plan_schema(self):
-        """Explicitly install Tasks 2.1-2.4 Stored-TAR persistence."""
+    # Exactly what migrations 016 and 017 install, used both to report
+    # installation state read-only and to validate an apply afterwards.
+    STORED_TAR_PLAN_TABLES = ("archive_container_members",)
+    STORED_TAR_PLAN_COLUMNS = {
+        "remote_chunks": ("stored_tar_max_size_bytes",),
+        "archive_containers": ("estimated_archive_bytes",),
+    }
+    STORED_TAR_PUBLICATION_COLUMNS = {
+        "archive_containers": (
+            "validated_part_locator", "validation_summary",
+            "disposition_counts"),
+    }
+    # Only constraints 017 ADDS.  `archive_containers_observed_ck` is
+    # deliberately absent: migration 015 already creates it and 017 merely
+    # drops and redefines it, so its presence says nothing about whether
+    # 016/017 ran -- counting it made a 015-only database report "partial".
+    STORED_TAR_PUBLICATION_CONSTRAINTS = (
+        "archive_containers_validated_part_ck",
+        "archive_containers_ready_pair_ck",
+    )
+    STORED_TAR_PLAN_INDEXES = ("idx_archive_container_members_container",)
+
+    @classmethod
+    def stored_tar_plan_migration_paths(cls):
         sql_dir = Path(PROJECT_ROOT) / "scripts" / "sql"
+        return (sql_dir / cls.STORED_TAR_PLAN_MIGRATION,
+                sql_dir / cls.STORED_TAR_PUBLICATION_MIGRATION)
+
+    @classmethod
+    def stored_tar_plan_migration_checksums(cls):
+        """SHA-256 identity of migrations 016 and 017 (read-only)."""
+        return {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in cls.stored_tar_plan_migration_paths()}
+
+    @staticmethod
+    def _constraint_exists_conn(conn, table_name, constraint_name):
+        return conn.execute(
+            """SELECT 1 FROM pg_constraint c
+               JOIN pg_class t ON t.oid=c.conrelid
+               JOIN pg_namespace n ON n.oid=t.relnamespace
+               WHERE n.nspname='public' AND t.relname=%s AND c.conname=%s""",
+            (table_name, constraint_name),
+        ).fetchone() is not None
+
+    def _stored_tar_plan_schema_report_conn(self, conn):
+        report = {
+            "database": conn.execute(
+                "SELECT current_database() AS db").fetchone()["db"],
+            "expected_migration_checksums":
+                self.stored_tar_plan_migration_checksums(),
+            "installation_state": "absent",
+            "issues": [],
+            "apply_blocking": [],
+        }
+        issues = report["issues"]
+
+        # 016 and 017 both RAISE unless migration 015 is present.  Reporting
+        # that as a blocker keeps the ordering failure readable instead of
+        # surfacing as a raw PostgreSQL exception mid-apply.
+        prerequisites = ("archive_containers", "remote_chunks",
+                         "remote_plan_files", "archive_artifacts")
+        missing_prerequisites = [name for name in prerequisites
+                                 if not self._table_exists_conn(conn, name)]
+        if missing_prerequisites:
+            report["apply_blocking"].append(
+                "migrations 016/017 require migration 015 first; missing: "
+                + ", ".join(missing_prerequisites))
+
+        present = 0
+        expected = 0
+        for table in self.STORED_TAR_PLAN_TABLES:
+            expected += 1
+            if self._table_exists_conn(conn, table):
+                present += 1
+            else:
+                issues.append(f"missing table: {table}")
+        for group in (self.STORED_TAR_PLAN_COLUMNS,
+                      self.STORED_TAR_PUBLICATION_COLUMNS):
+            for table, columns in group.items():
+                for column in columns:
+                    expected += 1
+                    if self._column_exists_conn(conn, table, column):
+                        present += 1
+                    else:
+                        issues.append(f"missing column: {table}.{column}")
+        for constraint in self.STORED_TAR_PUBLICATION_CONSTRAINTS:
+            expected += 1
+            if self._constraint_exists_conn(
+                    conn, "archive_containers", constraint):
+                present += 1
+            else:
+                issues.append(f"missing constraint: {constraint}")
+        for index in self.STORED_TAR_PLAN_INDEXES:
+            expected += 1
+            if conn.execute(
+                    """SELECT 1 FROM pg_indexes
+                       WHERE schemaname='public' AND indexname=%s""",
+                    (index,)).fetchone() is not None:
+                present += 1
+            else:
+                issues.append(f"missing index: {index}")
+
+        if present == 0:
+            report["installation_state"] = "absent"
+        elif present == expected:
+            report["installation_state"] = "installed"
+        else:
+            report["installation_state"] = "partial"
+            report["apply_blocking"].append(
+                f"migrations 016/017 are partially installed "
+                f"({present}/{expected} objects): "
+                + "; ".join(issues))
+        report["objects_present"] = present
+        report["objects_expected"] = expected
+        report["ready"] = not issues
+        return report
+
+    def stored_tar_plan_schema_report(self):
+        """Exact, read-only migrations 016+017 report."""
+        return self._run_read(
+            self._stored_tar_plan_schema_report_conn,
+            "stored tar plan schema report")
+
+    def validate_stored_tar_plan_schema(self):
+        report = self.stored_tar_plan_schema_report()
+        if not report["ready"]:
+            raise RuntimeError(
+                "[DB] Stored-TAR plan schema missing or drifted: "
+                + "; ".join(report["issues"]))
+        return report
+
+    def apply_stored_tar_plan_schema(self, *, require_archiver_lock=False):
+        """Explicitly install Tasks 2.1-2.4 Stored-TAR persistence.
+
+        Migrations 016 and 017 are explicit-only and deliberately absent from
+        :meth:`_init_schema`.  Both are applied inside ONE transaction, in
+        order, so a failure in 017 cannot leave 016 half-committed.  Each
+        migration re-checks its own prerequisites in SQL, so the ordering
+        guarantee does not depend on this method.  The guarded inspector
+        command pins the archiver advisory lock to this same database session;
+        isolated tests may apply directly without that operational
+        precondition.
+        """
         migrations = (
             self.STORED_TAR_PLAN_MIGRATION,
             self.STORED_TAR_PUBLICATION_MIGRATION,
         )
+        paths = self.stored_tar_plan_migration_paths()
         with self._pool.connection() as conn:
             with conn.transaction():
+                if require_archiver_lock:
+                    owned = conn.execute(
+                        """SELECT EXISTS (
+                               SELECT 1 FROM pg_locks
+                               WHERE locktype='advisory' AND granted
+                                 AND pid=pg_backend_pid()
+                                 AND classid=%s AND objid=%s
+                                 AND objsubid=1) AS owned""",
+                        (self.ARCHIVER_LOCK_KEY >> 32,
+                         self.ARCHIVER_LOCK_KEY & 0xFFFFFFFF),
+                    ).fetchone()["owned"]
+                    if not owned:
+                        raise RuntimeError(
+                            "[DB] Refusing migrations 016/017 without the "
+                            "archiver advisory lock on this session")
                 with conn.cursor() as cur:
-                    for migration in migrations:
-                        cur.execute((sql_dir / migration).read_text(
-                            encoding="utf-8"))
+                    for path in paths:
+                        cur.execute(path.read_text(encoding="utf-8"))
         return list(migrations)
 
     @classmethod

@@ -116,5 +116,61 @@ class PostgresBackupHelperTests(unittest.TestCase):
             self.assertNotIn(token, sql)
 
 
+class WindowsDeviceTargetTests(unittest.TestCase):
+    """`_windows_device_target` must resolve, never guess.
+
+    The IBM LTFS driver lists the same device symlink twice for its drive
+    letter (verified 2026-08-05: survives a reboot, remounts fine with it
+    present).  A repeated target resolves to exactly one device and is
+    therefore determinate; two DIFFERENT targets are not, and must still be
+    refused so a dump can never land on the LTFS drive.
+    """
+
+    @staticmethod
+    def _query_returning(targets):
+        import ctypes
+
+        def fake_query(name, buffer, size):
+            data = "\0".join(targets) + "\0\0"
+            encoded = data.encode("utf-16-le")
+            ctypes.memmove(buffer, encoded, len(encoded))
+            return len(data)
+
+        return fake_query
+
+    def _resolve(self, targets):
+        import ctypes
+
+        from src import pg_backup
+
+        with mock.patch.object(pg_backup.os, "name", "nt"), \
+                mock.patch.object(
+                    ctypes.windll.kernel32, "QueryDosDeviceW",
+                    self._query_returning(targets)):
+            return pg_backup._windows_device_target("Z:")
+
+    def test_single_mapping_resolves(self):
+        self.assertEqual(
+            self._resolve(["\\Device\\HarddiskVolume3"]),
+            "\\device\\harddiskvolume3")
+
+    def test_repeated_identical_mapping_resolves(self):
+        # The live LTFS shape: the same target listed twice.
+        target = "\\Device\\UfsIoDev_4EEB10F8LTFS"
+        self.assertEqual(
+            self._resolve([target, target]), target.casefold())
+
+    def test_differing_mappings_are_still_refused(self):
+        with self.assertRaisesRegex(RuntimeError, "multiple mappings"):
+            self._resolve(["\\Device\\HarddiskVolume3",
+                           "\\Device\\HarddiskVolume7"])
+
+    def test_repeated_network_mapping_is_still_refused(self):
+        # Deduplication must not smuggle an aliased target past the next gate.
+        target = "\\Device\\LanmanRedirector\\server\\share"
+        with self.assertRaisesRegex(RuntimeError, "Aliased or non-local"):
+            self._resolve([target, target])
+
+
 if __name__ == "__main__":
     unittest.main()

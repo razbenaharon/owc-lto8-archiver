@@ -941,44 +941,84 @@ class PgContainerMixin:
                     f"{ambiguous_files} catalog row(s) lack trustworthy "
                     "remote chunk provenance")
 
+            # A run is ambiguous when its OUTPUT exists and cannot be
+            # attributed to this session -- not merely when it produced no
+            # `files_index` rows.  `files_index` indexes only files at or
+            # above `index_min_file_mb`, so a chunk built entirely from small
+            # files produces none BY DESIGN, and the migration-007 bundle rows
+            # are the evidence such a run does leave.  A run with no output of
+            # any kind is likewise not ambiguous: nothing survives that could
+            # be misattributed.  What still fails is a run whose output DOES
+            # exist but names a foreign session or carries no chunk identity.
+            #
+            # This mirrors migration 015's `run_evidence_sql` clause for
+            # clause, including the migration-007-absent case, where the three
+            # bundle fragments collapse to empty exactly as they do there.
+            # Named parameters are used because `session_id` appears up to
+            # seven times across conditionally-assembled fragments.
+            if directory_count == 3:
+                foreign_bundle_expr = (
+                    "OR EXISTS (SELECT 1 FROM directory_archive_bundles dab "
+                    "WHERE dab.archive_run_id=ar.run_id "
+                    "  AND dab.remote_session_id "
+                    "      IS DISTINCT FROM %(session)s::BIGINT)")
+                any_bundle_expr = (
+                    "OR EXISTS (SELECT 1 FROM directory_archive_bundles dab "
+                    "WHERE dab.archive_run_id=ar.run_id)")
+                good_bundle_expr = (
+                    "AND NOT EXISTS "
+                    "(SELECT 1 FROM directory_archive_bundles dab "
+                    "WHERE dab.archive_run_id=ar.run_id "
+                    "  AND dab.remote_session_id=%(session)s::BIGINT)")
+            else:
+                foreign_bundle_expr = ""
+                any_bundle_expr = ""
+                good_bundle_expr = ""
+
+            unattributed_output_sql = f"""
+                        EXISTS (SELECT 1 FROM files_index fi
+                                WHERE fi.archive_run_id=ar.run_id
+                                  AND (fi.remote_session_id IS DISTINCT FROM
+                                           %(session)s::BIGINT
+                                       OR fi.remote_chunk_index IS NULL))
+                        {foreign_bundle_expr}
+                        OR ((EXISTS (SELECT 1 FROM files_index fi
+                                     WHERE fi.archive_run_id=ar.run_id)
+                             {any_bundle_expr})
+                            AND NOT EXISTS (SELECT 1 FROM files_index fi
+                                            WHERE fi.archive_run_id=ar.run_id
+                                              AND fi.remote_session_id=
+                                                  %(session)s::BIGINT
+                                              AND fi.remote_chunk_index
+                                                  IS NOT NULL)
+                            {good_bundle_expr})"""
             if has_run_chunk:
-                run_ambiguity_sql = """
+                run_ambiguity_sql = f"""
                     SELECT count(*) AS n FROM archive_runs ar
-                    WHERE ar.remote_session_id=%s AND (
+                    WHERE ar.remote_session_id=%(session)s::BIGINT AND (
                       (ar.remote_chunk_index IS NOT NULL AND (
                         NOT EXISTS (SELECT 1 FROM remote_chunks c
-                                    WHERE c.session_id=%s
+                                    WHERE c.session_id=%(session)s::BIGINT
                                       AND c.chunk_index=ar.remote_chunk_index)
                         OR EXISTS (SELECT 1 FROM files_index fi
                                    WHERE fi.archive_run_id=ar.run_id
-                                     AND (fi.remote_session_id IS DISTINCT FROM %s
+                                     AND (fi.remote_session_id IS DISTINCT FROM
+                                              %(session)s::BIGINT
                                           OR fi.remote_chunk_index IS DISTINCT FROM
                                              ar.remote_chunk_index))))
                       OR (ar.remote_chunk_index IS NULL AND (
-                        NOT EXISTS (SELECT 1 FROM files_index fi
-                                    WHERE fi.archive_run_id=ar.run_id
-                                      AND fi.remote_session_id=%s
-                                      AND fi.remote_chunk_index IS NOT NULL)
-                        OR EXISTS (SELECT 1 FROM files_index fi
-                                   WHERE fi.archive_run_id=ar.run_id
-                                     AND (fi.remote_session_id IS DISTINCT FROM %s
-                                          OR fi.remote_chunk_index IS NULL)))))"""
-                run_params = (session_id,) * 5
+                        {unattributed_output_sql})))"""
             else:
-                run_ambiguity_sql = """
+                # `archive_runs.remote_chunk_index` is added by migration 015
+                # itself, so a pre-015 database has no direct chunk identity at
+                # all: every run takes the IS NULL branch, exactly as it will
+                # once the column exists and is unset.
+                run_ambiguity_sql = f"""
                     SELECT count(*) AS n FROM archive_runs ar
-                    WHERE ar.remote_session_id=%s AND (
-                        NOT EXISTS (SELECT 1 FROM files_index fi
-                                    WHERE fi.archive_run_id=ar.run_id
-                                      AND fi.remote_session_id=%s
-                                      AND fi.remote_chunk_index IS NOT NULL)
-                        OR EXISTS (SELECT 1 FROM files_index fi
-                                   WHERE fi.archive_run_id=ar.run_id
-                                     AND (fi.remote_session_id IS DISTINCT FROM %s
-                                          OR fi.remote_chunk_index IS NULL)))"""
-                run_params = (session_id,) * 3
+                    WHERE ar.remote_session_id=%(session)s::BIGINT AND (
+                        {unattributed_output_sql})"""
             ambiguous_runs = int(conn.execute(
-                run_ambiguity_sql, run_params).fetchone()["n"])
+                run_ambiguity_sql, {"session": session_id}).fetchone()["n"])
             if ambiguous_runs:
                 blocking.append(
                     f"{ambiguous_runs} archive run(s) lack trustworthy "
@@ -1109,10 +1149,17 @@ class PgContainerMixin:
                                    d.run_session_id IS DISTINCT FROM
                                        c.session_id)
                                OR COALESCE(d.bad_file_count,0) <> 0
-                               OR d.file_chunk_index IS DISTINCT FROM
-                                  d.maximum_file_chunk_index"""
+                               -- A run's catalog rows spanning SEVERAL chunk
+                               -- indexes is the normal shape here: the writer
+                               -- archives one finite GROUP of chunks per run,
+                               -- so a run that wrote chunks 0..9 legitimately
+                               -- has min<>max.  Treating that as contradictory
+                               -- condemns every multi-chunk group ever
+                               -- written.  What matters for the approved
+                               -- suffix is whether such a range REACHES it.
+                               OR d.maximum_file_chunk_index >= %s"""
                         directory_blockers = conn.execute(
-                            directory_sql, (session_id, derived)
+                            directory_sql, (session_id, derived, derived)
                         ).fetchone()
                         ambiguous_directories = int(directory_blockers["n"])
                         directory_summary["suffix_blocker_count"] = (

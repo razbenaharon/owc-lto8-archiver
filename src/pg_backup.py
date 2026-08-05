@@ -436,11 +436,24 @@ def _windows_device_target(drive):
             "[DB BACKUP] A drive mapping is unreadable; local-path safety is "
             "indeterminate")
     targets = [item for item in buffer[:result].split("\0") if item]
-    if len(targets) != 1:
+    # The IBM LTFS driver publishes its DOS device symlink TWICE for the same
+    # drive letter -- the identical `\Device\UfsIoDev_<id>LTFS` target listed
+    # two times.  Verified 2026-08-05: it survives a full reboot (which clears
+    # every DOS device symlink), regenerates with a fresh device id on each
+    # boot, and a cartridge mounts successfully while it is present.  So a
+    # repeated target is this driver's normal shape, not a stale leftover.
+    #
+    # What this guard exists to refuse is *guessing* which device a letter
+    # resolves to, so a dump can never land on the LTFS drive.  Repeated
+    # copies of one target leave nothing to guess: the letter resolves to
+    # exactly one device.  Genuinely DIFFERENT targets remain indeterminate
+    # and are still refused.
+    distinct = {item.casefold() for item in targets}
+    if len(distinct) != 1:
         raise RuntimeError(
             "[DB BACKUP] A drive has multiple mappings; local-path safety is "
             "indeterminate")
-    target = targets[0].casefold()
+    target = distinct.pop()
     if (not target.startswith("\\device\\")
             or target.startswith(("\\device\\mup\\",
                                   "\\device\\lanmanredirector\\"))):

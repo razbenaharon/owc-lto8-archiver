@@ -243,5 +243,58 @@ class ContainerFormatCliDispatchTests(unittest.TestCase):
             require_archiver_lock=True)
 
 
+class WindowsDriveDeviceTargetTests(unittest.TestCase):
+    """`_windows_drive_device_target` must resolve, never guess.
+
+    Mirrors `src.pg_backup._windows_device_target`: the IBM LTFS driver lists
+    the same device symlink twice for its drive letter, which resolves to one
+    device and is determinate.  Two DIFFERENT targets are not, and are still
+    refused so staging can never be mistaken for the LTFS drive.
+    """
+
+    @staticmethod
+    def _query_returning(targets):
+        import ctypes
+
+        def fake_query(name, buffer, size):
+            data = "\0".join(targets) + "\0\0"
+            encoded = data.encode("utf-16-le")
+            ctypes.memmove(buffer, encoded, len(encoded))
+            return len(data)
+
+        return fake_query
+
+    def _resolve(self, targets):
+        import ctypes
+
+        with mock.patch.object(inspect_db.os, "name", "nt"), \
+                mock.patch.object(
+                    ctypes.windll.kernel32, "QueryDosDeviceW",
+                    self._query_returning(targets)):
+            return inspect_db._windows_drive_device_target("Z:")
+
+    def test_single_mapping_resolves(self):
+        self.assertEqual(
+            self._resolve(["\\Device\\HarddiskVolume3"]),
+            "\\device\\harddiskvolume3")
+
+    def test_repeated_identical_mapping_resolves(self):
+        target = "\\Device\\UfsIoDev_4EEB10F8LTFS"
+        self.assertEqual(
+            self._resolve([target, target]), target.casefold())
+
+    def test_differing_mappings_are_still_refused(self):
+        with self.assertRaisesRegex(
+                OperationalError, "multiple device mappings"):
+            self._resolve(["\\Device\\HarddiskVolume3",
+                           "\\Device\\HarddiskVolume7"])
+
+    def test_repeated_aliased_mapping_is_still_refused(self):
+        target = "\\Device\\LanmanRedirector\\server\\share"
+        with self.assertRaisesRegex(
+                OperationalError, "aliased or non-local"):
+            self._resolve([target, target])
+
+
 if __name__ == "__main__":
     unittest.main()

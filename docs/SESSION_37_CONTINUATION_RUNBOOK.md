@@ -41,16 +41,39 @@ Get-ScheduledTask | Where-Object { $_.TaskName -like '*LTO*' } |
 # 1.2 no advisory lock, no application connection
 python inspect_db.py --session-forensics --session 37
 
-# 1.3 the LTFS mount is REAL, not just a drive letter
-Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='Z:'" |
-    Select-Object DeviceID, FileSystem, Size, FreeSpace
+# 1.3 the LTFS mount is REAL, not just a drive letter.
+#     Win32_LogicalDisk / Get-PSDrive CANNOT see an LTFS volume -- use
+#     GetDiskFreeSpaceEx, which is one stat call and never walks the tape.
+python -c "import ctypes; f=ctypes.c_ulonglong(); t=ctypes.c_ulonglong(); tf=ctypes.c_ulonglong(); ok=ctypes.windll.kernel32.GetDiskFreeSpaceExW('Z:\\', ctypes.byref(f), ctypes.byref(t), ctypes.byref(tf)); print('ok', ok, 'total', t.value, 'free', f.value)"
+
+# corroborate with the mount's own record: a successful mount logs 11031
+Get-Content "C:\Program Files\IBM\LTFS\log\LogFile.csv" |
+    Select-String -Pattern '"(11031|17227)"' | Select-Object -Last 12
 ```
 
-> **The trap that has bitten this system before.** `Test-Path Z:\` returns
-> **True** on a dead mount ([incident 011](incidents/011-20260726-tape-swap-blockers.md)).
-> The mount is only real when `Win32_LogicalDisk` reports a non-empty
-> `FileSystem` **and** a non-zero `Size`. Empty/zero means **no cartridge is
-> loaded** — stop and get someone to the drive.
+> **Two opposite traps, both seen on this host.**
+>
+> - `Test-Path Z:\` returns **True** on a dead mount
+>   ([incident 011](incidents/011-20260726-tape-swap-blockers.md)) — a live-looking
+>   letter over nothing.
+> - `Win32_LogicalDisk` reports an **empty** `FileSystem`/`Size`/`FreeSpace` on a
+>   perfectly mounted LTFS volume. Verified 2026-08-05: while the cartridge was
+>   mounted and healthy, WMI showed all-empty and `GetDiskFreeSpaceEx` correctly
+>   returned 11.712 TB. An earlier revision of this runbook told you to stop on
+>   that emptiness; doing so **rejects a working drive**.
+>
+> The mount is real when `GetDiskFreeSpaceEx` succeeds with a non-zero total
+> **and** the LTFS log shows `11031 Volume mounted successfully` with a
+> `Medium Label` matching the intended cartridge. If `GetDiskFreeSpaceEx` fails,
+> no cartridge is loaded — stop and get someone to the drive.
+>
+> **`Z:` has TWO identical DOS device symlinks, and that is normal.** The IBM
+> LTFS driver publishes the same `\Device\UfsIoDev_<id>LTFS` target twice. It
+> survives a full reboot (which clears every DOS device symlink), regenerates
+> with a fresh id each boot, and a cartridge mounts successfully with it
+> present. Do not read a repeated *identical* target as a fault; only
+> genuinely **different** targets are ambiguous.
+> See [incident 012](incidents/012-20260805-ltfs-mount-absent-blocks-backup.md).
 
 ```powershell
 # 1.4 the drive letter still matches config (it has moved before: E: -> Z:)

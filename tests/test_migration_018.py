@@ -1148,5 +1148,98 @@ class ManifestDirectoryCatalogMigrationTests(unittest.TestCase):
             self.db.validate_manifest_directory_catalog_schema()
 
 
+@unittest.skipUnless(_pg_available(), SKIP_REASON)
+class StoredTarPlanSchemaCommandTests(unittest.TestCase):
+    """Migrations 016+017 report, validation, and lock-guarded apply.
+
+    These exist because 016 and 017 previously had no operator entry point at
+    all -- only tests called ``apply_stored_tar_plan_schema`` -- so there was
+    no supported way to install them on production between 015 and 018.
+    """
+
+    def setUp(self):
+        from src.pg_db import PgDatabaseManager
+
+        self.dbname, self.conninfo = create_test_database(
+            "lto_stored_tar_plan")
+        self.db = PgDatabaseManager(self.conninfo)
+
+        def cleanup():
+            try:
+                self.db.close()
+            finally:
+                drop_test_database(self.dbname)
+
+        self.addCleanup(cleanup)
+
+    def _apply_015(self):
+        self.db.apply_incremental_scan_schema(finalize=True)
+        self.db.apply_container_format_schema()
+
+    def test_report_blocks_before_migration_015(self):
+        report = self.db.stored_tar_plan_schema_report()
+        self.assertEqual(report["installation_state"], "absent")
+        self.assertFalse(report["ready"])
+        self.assertEqual(report["objects_present"], 0)
+        self.assertTrue(
+            any("require migration 015" in item
+                for item in report["apply_blocking"]),
+            report["apply_blocking"])
+
+    def test_report_is_applyable_once_015_is_present(self):
+        self._apply_015()
+        report = self.db.stored_tar_plan_schema_report()
+        self.assertEqual(report["installation_state"], "absent")
+        self.assertEqual(report["apply_blocking"], [])
+
+    def test_apply_installs_every_declared_object(self):
+        self._apply_015()
+        self.assertEqual(
+            self.db.apply_stored_tar_plan_schema(),
+            ["016_postgres_stored_tar_plans.sql",
+             "017_postgres_stored_tar_publication.sql"])
+        report = self.db.validate_stored_tar_plan_schema()
+        self.assertEqual(report["installation_state"], "installed")
+        self.assertTrue(report["ready"])
+        self.assertEqual(report["issues"], [])
+        self.assertEqual(
+            report["objects_present"], report["objects_expected"])
+
+    def test_validate_refuses_before_apply(self):
+        self._apply_015()
+        with self.assertRaisesRegex(RuntimeError, "missing or drifted"):
+            self.db.validate_stored_tar_plan_schema()
+
+    def test_apply_refuses_without_the_archiver_lock(self):
+        self._apply_015()
+        with self.assertRaisesRegex(RuntimeError, "archiver advisory lock"):
+            self.db.apply_stored_tar_plan_schema(require_archiver_lock=True)
+        # The refusal must leave nothing behind.
+        self.assertEqual(
+            self.db.stored_tar_plan_schema_report()["objects_present"], 0)
+
+    def test_apply_is_idempotent(self):
+        self._apply_015()
+        self.db.apply_stored_tar_plan_schema()
+        self.db.apply_stored_tar_plan_schema()
+        self.assertTrue(
+            self.db.stored_tar_plan_schema_report()["ready"])
+
+    def test_partial_installation_is_reported_and_blocks(self):
+        self._apply_015()
+        self.db.apply_stored_tar_plan_schema()
+        with self.db._pool.connection() as conn:
+            conn.execute("ALTER TABLE archive_containers "
+                         "DROP CONSTRAINT archive_containers_ready_pair_ck")
+            conn.commit()
+        report = self.db.stored_tar_plan_schema_report()
+        self.assertEqual(report["installation_state"], "partial")
+        self.assertFalse(report["ready"])
+        self.assertTrue(report["apply_blocking"])
+        self.assertIn(
+            "missing constraint: archive_containers_ready_pair_ck",
+            report["issues"])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

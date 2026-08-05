@@ -273,11 +273,19 @@ def _windows_drive_device_target(drive):
             "[MIGRATION 015] A drive mapping could not be resolved; staging "
             "location evidence is indeterminate")
     targets = [item for item in buffer[:result].split("\0") if item]
-    if len(targets) != 1:
+    # The IBM LTFS driver publishes its device symlink twice for one drive
+    # letter -- the same target listed repeatedly.  Verified 2026-08-05: it
+    # survives a full reboot, regenerates with a fresh device id each boot,
+    # and a cartridge mounts successfully while present.  Identical repeats
+    # resolve to exactly one device, so nothing is being guessed; genuinely
+    # DIFFERENT targets stay indeterminate and are still refused.  This
+    # mirrors ``src.pg_backup._windows_device_target``.
+    distinct = {item.casefold() for item in targets}
+    if len(distinct) != 1:
         raise OperationalError(
             "[MIGRATION 015] A drive has multiple device mappings; staging "
             "location evidence is indeterminate")
-    target = targets[0].casefold()
+    target = distinct.pop()
     # SUBST commonly returns ``\??\Z:\...``.  Treat every namespace alias
     # as indeterminate rather than recursively resolving a path that may lead
     # to LTFS.  Plain local and LTFS drive letters both resolve canonically
@@ -491,6 +499,18 @@ def _run_container_format_schema_report(cfg, *, validate=False):
     return 0
 
 
+def _run_stored_tar_plan_schema_report(cfg, *, validate=False):
+    """Read-only migrations 016/017 report/validation."""
+    db = _open_read_only_db(cfg)
+    try:
+        report = (db.validate_stored_tar_plan_schema() if validate
+                  else db.stored_tar_plan_schema_report())
+    finally:
+        db.close()
+    _print_json(report)
+    return 0
+
+
 def _run_manifest_directory_catalog_schema_report(cfg, *, validate=False):
     """Read-only migration-018 report/validation; never initializes schema."""
     db = _open_read_only_db(cfg)
@@ -501,6 +521,95 @@ def _run_manifest_directory_catalog_schema_report(cfg, *, validate=False):
     finally:
         db.close()
     _print_json(report)
+    return 0
+
+
+def _apply_stored_tar_plan_schema(cfg, args, parser):
+    """Guarded, explicit migrations 016+017 entry point (Plan 2 Tasks 2.1-2.4).
+
+    Same operator contract as migrations 015 and 018: database identity in the
+    report, a read-only preflight by default, and for an execute an explicit
+    ``--execute --yes``, a verified backup receipt, proven quiescence before
+    and again under the archiver lock, then post-apply validation.  Both
+    migrations land in one transaction inside
+    :meth:`apply_stored_tar_plan_schema`.
+    """
+    if args.dry_run and args.execute:
+        parser.error(
+            "--apply-stored-tar-plan-schema accepts only one of "
+            "--dry-run or --execute")
+
+    db = _open_read_only_db(cfg)
+    try:
+        schema_report = db.stored_tar_plan_schema_report()
+    finally:
+        db.close()
+    preflight = {
+        "database": cfg.pg_dbname,
+        "schema": schema_report,
+        "blocking": list(schema_report.get("apply_blocking", ())),
+        "requested": {"execute": bool(args.execute)},
+    }
+
+    if not args.execute:
+        preflight["applied"] = []
+        preflight["note"] = (
+            "read-only preflight; execute requires --execute --yes and a "
+            "verified --backup-file")
+        _print_json(preflight)
+        return 0
+
+    if not args.yes:
+        parser.error(
+            "--apply-stored-tar-plan-schema --execute requires --yes")
+    if not args.backup_file:
+        parser.error(
+            "--apply-stored-tar-plan-schema --execute requires --backup-file "
+            "naming a PostgreSQL backup this tool can verify")
+    if preflight["blocking"]:
+        raise OperationalError(
+            "[MIGRATION 016/017] Refusing migration: "
+            + "; ".join(preflight["blocking"]))
+
+    holders = archiver_lock_status(_conninfo(cfg))
+    if holders:
+        raise OperationalError(
+            "[MIGRATION 016/017] Refusing while the archiver lock is held: "
+            f"{holders}")
+    processes = active_archive_processes()
+    if processes:
+        raise OperationalError(
+            "[MIGRATION 016/017] Refusing while archive/transfer processes "
+            f"are running ({len(processes)} detected)")
+    preflight["backup"] = verify_backup_receipt(cfg, args.backup_file)
+
+    db = _open_no_init_db(cfg)
+    try:
+        db.acquire_archiver_lock()
+        processes = active_archive_processes()
+        if processes:
+            raise OperationalError(
+                "[MIGRATION 016/017] Refusing after final liveness check "
+                f"({len(processes)} archive/transfer process(es) detected)")
+        locked_backup = verify_backup_receipt(cfg, args.backup_file)
+        if locked_backup["receipt_id"] != preflight["backup"]["receipt_id"]:
+            raise OperationalError(
+                "[MIGRATION 016/017] Backup receipt changed before locked "
+                "apply")
+
+        final_report = db.stored_tar_plan_schema_report()
+        final_blocking = list(final_report.get("apply_blocking", ()))
+        if final_blocking:
+            raise OperationalError(
+                "[MIGRATION 016/017] Final locked preflight refused "
+                "migration: " + "; ".join(final_blocking))
+        preflight["applied"] = db.apply_stored_tar_plan_schema(
+            require_archiver_lock=True)
+        preflight["validation"] = db.validate_stored_tar_plan_schema()
+        preflight["final_locked_preflight"] = final_report
+    finally:
+        db.close()
+    _print_json(preflight)
     return 0
 
 
@@ -1086,6 +1195,18 @@ def _build_parser():
     parser.add_argument("--container-format-schema-report",
                         action="store_true",
                         help="Read-only migration-015 schema/format report.")
+    parser.add_argument("--apply-stored-tar-plan-schema",
+                        action="store_true",
+                        help="Migrations 016+017, applied together in one "
+                             "transaction. Read-only preflight unless "
+                             "--execute --yes --backup-file are supplied.")
+    parser.add_argument("--validate-stored-tar-plan-schema",
+                        action="store_true",
+                        help="Fail-closed read-only validation of migrations "
+                             "016 and 017.")
+    parser.add_argument("--stored-tar-plan-schema-report",
+                        action="store_true",
+                        help="Read-only migrations 016/017 schema report.")
     parser.add_argument("--apply-manifest-directory-catalog-schema",
                         action="store_true",
                         help="Migration 018. Read-only preflight unless "
@@ -1268,6 +1389,15 @@ def _dispatch(parser, args):
 
     if args.container_format_schema_report:
         return _run_container_format_schema_report(cfg, validate=False)
+
+    if args.apply_stored_tar_plan_schema:
+        return _apply_stored_tar_plan_schema(cfg, args, parser)
+
+    if args.validate_stored_tar_plan_schema:
+        return _run_stored_tar_plan_schema_report(cfg, validate=True)
+
+    if args.stored_tar_plan_schema_report:
+        return _run_stored_tar_plan_schema_report(cfg, validate=False)
 
     if args.apply_manifest_directory_catalog_schema:
         return _apply_manifest_directory_catalog_schema(cfg, args, parser)
