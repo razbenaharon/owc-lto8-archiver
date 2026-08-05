@@ -1,8 +1,6 @@
 # Plan 3 implementation handoff
 
-Status date: **2026-08-05**. Plan 3 is **partially implemented**: Phases 0, 1, 2
-and Tasks 3.1–3.2 are complete and tested; Task 3.3 and Phase 4 are **not
-started**. The authoritative task list remains
+Status date: **2026-08-05**. Plan 3's **implementation is complete** - Phases 0-4 and Tasks 3.1-3.3 are written and tested. What is **not** done is the production rollout: Approvals A, B and C are blocked by a hardware fault (see "Blocked: the LTFS mount" below), and Task 3.4's pilot and bounded group have not run. The authoritative task list remains
 `03_MANIFEST_FIRST_DIRECTORY_CATALOG_AND_SESSION_37.md`.
 
 **Nothing has been applied to production.** No migration, no session resume, no
@@ -31,20 +29,40 @@ extending an applied one.
 | 2.3 adapters | `PgDirectoryCatalogMixin.ingest_legacy_directory_parts` | `tests/test_directory_catalog_pg.py` |
 | 3.1 boundary | `src/session_transition.py`, `PgSessionMixin.audit_session_transition_evidence` | `tests/test_session37_transition.py` |
 | 3.2 export | `src/legacy_export.py`, `PgSessionMixin.iter_legacy_chunk_membership` | `tests/test_legacy_export.py` |
+| 3.3 continuation | `SegmentChunkPublisher._seal_manifest_first`, `active_manifest_boundary` | `tests/test_scan_frontier.py` |
+| 3.1 execute | `PgDirectoryCatalogMixin.persist_session_transition` | rehearsal + `tests/test_session37_transition.py` |
+| 4.1 restore routing | `PgDirectoryCatalogMixin.find_directory_restore_parts` | `tests/test_directory_catalog_pg.py` |
+| 4.2 + 4.3 rebuild/compare | `src/catalog_rebuild.py` | `tests/test_catalog_rebuild.py` |
 
 Suite: **1,654 at baseline → 1,892 passing, 0 failed.**
 
-## What is NOT implemented
+## Blocked: the LTFS mount (2026-08-05)
 
-- **Task 3.3** — wiring the manifest-first flow into live Session 37
-  continuation. The pieces exist (`ManifestChunkSealer`, `PlanSource`
-  selection); the frontier does not yet call the sealer.
-- **Task 4.1** — directory restore routing through
-  `directory_catalog_status_v` / `find_directory_restore_parts`.
-- **Task 4.2** — the shadow-database rebuild (`src/catalog_rebuild.py`).
-- **Task 4.3** — semantic catalog comparison.
-- **Task 3.4** — the rollout gate: no synthetic pilot, no bounded production
-  group, no isolated rehearsal on a restored copy.
+Approvals A and C are blocked by one physical fault, documented in
+[incident 012](../incidents/012-20260805-ltfs-mount-absent-blocks-backup.md):
+
+* **No cartridge is mounted.** `Z:` is a drive letter with an empty
+  `FileSystem`, `Size` and `FreeSpace`; `Test-Path` on it still returns True,
+  which is the incident-011 trap. There are no LTFS mount events (61259).
+* **`Z:` has a duplicated device symlink** (the same LTFS device listed
+  twice), so `src/pg_backup.py::_windows_device_target` refuses to resolve it
+  and **every `--backup-postgres` run fails**. The guard is correct - it
+  exists to prove a dump never lands on the tape drive - and must not be
+  relaxed to work around this.
+
+Consequences: **Approval A** cannot take a fresh pre-migration backup;
+**Approval C** cannot run a pilot against an unmounted drive; **Approval B**
+is database-only and technically unblocked, but is deliberately not exercised
+without A.
+
+Production is unaffected: the last mutation was **2026-08-02 09:56**, so the
+existing `..._20260803_151701.dump` is a faithful image of the current
+catalog and was used for the isolated rehearsal.
+
+## What is NOT done
+
+- **Task 3.4** - no synthetic pilot, no bounded production group.
+- Approvals A, B and C - see above.
 - The independent adversarial review of the whole plan.
 
 ## Findings that changed the plan

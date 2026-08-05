@@ -14,6 +14,19 @@ from .pg_core import _now_utc, _rows
 MANIFEST_DIRECTORY_CATALOG_SCHEMA_VERSION = 1
 
 
+class _DryRun(Exception):
+    """Abort a transaction after computing its effect, rolling everything back.
+
+    A dry run that computed its answer with a SELECT would be describing a
+    different operation from the one it previews. Doing the real work and then
+    rolling back is what makes the preview trustworthy.
+    """
+
+    def __init__(self, payload):
+        super().__init__("dry run")
+        self.payload = payload
+
+
 def _parent_path(path):
     """The canonical parent directory of a source path, POSIX-normalized."""
     text = str(path or "").replace("\\", "/").rstrip("/")
@@ -1107,6 +1120,190 @@ class PgDirectoryCatalogMixin:
 
         return self._transaction(
             operation, f"recalculate directory completeness for {session_id}")
+
+    def find_directory_restore_parts(self, session_id, directory_id):
+        """Expand one directory into the exact archive parts a restore needs.
+
+        Plan 3, Task 4.1. Returns a list of route dicts carrying format, tape,
+        stored path, source base path, container/member candidate and artifact
+        locator - everything the retriever dispatches on, and nothing it has to
+        go to the tape to discover.
+
+        The directory's persisted status rides along on every route so the
+        caller can refuse to claim a full restore for a directory that is
+        provisional, incomplete or ambiguous.
+        """
+        self._require_manifest_directory_catalog_schema()
+
+        def operation(conn):
+            status_row = conn.execute(
+                """SELECT status FROM directory_completeness
+                   WHERE session_id=%s AND directory_id=%s""",
+                (session_id, int(directory_id))).fetchone()
+            status = status_row["status"] if status_row else None
+            rows = _rows(conn.execute(
+                """SELECT p.part_id, p.chunk_index, p.storage_class,
+                          p.restore_format, p.tape_label, p.stored_path,
+                          p.source_base_path, p.container_member_candidate,
+                          p.routing_precision, p.container_id,
+                          p.loose_record_key, p.tape_generation_id,
+                          p.sidecar_artifact_locator, p.plan_artifact_locator,
+                          p.terminal_artifact_locator,
+                          p.writer_state, p.catalog_state,
+                          g.volume_label AS generation_label,
+                          g.generation AS generation_value
+                   FROM directory_archive_parts p
+                   LEFT JOIN tape_generations g
+                     ON g.generation_id=p.tape_generation_id
+                   WHERE p.session_id=%s AND p.directory_id=%s
+                   ORDER BY p.chunk_index, p.part_id""",
+                (session_id, int(directory_id))).fetchall())
+            for row in rows:
+                row["directory_status"] = status
+                # A coarse route names a container but not the member inside
+                # it; the caller must search local sidecar/manifest candidates
+                # rather than assume a member name.
+                row["requires_member_search"] = (
+                    row["routing_precision"] == "coarse"
+                    and row["storage_class"] == "container")
+                row["restorable"] = (row["writer_state"] == "copied")
+            return rows
+
+        return self._run_read(
+            operation,
+            f"find directory restore parts {session_id}/{directory_id}")
+
+    def persist_session_transition(self, session_id, *, proposal,
+                                   approval_identity, evidence_locator,
+                                   state="active", dry_run=False):
+        """Atomically persist one approved planning-source boundary.
+
+        Plan 3, Task 3.1 execute mode. Re-derives the audit **inside** the
+        transaction and refuses if it no longer matches the proposal being
+        approved: a boundary approved against evidence that has since changed
+        is not an approved boundary.
+
+        Backfills ``plan_source='legacy_db'`` for every chunk that exists at
+        this instant, and fills ``packaging_format`` only where it is still
+        NULL - an approved Stored-TAR exception assigned by migration 015 must
+        survive untouched, so a non-NULL format is never overwritten.
+        """
+        self._require_manifest_directory_catalog_schema()
+        now = _now_utc()
+
+        def operation(conn):
+            conn.execute("SELECT session_id FROM remote_sessions "
+                         "WHERE session_id=%s FOR UPDATE", (session_id,))
+            live = conn.execute(
+                """SELECT count(*) AS chunk_count,
+                          COALESCE(max(chunk_index), -1) AS max_index
+                   FROM remote_chunks WHERE session_id=%s""",
+                (session_id,)).fetchone()
+            if (int(live["max_index"]) != int(
+                    proposal.last_legacy_planned_chunk)
+                    or int(live["chunk_count"]) != int(
+                        proposal.existing_chunk_count)):
+                raise RuntimeError(
+                    "[DB] the session changed since the proposal was built "
+                    f"(now {live['chunk_count']} chunks, max index "
+                    f"{live['max_index']}); refusing to persist a boundary "
+                    "approved against stale evidence")
+
+            existing_active = conn.execute(
+                """SELECT transition_id FROM remote_session_plan_transitions
+                   WHERE session_id=%s AND state='active'
+                     AND first_chunk_after_transition=%s""",
+                (session_id, int(proposal.first_manifest_first_chunk)),
+            ).fetchone()
+            if existing_active is not None:
+                return {"created": False,
+                        "transition_id": int(existing_active["transition_id"]),
+                        "first_chunk_after_transition":
+                            int(proposal.first_manifest_first_chunk)}
+
+            epoch = conn.execute(
+                """SELECT COALESCE(max(transition_epoch), 0) + 1 AS epoch
+                   FROM remote_session_plan_transitions
+                   WHERE session_id=%s""", (session_id,)).fetchone()["epoch"]
+
+            backfilled = conn.execute(
+                """UPDATE remote_chunks SET plan_source='legacy_db'
+                   WHERE session_id=%s AND plan_source IS DISTINCT FROM
+                         'legacy_db'
+                     AND plan_source IS DISTINCT FROM 'manifest'""",
+                (session_id,)).rowcount
+            # NEVER overwrite an assigned format: migration 015's approved
+            # exception lives there.
+            formats = conn.execute(
+                """UPDATE remote_chunks SET packaging_format='zip',
+                       packaging_assigned_at=COALESCE(packaging_assigned_at,%s)
+                   WHERE session_id=%s AND packaging_format IS NULL""",
+                (now, session_id)).rowcount
+
+            if dry_run:
+                raise _DryRun({
+                    "created": True, "epoch": int(epoch),
+                    "plan_source_backfilled": int(backfilled),
+                    "formats_filled": int(formats),
+                    "first_chunk_after_transition":
+                        int(proposal.first_manifest_first_chunk)})
+
+            row = conn.execute(
+                """INSERT INTO remote_session_plan_transitions
+                       (session_id, transition_epoch, state,
+                        prior_plan_source, new_plan_source,
+                        last_chunk_before_transition,
+                        first_chunk_after_transition,
+                        scan_frontier_generation, evidence_report_locator,
+                        approval_identity, approved_at, created_at, updated_at)
+                   VALUES (%s,%s,%s,'legacy_db','manifest',%s,%s,%s,%s,%s,%s,
+                           %s,%s)
+                   RETURNING transition_id""",
+                (session_id, int(epoch), state,
+                 int(proposal.last_legacy_planned_chunk),
+                 int(proposal.first_manifest_first_chunk),
+                 int(proposal.frontier_generation), str(evidence_locator),
+                 str(approval_identity), now, now, now)).fetchone()
+            return {"created": True, "transition_id": int(row["transition_id"]),
+                    "epoch": int(epoch),
+                    "plan_source_backfilled": int(backfilled),
+                    "formats_filled": int(formats),
+                    "first_chunk_after_transition":
+                        int(proposal.first_manifest_first_chunk)}
+
+        try:
+            return self._transaction(
+                operation, f"persist session transition for {session_id}")
+        except _DryRun as preview:
+            return preview.payload
+
+    def active_manifest_boundary(self, session_id):
+        """The first chunk index planned from manifests, or ``None``.
+
+        Plan 3, Task 3.3. Reads the single ACTIVE transition epoch for the
+        session. Returns ``None`` - meaning "keep planning the legacy way" -
+        whenever the schema is absent, no epoch is active, or the active epoch
+        does not switch to manifest planning. Fails closed by construction:
+        manifest planning starts only where approved evidence says it does.
+        """
+        def operation(conn):
+            if not self._table_exists_conn(
+                    conn, "remote_session_plan_transitions"):
+                return None
+            row = conn.execute(
+                """SELECT first_chunk_after_transition
+                   FROM remote_session_plan_transitions
+                   WHERE session_id=%s AND state='active'
+                     AND new_plan_source='manifest'
+                   ORDER BY transition_epoch DESC LIMIT 1""",
+                (session_id,)).fetchone()
+            if row is None:
+                return None
+            value = row["first_chunk_after_transition"]
+            return None if value is None else int(value)
+
+        return self._run_read(
+            operation, f"active manifest boundary for session {session_id}")
 
     def get_directory_status(self, session_id, directory_id):
         """The persisted status of one directory, or ``None``."""

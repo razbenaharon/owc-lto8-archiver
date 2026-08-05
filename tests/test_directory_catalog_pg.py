@@ -208,13 +208,15 @@ class _DirectoryCatalogFixture:
                    tar_dialect,storage_class,container_name,
                    expected_member_count,expected_logical_bytes,
                    validation_state,writer_state,catalog_state,
-                   tape_label,tape_path,tape_generation_id,writer_started_at)
+                   tape_label,tape_path,tape_generation_id,writer_started_at,
+                   writer_completed_at)
                VALUES (%s,%s,%s,'zip','1',NULL,'small_files',%s,1,100,
-                       'planned',%s,'not_started','T_A',%s,%s,now())
+                       'planned',%s,'not_started','T_A',%s,%s,now(),
+                       CASE WHEN %s='copied' THEN now() ELSE NULL END)
                RETURNING container_id""",
             (self.session_id, chunk_index, chunk_index,
              f"c{chunk_index}.zip", writer_state, f"/tape/c{chunk_index}.zip",
-             self.generations["T_A"]))[0]["container_id"]
+             self.generations["T_A"], writer_state))[0]["container_id"]
         values = dict(
             storage_class="container", evidence_generation=1,
             direct_expected_count=1, direct_expected_bytes=100,
@@ -462,3 +464,90 @@ class LegacyAdapterTests(_DirectoryCatalogFixture, unittest.TestCase):
         after = self._query(
             "SELECT count(*) AS n FROM directory_archive_bundles")[0]["n"]
         self.assertEqual(before, after)
+
+
+@unittest.skipUnless(_pg_available(), SKIP_REASON)
+class RestoreRoutingTests(_DirectoryCatalogFixture, unittest.TestCase):
+    """Task 4.1: a directory expands into exact parts, without touching tape."""
+
+    def test_a_mixed_directory_expands_into_its_parts(self):
+        self._coverage(self.dir_id, "final")
+        self._part(self.dir_id, 0)                       # loose
+        self._container_part(self.dir_id, 1, writer_state="copied",
+                             catalog_state="committed",
+                             local_validation_state="succeeded",
+                             direct_archived_count=1,
+                             direct_archived_bytes=100)
+        self.db.recalculate_directory_completeness(self.session_id)
+        routes = self.db.find_directory_restore_parts(self.session_id,
+                                                      self.dir_id)
+        self.assertEqual(len(routes), 2)
+        self.assertEqual({r["restore_format"] for r in routes},
+                         {"loose", "zip"})
+        self.assertTrue(all(r["restorable"] for r in routes))
+
+    def test_every_route_carries_its_tape_identity(self):
+        self._coverage(self.dir_id, "final")
+        self._part(self.dir_id, 0, tape_label="T_B")
+        routes = self.db.find_directory_restore_parts(self.session_id,
+                                                      self.dir_id)
+        self.assertEqual(routes[0]["tape_label"], "T_B")
+        self.assertEqual(routes[0]["generation_label"], "T_B")
+        self.assertEqual(routes[0]["generation_value"], 1)
+        self.assertTrue(routes[0]["stored_path"])
+
+    def test_the_directory_status_rides_along_with_every_route(self):
+        self._coverage(self.dir_id, "provisional")
+        self._part(self.dir_id, 0)
+        self.db.recalculate_directory_completeness(self.session_id)
+        routes = self.db.find_directory_restore_parts(self.session_id,
+                                                      self.dir_id)
+        self.assertEqual(routes[0]["directory_status"], "provisional")
+
+    def test_a_coarse_container_route_demands_a_member_search(self):
+        self._coverage(self.dir_id, "final")
+        self._container_part(self.dir_id, 1, writer_state="copied",
+                             catalog_state="committed",
+                             local_validation_state="succeeded",
+                             direct_archived_count=1,
+                             direct_archived_bytes=100,
+                             routing_precision="coarse",
+                             container_member_candidate=None)
+        routes = self.db.find_directory_restore_parts(self.session_id,
+                                                      self.dir_id)
+        self.assertTrue(routes[0]["requires_member_search"])
+
+    def test_an_exact_route_names_its_member(self):
+        self._coverage(self.dir_id, "final")
+        self._container_part(self.dir_id, 1, writer_state="copied",
+                             catalog_state="committed",
+                             local_validation_state="succeeded",
+                             direct_archived_count=1,
+                             direct_archived_bytes=100)
+        routes = self.db.find_directory_restore_parts(self.session_id,
+                                                      self.dir_id)
+        self.assertFalse(routes[0]["requires_member_search"])
+        self.assertTrue(routes[0]["container_member_candidate"])
+
+    def test_an_unwritten_part_is_not_restorable(self):
+        self._coverage(self.dir_id, "final")
+        self._container_part(self.dir_id, 1, writer_state="writing")
+        routes = self.db.find_directory_restore_parts(self.session_id,
+                                                      self.dir_id)
+        self.assertFalse(routes[0]["restorable"])
+
+    def test_a_directory_with_no_parts_returns_no_routes(self):
+        self._coverage(self.dir_id, "final")
+        self.assertEqual(
+            self.db.find_directory_restore_parts(self.session_id,
+                                                 self.dir_id), [])
+
+    def test_routing_reads_no_tape(self):
+        import inspect
+
+        import src.pg_directory_catalog as module
+
+        source = inspect.getsource(module.PgDirectoryCatalogMixin
+                                   .find_directory_restore_parts)
+        for token in ("open(", "robocopy", "LtfsCmd", "lto_drive"):
+            self.assertNotIn(token, source, token)
