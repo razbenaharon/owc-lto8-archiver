@@ -97,6 +97,10 @@ class RemotePipelineCoordinator:
         #: drain normally. A bounded run uses this rather than a mid-run kill,
         #: so the stop always lands on a chunk boundary.
         self.max_write_groups = max(0, int(max_write_groups or 0))
+        #: Write-only resume: drain already-planned, already-sealed legacy_db
+        #: chunks and do no discovery. Set by the orchestrator, which also
+        #: declines to construct a scan coordinator at all.
+        self.write_only = False
 
         #: Chunks this process has already picked up for staging. Purely
         #: in-process de-duplication on top of authoritative status — never a
@@ -141,6 +145,44 @@ class RemotePipelineCoordinator:
         with self._taken_lock:
             return sum(1 for ci in pending if ci not in self._taken)
 
+    def _write_only_admits(self, chunk_index):
+        """In write-only resume, a chunk must already be sealed legacy_db work.
+
+        Write-only exists to drain chunks planned by an earlier run. It must
+        never be a back door into writing something whose membership is not
+        already frozen and persisted, so a chunk is admitted only when its
+        durable state says so. Anything unreadable, unsealed, or
+        manifest-planned is refused and left alone: a manifest chunk's
+        membership lives in a local artifact, which is the scanner's business,
+        not this mode's.
+        """
+        reader = getattr(self.host.db, 'get_remote_chunk', None)
+        if not callable(reader):
+            return True
+        try:
+            chunk = reader(self.session_id, chunk_index)
+        except Exception:
+            get_logger().warning(
+                "write_only_chunk_unreadable: chunk=%s -- refusing",
+                chunk_index, exc_info=True)
+            return False
+        if not chunk:
+            return False
+        if chunk.get('membership_state') != 'sealed':
+            get_logger().info(
+                "write_only_refused_unsealed: chunk=%s membership_state=%r",
+                chunk_index, chunk.get('membership_state'))
+            return False
+        plan_source = chunk.get('plan_source')
+        # A pre-015/018 row may predate the column entirely; absent means the
+        # only planning source that existed then, which is the legacy one.
+        if plan_source is not None and plan_source != 'legacy_db':
+            get_logger().info(
+                "write_only_refused_plan_source: chunk=%s plan_source=%r",
+                chunk_index, plan_source)
+            return False
+        return True
+
     def next_chunk_to_stage(self):
         """The lowest-indexed sealed chunk this process has not taken yet."""
         try:
@@ -150,9 +192,15 @@ class RemotePipelineCoordinator:
             return None
         with self._taken_lock:
             for chunk_index in pending:
-                if chunk_index not in self._taken:
+                if chunk_index in self._taken:
+                    continue
+                if self.write_only and not self._write_only_admits(chunk_index):
+                    # Mark it taken so the loop does not re-check it forever;
+                    # it is skipped for this run, not altered in any way.
                     self._taken.add(chunk_index)
-                    return chunk_index
+                    continue
+                self._taken.add(chunk_index)
+                return chunk_index
         return None
 
     # ------------------------------------------------------------------
@@ -287,6 +335,13 @@ class RemotePipelineCoordinator:
     def run(self):
         """Start the producers and drain finite write groups until done."""
         host = self.host
+        if self.write_only and self.scan_coordinator is not None:
+            # Belt and braces: the orchestrator does not build a coordinator in
+            # this mode, so reaching here means the two disagree. Refuse rather
+            # than start discovery a write-only run promised not to do.
+            raise RuntimeError(
+                "[PIPELINE] write-only resume was given a scan coordinator; "
+                "refusing to start the scanner")
         if self.scan_coordinator is not None:
             self._scanner_thread = threading.Thread(
                 target=self._run_scanner, name='streaming-scanner', daemon=True)

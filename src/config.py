@@ -539,6 +539,27 @@ class ConfigManager:
         return self._get_int('PIPELINE', 'max_write_groups_per_run', 0,
                              minimum=0)
 
+    @property
+    def write_only_resume(self):
+        """Drain already-planned sealed chunks; run no scanner at all.
+
+        Writing a chunk that was planned and sealed by an earlier run needs no
+        discovery, but the resume path always started the frontier scanner
+        alongside the stager, so a healthy write depended on traversal being
+        healthy too. On a pre-frontier session it is not: the resumed scanner
+        collides on ``remote_scan_directories`` traversal ordinals.
+
+        With this set the orchestrator does not construct a scan coordinator,
+        so nothing can traverse, publish a scan segment, mutate the frontier or
+        create a chunk. The stager additionally admits only chunks whose
+        durable state is already ``membership_state='sealed'`` and
+        ``plan_source='legacy_db'``. Every tape, generation, ownership, lease,
+        capacity, writer-ambiguity and crash-recovery gate is unchanged.
+
+        Default off: a normal session must keep scanning.
+        """
+        return self._get_bool('PIPELINE', 'write_only_resume', False)
+
     def validated_ready_queue_limits(self):
         """Ready-queue limits proven to leave room for fetch/pack (Phase 4.5).
 

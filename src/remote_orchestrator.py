@@ -1155,6 +1155,30 @@ class RemoteOrchestrator:
                 'scan_complete')),
             writer_path='streaming')
 
+        # Write-only resume: drain chunks that were planned and sealed in an
+        # earlier run, and do no discovery at all. The scanner is not
+        # constructed -- not disabled at the last moment, not started and told
+        # to stop -- so no traversal, no scan segment, no frontier row and no
+        # new chunk can be produced by this run. Pipeline.run() sees
+        # scan_coordinator=None and marks scanning done immediately.
+        #
+        # This exists because writing an already-planned chunk needs no
+        # discovery whatsoever, while the resumed scanner currently cannot run
+        # on a pre-frontier session at all (see the ordinal-collision blocker
+        # in docs/SESSION_37_CONTINUATION_RUNBOOK.md). Making the two
+        # independent means a bounded write group no longer depends on
+        # traversal being healthy.
+        write_only = bool(getattr(self.cfg, 'write_only_resume', False))
+        if write_only:
+            pipeline.write_only = True
+            _status('PIPELINE',
+                    "Write-only resume: the frontier scanner is DISABLED. "
+                    "Only chunks already planned and sealed are written; no "
+                    "scanning, no frontier mutation, no new chunks.")
+            get_logger().info(
+                "write_only_resume_enabled: session=%s scanner=absent",
+                session_id)
+
         # Plan 1 completion: the frontier scanner is THE production scanner.
         # There is no legacy fallback here on purpose — a runtime fallback is
         # how two scanners end up running against one frontier. Git history and
@@ -1169,7 +1193,14 @@ class RemoteOrchestrator:
                 budget_bytes, alloc_unit=alloc_unit,
                 padding_factor=padding_factor, max_files=max_files)
 
-        scan_coordinator = FrontierScanCoordinator(
+        # In write-only resume the scanner is never CONSTRUCTED -- not built
+        # and disabled, not started and stopped. Nothing can traverse, publish
+        # a scan segment, mutate the frontier or seal a new chunk, because the
+        # object that does those things does not exist. `pipeline.run()` sees
+        # scan_coordinator=None and marks scanning done immediately. Every
+        # tape, generation, ownership, lease, capacity, writer-ambiguity and
+        # crash-recovery gate downstream is untouched.
+        scan_coordinator = None if write_only else FrontierScanCoordinator(
             db=self.db,
             session_id=session_id,
             scan_paths=self.remote_scan_paths,
