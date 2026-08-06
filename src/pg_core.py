@@ -143,6 +143,78 @@ class PgConnectionCore:
         "017_postgres_stored_tar_publication.sql")
     MANIFEST_DIRECTORY_CATALOG_MIGRATION = (
         "018_postgres_manifest_directory_catalog.sql")
+    CONTAINER_FORMAT_AUTHORITY_V2_MIGRATION = (
+        "019_postgres_container_format_schema_authority_v2.sql")
+
+    @classmethod
+    def container_format_authority_v2_migration_path(cls):
+        return (Path(PROJECT_ROOT) / "scripts" / "sql"
+                / cls.CONTAINER_FORMAT_AUTHORITY_V2_MIGRATION)
+
+    @classmethod
+    def container_format_authority_v2_migration_checksum(cls):
+        """SHA-256 identity of the explicit migration file (read-only)."""
+        return hashlib.sha256(
+            cls.container_format_authority_v2_migration_path().read_bytes()
+        ).hexdigest()
+
+    def apply_container_format_schema_authority_v2(
+            self, *, require_archiver_lock=False):
+        """Atomically apply migration 019: the additive v2 schema authority.
+
+        Purely additive.  Migration 015's row and function are untouched; this
+        inserts one new, permanently immutable authority row covering
+        015+016+017 together, after the migration's own completeness check
+        (every required table/column/constraint/index/trigger/function)
+        passes.  The three prerequisite migrations' checksums are supplied as
+        GUCs, the same idiom migrations 015 and 018 use, so the row records
+        exactly which file contents were verified.  Idempotent: re-running
+        this after the row exists changes nothing.
+        """
+        sql_path = self.container_format_authority_v2_migration_path()
+        settings = {
+            "lto.container_format_authority_v2_checksum_015":
+                self.container_format_migration_checksum(),
+            "lto.container_format_authority_v2_checksum_016":
+                self.stored_tar_plan_migration_checksums()[
+                    self.STORED_TAR_PLAN_MIGRATION],
+            "lto.container_format_authority_v2_checksum_017":
+                self.stored_tar_plan_migration_checksums()[
+                    self.STORED_TAR_PUBLICATION_MIGRATION],
+        }
+
+        def apply_on(conn):
+            with conn.transaction():
+                if require_archiver_lock:
+                    owned = conn.execute(
+                        """SELECT EXISTS (
+                               SELECT 1 FROM pg_locks
+                               WHERE locktype='advisory' AND granted
+                                 AND pid=pg_backend_pid()
+                                 AND classid=%s AND objid=%s
+                                 AND objsubid=1) AS owned""",
+                        (self.ARCHIVER_LOCK_KEY >> 32,
+                         self.ARCHIVER_LOCK_KEY & 0xFFFFFFFF),
+                    ).fetchone()["owned"]
+                    if not owned:
+                        raise RuntimeError(
+                            "[DB] Refusing migration 019 without the archiver "
+                            "advisory lock on this session")
+                for name, value in settings.items():
+                    conn.execute("SELECT set_config(%s, %s, true)",
+                                 (name, value))
+                with conn.cursor() as cur:
+                    cur.execute(sql_path.read_text(encoding="utf-8"))
+
+        if require_archiver_lock:
+            if self._lock_conn is None:
+                raise RuntimeError(
+                    "[DB] Migration 019 requires a pinned archiver lock")
+            apply_on(self._lock_conn)
+        else:
+            with self._pool.connection() as conn:
+                apply_on(conn)
+        return [self.CONTAINER_FORMAT_AUTHORITY_V2_MIGRATION]
 
     @classmethod
     def container_format_migration_path(cls):

@@ -512,6 +512,107 @@ class PgContainerMixin:
         return report
 
     # ------------------------------------------------------------------
+    # Migration 019 - additive v2 container-format schema authority
+    # ------------------------------------------------------------------
+
+    def _container_format_schema_authority_v2_report_conn(self, conn):
+        report = {
+            "database": conn.execute(
+                "SELECT current_database() AS db").fetchone()["db"],
+            "expected_migration_checksum":
+                self.container_format_authority_v2_migration_checksum(),
+            "installed": False,
+            "ready": False,
+            "row": None,
+            "actual_schema_fingerprint": None,
+            "issues": [],
+        }
+        issues = report["issues"]
+        if not self._table_exists_conn(
+                conn, "container_format_schema_authority"):
+            issues.append("v2 authority table is absent")
+            return report
+        row = conn.execute(
+            """SELECT authority_id, authority_version, schema_fingerprint,
+                      migration_checksums, applied_at
+               FROM container_format_schema_authority
+               WHERE authority_version=2""").fetchone()
+        if row is None:
+            issues.append("v2 authority row (version 2) is absent")
+            return report
+        report["installed"] = True
+        report["row"] = dict(row)
+        fingerprint_proc = conn.execute(
+            """SELECT to_regprocedure(
+                 'public.lto_container_format_schema_fingerprint_v2()') AS p
+            """).fetchone()["p"]
+        if fingerprint_proc is None:
+            issues.append("missing function: v2 schema fingerprint")
+            return report
+        actual = conn.execute(
+            "SELECT lto_container_format_schema_fingerprint_v2() AS fp"
+        ).fetchone()["fp"]
+        report["actual_schema_fingerprint"] = actual
+        if row["schema_fingerprint"] != actual:
+            issues.append("container format v2 catalog-definition fingerprint "
+                          "drift")
+        report["ready"] = not issues
+        return report
+
+    def container_format_schema_authority_v2_report(self):
+        """Exact, read-only migration-019 (v2 authority) report."""
+        return self._run_read(
+            self._container_format_schema_authority_v2_report_conn,
+            "container format schema authority v2 report")
+
+    def validate_container_format_schema_authority_v2(self):
+        report = self.container_format_schema_authority_v2_report()
+        if not report["ready"]:
+            raise RuntimeError(
+                "[DB] Container-format v2 authority missing or drifted: "
+                + "; ".join(report["issues"]))
+        return report
+
+    def validate_container_format_authority(self):
+        """Fail-closed pre-write gate: validate against the LATEST authority
+        this database has installed, v2 if present, else v1.
+
+        This is what ``validate_staged_chunk_readiness`` and
+        ``require_existing_stored_tar_recovery`` call before any LTFS
+        ownership is taken.  v1 alone (015 only, no 016/017) is a completely
+        normal, supported state and validates under v1 as always.  Once
+        016/017 exist, v1's own fingerprint is permanently unable to match
+        (that is the defect migration 019 exists to work around without
+        touching v1's immutable row) -- so from that point on this checks v2
+        instead.  A database with 016/017 installed but no v2 authority row
+        yet fails closed with an actionable message, rather than silently
+        falling back to a check that can never pass.
+        """
+        v1 = self.container_format_schema_report()
+        stored_tar_installed = bool(
+            v1.get("installation_state") == "installed"
+            and self.stored_tar_plan_schema_report().get(
+                "installation_state") == "installed")
+        if not stored_tar_installed:
+            if not v1["ready"]:
+                raise RuntimeError(
+                    "[DB] Container-format schema missing or drifted: "
+                    + "; ".join(v1["issues"]))
+            return v1
+        v2 = self.container_format_schema_authority_v2_report()
+        if not v2["installed"]:
+            raise RuntimeError(
+                "[DB] Migrations 016/017 are installed but the v2 schema "
+                "authority (migration 019) is not; apply it before writing "
+                "-- v1's own authority can never validate again once 016/017 "
+                "exist, by design (see migration 019).")
+        if not v2["ready"]:
+            raise RuntimeError(
+                "[DB] Container-format v2 authority missing or drifted: "
+                + "; ".join(v2["issues"]))
+        return v2
+
+    # ------------------------------------------------------------------
     # Legacy-session exception classification (read-only preflight)
     # ------------------------------------------------------------------
 
@@ -1320,7 +1421,7 @@ class PgContainerMixin:
         compatibility is still mandatory.  Phase 0 has no reader, so the normal
         runtime version is ``None`` and this correctly refuses until Phase 1.
         """
-        self.validate_container_format_schema()
+        self.validate_container_format_authority()
         if self.get_chunk_packaging_format(
                 session_id, chunk_index) is not ContainerFormat.STORED_TAR:
             raise RuntimeError("chunk is not assigned Stored TAR")
@@ -2441,7 +2542,7 @@ class PgContainerMixin:
         staged_chunk.assert_writer_ready()
         if staged_chunk.skip_tape:
             return True
-        self.validate_container_format_schema()
+        self.validate_container_format_authority()
 
         def operation(conn):
             chunk = conn.execute(

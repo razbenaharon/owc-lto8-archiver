@@ -796,6 +796,106 @@ def _persist_session_transition(cfg, args, parser):
     return 0
 
 
+def _apply_container_format_schema_authority_v2(cfg, args, parser):
+    """Guarded, explicit migration-019 entry point: additive v2 authority.
+
+    Purely additive over migrations 015-017; see migration 019's own header
+    for why v1's authority can never validate again once 016/017 are
+    installed, and why the fix must be a new row rather than an edit.
+    """
+    if args.dry_run and args.execute:
+        parser.error(
+            "--apply-container-format-schema-authority-v2 accepts only one "
+            "of --dry-run or --execute")
+
+    db = _open_read_only_db(cfg)
+    try:
+        v1_report = db.container_format_schema_report()
+        stored_tar_report = db.stored_tar_plan_schema_report()
+        v2_report = db.container_format_schema_authority_v2_report()
+    finally:
+        db.close()
+    blocking = []
+    if v1_report.get("installation_state") != "installed":
+        blocking.append("migration 015 is not installed")
+    if stored_tar_report.get("installation_state") != "installed":
+        blocking.append("migrations 016/017 are not installed")
+    preflight = {
+        "database": cfg.pg_dbname,
+        "v1_report": v1_report,
+        "stored_tar_plan_report": stored_tar_report,
+        "v2_report": v2_report,
+        "blocking": blocking,
+        "requested": {"execute": bool(args.execute)},
+    }
+
+    if not args.execute:
+        preflight["applied"] = []
+        preflight["note"] = (
+            "read-only preflight; execute requires --execute --yes and a "
+            "verified --backup-file")
+        _print_json(preflight)
+        return 0
+
+    if not args.yes:
+        parser.error(
+            "--apply-container-format-schema-authority-v2 --execute requires "
+            "--yes")
+    if not args.backup_file:
+        parser.error(
+            "--apply-container-format-schema-authority-v2 --execute requires "
+            "--backup-file naming a PostgreSQL backup this tool can verify")
+    if blocking:
+        raise OperationalError(
+            "[MIGRATION 019] Refusing migration: " + "; ".join(blocking))
+
+    holders = archiver_lock_status(_conninfo(cfg))
+    if holders:
+        raise OperationalError(
+            f"[MIGRATION 019] Refusing while the archiver lock is held: "
+            f"{holders}")
+    processes = active_archive_processes()
+    if processes:
+        raise OperationalError(
+            "[MIGRATION 019] Refusing while archive/transfer processes are "
+            f"running ({len(processes)} detected)")
+    preflight["backup"] = verify_backup_receipt(cfg, args.backup_file)
+
+    db = _open_no_init_db(cfg)
+    try:
+        db.acquire_archiver_lock()
+        processes = active_archive_processes()
+        if processes:
+            raise OperationalError(
+                "[MIGRATION 019] Refusing after final liveness check "
+                f"({len(processes)} archive/transfer process(es) detected)")
+        locked_backup = verify_backup_receipt(cfg, args.backup_file)
+        if locked_backup["receipt_id"] != preflight["backup"]["receipt_id"]:
+            raise OperationalError(
+                "[MIGRATION 019] Backup receipt changed before locked apply")
+        preflight["applied"] = db.apply_container_format_schema_authority_v2(
+            require_archiver_lock=True)
+        preflight["validation"] = (
+            db.validate_container_format_schema_authority_v2())
+    finally:
+        db.close()
+    _print_json(preflight)
+    return 0
+
+
+def _run_container_format_schema_authority_v2_report(cfg, *, validate=False):
+    """Read-only migration-019 (v2 authority) report/validation."""
+    db = _open_read_only_db(cfg)
+    try:
+        report = (db.validate_container_format_schema_authority_v2()
+                  if validate else
+                  db.container_format_schema_authority_v2_report())
+    finally:
+        db.close()
+    _print_json(report)
+    return 0
+
+
 def _apply_stored_tar_plan_schema(cfg, args, parser):
     """Guarded, explicit migrations 016+017 entry point (Plan 2 Tasks 2.1-2.4).
 
@@ -1475,6 +1575,19 @@ def _build_parser():
                              "--execute --yes --backup-file are supplied.")
     parser.add_argument("--chunk-index", type=int, action="append",
                         help="Chunk index to act on; repeat for several.")
+    parser.add_argument("--apply-container-format-schema-authority-v2",
+                        action="store_true",
+                        help="Migration 019: additive v2 container-format "
+                             "schema authority covering 015+016+017. "
+                             "Read-only preflight unless --execute --yes "
+                             "--backup-file are supplied.")
+    parser.add_argument("--validate-container-format-schema-authority-v2",
+                        action="store_true",
+                        help="Fail-closed read-only validation of the v2 "
+                             "authority (migration 019).")
+    parser.add_argument("--container-format-schema-authority-v2-report",
+                        action="store_true",
+                        help="Read-only migration-019 (v2 authority) report.")
     parser.add_argument("--repoint-session-tape-generation",
                         action="store_true",
                         help="Correct a session's stale target-cartridge "
@@ -1695,6 +1808,17 @@ def _dispatch(parser, args):
 
     if args.backfill_legacy_chunk_membership:
         return _backfill_legacy_chunk_membership(cfg, args, parser)
+
+    if args.apply_container_format_schema_authority_v2:
+        return _apply_container_format_schema_authority_v2(cfg, args, parser)
+
+    if args.validate_container_format_schema_authority_v2:
+        return _run_container_format_schema_authority_v2_report(
+            cfg, validate=True)
+
+    if args.container_format_schema_authority_v2_report:
+        return _run_container_format_schema_authority_v2_report(
+            cfg, validate=False)
 
     if args.repoint_session_tape_generation:
         return _repoint_session_tape_generation(cfg, args, parser)
