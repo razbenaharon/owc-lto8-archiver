@@ -645,6 +645,153 @@ class PgSessionMixin:
         return self._transaction(
             operation, f"seal chunk {int(chunk_index) + 1}")
 
+    def backfill_legacy_chunk_membership(self, session_id, chunk_indexes, *,
+                                         dry_run=True,
+                                         require_archiver_lock=False):
+        """Seal pre-frontier ``legacy_db`` chunks with their true expectation.
+
+        Sealing (Plan 1 Task 2.4) is done by the frontier scanner as it builds
+        a chunk. Chunks planned by the older planner -- Session 37's, for
+        instance -- therefore carry ``membership_state IS NULL``, and Stored
+        TAR planning refuses them because it will not build a container plan
+        against membership that might still move.
+
+        For a ``legacy_db`` chunk that membership cannot move: it lives in
+        ``remote_plan_files`` and the persisted transition epoch froze it. So
+        this does not *decide* anything -- it derives the file count and
+        logical byte total FROM THE EXISTING MEMBERSHIP ROWS and records what
+        is already true. Nothing about membership, ordinals or formats is
+        written.
+
+        Deliberately narrow, because a wrong expectation is a bad write
+        silently accepted. It refuses any chunk that is not ``legacy_db``, is
+        not ``pending``, is already sealed, carries an owner or a lease, or
+        whose membership is empty.
+
+        The ``legacy_db`` check is defence in depth and is deliberately not
+        unit-tested: a manifest chunk and its plan artifact reference each
+        other, and migration 018 forbids mutating ``plan_source`` outside an
+        audited transition, so the schema makes that state unreachable without
+        the real manifest-first sealing path. The check stays because it costs
+        nothing and states the precondition explicitly.
+        """
+        wanted = [int(index) for index in chunk_indexes]
+        if not wanted:
+            raise RuntimeError("[DB] no chunk indexes given")
+
+        def operation(conn):
+            if require_archiver_lock:
+                owned = conn.execute(
+                    """SELECT EXISTS (
+                           SELECT 1 FROM pg_locks
+                           WHERE locktype='advisory' AND granted
+                             AND pid=pg_backend_pid()
+                             AND classid=%s AND objid=%s AND objsubid=1
+                       ) AS owned""",
+                    (self.ARCHIVER_LOCK_KEY >> 32,
+                     self.ARCHIVER_LOCK_KEY & 0xFFFFFFFF),
+                ).fetchone()["owned"]
+                if not owned:
+                    raise RuntimeError(
+                        "[DB] Refusing a membership backfill without the "
+                        "archiver advisory lock on this session")
+
+            plan = conn.execute(
+                "SELECT plan_id FROM remote_sessions WHERE session_id=%s",
+                (session_id,)).fetchone()
+            if plan is None:
+                raise RuntimeError(f"[DB] session {session_id} does not exist")
+            plan_id = plan["plan_id"]
+
+            results = []
+            for chunk_index in wanted:
+                # The dry run must be able to execute on a read-only session,
+                # where FOR UPDATE is rejected. It writes nothing, so it needs
+                # no row lock; the write path still takes one.
+                chunk = conn.execute(
+                    """SELECT status, plan_source, membership_state,
+                              packaging_format, owner_token, lease_expires_at,
+                              expected_file_count, expected_bytes
+                       FROM remote_chunks
+                       WHERE session_id=%s AND chunk_index=%s"""
+                    + ("" if dry_run else " FOR UPDATE"),
+                    (session_id, chunk_index)).fetchone()
+                if chunk is None:
+                    raise RuntimeError(
+                        f"[DB] chunk {chunk_index} not found in session "
+                        f"{session_id}")
+                if chunk["plan_source"] != "legacy_db":
+                    raise RuntimeError(
+                        f"[DB] chunk {chunk_index} is plan_source "
+                        f"{chunk['plan_source']!r}; only legacy_db membership "
+                        "is frozen by construction")
+                if chunk["status"] != "pending":
+                    raise RuntimeError(
+                        f"[DB] chunk {chunk_index} is {chunk['status']!r}, not "
+                        "pending; refusing to seal a chunk that has started")
+                if chunk["owner_token"] or chunk["lease_expires_at"]:
+                    raise RuntimeError(
+                        f"[DB] chunk {chunk_index} carries an owner or lease; "
+                        "refusing")
+                if chunk["membership_state"] == "sealed":
+                    results.append({"chunk_index": chunk_index,
+                                    "sealed": False,
+                                    "reason": "already_sealed"})
+                    continue
+
+                derived = conn.execute(
+                    """SELECT count(*) AS files,
+                              COALESCE(sum(sf.file_size_bytes), 0) AS bytes,
+                              min(pf.ordinal) AS first_ordinal,
+                              max(pf.ordinal) AS last_ordinal
+                       FROM remote_plan_files pf
+                       JOIN remote_snapshot_files sf
+                         ON sf.snapshot_file_id=pf.snapshot_file_id
+                       WHERE pf.plan_id=%s AND pf.chunk_index=%s""",
+                    (plan_id, chunk_index)).fetchone()
+                if not int(derived["files"]):
+                    raise RuntimeError(
+                        f"[DB] chunk {chunk_index} has no membership rows; "
+                        "refusing to seal an empty expectation")
+
+                entry = {
+                    "chunk_index": chunk_index,
+                    "expected_file_count": int(derived["files"]),
+                    "expected_bytes": int(derived["bytes"]),
+                    "first_ordinal": int(derived["first_ordinal"]),
+                    "last_ordinal": int(derived["last_ordinal"]),
+                    "packaging_format": chunk["packaging_format"],
+                    "sealed": not dry_run,
+                }
+                if not dry_run:
+                    updated = conn.execute(
+                        """UPDATE remote_chunks
+                           SET membership_state='sealed',
+                               expected_file_count=%s, expected_bytes=%s,
+                               updated_at=%s
+                           WHERE session_id=%s AND chunk_index=%s
+                             AND membership_state IS NULL
+                             AND status='pending'""",
+                        (int(derived["files"]), int(derived["bytes"]),
+                         _now_utc(), session_id, chunk_index)).rowcount
+                    if updated != 1:
+                        raise RuntimeError(
+                            f"[DB] chunk {chunk_index}: expected to seal 1 "
+                            f"row, affected {updated}; rolling back")
+                results.append(entry)
+            return {"session_id": session_id, "dry_run": bool(dry_run),
+                    "chunks": results}
+
+        if require_archiver_lock:
+            if self._lock_conn is None:
+                raise RuntimeError(
+                    "[DB] A membership backfill requires a pinned archiver "
+                    "lock")
+            with self._lock_conn.transaction():
+                return operation(self._lock_conn)
+        return self._transaction(
+            operation, f"backfill membership for session {session_id}")
+
     def _persist_remote_plan(
             self, conn, session_id, remote_host, remote_path, rows, by_path, now,
             *, stored_tar_write_enabled=False, reader_contract_version=None,

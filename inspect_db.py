@@ -524,6 +524,79 @@ def _run_manifest_directory_catalog_schema_report(cfg, *, validate=False):
     return 0
 
 
+def _backfill_legacy_chunk_membership(cfg, args, parser):
+    """Guarded sealing of pre-frontier legacy_db chunks (bounded, derived)."""
+    if args.dry_run and args.execute:
+        parser.error(
+            "--backfill-legacy-chunk-membership accepts only one of --dry-run "
+            "or --execute")
+    session_id = int(args.session_id[0] if args.session_id else 37)
+    if not args.chunk_index:
+        parser.error(
+            "--backfill-legacy-chunk-membership requires at least one "
+            "--chunk-index")
+    indexes = [int(i) for i in args.chunk_index]
+
+    db = _open_read_only_db(cfg)
+    try:
+        preview = db.backfill_legacy_chunk_membership(
+            session_id, indexes, dry_run=True)
+    finally:
+        db.close()
+    preflight = {
+        "database": cfg.pg_dbname,
+        "session_id": session_id,
+        "chunk_indexes": indexes,
+        "preview": preview,
+        "requested": {"execute": bool(args.execute)},
+    }
+
+    if not args.execute:
+        preflight["note"] = (
+            "read-only preflight; execute requires --execute --yes and a "
+            "verified --backup-file")
+        _print_json(preflight)
+        return 0
+
+    if not args.yes:
+        parser.error(
+            "--backfill-legacy-chunk-membership --execute requires --yes")
+    if not args.backup_file:
+        parser.error(
+            "--backfill-legacy-chunk-membership --execute requires "
+            "--backup-file naming a PostgreSQL backup this tool can verify")
+
+    holders = archiver_lock_status(_conninfo(cfg))
+    if holders:
+        raise OperationalError(
+            f"[SEAL] Refusing while the archiver lock is held: {holders}")
+    processes = active_archive_processes()
+    if processes:
+        raise OperationalError(
+            "[SEAL] Refusing while archive/transfer processes are running "
+            f"({len(processes)} detected)")
+    preflight["backup"] = verify_backup_receipt(cfg, args.backup_file)
+
+    db = _open_no_init_db(cfg)
+    try:
+        db.acquire_archiver_lock()
+        processes = active_archive_processes()
+        if processes:
+            raise OperationalError(
+                "[SEAL] Refusing after final liveness check "
+                f"({len(processes)} archive/transfer process(es) detected)")
+        locked_backup = verify_backup_receipt(cfg, args.backup_file)
+        if locked_backup["receipt_id"] != preflight["backup"]["receipt_id"]:
+            raise OperationalError(
+                "[SEAL] Backup receipt changed before locked apply")
+        preflight["result"] = db.backfill_legacy_chunk_membership(
+            session_id, indexes, dry_run=False, require_archiver_lock=True)
+    finally:
+        db.close()
+    _print_json(preflight)
+    return 0
+
+
 def _repoint_session_tape_generation(cfg, args, parser):
     """Guarded correction of a session's stale target-cartridge generation.
 
@@ -1394,6 +1467,14 @@ def _build_parser():
     parser.add_argument("--container-format-schema-report",
                         action="store_true",
                         help="Read-only migration-015 schema/format report.")
+    parser.add_argument("--backfill-legacy-chunk-membership",
+                        action="store_true",
+                        help="Seal named pre-frontier legacy_db chunks with "
+                             "the expectation DERIVED from their existing "
+                             "membership rows. Read-only preflight unless "
+                             "--execute --yes --backup-file are supplied.")
+    parser.add_argument("--chunk-index", type=int, action="append",
+                        help="Chunk index to act on; repeat for several.")
     parser.add_argument("--repoint-session-tape-generation",
                         action="store_true",
                         help="Correct a session's stale target-cartridge "
@@ -1611,6 +1692,9 @@ def _dispatch(parser, args):
 
     if args.container_format_schema_report:
         return _run_container_format_schema_report(cfg, validate=False)
+
+    if args.backfill_legacy_chunk_membership:
+        return _backfill_legacy_chunk_membership(cfg, args, parser)
 
     if args.repoint_session_tape_generation:
         return _repoint_session_tape_generation(cfg, args, parser)

@@ -650,6 +650,116 @@ class TransitionPersistenceTests(_DirectoryCatalogFixture, unittest.TestCase):
 
 
 @unittest.skipUnless(_pg_available(), SKIP_REASON)
+class BackfillLegacyChunkMembershipTests(_DirectoryCatalogFixture,
+                                         unittest.TestCase):
+    """Sealing a pre-frontier chunk must DERIVE its expectation, never guess.
+
+    A wrong expectation is a bad write silently accepted, so every refusal
+    here matters more than the happy path.
+    """
+
+    def _make_pending(self, chunk_index=9, files=3, size=70):
+        """A legacy_db, pending, unsealed chunk with real membership rows."""
+        self._exec(
+            """INSERT INTO remote_chunks (session_id,chunk_index,status,
+                   updated_at,plan_source,packaging_format,
+                   packaging_assigned_at)
+               VALUES (%s,%s,'pending',now(),'legacy_db','zip',now())""",
+            (self.session_id, chunk_index))
+        plan_id = self._query(
+            "SELECT plan_id FROM remote_sessions WHERE session_id=%s",
+            (self.session_id,))[0]["plan_id"]
+        snapshot_id = self._query(
+            "SELECT snapshot_id FROM remote_plans WHERE plan_id=%s",
+            (plan_id,))[0]["snapshot_id"]
+        for ordinal in range(files):
+            snap = self._query(
+                """INSERT INTO remote_snapshot_files
+                       (snapshot_id,remote_path,file_size_bytes)
+                   VALUES (%s,%s,%s) RETURNING snapshot_file_id""",
+                (snapshot_id, f"/r/seal{chunk_index}_{ordinal}", size),
+            )[0]["snapshot_file_id"]
+            self._exec(
+                """INSERT INTO remote_plan_files
+                       (plan_id,snapshot_file_id,chunk_index,ordinal)
+                   VALUES (%s,%s,%s,%s)""",
+                (plan_id, snap, chunk_index, ordinal))
+        return chunk_index, files, files * size
+
+    def _state(self, chunk_index):
+        return self._query(
+            """SELECT membership_state, expected_file_count, expected_bytes
+               FROM remote_chunks WHERE session_id=%s AND chunk_index=%s""",
+            (self.session_id, chunk_index))[0]
+
+    def test_dry_run_derives_the_expectation_and_writes_nothing(self):
+        index, files, total = self._make_pending()
+        result = self.db.backfill_legacy_chunk_membership(
+            self.session_id, [index], dry_run=True)
+        entry = result["chunks"][0]
+        self.assertEqual(entry["expected_file_count"], files)
+        self.assertEqual(entry["expected_bytes"], total)
+        self.assertEqual(entry["first_ordinal"], 0)
+        self.assertEqual(entry["last_ordinal"], files - 1)
+        self.assertFalse(entry["sealed"])
+        self.assertIsNone(self._state(index)["membership_state"])
+
+    def test_execute_seals_with_the_derived_values(self):
+        index, files, total = self._make_pending()
+        self.db.backfill_legacy_chunk_membership(
+            self.session_id, [index], dry_run=False)
+        row = self._state(index)
+        self.assertEqual(row["membership_state"], "sealed")
+        self.assertEqual(row["expected_file_count"], files)
+        self.assertEqual(row["expected_bytes"], total)
+
+    def test_is_idempotent(self):
+        index, files, total = self._make_pending()
+        self.db.backfill_legacy_chunk_membership(
+            self.session_id, [index], dry_run=False)
+        again = self.db.backfill_legacy_chunk_membership(
+            self.session_id, [index], dry_run=False)
+        self.assertEqual(again["chunks"][0]["reason"], "already_sealed")
+        self.assertEqual(self._state(index)["expected_file_count"], files)
+
+    def test_refuses_a_chunk_that_is_not_pending(self):
+        # The fixture's chunk 0 is 'done' and already sealed.
+        with self.assertRaisesRegex(RuntimeError, "not\\s+pending"):
+            self.db.backfill_legacy_chunk_membership(
+                self.session_id, [0], dry_run=False)
+
+    def test_refuses_a_chunk_with_an_owner(self):
+        index, _files, _total = self._make_pending()
+        self._exec(
+            "UPDATE remote_chunks SET owner_token='w1' "
+            "WHERE session_id=%s AND chunk_index=%s",
+            (self.session_id, index))
+        with self.assertRaisesRegex(RuntimeError, "owner or lease"):
+            self.db.backfill_legacy_chunk_membership(
+                self.session_id, [index], dry_run=False)
+        self.assertIsNone(self._state(index)["membership_state"])
+
+    def test_refuses_an_empty_membership(self):
+        self._exec(
+            """INSERT INTO remote_chunks (session_id,chunk_index,status,
+                   updated_at,plan_source,packaging_format,
+                   packaging_assigned_at)
+               VALUES (%s,77,'pending',now(),'legacy_db','zip',now())""",
+            (self.session_id,))
+        with self.assertRaisesRegex(RuntimeError, "no membership rows"):
+            self.db.backfill_legacy_chunk_membership(
+                self.session_id, [77], dry_run=False)
+
+    def test_refuses_without_a_pinned_archiver_lock(self):
+        index, _files, _total = self._make_pending()
+        with self.assertRaisesRegex(RuntimeError, "pinned archiver lock"):
+            self.db.backfill_legacy_chunk_membership(
+                self.session_id, [index], dry_run=False,
+                require_archiver_lock=True)
+        self.assertIsNone(self._state(index)["membership_state"])
+
+
+@unittest.skipUnless(_pg_available(), SKIP_REASON)
 class RepointSessionTapeGenerationTests(_DirectoryCatalogFixture,
                                         unittest.TestCase):
     """Re-pointing a stale target generation must PROVE it is safe.
