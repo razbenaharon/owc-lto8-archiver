@@ -321,6 +321,38 @@ class CartridgeIdentityTests(unittest.TestCase):
         self.assertEqual(block.reason, REASON_UNEXPECTED_TAPE_OR_DB_STATE)
         self.assertFalse(block.resumable)
 
+    def test_a_differently_cased_label_is_the_same_cartridge(self):
+        """LTFS reports the mounted label in its own case (observed
+        uppercase, e.g. 'TAPE_03'); the catalog's convention is mixed-case
+        ('Tape_03'). Same cartridge, so this must NOT block -- neither the
+        LTFS volume nor the catalog row is ever renamed to make them agree."""
+        orch, _ = self._orch("TAPE_03")
+        with mock.patch.object(ro, "get_volume_label", return_value="TAPE_03"), \
+                mock.patch("builtins.print"), \
+                mock.patch.object(ro, "send_best_effort", lambda *a, **k: None):
+            block = orch._verify_mounted_cartridge("Tape_03")
+        self.assertIsNone(block)
+
+    def test_an_exact_match_still_passes(self):
+        orch, _ = self._orch("Tape_03")
+        with mock.patch.object(ro, "get_volume_label", return_value="Tape_03"), \
+                mock.patch("builtins.print"), \
+                mock.patch.object(ro, "send_best_effort", lambda *a, **k: None):
+            block = orch._verify_mounted_cartridge("Tape_03")
+        self.assertIsNone(block)
+
+    def test_a_whitespace_mounted_label_still_blocks(self):
+        """A blank/whitespace label must never be silently normalized into a
+        match, even against a real expected label."""
+        orch, _ = self._orch("   ")
+        with mock.patch.object(ro, "get_volume_label", return_value="   "), \
+                mock.patch("builtins.print"), \
+                mock.patch.object(ro, "send_best_effort", lambda *a, **k: None):
+            block = orch._verify_mounted_cartridge("Tape_03")
+        self.assertIsNotNone(block)
+        self.assertEqual(block.reason, REASON_UNEXPECTED_TAPE_OR_DB_STATE)
+        self.assertFalse(block.resumable)
+
     def test_an_unreadable_label_fails_closed(self):
         orch, _ = self._orch(None)
         for behaviour in ({"return_value": None},
@@ -362,6 +394,35 @@ class CartridgeIdentityTests(unittest.TestCase):
         self.assertIn("REFUSED", message)
         self.assertEqual(log.kinds(), [],
                          "the announcement touched the drive")
+
+
+class TapeLabelCanonicalizationTests(unittest.TestCase):
+    """Unit coverage for the comparison helper itself (incident 011 fix):
+    case-insensitive on real labels, but blank/whitespace never "matches"
+    anything -- including another blank -- just because both normalize to
+    the same empty string."""
+
+    def test_differently_cased_labels_match(self):
+        self.assertTrue(ro._tape_labels_match("TAPE_03", "Tape_03"))
+        self.assertTrue(ro._tape_labels_match("tape_03", "TAPE_03"))
+
+    def test_exact_matches_pass(self):
+        self.assertTrue(ro._tape_labels_match("Tape_03", "Tape_03"))
+
+    def test_genuinely_different_labels_fail(self):
+        self.assertFalse(ro._tape_labels_match("Tape_02", "Tape_03"))
+        self.assertFalse(ro._tape_labels_match("TAPE_02", "Tape_03"))
+
+    def test_whitespace_or_empty_labels_fail_rather_than_normalize(self):
+        self.assertFalse(ro._tape_labels_match("", "Tape_03"))
+        self.assertFalse(ro._tape_labels_match("Tape_03", ""))
+        self.assertFalse(ro._tape_labels_match("   ", "Tape_03"))
+        self.assertFalse(ro._tape_labels_match(None, "Tape_03"))
+        # Both sides blank must still fail closed -- not "equal because both
+        # normalize to ''".
+        self.assertFalse(ro._tape_labels_match("", ""))
+        self.assertFalse(ro._tape_labels_match("   ", "   "))
+        self.assertFalse(ro._tape_labels_match(None, None))
 
 
 # =============================================================================

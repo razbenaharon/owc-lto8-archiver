@@ -188,6 +188,34 @@ from .remote_staging import (                                    # noqa: E402
 from .remote_writer import RemoteChunkWriter                     # noqa: E402
 
 
+def _canonical_tape_label(label):
+    """Comparison-only key for a tape label; never used as the label itself.
+
+    LTFS reports the mounted volume label in whatever case it was formatted
+    with (observed uppercase, e.g. ``TAPE_03``), while the catalog's own
+    convention is mixed-case (``Tape_03``). Neither the LTFS volume nor the
+    catalog row is ever renamed to make them agree -- this exists purely so
+    ``_tape_labels_match`` can tell "same cartridge, different case" apart
+    from "different cartridge".
+    """
+    return (label or "").strip().casefold()
+
+
+def _tape_labels_match(mounted, tape_label):
+    """True only when both labels name the same cartridge, case-insensitively.
+
+    Blank/whitespace-only input on either side is never treated as a match
+    -- even if both sides happen to normalize to the same empty string --
+    so a missing or unreadable label always falls through to the caller's
+    fail-closed refusal instead of being silently normalized into "equal".
+    """
+    canonical_mounted = _canonical_tape_label(mounted)
+    canonical_expected = _canonical_tape_label(tape_label)
+    if not canonical_mounted or not canonical_expected:
+        return False
+    return canonical_mounted == canonical_expected
+
+
 class RemoteOrchestrator:
     """Public façade over the remote host -> staging -> tape pipeline.
 
@@ -2368,7 +2396,7 @@ class RemoteOrchestrator:
                 reason=REASON_UNEXPECTED_TAPE_OR_DB_STATE, resumable=False,
                 source="gate", detailed_reason=msg)
 
-        if mounted != tape_label:
+        if not _tape_labels_match(mounted, tape_label):
             msg = (f"The mounted cartridge is '{mounted}' but this session "
                    f"writes to '{tape_label}'. Refusing to write: the chunks "
                    f"would land on '{mounted}' and be cataloged under "
