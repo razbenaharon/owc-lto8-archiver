@@ -2737,6 +2737,64 @@ class ContainerFormatMigrationTests(unittest.TestCase):
              for m in plan.members],
             [(0, "source_missing", None), (1, "small_files", 0)])
 
+    def test_stored_tar_plan_bulk_copy_persists_identical_rows_idempotently(self):
+        """The COPY-based member persistence writes exactly the plan's rows and
+        re-creating the plan neither duplicates nor alters them.
+
+        Guards the executemany->COPY change (src/pg_containers.py): at real
+        member volume the persisted archive_container_members must equal
+        plan.members field-for-field, and a second get_or_create must reuse the
+        stored plan without inserting a single extra row.
+        """
+        from src.stored_tar_planning import GNU_TAR_RECORD_SIZE
+
+        rows = [
+            (1, f"/fixture/chunk_001/small_{i:04d}.bin",
+             f"small_{i:04d}.bin", 7 + (i % 5))
+            for i in range(300)
+        ]
+        session_id = self._stored_tar_planning_session(rows)
+        chunk_files = self.db.get_chunk_files(session_id, 1)
+        plan = self.db.get_or_create_stored_tar_chunk_plan(
+            session_id, 1, chunk_files, loose_threshold_bytes=1024,
+            max_size_bytes=GNU_TAR_RECORD_SIZE * 4096)
+
+        expected = [
+            (int(m.plan_ordinal), m.storage_class,
+             None if m.container_ordinal is None else int(m.container_ordinal),
+             m.remote_path, int(m.file_size_bytes), int(m.estimated_tar_bytes))
+            for m in plan.members
+        ]
+        self.assertEqual(len(expected), 300)
+
+        def _stored():
+            return [
+                (r["plan_ordinal"], r["storage_class"], r["container_ordinal"],
+                 r["remote_path"], r["expected_logical_bytes"],
+                 r["estimated_tar_bytes"])
+                for r in self._query(
+                    """SELECT plan_ordinal, storage_class, container_ordinal,
+                              remote_path, expected_logical_bytes,
+                              estimated_tar_bytes
+                       FROM archive_container_members
+                       WHERE session_id=%s AND chunk_index=1
+                       ORDER BY plan_ordinal""", (session_id,))
+            ]
+
+        self.assertEqual(_stored(), expected)
+        # every small-file member landed with a non-null container binding
+        self.assertTrue(all(
+            r["container_id"] is not None for r in self._query(
+                """SELECT container_id FROM archive_container_members
+                   WHERE session_id=%s AND chunk_index=1""", (session_id,))))
+
+        # Idempotent re-create: reuses the stored plan, inserts nothing new.
+        again = self.db.get_or_create_stored_tar_chunk_plan(
+            session_id, 1, self.db.get_chunk_files(session_id, 1),
+            loose_threshold_bytes=1, max_size_bytes=GNU_TAR_RECORD_SIZE * 99)
+        self.assertEqual(again.members, plan.members)
+        self.assertEqual(_stored(), expected)
+
     def test_approved_session37_shape_assigns_only_never_started_suffix(self):
         """Session-37's provenance gaps still yield the approved boundary."""
         session_id = self._session(label="MIXED_FORMAT_FIXTURE")

@@ -64,14 +64,26 @@ def estimate_stored_tar_member_bytes(name, logical_size):
     )
 
 
-def estimate_stored_tar_archive_bytes(member_estimates):
-    """Estimate finalized archive bytes including end and blocking padding."""
-    payload = sum(int(value) for value in member_estimates)
+def _archive_bytes_from_payload(payload):
+    """Finalized archive bytes for a payload already summed once.
+
+    Extracted so ``build_stored_tar_chunk_plan`` can keep a running payload sum
+    instead of re-summing the whole open container per member (the old
+    ``estimate_stored_tar_archive_bytes(current_estimates + [x])`` was O(n) per
+    file → O(n²) per chunk). The rounding/zero/negative rules are unchanged.
+    """
+    payload = int(payload)
     if payload < 0:
         raise ValueError("member estimates cannot sum below zero")
     if payload == 0:
         return 0
     return _round_up(payload + END_OF_ARCHIVE_BYTES, GNU_TAR_RECORD_SIZE)
+
+
+def estimate_stored_tar_archive_bytes(member_estimates):
+    """Estimate finalized archive bytes including end and blocking padding."""
+    return _archive_bytes_from_payload(
+        sum(int(value) for value in member_estimates))
 
 
 @dataclass(frozen=True)
@@ -138,15 +150,19 @@ def build_stored_tar_chunk_plan(
     members: List[StoredTarPlanMember] = []
     containers: List[StoredTarContainerPlan] = []
     current_members: List[StoredTarPlanMember] = []
-    current_estimates: List[int] = []
+    # Running sum of the open container's member estimates. Kept incrementally
+    # so the per-member fit check is O(1) instead of re-summing a list that
+    # grows to the whole chunk (200k for Session 37) — see
+    # _archive_bytes_from_payload.
+    current_payload = 0
     current_logical = 0
 
     def flush_container():
-        nonlocal current_members, current_estimates, current_logical
+        nonlocal current_members, current_payload, current_logical
         if not current_members:
             return
         ordinal = len(containers)
-        archive_estimate = estimate_stored_tar_archive_bytes(current_estimates)
+        archive_estimate = _archive_bytes_from_payload(current_payload)
         container_name = (
             f"chunk_{int(chunk_index):06d}_stored_tar_{ordinal:04d}.tar")
         containers.append(StoredTarContainerPlan(
@@ -170,7 +186,7 @@ def build_stored_tar_chunk_plan(
                 estimated_tar_bytes=item.estimated_tar_bytes,
             ))
         current_members = []
-        current_estimates = []
+        current_payload = 0
         current_logical = 0
 
     for ordinal, row in enumerate(ordered):
@@ -199,8 +215,7 @@ def build_stored_tar_chunk_plan(
             continue
 
         member_estimate = estimate_stored_tar_member_bytes(remote_path, size)
-        candidate = estimate_stored_tar_archive_bytes(
-            current_estimates + [member_estimate])
+        candidate = _archive_bytes_from_payload(current_payload + member_estimate)
         if current_members and candidate > max_size_bytes:
             flush_container()
         current_members.append(StoredTarPlanMember(
@@ -211,7 +226,7 @@ def build_stored_tar_chunk_plan(
             storage_class="small_files",
             estimated_tar_bytes=member_estimate,
         ))
-        current_estimates.append(member_estimate)
+        current_payload += member_estimate
         current_logical += size
 
     flush_container()

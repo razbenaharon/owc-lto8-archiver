@@ -12,6 +12,7 @@ from dataclasses import asdict, is_dataclass
 
 from .pipeline_types import (ArtifactReadiness, ContainerFormat,
                              ContainerValidationState, SourceDisposition)
+from .pg_bulk import copy_rows
 from .pg_core import _row, _rows
 from .session_reconcile import classify_session37_format_boundary_category
 from .stored_tar_planning import (build_stored_tar_chunk_plan,
@@ -2031,17 +2032,32 @@ class PgContainerMixin:
                     member.container_ordinal, member.remote_path,
                     member.file_size_bytes, member.estimated_tar_bytes))
             if member_rows:
+                # Bulk-persist the sealed split via COPY into an ON COMMIT DROP
+                # temp table, then one set-based INSERT ... ON CONFLICT DO
+                # NOTHING. This is the house pattern (see
+                # PgCatalogMixin._bulk_upsert_batch) and is behaviourally
+                # identical to the previous cur.executemany(): the same rows,
+                # the same ON CONFLICT idempotency, every FK/CHECK constraint
+                # enforced by the final INSERT, all inside this one transaction
+                # so crash-resume is unchanged. The executemany paid ~200k
+                # client round-trips (~15 min for a full-size legacy chunk, the
+                # pre-fetch idle); COPY collapses that to seconds.
+                member_columns = (
+                    "session_id", "chunk_index", "plan_file_id", "plan_ordinal",
+                    "storage_class", "container_id", "container_ordinal",
+                    "remote_path", "expected_logical_bytes",
+                    "estimated_tar_bytes")
+                col_sql = ", ".join(member_columns)
+                conn.execute(
+                    "CREATE TEMP TABLE _stage_acm ON COMMIT DROP AS "
+                    f"SELECT {col_sql} FROM archive_container_members "
+                    "WITH NO DATA")
                 with conn.cursor() as cur:
-                    cur.executemany(
-                        """INSERT INTO archive_container_members
-                               (session_id, chunk_index, plan_file_id,
-                                plan_ordinal, storage_class, container_id,
-                                container_ordinal, remote_path,
-                                expected_logical_bytes, estimated_tar_bytes)
-                           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                           ON CONFLICT DO NOTHING""",
-                        member_rows,
-                    )
+                    copy_rows(cur, "_stage_acm", member_columns, member_rows)
+                conn.execute(
+                    f"INSERT INTO archive_container_members ({col_sql}) "
+                    f"SELECT {col_sql} FROM _stage_acm "
+                    "ON CONFLICT DO NOTHING")
             return self._read_stored_tar_chunk_plan_conn(
                 conn, session_id, chunk_index)
 

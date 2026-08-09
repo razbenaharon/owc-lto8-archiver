@@ -107,6 +107,96 @@ class StoredTarPartitionPlanTests(unittest.TestCase):
         self.assertEqual(len(plan.containers), 1)
         self.assertEqual(plan.containers[0].estimated_archive_bytes, cap)
 
+    def test_running_sum_matches_naive_resum_and_is_linear(self):
+        """The O(n) running-sum accumulation is byte-identical to the naive
+        re-sum it replaced (small/loose/source_missing + multi-container flush)
+        and scales linearly -- guarding the O(n^2) idle this fixes."""
+        import random
+        import time
+        from src import stored_tar_planning as stp
+
+        def naive_plan(rows, *, loose_threshold_bytes, max_size_bytes):
+            # The pre-optimization algorithm: re-sum the whole open container on
+            # every member. Kept here only as the equivalence oracle.
+            members, containers = [], []
+            cur, cur_est = [], []
+
+            def flush():
+                if not cur:
+                    return
+                ordinal = len(containers)
+                containers.append((ordinal, len(cur),
+                                   stp.estimate_stored_tar_archive_bytes(cur_est)))
+                for it in cur:
+                    members.append((it[0], "small_files", ordinal, it[1]))
+                cur.clear()
+                cur_est.clear()
+
+            for ordinal, row in enumerate(rows):
+                size = int(row["file_size_bytes"])
+                if row.get("status") == "source_missing":
+                    flush()
+                    members.append((ordinal, "source_missing", None, 0))
+                    continue
+                if size >= loose_threshold_bytes:
+                    flush()
+                    members.append((ordinal, "loose_files", None, 0))
+                    continue
+                est = stp.estimate_stored_tar_member_bytes(
+                    str(row["remote_path"]), size)
+                cand = stp.estimate_stored_tar_archive_bytes(cur_est + [est])
+                if cur and cand > max_size_bytes:
+                    flush()
+                cur.append((ordinal, est))
+                cur_est.append(est)
+            flush()
+            return members, containers
+
+        rnd = random.Random(52)
+        rows = []
+        for i in range(4000):
+            r = rnd.random()
+            if r < 0.05:
+                rows.append({"manifest_id": i + 1,
+                             "remote_path": f"/s/missing_{i}.dat",
+                             "file_size_bytes": rnd.randint(1, 40),
+                             "status": "source_missing"})
+            elif r < 0.15:
+                rows.append({"manifest_id": i + 1,
+                             "remote_path": f"/s/large_{i}.dat",
+                             "file_size_bytes": rnd.randint(5000, 9000)})
+            else:
+                rows.append({"manifest_id": i + 1,
+                             "remote_path": f"/s/small_{i}.dat",
+                             "file_size_bytes": rnd.randint(1, 400)})
+        # cap ~6 max-size small members so the small stream spills across many
+        # containers (exercise flush on the optimized path)
+        cap = estimate_stored_tar_archive_bytes(
+            [estimate_stored_tar_member_bytes("/s/small_0.dat", 400)] * 6)
+        plan = build_stored_tar_chunk_plan(
+            1, 0, rows, loose_threshold_bytes=4096, max_size_bytes=cap)
+        exp_members, exp_containers = naive_plan(
+            rows, loose_threshold_bytes=4096, max_size_bytes=cap)
+        self.assertEqual(
+            [(m.plan_ordinal, m.storage_class, m.container_ordinal,
+              m.estimated_tar_bytes) for m in plan.members],
+            exp_members)
+        self.assertEqual(
+            [(c.container_ordinal, c.expected_member_count,
+              c.estimated_archive_bytes) for c in plan.containers],
+            exp_containers)
+        self.assertGreater(len(plan.containers), 1)  # flush really happened
+
+        # Linear scale: 60k small files build fast. The old O(n^2) took minutes
+        # at 200k (~11x this size); 5 s cleanly separates O(n) from O(n^2).
+        big = [self._row(i, 100) for i in range(60000)]
+        start = time.time()
+        big_plan = build_stored_tar_chunk_plan(
+            1, 0, big, loose_threshold_bytes=4096,
+            max_size_bytes=GNU_TAR_RECORD_SIZE * 100000)
+        self.assertEqual(len(big_plan.members), 60000)
+        self.assertLess(time.time() - start, 5.0)
+
     def test_pax_header_and_padding_are_counted(self):
         estimate = estimate_stored_tar_member_bytes("/src/a", 513)
         self.assertGreaterEqual(estimate, 512 + 512 + 512 + 1024)
