@@ -1,4 +1,5 @@
 import os
+import io
 import tempfile
 import threading
 import unittest
@@ -15,14 +16,27 @@ from src.orchestrators import (
 # facade: Plan 1 completion removed them from that facade so it cannot
 # advertise a class no production path may build.
 from src.scanning import RemoteScanner, StreamingRemoteScanner
-from src.pipeline_types import StagedChunk
+from src.paths import remote_store_base_and_rel, validate_remote_posix_relpath
+from src.pipeline_types import (
+    ContainerFormat, SourceDisposition, StagedChunk,
+    StoredTarSourceDiagnostic,
+)
 from src.remote_transport import (
     _ASKPASS_HELPERS,
     _cleanup_askpass_helpers,
     _is_recoverable_remote_tar_warning,
+    _remote_source_status_probe,
+    _remote_tar_store,
+    _source_status_command,
+    _stored_tar_command,
     _openssh_askpass_env,
     _ssh_run,
     _ssh_stream_command,
+)
+from src.remote_staging import (
+    RemoteChunkStager,
+    StagingReservation,
+    _tar_progress_watchdog_action,
 )
 from src.skipped import SkippedFileTracker
 
@@ -44,10 +58,32 @@ class RemoteStagingSafetyTests(unittest.TestCase):
         planned = 100
         free = 2 * planned + LOCAL_STAGING_RESERVE_BYTES - 1
         usage = SimpleNamespace(total=free, used=0, free=free)
-        with mock.patch("src.remote_orchestrator.shutil.disk_usage",
+        with mock.patch("src.remote_staging.shutil.disk_usage",
                         return_value=usage):
             with self.assertRaisesRegex(RuntimeError, "Insufficient local staging"):
                 orch._await_staging_capacity(planned, 0, threading.Event())
+
+    def test_direct_tar_admission_accepts_exact_disk_boundary(self):
+        orch = self._orchestrator()
+        reserve = StagingReservation(ContainerFormat.STORED_TAR, 12345)
+        free = reserve.needed_bytes + LOCAL_STAGING_RESERVE_BYTES
+        usage = SimpleNamespace(total=free, used=0, free=free)
+        with mock.patch("src.remote_staging.shutil.disk_usage",
+                        return_value=usage):
+            got = orch._await_staging_capacity(
+                10**9, 10**6, threading.Event(), reservation=reserve)
+        self.assertIs(got, reserve)
+
+    def test_direct_tar_admission_rejects_below_disk_boundary(self):
+        orch = self._orchestrator()
+        reserve = StagingReservation(ContainerFormat.STORED_TAR, 12345)
+        free = reserve.needed_bytes + LOCAL_STAGING_RESERVE_BYTES - 1
+        usage = SimpleNamespace(total=free, used=0, free=free)
+        with mock.patch("src.remote_staging.shutil.disk_usage",
+                        return_value=usage):
+            with self.assertRaisesRegex(RuntimeError, "Insufficient local staging"):
+                orch._await_staging_capacity(
+                    10**9, 10**6, threading.Event(), reservation=reserve)
 
     def test_chunk_budget_creates_staging_and_reserves_floor(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -77,8 +113,11 @@ class RemoteStagingSafetyTests(unittest.TestCase):
                 ]
 
             def get_chunk_size_summary(self, session_id, chunk_index=None):
-                # planned counts every file; present excludes source_missing.
-                return {0: (2000, 1000, 2)}
+                raise AssertionError(
+                    "logical plan bytes are not tape-capacity authority")
+
+            def get_chunk_packaging_format(self, session_id, chunk_index):
+                return ContainerFormat.ZIP
 
             def get_tape(self, label):
                 return {"total_capacity": 1 / 1024**3}
@@ -105,16 +144,18 @@ class RemoteStagingSafetyTests(unittest.TestCase):
             pack_dir=r"C:\stage\pack",
             fetch_dir=r"C:\stage\fetch",
             metadata=[{"is_packed": True}],
-            staged_bytes=0,
+            staged_bytes=2000,
+            session_id=1,
+            packaging_format=ContainerFormat.ZIP,
         )
         result = orch._write_chunk(1, desc, "T1", eject_after=False,
                                    stop_pipeline=_threading.Event())
-        # A chunk that does not fit is a re-fetchable safety block that leaves
-        # the chunk 'backup_failed' and does NOT transition it to 'backing'.
+        # A finite group that does not fit is rejected from actual staged bytes
+        # before ownership/status mutation and its reusable pack is preserved.
         self.assertIsNotNone(result)
         self.assertEqual(result.exit_code, ExitCode.SAFETY_BLOCK)
-        self.assertFalse(result.preserve_pack)
-        self.assertEqual(orch.db.statuses, ["backup_failed"])
+        self.assertTrue(result.preserve_pack)
+        self.assertEqual(orch.db.statuses, [])
 
 
 class MountedCartridgeGuardTests(unittest.TestCase):
@@ -331,6 +372,60 @@ class FetchWatchdogTests(unittest.TestCase):
             self.assertFalse(abort.wait(timeout=3))
         stop.set()
 
+    def test_tar_progress_aggregate_overrun_aborts(self):
+        snapshot = {"parts": {"a.part": 90, "b.part": 80}, "loose_bytes": 0,
+                    "total_bytes": 170}
+        action = _tar_progress_watchdog_action(
+            snapshot=snapshot, previous_snapshot=None,
+            part_last_growth={}, aggregate_last_growth=0, now=10,
+            total_bytes=100, abort_factor=1.5, stall_timeout=600,
+            free_bytes=10**12, reserve_bytes=LOCAL_STAGING_RESERVE_BYTES)
+        self.assertEqual(action, "overrun")
+
+    def test_tar_progress_detects_one_stalled_part_while_sibling_grows(self):
+        part_growth = {"a.part": 0, "b.part": 9}
+        previous = {"parts": {"a.part": 50, "b.part": 50},
+                    "loose_bytes": 0, "total_bytes": 100}
+        snapshot = {"parts": {"a.part": 50, "b.part": 60},
+                    "loose_bytes": 0, "total_bytes": 110}
+        action = _tar_progress_watchdog_action(
+            snapshot=snapshot, previous_snapshot=previous,
+            part_last_growth=part_growth, aggregate_last_growth=9, now=10,
+            total_bytes=1000, abort_factor=2.0, stall_timeout=5,
+            free_bytes=10**12, reserve_bytes=LOCAL_STAGING_RESERVE_BYTES)
+        self.assertEqual(action, "part_stall")
+
+    def test_sparse_tar_part_growth_is_progress(self):
+        part_growth = {"sparse.part": 0}
+        previous = {"parts": {"sparse.part": 4096}, "loose_bytes": 0,
+                    "total_bytes": 4096}
+        snapshot = {"parts": {"sparse.part": 8192}, "loose_bytes": 0,
+                    "total_bytes": 8192}
+        action = _tar_progress_watchdog_action(
+            snapshot=snapshot, previous_snapshot=previous,
+            part_last_growth=part_growth, aggregate_last_growth=10, now=10,
+            total_bytes=10**9, abort_factor=2.0, stall_timeout=5,
+            free_bytes=10**12, reserve_bytes=LOCAL_STAGING_RESERVE_BYTES)
+        self.assertIsNone(action)
+        self.assertEqual(part_growth["sparse.part"], 10)
+
+    def test_tar_monitor_cancels_on_part_overrun(self):
+        orch = self._orchestrator()
+        stager = RemoteChunkStager(orch)
+        stop, abort = threading.Event(), threading.Event()
+        plenty = SimpleNamespace(total=10**12, used=0, free=10**12)
+        with tempfile.TemporaryDirectory() as root:
+            part = os.path.join(root, "container.tar.owner.part")
+            with open(part, "wb") as handle:
+                handle.write(b"x" * 300)
+            with mock.patch("src.remote_staging.shutil.disk_usage",
+                            return_value=plenty):
+                stager._start_fetch_monitor(
+                    stop, abort, root, 100, tar_part_paths=[part])
+                self.assertTrue(abort.wait(timeout=15))
+            self.assertTrue(os.path.isfile(part))
+        stop.set()
+
 
 class RemotePasswordSafetyTests(unittest.TestCase):
     def test_askpass_cleanup_removes_helpers_and_registry_entries(self):
@@ -378,6 +473,242 @@ class RemotePasswordSafetyTests(unittest.TestCase):
             "Warning: Cannot open: Input/output error"
         )
         self.assertFalse(_is_recoverable_remote_tar_warning(line))
+
+
+class _StoreInputSink:
+    def __init__(self):
+        self.data = bytearray()
+
+    def write(self, data):
+        self.data.extend(data)
+        return len(data)
+
+    def close(self):
+        pass
+
+
+class _StorePopen:
+    payload_chunks = 1
+    payload = b"tar-block"
+    stderr_payload = b""
+    exit_code = 0
+    last = None
+    remote_command = None
+
+    def __init__(self, command, *, stdin, stdout, stderr, env=None):
+        del stdin, stderr, env
+        self.command = command
+        self.stdin = _StoreInputSink()
+        self.stderr = io.BytesIO(type(self).stderr_payload)
+        self.pid = 2_000_000_000
+        self.returncode = type(self).exit_code
+        self.stdout_was_pipe = stdout == __import__('subprocess').PIPE
+        for _ in range(type(self).payload_chunks):
+            stdout.write(type(self).payload)
+        type(self).last = self
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        del timeout
+        return self.returncode
+
+
+class _BlockingStorePopen(_StorePopen):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.terminated = False
+        self.returncode = None
+
+    def poll(self):
+        return -15 if self.terminated else None
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.terminated = True
+
+    def wait(self, timeout=None):
+        del timeout
+        self.terminated = True
+        self.returncode = -15
+        return self.returncode
+
+
+class DirectStoredTarTransportTests(unittest.TestCase):
+    def setUp(self):
+        _StorePopen.payload_chunks = 1
+        _StorePopen.payload = b"tar-block"
+        _StorePopen.stderr_payload = b""
+        _StorePopen.exit_code = 0
+
+    def _store(self, root, paths, *, ordinals=None, use_mbuffer=False):
+        part = os.path.join(root, "container.tar.unique.part")
+        def stream_command(_user, _host, command, **_kwargs):
+            _StorePopen.remote_command = command
+            return ["ssh"], None, None
+        with mock.patch(
+                "src.remote_transport._ssh_stream_command",
+                side_effect=stream_command), \
+             mock.patch("src.remote_transport.subprocess.Popen", _StorePopen), \
+             mock.patch("src.remote_transport._apply_proc_tuning"):
+            result = _remote_tar_store(
+                "u", "h", "/remote base", paths, part,
+                plan_ordinals=ordinals, use_mbuffer=use_mbuffer)
+        return result, _StorePopen.last
+
+    def test_exact_pinned_dialect_and_no_filename_in_command(self):
+        command = _stored_tar_command("/base with ' quote")
+        self.assertEqual(
+            command,
+            "LC_ALL=C tar -C '/base with '\"'\"' quote' -b 512 "
+            "--format=pax --sparse --sparse-version=1.0 --no-recursion "
+            "--ignore-failed-read -cf - --null -T -")
+        for filename in ("space name", "tab\tname", "line\nname", "×§×•×‘×¥",
+                         r"literal\backslash", "-leading", "$(touch nope);&"):
+            self.assertNotIn(filename, command)
+
+    def test_special_names_are_nul_framed_on_stdin_unchanged(self):
+        paths = ["space name", "tab\tname", "line\nname", "×§×•×‘×¥",
+                 r"literal\backslash", "-leading", "$(echo bad);&"]
+        with tempfile.TemporaryDirectory() as root:
+            result, proc = self._store(root, paths, ordinals=range(10, 17))
+        self.assertTrue(result.ok, result.error)
+        expected = b"".join(path.encode("utf-8") + b"\0" for path in paths)
+        self.assertEqual(bytes(proc.stdin.data), expected)
+        for path in paths:
+            self.assertNotIn(path, " ".join(proc.command))
+
+    def test_absolute_traversal_empty_component_and_nul_are_rejected(self):
+        bad = ("/absolute", "../up", "a/../b", "a//b", "a/./b", "nul\0x")
+        for path in bad:
+            with self.subTest(path=path):
+                with self.assertRaises(ValueError):
+                    validate_remote_posix_relpath(path)
+
+    def test_store_base_mapping_preserves_literal_backslash_and_whitespace(self):
+        base, rel = remote_store_base_and_rel(
+            "/remote root/", "/remote root/tab\t trailing \\name ")
+        self.assertEqual(base, "/remote root")
+        self.assertEqual(rel, "tab\t trailing \\name ")
+
+    def test_machine_probe_command_has_no_filename_slot(self):
+        command = _source_status_command("/remote base")
+        self.assertIn("read -r -d", command)
+        self.assertIn("path; do", command)
+        self.assertIn('target="./$path"', command)
+        self.assertNotIn("%q", command)
+
+    def test_machine_probe_nul_frames_attribute_newline_and_backslash(self):
+        special = "line\nname\\literal"
+        _StorePopen.payload = (
+            b"7\0" + special.encode("utf-8")
+            + b"\0source_permission_denied\0not_readable\0")
+        with mock.patch(
+                "src.remote_transport._ssh_stream_command",
+                return_value=(["ssh"], None, None)), \
+             mock.patch("src.remote_transport.subprocess.Popen", _StorePopen), \
+             mock.patch("src.remote_transport._apply_proc_tuning"):
+            diagnostics, unresolved = _remote_source_status_probe(
+                "u", "h", "/base", ((7, special),))
+        self.assertEqual(unresolved, ())
+        self.assertEqual(
+            diagnostics,
+            (StoredTarSourceDiagnostic(
+                7, special, SourceDisposition.SOURCE_PERMISSION_DENIED,
+                "not_readable"),))
+        self.assertEqual(
+            bytes(_StorePopen.last.stdin.data),
+            b"7\0" + special.encode("utf-8") + b"\0")
+
+    def test_machine_attributed_special_name_exceptions_are_returned(self):
+        special = "odd\nname\\byte"
+        cases = (
+            (SourceDisposition.SOURCE_MISSING, "lstat_missing",
+             b"tar: diagnostic: Warning: Cannot stat: No such file or directory\n"),
+            (SourceDisposition.SOURCE_PERMISSION_DENIED, "not_readable",
+             b"tar: diagnostic: Warning: Cannot open: Permission denied\n"),
+            (SourceDisposition.SOURCE_UNREADABLE, "read_probe_failed",
+             b"tar: diagnostic: Warning: Cannot open: Input/output error\n"),
+        )
+        for disposition, evidence, stderr in cases:
+            with self.subTest(disposition=disposition), \
+                    tempfile.TemporaryDirectory() as root:
+                _StorePopen.stderr_payload = stderr
+                diagnostic = StoredTarSourceDiagnostic(
+                    4, special, disposition, evidence)
+                with mock.patch(
+                        "src.remote_transport._remote_source_status_probe",
+                        return_value=((diagnostic,), ())):
+                    result, _ = self._store(root, [special], ordinals=[4])
+                self.assertTrue(result.ok, result.error)
+                self.assertEqual(result.diagnostics, (diagnostic,))
+
+    def test_unassignable_diagnostic_is_unresolved(self):
+        _StorePopen.stderr_payload = b"tar: something entirely new\n"
+        with tempfile.TemporaryDirectory() as root:
+            result, _ = self._store(root, ["a"], ordinals=[0])
+        self.assertFalse(result.ok)
+        self.assertIn("unclassified", result.unresolved[0])
+
+    def test_unknown_warning_is_not_hidden_by_a_known_warning(self):
+        _StorePopen.stderr_payload = (
+            b"tar: a: Warning: Cannot stat: No such file or directory\n"
+            b"tar: second diagnostic has no classification\n")
+        with tempfile.TemporaryDirectory() as root:
+            result, _ = self._store(root, ["a"], ordinals=[0])
+        self.assertFalse(result.ok)
+        self.assertIn("unclassified", " ".join(result.unresolved))
+
+    def test_mbuffer_can_never_mask_tar_failure(self):
+        _StorePopen.exit_code = 2
+        with tempfile.TemporaryDirectory() as root, mock.patch(
+                "src.remote_transport._mbuffer_pipefail_capable",
+                return_value=True):
+            result, proc = self._store(
+                root, ["a"], ordinals=[0], use_mbuffer=True)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.remote_exit_code, 2)
+        self.assertEqual(result.transport_mode, "tar_mbuffer_pipefail")
+        self.assertIn("bash -o pipefail", _StorePopen.remote_command)
+
+    def test_stdout_goes_directly_to_file_with_bounded_python_memory(self):
+        _StorePopen.payload_chunks = 4096
+        _StorePopen.payload = bytes(65536)
+        with tempfile.TemporaryDirectory() as root:
+            result, proc = self._store(root, ["a"], ordinals=[0])
+            self.assertEqual(os.path.getsize(result.part_path), 256 * 1024 * 1024)
+        self.assertTrue(result.ok)
+        self.assertFalse(proc.stdout_was_pipe)
+
+    def test_transient_network_classification_remains_retryable(self):
+        from src.remote_staging import _is_transient_fetch_error
+        self.assertTrue(_is_transient_fetch_error(
+            "remote TAR/SSH exited with status 255: Connection reset by peer"))
+        self.assertFalse(_is_transient_fetch_error(
+            "Permission denied (publickey,password)"))
+
+    def test_shared_abort_cancels_registered_stream_and_leaves_part(self):
+        abort = threading.Event()
+        abort.set()  # models the first failed sibling signalling this worker
+        with tempfile.TemporaryDirectory() as root:
+            part = os.path.join(root, "cancelled.tar.unique.part")
+            with mock.patch(
+                    "src.remote_transport._ssh_stream_command",
+                    return_value=(["ssh"], None, None)), \
+                 mock.patch(
+                    "src.remote_transport.subprocess.Popen",
+                    _BlockingStorePopen), \
+                 mock.patch("src.remote_transport._apply_proc_tuning"):
+                result = _remote_tar_store(
+                    "u", "h", "/base", ["a"], part,
+                    plan_ordinals=[0], abort_evt=abort)
+            self.assertFalse(result.ok)
+            self.assertTrue(result.cancelled)
+            self.assertTrue(os.path.isfile(part))
+            self.assertFalse(os.path.exists(part[:-5]))
 
 
 class RemoteScannerTests(unittest.TestCase):

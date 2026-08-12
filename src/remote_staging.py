@@ -29,7 +29,9 @@ import random
 import shutil
 import threading
 import time
+import uuid
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import datetime
 
 from .constants import LOCAL_STAGING_RESERVE_BYTES
@@ -41,14 +43,20 @@ from .exit_codes import (
     REASON_MISSING_NONINTERACTIVE_CREDENTIAL, REASON_SSH_AUTHENTICATION_FAILED,
     REASON_SSH_HOST_KEY_MISMATCH, REASON_SSH_PERMISSION_DENIED)
 from .logsetup import get_logger
-from .packer import LTOPacker
+from .archive_artifacts import (
+    publish_stored_tar_pair, resolve_locator, tar_sidecar_locator)
+from .packer import LTOPacker, StagingSpaceError
 from .paths import (_LEGACY_PATH_LIMIT, _dir_tree_size,
-                    _disambiguate_local_rel, _exceeds_legacy_path_limit,
-                    _long, _remote_fetch_base_and_rel,
+                     _disambiguate_local_rel, _exceeds_legacy_path_limit,
+                     _long, _remote_fetch_base_and_rel,
+                     remote_store_base_and_rel,
                     _reserved_name_component, _winsafe_extracted_rel)
-from .pipeline_types import ChunkStatus, StagedChunk
+from .pipeline_types import (
+    ArtifactKind, ArtifactReadiness, ChunkStatus, ContainerFormat,
+    ContainerValidationState, StagedArtifact, StagedChunk, StagedContainer)
 from .ram_telemetry import RamStageSampler
-from .remote_transport import _remote_tar_fetch
+from .remote_transport import _remote_tar_fetch, _remote_tar_store
+from .tar_container import validate_stored_tar_part
 from .runtime import (CANCEL, _fmt_eta, _phase, _progress_done, _progress_line,
                       _status)
 from .telegram_notify import send_best_effort
@@ -79,10 +87,213 @@ def _fetch_watchdog_action(*, cur, last_growth_at, now, total_bytes,
         return 'stall'
     return None
 
+
+@dataclass(frozen=True)
+class StagingReservation:
+    """Local staging bytes reserved before a producer is launched."""
+
+    packaging_format: ContainerFormat
+    needed_bytes: int
+    tar_stream_bytes: int = 0
+    sidecar_bytes: int = 0
+    loose_bytes: int = 0
+    pack_copy_bytes: int = 0
+
+
+def _sidecar_reserve_bytes(member_count, cfg):
+    fixed = int(getattr(cfg, "stored_tar_sidecar_fixed_reserve_bytes", 4096))
+    per_member = int(getattr(
+        cfg, "stored_tar_sidecar_member_reserve_bytes", 1024))
+    return max(0, fixed) + max(0, per_member) * max(0, int(member_count or 0))
+
+
+def stored_tar_staging_reservation(chunk_plan, host):
+    """Conservative peak footprint for direct Stored TAR staging.
+
+    Direct TAR never extracts its small-file members.  The reserve therefore
+    covers the aggregate unfinished/final TAR artifacts, permanent sidecar
+    temp+final files, the sidecar copy placed in the pack tree, loose large-file
+    fetch+pack coexistence, and the writer-visible pack copy.
+    """
+    tar_stream_bytes = sum(
+        int(item.estimated_archive_bytes) for item in chunk_plan.containers)
+    small_members = len(chunk_plan.small_members)
+    sidecar_final = _sidecar_reserve_bytes(small_members, host.cfg)
+    sidecar_bytes = 3 * sidecar_final
+    loose_logical = sum(
+        int(item.file_size_bytes) for item in chunk_plan.loose_members)
+    loose_count = len(chunk_plan.loose_members)
+    if loose_count:
+        loose_physical = host._physical_estimate(loose_logical, loose_count)
+    else:
+        loose_physical = 0
+    loose_bytes = 2 * loose_physical
+    pack_copy_bytes = tar_stream_bytes
+    return StagingReservation(
+        packaging_format=ContainerFormat.STORED_TAR,
+        needed_bytes=tar_stream_bytes + sidecar_bytes + loose_bytes
+        + pack_copy_bytes,
+        tar_stream_bytes=tar_stream_bytes,
+        sidecar_bytes=sidecar_bytes,
+        loose_bytes=loose_bytes,
+        pack_copy_bytes=pack_copy_bytes,
+    )
+
+
+def zip_staging_reservation(planned_bytes, planned_files, host):
+    need = 2 * host._physical_estimate(planned_bytes, planned_files)
+    return StagingReservation(
+        packaging_format=ContainerFormat.ZIP, needed_bytes=need)
+
+
+def _file_size_or_zero(path):
+    try:
+        return os.path.getsize(_long(path))
+    except OSError:
+        return 0
+
+
+def _staging_progress_snapshot(part_paths=(), loose_dirs=()):
+    parts = {
+        str(path): _file_size_or_zero(path)
+        for path in part_paths or ()
+        if path and os.path.isfile(_long(path))
+    }
+    loose = sum(_dir_tree_size(path) for path in loose_dirs or ()
+                if path and os.path.isdir(_long(path)))
+    return {"parts": parts, "loose_bytes": loose,
+            "total_bytes": sum(parts.values()) + loose}
+
+
+def _tar_progress_watchdog_action(
+        *, snapshot, previous_snapshot, part_last_growth, aggregate_last_growth,
+        now, total_bytes, abort_factor, stall_timeout, free_bytes,
+        reserve_bytes):
+    action = _fetch_watchdog_action(
+        cur=int(snapshot["total_bytes"]),
+        last_growth_at=aggregate_last_growth,
+        now=now,
+        total_bytes=total_bytes,
+        abort_factor=abort_factor,
+        stall_timeout=stall_timeout,
+        free_bytes=free_bytes,
+        reserve_bytes=reserve_bytes)
+    if action is not None:
+        return action
+    if not stall_timeout:
+        return None
+    previous_parts = (previous_snapshot or {}).get("parts", {})
+    for path, size in snapshot["parts"].items():
+        if size > int(previous_parts.get(path, -1)):
+            part_last_growth[path] = now
+        elif now - part_last_growth.get(path, now) >= stall_timeout:
+            return "part_stall"
+    return None
+
 # Written inside a pack dir when a stop preserves it, and the only thing that
 # makes that pack reusable. Written last and atomically, so its presence means
 # the pack is complete — a pack interrupted mid-write simply has no marker.
 _RESUME_MARKER = "_resume_pack.json"
+
+
+def _pack_inventory_readonly(pack_dir):
+    """Return the marker-excluded name/size inventory, or ``None`` unreadable.
+
+    This is deliberately path/size based.  Plan 2 does not use content hashes,
+    and callers must be able to inspect a preserved pack without changing it.
+    """
+    items = []
+    walk_errors = []
+
+    def onerror(exc):
+        walk_errors.append(exc)
+
+    try:
+        for root, _dirs, files in os.walk(pack_dir, onerror=onerror):
+            for name in files:
+                if name == _RESUME_MARKER:
+                    continue
+                full = os.path.join(root, name)
+                rel = os.path.relpath(full, pack_dir).replace("\\", "/")
+                items.append([rel, os.path.getsize(_long(full))])
+    except OSError:
+        return None
+    return None if walk_errors else sorted(items)
+
+
+def _read_resume_pack_marker(pack_dir, session_id, chunk_index):
+    """Parse and inventory-check one resume marker without modifying it."""
+    result = {
+        "marker_state": "unknown",
+        "inventory_state": "unknown",
+        "pack_file_count": None,
+        "packaging_format": None,
+    }
+    try:
+        os.stat(_long(pack_dir))
+    except FileNotFoundError:
+        result["marker_state"] = "pack_directory_absent"
+        return result, None
+    except OSError:
+        result["marker_state"] = "pack_directory_unreadable"
+        return result, None
+    if not os.path.isdir(_long(pack_dir)):
+        result["marker_state"] = "pack_directory_unreadable"
+        return result, None
+
+    actual = _pack_inventory_readonly(pack_dir)
+    if actual is None:
+        result["marker_state"] = "pack_directory_unreadable"
+        return result, None
+    result["pack_file_count"] = len(actual)
+    result["inventory_state"] = "readable"
+
+    marker = os.path.join(pack_dir, _RESUME_MARKER)
+    try:
+        with open(_long(marker), encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except FileNotFoundError:
+        result["marker_state"] = "absent"
+        return result, None
+    except (OSError, ValueError, TypeError):
+        result["marker_state"] = "unreadable"
+        return result, None
+
+    if not isinstance(payload, dict):
+        result["marker_state"] = "unreadable"
+        return result, None
+    result["packaging_format"] = payload.get(
+        "packaging_format", ContainerFormat.ZIP.value)
+    if (payload.get("version") != 1
+            or payload.get("chunk_index") != int(chunk_index)
+            or payload.get("session_id") != int(session_id)):
+        result["marker_state"] = "identity_mismatch"
+        return result, None
+
+    expected = payload.get("pack_inventory")
+    if not isinstance(expected, list):
+        result["marker_state"] = "unreadable"
+        return result, None
+    try:
+        expected = sorted([list(item) for item in expected])
+    except (TypeError, ValueError):
+        result["marker_state"] = "unreadable"
+        return result, None
+    if expected != actual:
+        result["marker_state"] = "inventory_mismatch"
+        result["inventory_state"] = "mismatch"
+        return result, None
+
+    result["marker_state"] = "valid"
+    result["inventory_state"] = "matched"
+    return result, payload
+
+
+def inspect_resume_pack_marker(pack_dir, session_id, chunk_index):
+    """Return path-free, read-only resume-marker and pack-content evidence."""
+    report, _payload = _read_resume_pack_marker(
+        pack_dir, session_id, chunk_index)
+    return report
 
 # Permanent fetch-failure signatures, checked FIRST. An auth/permission/host-key/
 # config failure is never a retryable network blip: retrying it just spins on an
@@ -161,6 +372,26 @@ def _is_transient_fetch_error(err):
     return _classify_fetch_error(err)[0] == "transient"
 
 
+def _enum_value(value):
+    return getattr(value, "value", value)
+
+
+def _serialize_staged_container(item):
+    data = dict(item.__dict__)
+    for key in ("container_format", "validation_state",
+                "database_validation_state"):
+        data[key] = _enum_value(data[key])
+    return data
+
+
+def _serialize_staged_artifact(item):
+    data = dict(item.__dict__)
+    for key in ("artifact_kind", "readiness_state",
+                "database_readiness_state"):
+        data[key] = _enum_value(data[key])
+    return data
+
+
 class RemoteChunkStager:
     """Fetch + pack one chunk onto local staging. Never touches the tape."""
 
@@ -168,34 +399,753 @@ class RemoteChunkStager:
         #: The RemoteOrchestrator façade that owns session state and config.
         self.host = host
 
+    def _start_stored_tar_attempt(self, owner, session_id, chunk_index):
+        """Persist process identity so a restart can prove this owner dead."""
+        starter = getattr(self.host.db, "start_worker_attempt", None)
+        if not callable(starter):
+            return None
+        started_at = None
+        try:
+            import psutil
+            started_at = psutil.Process(os.getpid()).create_time()
+        except Exception:
+            # PID absence after a crash remains useful evidence.  If the PID is
+            # later reused, missing creation identity correctly blocks reclaim.
+            pass
+        try:
+            return starter(
+                owner_token=owner, attempt_kind="stored_tar_build",
+                session_id=session_id, chunk_index=chunk_index,
+                local_pid=os.getpid(),
+                local_process_started_at=started_at)
+        except Exception:
+            get_logger().warning(
+                "could not record a durable Stored TAR build attempt; a crash "
+                "will require fail-closed owner reconciliation", exc_info=True)
+            return None
+
+    def _finish_stored_tar_attempt(self, attempt_id):
+        if attempt_id is None:
+            return
+        try:
+            self.host.db.finish_worker_attempt(attempt_id, "completed")
+        except Exception:
+            get_logger().warning(
+                "could not close Stored TAR build attempt %s", attempt_id,
+                exc_info=True)
+
+    def _build_stored_tar_container(
+            self, session_id, chunk_index, container_plan, plan_members,
+            pack_dir, *, owner_token=None, abort_evt=None, crash_hook=None,
+            progress_part_paths=None, progress_lock=None):
+        """Build and publish one Task-2.2/2.3/2.4 container pair.
+
+        Task 2.5 routes TAR-assigned chunks here while ZIP chunks stay on the
+        existing extraction/packer path.
+        """
+        owner = str(owner_token or uuid.uuid4().hex)
+        members = sorted(plan_members, key=lambda item: int(item.plan_ordinal))
+        remote_bases = []
+        sidecar_plan = []
+        for item in members:
+            base, rel = remote_store_base_and_rel(
+                self.host.remote_path, item.remote_path)
+            remote_bases.append(base)
+            sidecar_plan.append({
+                "member_name": rel,
+                "canonical_source_path": item.remote_path,
+                "expected_size": int(item.file_size_bytes),
+                "plan_ordinal": int(item.plan_ordinal),
+                "container_ordinal": int(container_plan.container_ordinal),
+            })
+        if not sidecar_plan:
+            raise RuntimeError("Stored TAR container plan is empty")
+        if len(set(remote_bases)) != 1:
+            raise RuntimeError(
+                "Stored TAR container members do not share one remote base")
+
+        os.makedirs(_long(pack_dir), exist_ok=True)
+        final_tar = os.path.join(pack_dir, container_plan.container_name)
+        container_rows = self.host.db.get_archive_containers(
+            session_id, chunk_index)
+        container_row = next(
+            (row for row in container_rows
+             if int(row["container_ordinal"])
+             == int(container_plan.container_ordinal)), None)
+        if container_row is None:
+            raise RuntimeError("Stored TAR container identity is absent")
+        container_id = int(container_row["container_id"])
+        existing_state = container_row.get("validation_state")
+        existing_owner = container_row.get("owner_token")
+        existing_part = container_row.get("validated_part_locator")
+        if (existing_part and container_row.get("validation_state") in (
+                "building", "validated_part", "ready")
+                and (existing_owner in (None, owner))):
+            part_path = existing_part
+        else:
+            part_path = f"{final_tar}.{uuid.uuid4().hex[:12]}.part"
+        claimed = self.host.db.claim_stored_tar_container_build(
+            container_id, owner, part_path)
+        if progress_part_paths is not None:
+            lock = progress_lock or threading.Lock()
+            with lock:
+                if part_path not in progress_part_paths:
+                    progress_part_paths.append(part_path)
+        claimed_state = (claimed.get("validation_state")
+                         if isinstance(claimed, dict) else existing_state)
+        attempt_id = (None if claimed_state == "ready"
+                      else self._start_stored_tar_attempt(
+                          owner, session_id, chunk_index))
+        if existing_state in ("validated_part", "ready"):
+            summary = container_row.get("validation_summary") or {}
+            diagnostics = tuple(summary.get("source_diagnostics") or ())
+            sidecar_path = resolve_locator(
+                self.host.cfg.local_manifest_archive_root,
+                tar_sidecar_locator(
+                    session_id, chunk_index,
+                    container_plan.container_ordinal))
+            if (existing_state == "validated_part" and diagnostics
+                    and os.path.isfile(_long(final_tar))
+                    and not os.path.isfile(_long(sidecar_path))):
+                # The only durable exception evidence should have preceded the
+                # final TAR.  Preserve the anomalous local data as evidence,
+                # reset only under the still-current pre-writer owner, and
+                # recapture source outcomes instead of inventing them.
+                quarantine = (
+                    f"{final_tar}.{uuid.uuid4().hex[:12]}.unready")
+                os.rename(_long(final_tar), _long(quarantine))
+                part_path = f"{final_tar}.{uuid.uuid4().hex[:12]}.part"
+                self.host.db.restart_stored_tar_build_from_source(
+                    container_id, owner, part_path)
+                existing_state = "building"
+            else:
+                publication = publish_stored_tar_pair(
+                    self.host.cfg.local_manifest_archive_root,
+                    part_path, final_tar, sidecar_plan, diagnostics,
+                    validation=None, session_id=session_id,
+                    chunk_index=chunk_index, container_id=container_id,
+                    container_ordinal=container_plan.container_ordinal,
+                    owner_token=owner, db=self.host.db, pack_dir=pack_dir,
+                    crash_hook=crash_hook)
+                self._finish_stored_tar_attempt(attempt_id)
+                return publication
+
+        retries = max(0, int(getattr(
+            self.host, "fetch_transient_retries", 0)))
+        retry_base = float(getattr(
+            self.host, "fetch_transient_retry_base", 5.0))
+        result = None
+        for attempt in range(retries + 1):
+            if attempt or (existing_state == "building"
+                           and os.path.exists(_long(part_path))):
+                # Ownership was established before the first byte.  A transient
+                # retry discards only that owner's unpublished partial stream and
+                # restarts at byte zero.
+                try:
+                    os.remove(_long(part_path))
+                except FileNotFoundError:
+                    pass
+            result = _remote_tar_store(
+                self.host.remote_user, self.host.remote_host, remote_bases[0],
+                [item["member_name"] for item in sidecar_plan], part_path,
+                plan_ordinals=[item["plan_ordinal"] for item in sidecar_plan],
+                password=self.host.remote_password, cipher=self.host.ssh_cipher,
+                use_mbuffer=self.host.use_mbuffer,
+                mbuffer_size=self.host.mbuffer_size,
+                fetch_cores=self.host.fetch_cores, abort_evt=abort_evt)
+            if result.ok:
+                break
+            detail = "\n".join(filter(None, (result.error, result.stderr)))
+            if (attempt >= retries or result.cancelled
+                    or not _is_transient_fetch_error(detail)):
+                self.host._note_fetch_failure(detail)
+                raise RuntimeError(f"direct Stored TAR stream failed: {detail}")
+            delay = self.host._fetch_backoff_delay(attempt, retry_base)
+            self.host._note_fetch_failure(
+                detail, retry_attempt=attempt + 1,
+                next_retry_delay=delay)
+            if abort_evt is not None and abort_evt.wait(delay):
+                raise RuntimeError("direct Stored TAR stream cancelled")
+            if CANCEL.is_set():
+                raise RuntimeError("direct Stored TAR stream cancelled")
+        assert result is not None and result.ok
+
+        validation = validate_stored_tar_part(
+            part_path, sidecar_plan,
+            container_ordinal=container_plan.container_ordinal,
+            source_diagnostics=result.diagnostics,
+            tar_dialect=container_plan.tar_dialect,
+            format_version=container_plan.format_version)
+        self.host.db.mark_stored_tar_validated_part(
+            container_id, owner, part_path, validation,
+            result.diagnostics)
+        if crash_hook is not None:
+            crash_hook("after_validated_part_state")
+        publication = publish_stored_tar_pair(
+            self.host.cfg.local_manifest_archive_root,
+            part_path, final_tar, sidecar_plan, result.diagnostics,
+            validation=validation, session_id=session_id,
+            chunk_index=chunk_index, container_id=container_id,
+            container_ordinal=container_plan.container_ordinal,
+            owner_token=owner, db=self.host.db, pack_dir=pack_dir,
+            crash_hook=crash_hook)
+        self._finish_stored_tar_attempt(attempt_id)
+        return publication
+
+    @staticmethod
+    def _source_diagnostic_ordinals(diagnostics):
+        ordinals = set()
+        for item in diagnostics or ():
+            if isinstance(item, dict):
+                ordinal = item.get("plan_ordinal")
+            else:
+                ordinal = getattr(item, "plan_ordinal", None)
+            if ordinal is not None:
+                ordinals.add(int(ordinal))
+        return ordinals
+
+    @staticmethod
+    def _safe_artifact_stage_name(row):
+        kind = str(row["artifact_kind"])
+        artifact_id = int(row["artifact_id"])
+        locator = str(row.get("local_locator") or "")
+        base = os.path.basename(locator.replace("\\", "/")) or kind
+        return f"_artifact_{artifact_id:08d}_{base}"
+
+    def _copy_ready_artifact_to_pack(self, row, pack_dir):
+        src = resolve_locator(
+            self.host.cfg.local_manifest_archive_root, row["local_locator"])
+        if not os.path.isfile(_long(src)):
+            raise RuntimeError(
+                f"ready artifact is missing locally: {row['local_locator']}")
+        dst = os.path.join(pack_dir, self._safe_artifact_stage_name(row))
+        if os.path.exists(_long(dst)):
+            if os.path.getsize(_long(dst)) != os.path.getsize(_long(src)):
+                raise RuntimeError(f"pack artifact conflicts: {dst}")
+            return dst
+        part = f"{dst}.{uuid.uuid4().hex[:12]}.part"
+        os.makedirs(_long(os.path.dirname(dst)), exist_ok=True)
+        try:
+            with open(_long(src), "rb") as source, open(_long(part), "xb") as target:
+                shutil.copyfileobj(source, target, 1024 * 1024)
+                target.flush()
+                os.fsync(target.fileno())
+            os.replace(_long(part), _long(dst))
+        finally:
+            if os.path.exists(_long(part)):
+                try:
+                    os.remove(_long(part))
+                except OSError:
+                    pass
+        return dst
+
+    def _stored_tar_metadata_for_container(
+            self, container_plan, plan_members, publication, container_row,
+            artifact_row):
+        excluded = self._source_diagnostic_ordinals(
+            getattr(publication, "source_diagnostics", ()))
+        records = []
+        threshold_bytes = int(float(
+            getattr(self.host.cfg, 'index_min_file_mb', 10) or 10)
+                              * 1024 * 1024)
+        index_all = bool(getattr(
+            self.host.cfg, 'index_packed_small_files', False))
+        for member in sorted(plan_members, key=lambda item: int(item.plan_ordinal)):
+            if int(member.plan_ordinal) in excluded:
+                continue
+            records.append({
+                "file_name": os.path.basename(str(member.remote_path)),
+                "original_path": str(member.remote_path),
+                "file_size_bytes": int(member.file_size_bytes),
+                "is_packed": True,
+                "container_name": container_plan.container_name,
+                "stored_path": str(member.remote_path),
+                "canonical_source_path": str(member.remote_path),
+                "catalog_policy": (
+                    "index" if index_all
+                    or int(member.file_size_bytes) >= threshold_bytes
+                    else "manifest_only"),
+                "container_id": int(container_row["container_id"]),
+                "container_format": ContainerFormat.STORED_TAR.value,
+                "container_ordinal": int(container_plan.container_ordinal),
+                "artifact_id": int(artifact_row["artifact_id"]),
+                "artifact_kind": ArtifactKind.TAR_SIDECAR.value,
+                "artifact_version": str(artifact_row["artifact_version"]),
+            })
+        return records
+
+    def _stored_tar_rows_after_publication(
+            self, session_id, chunk_index, container_id):
+        containers = {
+            int(row["container_id"]): row
+            for row in self.host.db.get_archive_containers(session_id, chunk_index)
+        }
+        artifacts = {
+            int(row["container_id"]): row
+            for row in self.host.db.get_archive_artifacts(session_id, chunk_index)
+            if row.get("container_id") is not None
+            and row["artifact_kind"] == ArtifactKind.TAR_SIDECAR.value
+            and row["readiness_state"] == ArtifactReadiness.READY.value
+        }
+        container = containers.get(int(container_id))
+        artifact = artifacts.get(int(container_id))
+        if container is None or artifact is None:
+            raise RuntimeError(
+                "Stored TAR publication did not produce durable ready rows")
+        return container, artifact
+
+    def _stored_tar_rows_after_publication_by_ordinal(
+            self, session_id, chunk_index, container_ordinal):
+        rows = self.host.db.get_archive_containers(session_id, chunk_index)
+        match = next(
+            (row for row in rows
+             if int(row["container_ordinal"]) == int(container_ordinal)),
+            None)
+        if match is None:
+            raise RuntimeError("Stored TAR container identity is absent")
+        return self._stored_tar_rows_after_publication(
+            session_id, chunk_index, int(match["container_id"]))
+
+    def _stage_stored_tar_chunk(
+            self, session_id, chunk_index, chunk_files, chunk_plan,
+            fetch_dir, pack_dir, ram_stats, fetch_seconds, fetch_bytes,
+            abort_evt=None, progress_part_paths=None, progress_lock=None):
+        self.host.db.update_chunk_status(
+            session_id, chunk_index, ChunkStatus.PACKING.value)
+        # Task 2.6 may have adopted a crash-published TAR/sidecar pair in this
+        # deterministic pack.  Reconciliation has already validated every
+        # surviving local member; deleting the directory here would discard
+        # the very no-refetch recovery it just proved safe.
+        os.makedirs(_long(pack_dir), exist_ok=True)
+        _phase('PACK', f"Staging Stored TAR chunk {chunk_index + 1}: "
+                       "small files -> TAR, large files staged loose")
+        pack_start = time.perf_counter()
+
+        source_missing_files = [
+            {
+                "manifest_id": item.manifest_id,
+                "remote_path": item.remote_path,
+                "file_size_bytes": item.file_size_bytes,
+            }
+            for item in chunk_plan.source_missing_members
+        ]
+        for item in source_missing_files:
+            self.host.skipped_tracker.add(
+                'remote', item["remote_path"], "source missing",
+                'fetch', session_id=session_id, chunk_index=chunk_index)
+
+        metadata = []
+        staged_containers = []
+        staged_artifacts = []
+        members_by_container = defaultdict(list)
+        for member in chunk_plan.small_members:
+            members_by_container[int(member.container_ordinal)].append(member)
+
+        try:
+            for container_plan in chunk_plan.containers:
+                members = members_by_container[int(container_plan.container_ordinal)]
+                publication = self._build_stored_tar_container(
+                    session_id, chunk_index, container_plan, members, pack_dir,
+                    abort_evt=abort_evt,
+                    progress_part_paths=progress_part_paths,
+                    progress_lock=progress_lock)
+                container_row, artifact_row = (
+                    self._stored_tar_rows_after_publication_by_ordinal(
+                        session_id, chunk_index,
+                        container_plan.container_ordinal))
+                metadata.extend(self._stored_tar_metadata_for_container(
+                    container_plan, members, publication, container_row,
+                    artifact_row))
+                staged_containers.append(StagedContainer(
+                    container_id=int(container_row["container_id"]),
+                    session_id=session_id,
+                    chunk_index=chunk_index,
+                    container_ordinal=int(container_row["container_ordinal"]),
+                    container_format=ContainerFormat.STORED_TAR,
+                    format_version=str(container_row["format_version"]),
+                    storage_class=str(container_row["storage_class"]),
+                    container_name=str(container_row["container_name"]),
+                    data_path=str(container_row["temporary_data_locator"]),
+                    temporary_data_locator=str(
+                        container_row["temporary_data_locator"]),
+                    data_size_bytes=int(container_row["actual_artifact_bytes"]),
+                    expected_member_count=int(
+                        container_row["expected_member_count"]),
+                    expected_logical_bytes=int(
+                        container_row["expected_logical_bytes"]),
+                    observed_member_count=int(
+                        container_row["observed_member_count"]),
+                    observed_logical_bytes=int(
+                        container_row["observed_logical_bytes"]),
+                    permanent_local_metadata_locator=(
+                        container_row["permanent_local_metadata_locator"]),
+                    validation_state=ContainerValidationState.READY,
+                    database_validation_state=ContainerValidationState.READY,
+                    tar_dialect=str(container_row["tar_dialect"]),
+                ))
+                staged_artifacts.append(StagedArtifact(
+                    artifact_id=int(artifact_row["artifact_id"]),
+                    session_id=session_id,
+                    chunk_index=chunk_index,
+                    container_id=int(container_row["container_id"]),
+                    artifact_kind=ArtifactKind.TAR_SIDECAR,
+                    artifact_version=str(artifact_row["artifact_version"]),
+                    staged_path=publication.pack_sidecar_path,
+                    local_locator=str(artifact_row["local_locator"]),
+                    staged_size_bytes=int(artifact_row["artifact_size_bytes"]),
+                    readiness_state=ArtifactReadiness.READY,
+                    database_readiness_state=ArtifactReadiness.READY,
+                ))
+
+            for artifact_row in self.host.db.get_archive_artifacts(
+                    session_id, chunk_index):
+                if artifact_row.get("container_id") is not None:
+                    continue
+                if artifact_row["artifact_kind"] not in {
+                        ArtifactKind.PLAN_MANIFEST.value,
+                        ArtifactKind.TERMINAL_MANIFEST.value}:
+                    continue
+                if artifact_row["readiness_state"] != ArtifactReadiness.READY.value:
+                    continue
+                staged_path = self._copy_ready_artifact_to_pack(
+                    artifact_row, pack_dir)
+                staged_artifacts.append(StagedArtifact(
+                    artifact_id=int(artifact_row["artifact_id"]),
+                    session_id=session_id,
+                    chunk_index=chunk_index,
+                    container_id=None,
+                    artifact_kind=ArtifactKind(artifact_row["artifact_kind"]),
+                    artifact_version=str(artifact_row["artifact_version"]),
+                    staged_path=staged_path,
+                    local_locator=str(artifact_row["local_locator"]),
+                    staged_size_bytes=int(artifact_row["artifact_size_bytes"]),
+                    readiness_state=ArtifactReadiness.READY,
+                    database_readiness_state=ArtifactReadiness.READY,
+                ))
+
+            loose_members = list(chunk_plan.loose_members)
+            if loose_members:
+                loose_ids = {int(item.manifest_id) for item in loose_members}
+                loose_rows = [
+                    row for row in chunk_files
+                    if int(row["manifest_id"]) in loose_ids]
+                fetch_ok, loose_missing, loose_count = self.host._fetch_chunk(
+                    session_id, chunk_index, loose_rows, fetch_dir)
+                source_missing_files.extend(loose_missing)
+                if not fetch_ok:
+                    raise RuntimeError("large-file fetch failed")
+                if loose_count:
+                    packer = LTOPacker(
+                        self.host.cfg.max_zip_size_gb,
+                        index_min_file_mb=self.host.cfg.index_min_file_mb,
+                        index_packed_small_files=(
+                            self.host.cfg.index_packed_small_files),
+                        manifest_enabled=False,
+                    )
+                    loose_metadata = packer.run(
+                        source=fetch_dir,
+                        dest=pack_dir,
+                        threshold_mb=0,
+                        skipped_tracker=self.host.skipped_tracker,
+                        source_name='remote',
+                        session_id=session_id,
+                        chunk_index=chunk_index,
+                        on_existing='reuse',
+                        governor=getattr(self.host, 'governor', None),
+                        pack_file_batch_size=self.host.pack_file_batch_size,
+                        pack_parallel_workers=1,
+                    )
+                    canonical_count = _apply_canonical_remote_paths(
+                        loose_metadata, loose_rows)
+                    if canonical_count != len(loose_metadata):
+                        raise RuntimeError(
+                            "[DB] Refusing to index temporary loose staging "
+                            "paths: canonical SOURCE paths mapped for only "
+                            f"{canonical_count:,}/{len(loose_metadata):,} "
+                            "staged file(s).")
+                    metadata.extend(loose_metadata)
+
+            ready_object_count = len(staged_containers) + sum(
+                1 for item in metadata if not item.get("is_packed"))
+            if ready_object_count == 0:
+                if source_missing_files:
+                    self.host._cleanup_dir(fetch_dir)
+                    self.host._cleanup_dir(pack_dir)
+                    _status('REMOTE', f"Chunk {chunk_index + 1}: all source "
+                                      "files are missing; no tape write is "
+                                      "required.")
+                    return StagedChunk(
+                        chunk_index=chunk_index,
+                        fetch_dir=fetch_dir,
+                        pack_dir=pack_dir,
+                        metadata=[],
+                        staged_bytes=0,
+                        fetch_seconds=fetch_seconds,
+                        fetch_bytes=fetch_bytes,
+                        pack_seconds=0,
+                        pack_bytes=0,
+                        ram_stats=ram_stats,
+                        source_missing_files=source_missing_files,
+                        skip_tape=True,
+                        session_id=session_id,
+                        packaging_format=ContainerFormat.STORED_TAR,
+                    )
+                raise RuntimeError("Stored TAR chunk produced no ready objects")
+
+            pack_seconds = time.perf_counter() - pack_start
+            self.host._cleanup_dir(fetch_dir)
+            gc.collect()
+            staged_bytes = _dir_tree_size(pack_dir)
+            desc = StagedChunk(
+                chunk_index=chunk_index,
+                fetch_dir=fetch_dir,
+                pack_dir=pack_dir,
+                metadata=metadata,
+                staged_bytes=staged_bytes,
+                fetch_seconds=fetch_seconds,
+                fetch_bytes=fetch_bytes,
+                pack_seconds=pack_seconds,
+                pack_bytes=staged_bytes,
+                ram_stats=ram_stats,
+                source_missing_files=source_missing_files,
+                skip_tape=False,
+                session_id=session_id,
+                packaging_format=ContainerFormat.STORED_TAR,
+                containers=staged_containers,
+                artifacts=staged_artifacts,
+            )
+            desc.assert_writer_ready()
+            with self.host._staged_lock:
+                self.host._staged_bytes += staged_bytes
+            _status('PIPELINE', f"Chunk {chunk_index + 1} staged & ready "
+                                f"({staged_bytes / 1024**3:.1f} GB) - queued for tape.")
+            return desc
+        except StagingSpaceError:
+            raise
+        except Exception:
+            if not CANCEL.is_set():
+                self.host.db.update_chunk_status(
+                    session_id, chunk_index, ChunkStatus.FETCH_FAILED.value)
+            if abort_evt is not None and abort_evt.is_set():
+                self.host._cleanup_dir(fetch_dir)
+            else:
+                self.host._cleanup_dir(fetch_dir)
+                self.host._cleanup_dir(pack_dir)
+            raise
+
+    def _reservation_for_chunk(
+            self, planned_bytes, planned_files, *, session_id=None,
+            chunk_index=None, chunk_files=None):
+        packaging_format = ContainerFormat.ZIP
+        if session_id is not None and chunk_index is not None:
+            reader = getattr(self.host.db, "get_chunk_packaging_format", None)
+            if callable(reader):
+                packaging_format = ContainerFormat(
+                    reader(session_id, chunk_index))
+        if packaging_format is not ContainerFormat.STORED_TAR:
+            return zip_staging_reservation(
+                planned_bytes, planned_files, self.host)
+
+        if chunk_files is None:
+            chunk_files = self.host.db.get_chunk_files(session_id, chunk_index)
+        planner = getattr(
+            self.host.db, "get_or_create_stored_tar_chunk_plan", None)
+        if not callable(planner):
+            raise RuntimeError(
+                "[STAGING] Stored TAR chunk has no persisted container-plan "
+                "repository; refusing admission")
+        chunk_plan = planner(
+            session_id, chunk_index, chunk_files,
+            loose_threshold_bytes=int(
+                self.host.cfg.zip_threshold_mb * 1024 * 1024),
+            max_size_bytes=int(
+                self.host.cfg.stored_tar_max_size_gb * 1024**3),
+        )
+        return stored_tar_staging_reservation(chunk_plan, self.host)
+
+    def _await_staging_capacity(
+            self, planned_bytes, planned_files, stop_evt, ready_q=None,
+            session_id=None, chunk_index=None, chunk_files=None,
+            reservation=None):
+        """Block until a ZIP or TAR chunk fits the local staging envelope."""
+        if reservation is None:
+            reservation = self._reservation_for_chunk(
+                planned_bytes, planned_files, session_id=session_id,
+                chunk_index=chunk_index, chunk_files=chunk_files)
+        need = int(reservation.needed_bytes)
+        floor = LOCAL_STAGING_RESERVE_BYTES
+        warned = False
+        while not (CANCEL.is_set() or stop_evt.is_set()):
+            with self.host._staged_lock:
+                resident = self.host._staged_bytes
+            self.host._apply_staging_pressure(ready_q, resident, need)
+            try:
+                free = shutil.disk_usage(self.host.staging_dir).free
+            except OSError:
+                free = need + floor
+            governor = getattr(self.host, 'governor', None)
+            if governor:
+                if not warned:
+                    _status('PIPELINE',
+                            "Backpressure - waiting for RAM/staging/tape "
+                            "governor before fetching the next chunk.")
+                    warned = True
+                if not governor.wait_or_pause(
+                        "fetch", "start", needed_bytes=need,
+                        queued_bytes=resident, stop_evt=stop_evt):
+                    return
+            room_cap = (resident + need) <= self.host.staging_max_bytes
+            room_disk = (free - need) >= floor
+            if not room_disk:
+                raise RuntimeError(
+                    "Insufficient local staging space for remote chunk. "
+                    f"Need {need / 1024**3:.2f} GiB peak staging + "
+                    f"{floor / 1024**3:.0f} GiB reserve; current free on "
+                    f"'{self.host.staging_dir}': {free / 1024**3:.2f} GiB."
+                )
+            alone = (resident == 0)
+            if room_cap or alone:
+                return reservation
+            if not warned:
+                _status('PIPELINE',
+                        f"Backpressure - {resident / 1024**3:.0f} GB staged, "
+                        f"waiting for the tape to drain before fetching the next "
+                        f"chunk (cap {self.host.staging_max_bytes / 1024**3:.0f} GB).")
+                warned = True
+            time.sleep(2)
+        return reservation
+
     def _stage_chunk(self, session_id, chunk_index, chunk_files):
         """Fetch then pack one chunk. Returns a ready-descriptor or None."""
         self.host._producer_chunk = chunk_index
-        # The session id is embedded so the on-tape root (basename(pack_dir),
-        # see LTOBackup._run_locked) is unique per session — two sessions on the
-        # same tape never collide on '_pack_NNN'. Resuming a session reuses the
-        # same deterministic names, so robocopy still same-size-skips.
+        format_reader = getattr(
+            self.host.db, "get_chunk_packaging_format", None)
+        if not callable(format_reader):
+            raise RuntimeError(
+                "[STAGING] No durable chunk-format reader is available; "
+                "refusing to guess ZIP")
+        chunk_format = ContainerFormat(
+            format_reader(session_id, chunk_index))
         fetch_dir = os.path.join(
             self.host.staging_dir, f"_fetch_s{session_id:04d}_{chunk_index:03d}")
         pack_dir  = os.path.join(
             self.host.staging_dir, f"_pack_s{session_id:04d}_{chunk_index:03d}")
-
-        # A pack this session preserved on an earlier stop can go straight to
-        # tape: it is the same deterministic path, and the marker proves it is
-        # complete. This is what makes a restart-driven stop cheap.
+        if chunk_format is ContainerFormat.STORED_TAR:
+            recovery_guard = getattr(
+                self.host.db, "require_existing_stored_tar_recovery", None)
+            if not callable(recovery_guard):
+                raise RuntimeError(
+                    "[STAGING] Stored TAR chunk has no format-aware recovery "
+                    "reader; refusing to reinterpret it as ZIP")
+            # This deliberately does not inspect stored_tar_write_enabled:
+            # disabling NEW creation must not strand an existing immutable TAR.
+            recovery_guard(session_id, chunk_index)
+            planner = getattr(
+                self.host.db, "get_or_create_stored_tar_chunk_plan", None)
+            if not callable(planner):
+                raise RuntimeError(
+                    "[STAGING] Stored TAR chunk has no persisted container-plan "
+                    "repository; refusing to start a producer")
+            chunk_plan = planner(
+                session_id, chunk_index, chunk_files,
+                loose_threshold_bytes=int(
+                    self.host.cfg.zip_threshold_mb * 1024 * 1024),
+                max_size_bytes=int(
+                    self.host.cfg.stored_tar_max_size_gb * 1024**3),
+            )
+            from .startup_reconcile import (TAR_RECONCILE_BLOCKED,
+                                            reconcile_tar_artifacts)
+            if chunk_plan.containers:
+                reconcile_report = reconcile_tar_artifacts(
+                    self.host.db, session_id, chunk_index,
+                    archive_root=self.host.cfg.local_manifest_archive_root,
+                    pack_dir=pack_dir,
+                    remote_base=getattr(self.host, "remote_path", None),
+                    owner_probe=getattr(
+                        self.host, "stored_tar_owner_probe", None),
+                    plan=chunk_plan)
+            else:
+                # All-source-missing/loose-only plans have no TAR artifact pair
+                # to reconcile.  Their existing skip/loose path remains the
+                # authority and performs no LTFS operation.
+                reconcile_report = {
+                    "verdict": "ready", "blocking": [], "cases": []}
+            if reconcile_report["verdict"] == TAR_RECONCILE_BLOCKED:
+                raise RuntimeError(
+                    "[STAGING] Stored TAR startup reconciliation blocked the "
+                    "chunk: " + "; ".join(reconcile_report["blocking"]))
+            preserve_reconciled = any(
+                item.get("action") in (
+                    "adopted_pair", "none", "quarantined_equivalent_part")
+                and item.get("container_id") is not None
+                for item in reconcile_report["cases"])
+            if (not preserve_reconciled and os.path.isdir(pack_dir)):
+                self.host._cleanup_dir(pack_dir)
+            resumed = self.host._try_resume_pack(
+                session_id, chunk_index, pack_dir)
+            if resumed is not None:
+                return resumed
+            self.host.db.update_chunk_status(session_id, chunk_index,
+                    ChunkStatus.FETCHING.value)
+            fetch_start = time.perf_counter()
+            ram_stats = {}
+            reservation = stored_tar_staging_reservation(chunk_plan, self.host)
+            governor = getattr(self.host, 'governor', None)
+            if governor:
+                governor.wait_or_pause(
+                    "fetch", "start",
+                    needed_bytes=reservation.needed_bytes)
+                fetch_guard = governor.mark_fetch_active()
+            else:
+                fetch_guard = None
+            fetch_stop = threading.Event()
+            fetch_abort = threading.Event()
+            progress_lock = threading.Lock()
+            progress_part_paths = []
+            self._start_fetch_monitor(
+                fetch_stop, fetch_abort, fetch_dir,
+                reservation.tar_stream_bytes + reservation.loose_bytes,
+                tar_part_paths=progress_part_paths,
+                tar_part_paths_lock=progress_lock,
+                label="STORED_TAR")
+            with RamStageSampler(
+                    "fetch", self.host.ram_sample_interval) as fetch_sampler:
+                try:
+                    if fetch_guard:
+                        with fetch_guard:
+                            desc = self._stage_stored_tar_chunk(
+                                session_id, chunk_index, chunk_files, chunk_plan,
+                                fetch_dir, pack_dir, ram_stats, 0, 0,
+                                abort_evt=fetch_abort,
+                                progress_part_paths=progress_part_paths,
+                                progress_lock=progress_lock)
+                    else:
+                        desc = self._stage_stored_tar_chunk(
+                            session_id, chunk_index, chunk_files, chunk_plan,
+                            fetch_dir, pack_dir, ram_stats, 0, 0,
+                            abort_evt=fetch_abort,
+                            progress_part_paths=progress_part_paths,
+                            progress_lock=progress_lock)
+                finally:
+                    fetch_stop.set()
+            ram_stats.update(fetch_sampler.as_details("fetch"))
+            if desc is not None:
+                desc.fetch_seconds = time.perf_counter() - fetch_start
+                desc.fetch_bytes = _dir_tree_size(fetch_dir)
+                desc.ram_stats.update(ram_stats)
+            return desc
         resumed = self.host._try_resume_pack(session_id, chunk_index, pack_dir)
         if resumed is not None:
             return resumed
-
-        # No usable pack. Any leftover pack dir is now known-untrustworthy, and
-        # packing into it would silently mix stale files into the chunk, so it
-        # goes before the packer runs.
         if os.path.isdir(pack_dir):
             get_logger().warning(
                 "clearing an unusable leftover pack dir before repacking "
                 "chunk %s: %s", chunk_index + 1, pack_dir)
             self.host._cleanup_dir(pack_dir)
-
+        # The session id is embedded so the on-tape root (basename(pack_dir),
+        # see LTOBackup._run_locked) is unique per session — two sessions on the
+        # same tape never collide on '_pack_NNN'. Resuming a session reuses the
+        # same deterministic names, so robocopy still same-size-skips.
         # --- FETCH (remote -> PC) ---
         self.host.db.update_chunk_status(session_id, chunk_index,
                 ChunkStatus.FETCHING.value)
@@ -252,6 +1202,8 @@ class RemoteChunkStager:
                 ram_stats=ram_stats,
                 source_missing_files=source_missing_files,
                 skip_tape=True,
+                session_id=session_id,
+                packaging_format=chunk_format,
             )
 
         # --- PACK (small files -> ZIP, large files staged loose) ---
@@ -380,6 +1332,8 @@ class RemoteChunkStager:
             ram_stats=ram_stats,
             source_missing_files=source_missing_files,
             skip_tape=False,
+            session_id=session_id,
+            packaging_format=chunk_format,
         )
 
     def _discard_desc(self, desc):
@@ -391,18 +1345,7 @@ class RemoteChunkStager:
 
     def _pack_inventory(self, pack_dir):
         """(name, size) for every file under pack_dir, sorted. The integrity basis."""
-        items = []
-        for root, _dirs, files in os.walk(pack_dir):
-            for name in files:
-                if name == _RESUME_MARKER:
-                    continue
-                full = os.path.join(root, name)
-                rel = os.path.relpath(full, pack_dir).replace("\\", "/")
-                try:
-                    items.append([rel, os.path.getsize(full)])
-                except OSError:
-                    return None
-        return sorted(items)
+        return _pack_inventory_readonly(pack_dir)
 
     def _preserve_desc(self, session_id, desc, why):
         """Keep a staged pack on disk so the resume can write it directly.
@@ -433,7 +1376,41 @@ class RemoteChunkStager:
                 "pack_dir": desc.pack_dir,
                 "staged_bytes": desc.staged_bytes,
                 "skip_tape": desc.skip_tape,
+                "packaging_format": desc.packaging_format.value,
                 "metadata": desc.metadata,
+                "containers": [
+                    _serialize_staged_container(item)
+                    for item in desc.containers
+                ],
+                "artifacts": [
+                    _serialize_staged_artifact(item)
+                    for item in desc.artifacts
+                ],
+                "artifact_inventory": {
+                    "containers": [
+                        {
+                            "container_id": item.container_id,
+                            "container_ordinal": item.container_ordinal,
+                            "container_name": item.container_name,
+                            "data_path": item.data_path,
+                            "data_size_bytes": item.data_size_bytes,
+                            "validation_state": item.validation_state.value,
+                        }
+                        for item in desc.containers
+                    ],
+                    "artifacts": [
+                        {
+                            "artifact_id": item.artifact_id,
+                            "container_id": item.container_id,
+                            "artifact_kind": item.artifact_kind.value,
+                            "staged_path": item.staged_path,
+                            "local_locator": item.local_locator,
+                            "staged_size_bytes": item.staged_size_bytes,
+                            "readiness_state": item.readiness_state.value,
+                        }
+                        for item in desc.artifacts
+                    ],
+                },
                 "source_missing_files": desc.source_missing_files,
                 "fetch_seconds": desc.fetch_seconds,
                 "fetch_bytes": desc.fetch_bytes,
@@ -474,35 +1451,77 @@ class RemoteChunkStager:
         heuristics.
         """
         marker = os.path.join(pack_dir, _RESUME_MARKER)
-        if not os.path.isfile(marker):
-            return None
-        try:
-            with open(marker, encoding="utf-8") as fh:
-                payload = json.load(fh)
-        except Exception:
+        marker_report, payload = _read_resume_pack_marker(
+            pack_dir, session_id, chunk_index)
+        if marker_report["marker_state"] in ("unreadable",
+                                               "pack_directory_unreadable"):
             get_logger().warning(
                 "resume marker for chunk %s is unreadable; re-fetching",
                 chunk_index + 1)
             return None
-
-        if (payload.get("version") != 1
-                or payload.get("chunk_index") != chunk_index
-                or payload.get("session_id") != session_id):
+        if marker_report["marker_state"] == "identity_mismatch":
             get_logger().warning(
                 "resume marker at %s does not match session %s chunk %s; "
                 "re-fetching", pack_dir, session_id, chunk_index + 1)
             return None
-
-        expected = payload.get("pack_inventory")
-        actual = self.host._pack_inventory(pack_dir)
-        if actual is None or [list(x) for x in expected or []] != [
-                list(x) for x in actual]:
+        if marker_report["marker_state"] == "inventory_mismatch":
             get_logger().warning(
                 "preserved pack for chunk %s failed its integrity check "
                 "(inventory changed); re-fetching", chunk_index + 1)
             print(f"[REMOTE] Preserved pack for chunk {chunk_index + 1} failed "
                   f"its integrity check — re-fetching it.")
             return None
+        if marker_report["marker_state"] != "valid" or payload is None:
+            return None
+
+        try:
+            marker_format = ContainerFormat(
+                payload.get("packaging_format", ContainerFormat.ZIP.value))
+        except ValueError:
+            get_logger().warning(
+                "resume marker for chunk %s has an unknown format; re-fetching",
+                chunk_index + 1)
+            return None
+        reader = getattr(
+            getattr(self.host, "db", None), "get_chunk_packaging_format", None)
+        if not callable(reader):
+            get_logger().warning(
+                "resume marker for chunk %s cannot be checked against durable "
+                "format; re-fetching", chunk_index + 1)
+            return None
+        try:
+            durable_format = ContainerFormat(reader(session_id, chunk_index))
+        except (TypeError, ValueError):
+            get_logger().warning(
+                "resume marker for chunk %s found no durable format; re-fetching",
+                chunk_index + 1)
+            return None
+        if durable_format is not marker_format:
+            get_logger().warning(
+                "resume marker for chunk %s is %s but durable format is %s; "
+                "re-fetching", chunk_index + 1, marker_format.value,
+                durable_format.value)
+            return None
+
+        # The marker authorizes reuse but is not archive payload.  Consume it
+        # before the descriptor reaches the writer's exact-pack validator, so
+        # it can never be copied to tape as an undeclared extra file.
+        try:
+            os.remove(marker)
+        except OSError:
+            get_logger().warning(
+                "validated resume marker for chunk %s could not be consumed; "
+                "refusing reuse", chunk_index + 1, exc_info=True)
+            return None
+
+        containers = [
+            StagedContainer(**item)
+            for item in payload.get("containers") or []
+        ]
+        artifacts = [
+            StagedArtifact(**item)
+            for item in payload.get("artifacts") or []
+        ]
 
         desc = StagedChunk(
             chunk_index=chunk_index,
@@ -517,6 +1536,10 @@ class RemoteChunkStager:
             ram_stats=payload.get("ram_stats") or {},
             source_missing_files=payload.get("source_missing_files") or [],
             skip_tape=bool(payload.get("skip_tape")),
+            session_id=session_id,
+            packaging_format=marker_format,
+            containers=containers,
+            artifacts=artifacts,
         )
         with self.host._staged_lock:
             self.host._staged_bytes += desc.staged_bytes
@@ -995,7 +2018,9 @@ class RemoteChunkStager:
         finally:
             shutil.rmtree(_long(collide_root), ignore_errors=True)
 
-    def _start_fetch_monitor(self, stop_evt, abort_evt, fetch_dir, total_bytes):
+    def _start_fetch_monitor(
+            self, stop_evt, abort_evt, fetch_dir, total_bytes,
+            tar_part_paths=None, tar_part_paths_lock=None, label="FETCH"):
         """Live remote->PC throughput, plus a staging watchdog.
 
         Progress is the fetch dir's logical growth. The watchdog fires
@@ -1006,8 +2031,8 @@ class RemoteChunkStager:
         overrun past the warn threshold is reported loudly (the plan's sizes
         come from the scan, so a growing or sparse-expanded remote file shows
         up here first)."""
-        abort_factor = self.host.fetch_abort_factor
-        stall_timeout = self.host.fetch_stall_timeout
+        abort_factor = getattr(self.host, "fetch_abort_factor", 2.0)
+        stall_timeout = getattr(self.host, "fetch_stall_timeout", 600)
 
         def _alarm(msg):
             print(f"\n[FETCH][ALERT] {msg}")
@@ -1027,9 +2052,20 @@ class RemoteChunkStager:
             # bounded, resumable retry.
             max_seen = 0
             last_growth_at = time.time()
+            previous_snapshot = None
+            part_last_growth = {}
             while not stop_evt.wait(interval):
                 walk_start = time.time()
-                cur   = _dir_tree_size(fetch_dir)
+                if tar_part_paths is None:
+                    cur = _dir_tree_size(fetch_dir)
+                    snapshot = None
+                else:
+                    lock = tar_part_paths_lock or threading.Lock()
+                    with lock:
+                        parts = list(tar_part_paths)
+                    snapshot = _staging_progress_snapshot(
+                        parts, (fetch_dir,))
+                    cur = int(snapshot["total_bytes"])
                 now   = time.time()
                 # Rewalking a chunk with many small files is itself expensive;
                 # keep the scan overhead under ~10% of the monitor's cycle.
@@ -1064,11 +2100,23 @@ class RemoteChunkStager:
                     free = shutil.disk_usage(self.host.staging_dir).free
                 except OSError:
                     free = None
-                action = _fetch_watchdog_action(
-                    cur=cur, last_growth_at=last_growth_at, now=now,
-                    total_bytes=total_bytes, abort_factor=abort_factor,
-                    stall_timeout=stall_timeout, free_bytes=free,
-                    reserve_bytes=LOCAL_STAGING_RESERVE_BYTES)
+                if snapshot is None:
+                    action = _fetch_watchdog_action(
+                        cur=cur, last_growth_at=last_growth_at, now=now,
+                        total_bytes=total_bytes, abort_factor=abort_factor,
+                        stall_timeout=stall_timeout, free_bytes=free,
+                        reserve_bytes=LOCAL_STAGING_RESERVE_BYTES)
+                else:
+                    action = _tar_progress_watchdog_action(
+                        snapshot=snapshot,
+                        previous_snapshot=previous_snapshot,
+                        part_last_growth=part_last_growth,
+                        aggregate_last_growth=last_growth_at,
+                        now=now, total_bytes=total_bytes,
+                        abort_factor=abort_factor,
+                        stall_timeout=stall_timeout, free_bytes=free,
+                        reserve_bytes=LOCAL_STAGING_RESERVE_BYTES)
+                    previous_snapshot = snapshot
                 if action == 'diskfull':
                     _alarm(
                         f"aborting fetch: staging free space is down to "
@@ -1094,6 +2142,15 @@ class RemoteChunkStager:
                         f"({cur / 1024**3:.1f} GB) for {stall_timeout}s — the "
                         "remote stream is wedged (connected but delivering no "
                         "data). The chunk stays resumable and will be retried."
+                    )
+                    abort_evt.set()
+                    return
+                if action == 'part_stall':
+                    _alarm(
+                        f"aborting fetch: a Stored TAR .part stream has not "
+                        f"grown for {stall_timeout}s while sibling progress "
+                        "may still be occurring. The chunk stays unready and "
+                        "owned .part evidence is preserved."
                     )
                     abort_evt.set()
                     return

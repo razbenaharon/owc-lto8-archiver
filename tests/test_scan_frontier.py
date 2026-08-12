@@ -20,7 +20,7 @@ from unittest import mock
 
 from src import runtime as rt
 from src import scan_frontier as sf
-from src.pipeline_types import StreamState
+from src.pipeline_types import ContainerFormat, StreamState
 from src.scan_frontier import (RemoteScanCoordinator, TapeBudgetExceeded,
                                build_legacy_scanner_factory)
 
@@ -44,13 +44,19 @@ class FakeDB:
         self.membership_queries.append(list(paths))
         return {p for p in paths if p in self.existing}
 
-    def append_remote_streaming_chunk(self, session_id, chunk_index, rows):
+    def append_remote_streaming_chunk(
+            self, session_id, chunk_index, rows, *,
+            stored_tar_write_enabled=False, reader_contract_version=None,
+            require_container_format_schema=False):
         rows = list(rows)
         self.appended.append((chunk_index, rows))
         if self.insert_result is not None:
             return self.insert_result
         return {"inserted_files": len(rows),
                 "inserted_bytes": sum(int(r[3]) for r in rows)}
+
+    def get_chunk_packaging_format(self, session_id, chunk_index):
+        return ContainerFormat.ZIP
 
     def mark_remote_scan_complete(self, session_id):
         self.scan_complete = True

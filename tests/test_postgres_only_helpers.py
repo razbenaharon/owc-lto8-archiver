@@ -1,14 +1,100 @@
 import unittest
+import json
+import os
+import tempfile
 from datetime import datetime, timezone
+from types import SimpleNamespace
+
+import zstandard as zstd
 
 from src.catalog_v3 import catalog_directory_chain, catalog_file_name
 from src.db import DatabaseManager, _apply_canonical_remote_paths, _file_record_key
+from src.container_catalog import TarCatalogAdapter
 from src.inspector_repository import InspectorRepository
 from src.pg_db import _canonical_remote_path, _coerce_timestamptz, _now_utc
+from src.pipeline_types import ArtifactKind, ContainerFormat
+from src.stored_tar_planning import (StoredTarChunkPlan,
+                                     StoredTarContainerPlan,
+                                     StoredTarPlanMember)
 from inspect_db import _DbOverrideConfig
 
 
 class PostgresOnlyHelperTests(unittest.TestCase):
+    def _tar_adapter_fixture(self, root):
+        sidecar = os.path.join(root, "c0.jsonl.zst")
+        records = [
+            {"record_type": "header", "version": "tar-sidecar-v1",
+             "session_id": 7, "chunk_index": 3, "container_id": 11,
+             "container_ordinal": 0, "tar_size_bytes": 4096},
+            {"record_type": "member", "member_name": "project/a.txt",
+             "canonical_source_path": "/remote/project/a.txt",
+             "logical_size": 5, "observed_archived_size": 5,
+             "plan_ordinal": 10},
+            {"record_type": "footer", "member_count": 1,
+             "logical_bytes": 5, "tar_size_bytes": 4096},
+        ]
+        with open(sidecar, "wb") as raw:
+            with zstd.ZstdCompressor().stream_writer(raw) as writer:
+                for record in records:
+                    writer.write((json.dumps(record) + "\n").encode("utf-8"))
+        plan = StoredTarChunkPlan(
+            session_id=7, chunk_index=3, max_size_bytes=10_000,
+            containers=(StoredTarContainerPlan(
+                session_id=7, chunk_index=3, container_ordinal=0,
+                container_name="c0.tar", expected_member_count=1,
+                expected_logical_bytes=5, estimated_archive_bytes=4096,
+                max_size_bytes=10_000),),
+            members=(StoredTarPlanMember(
+                manifest_id=1, plan_ordinal=10,
+                remote_path="/remote/project/a.txt", file_size_bytes=5,
+                storage_class="small_files", container_ordinal=0),))
+        packed = {
+            "is_packed": True, "container_id": 11,
+            "container_format": "stored_tar", "container_ordinal": 0,
+            "canonical_source_path": "/remote/project/a.txt",
+            "original_path": "/remote/project/a.txt",
+            "file_size_bytes": 5, "catalog_policy": "manifest_only",
+        }
+        loose = {"is_packed": False, "stored_path": "large.bin",
+                 "canonical_source_path": "/remote/large.bin",
+                 "original_path": "/remote/large.bin",
+                 "file_size_bytes": 20 * 1024 * 1024}
+        chunk = SimpleNamespace(
+            packaging_format=ContainerFormat.STORED_TAR, session_id=7,
+            chunk_index=3, metadata=[packed, loose],
+            containers=[SimpleNamespace(
+                container_id=11, container_ordinal=0,
+                container_name="c0.tar", expected_member_count=1,
+                expected_logical_bytes=5, data_size_bytes=4096)],
+            artifacts=[SimpleNamespace(
+                artifact_id=12, container_id=11,
+                artifact_kind=ArtifactKind.TAR_SIDECAR,
+                artifact_version="tar-sidecar-v1", staged_path=sidecar,
+                local_locator="tar_sidecars/s7/c3/c0.jsonl.zst")])
+        db = SimpleNamespace(get_stored_tar_chunk_plan=lambda *_: plan)
+        return db, chunk, packed, loose
+
+    def test_tar_catalog_adapter_joins_sidecar_plan_and_passes_loose_record(self):
+        with tempfile.TemporaryDirectory() as root:
+            db, chunk, _packed, loose = self._tar_adapter_fixture(root)
+            records = list(TarCatalogAdapter(
+                db, chunk, index_min_file_mb=10,
+                index_packed_small_files=False).records())
+        self.assertEqual(records[0]["original_path"],
+                         "/remote/project/a.txt")
+        self.assertEqual(records[0]["stored_path"], "project/a.txt")
+        self.assertEqual(records[0]["catalog_policy"], "manifest_only")
+        self.assertEqual(records[0]["container_id"], 11)
+        self.assertIs(records[1], loose)
+
+    def test_tar_catalog_adapter_rejects_transient_or_wrong_source_path(self):
+        with tempfile.TemporaryDirectory() as root:
+            db, chunk, packed, _loose = self._tar_adapter_fixture(root)
+            packed["canonical_source_path"] = os.path.join(root, "a.txt")
+            packed["original_path"] = packed["canonical_source_path"]
+            with self.assertRaisesRegex(RuntimeError, "canonical POSIX"):
+                list(TarCatalogAdapter(db, chunk).records())
+
     def test_database_manager_direct_sqlite_constructor_is_removed(self):
         with self.assertRaisesRegex(RuntimeError, "SQLite DatabaseManager has been removed"):
             DatabaseManager("archive.db")

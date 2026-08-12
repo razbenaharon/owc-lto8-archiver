@@ -2,7 +2,9 @@
 import argparse
 import json
 import os
+import stat
 import sys
+from datetime import datetime, timezone
 from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -36,8 +38,11 @@ from src.pg_backup import (
     create_migrated_database_from_backup,
     create_verified_production_backup,
     verify_backup_file,
+    verify_backup_receipt,
 )
-from src.pg_bulk import build_conninfo
+from src.pg_bulk import build_conninfo, make_conninfo
+from src.remote_staging import inspect_resume_pack_marker
+from src.schema_audit import audit_manager, render_schema_audit
 from src.session_reconcile import (
     DEFAULT_IDLE_SECONDS,
     format_report,
@@ -102,6 +107,28 @@ def _print_json(payload):
 def _open_db(cfg):
     try:
         return create_database_manager(cfg)
+    except RuntimeError as exc:
+        print(f"\n{exc}")
+        raise SystemExit(1) from exc
+
+
+def _open_no_init_db(cfg):
+    """Open PostgreSQL without implicit startup DDL."""
+    from src.pg_db import PgDatabaseManager
+    try:
+        return PgDatabaseManager(_conninfo(cfg), init_schema=False)
+    except RuntimeError as exc:
+        print(f"\n{exc}")
+        raise SystemExit(1) from exc
+
+
+def _open_read_only_db(cfg):
+    """Open a manager whose server sessions reject every write."""
+    from src.pg_db import PgDatabaseManager
+    conninfo = make_conninfo(
+        _conninfo(cfg), options="-c default_transaction_read_only=on")
+    try:
+        return PgDatabaseManager(conninfo, init_schema=False)
     except RuntimeError as exc:
         print(f"\n{exc}")
         raise SystemExit(1) from exc
@@ -226,6 +253,1014 @@ def _apply_incremental_scan_schema(cfg, args, parser):
             finalize=bool(args.finalize))
         preflight["installed"] = db.incremental_scan_schema_installed()
         preflight["finalized"] = db.incremental_scan_schema_finalized()
+    finally:
+        db.close()
+    _print_json(preflight)
+    return 0
+
+
+def _windows_drive_device_target(drive):
+    """Resolve a DOS drive mapping without opening the mounted filesystem."""
+    if os.name != "nt":
+        return drive.casefold()
+    import ctypes
+
+    buffer = ctypes.create_unicode_buffer(32768)
+    result = ctypes.windll.kernel32.QueryDosDeviceW(
+        drive.rstrip("\\/"), buffer, len(buffer))
+    if not result:
+        raise OperationalError(
+            "[MIGRATION 015] A drive mapping could not be resolved; staging "
+            "location evidence is indeterminate")
+    targets = [item for item in buffer[:result].split("\0") if item]
+    # The IBM LTFS driver publishes its device symlink twice for one drive
+    # letter -- the same target listed repeatedly.  Verified 2026-08-05: it
+    # survives a full reboot, regenerates with a fresh device id each boot,
+    # and a cartridge mounts successfully while present.  Identical repeats
+    # resolve to exactly one device, so nothing is being guessed; genuinely
+    # DIFFERENT targets stay indeterminate and are still refused.  This
+    # mirrors ``src.pg_backup._windows_device_target``.
+    distinct = {item.casefold() for item in targets}
+    if len(distinct) != 1:
+        raise OperationalError(
+            "[MIGRATION 015] A drive has multiple device mappings; staging "
+            "location evidence is indeterminate")
+    target = distinct.pop()
+    # SUBST commonly returns ``\??\Z:\...``.  Treat every namespace alias
+    # as indeterminate rather than recursively resolving a path that may lead
+    # to LTFS.  Plain local and LTFS drive letters both resolve canonically
+    # through the device namespace; redirected network drives are not local.
+    if (not target.startswith("\\device\\")
+            or target.startswith(("\\device\\mup\\",
+                                  "\\device\\lanmanredirector\\"))):
+        raise OperationalError(
+            "[MIGRATION 015] A drive mapping is aliased or non-local; staging "
+            "location evidence is indeterminate")
+    return target
+
+
+def _assert_plain_local_directory(path):
+    """Reject aliases/reparse components without following any of them."""
+    if (path.startswith(("\\\\", "//"))
+            or path.casefold().startswith(("\\\\?\\", "\\\\.\\"))):
+        raise OperationalError(
+            "[MIGRATION 015] Staging must be a plain local drive path; aliases "
+            "and device/UNC paths are refused")
+    drive, tail = os.path.splitdrive(path)
+    if not drive or not tail.startswith(("\\", "/")):
+        raise OperationalError(
+            "[MIGRATION 015] Staging is not an absolute local drive path")
+
+    current = drive + os.sep
+    components = [part for part in tail.replace("/", "\\").split("\\")
+                  if part]
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    try:
+        for component in components:
+            current = os.path.join(current, component)
+            info = os.lstat(current)
+            if (not stat.S_ISDIR(info.st_mode)
+                    or getattr(info, "st_file_attributes", 0) & reparse_flag):
+                raise OperationalError(
+                    "[MIGRATION 015] Staging contains a non-directory or "
+                    "reparse component; evidence is indeterminate")
+    except OperationalError:
+        raise
+    except OSError as exc:
+        raise OperationalError(
+            "[MIGRATION 015] Staging path metadata is unreadable; evidence is "
+            "indeterminate") from exc
+    return drive
+
+
+def _inspect_container_format_staging(
+        cfg, db, session_id, chunk_indexes, *, strict=True,
+        include_details=False):
+    """Inspect deterministic candidate staging paths without changing them.
+
+    Execute mode uses the five path-free aggregate fields as an attestation.
+    The read-only rehearsal additionally requests per-chunk marker/inventory
+    observations.  Missing or unreadable roots are ``unknown`` in that report;
+    strict execute mode still fails closed.
+    """
+    session = db.get_remote_session(int(session_id))
+    if not session:
+        raise OperationalError(
+            f"[MIGRATION 015] Session {session_id} does not exist")
+    root_text = str(session.get("staging_dir") or "").strip()
+    if not root_text:
+        if strict:
+            raise OperationalError(
+                "[MIGRATION 015] Session staging root is absent; evidence is "
+                "indeterminate")
+        return {
+            "root_accessible": False,
+            "root_state": "absent",
+            "evidence_state": "unknown",
+            "checked_chunk_indexes": sorted(
+                {int(index) for index in chunk_indexes}),
+            "entry_count": None,
+            "unreadable_count": None,
+            "chunks": [],
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+    root = os.path.abspath(root_text)
+    lto_text = str(getattr(cfg, "lto_drive", "") or "").strip()
+    if not lto_text:
+        raise OperationalError(
+            "[MIGRATION 015] LTFS drive configuration is absent; staging "
+            "separation cannot be proved")
+    lto_root = os.path.abspath(lto_text)
+    if (lto_root.startswith(("\\\\", "//"))
+            or lto_root.casefold().startswith(("\\\\?\\", "\\\\.\\"))):
+        raise OperationalError(
+            "[MIGRATION 015] LTFS drive configuration is aliased; staging "
+            "separation cannot be proved")
+    lto_drive = os.path.splitdrive(lto_root)[0]
+    if not lto_drive:
+        raise OperationalError(
+            "[MIGRATION 015] LTFS drive configuration is indeterminate")
+    if (root.startswith(("\\\\", "//"))
+            or root.casefold().startswith(("\\\\?\\", "\\\\.\\"))):
+        raise OperationalError(
+            "[MIGRATION 015] Staging must be a plain local drive path")
+    root_drive = os.path.splitdrive(root)[0]
+    if not root_drive:
+        raise OperationalError(
+            "[MIGRATION 015] Staging is not an absolute local drive path")
+
+    # Resolve and compare drive mappings before *any* lstat/scandir call.  A
+    # literal LTFS path or SUBST alias must be refused without opening it.
+    if (root_drive.casefold() == lto_drive.casefold()
+            or _windows_drive_device_target(root_drive)
+            == _windows_drive_device_target(lto_drive)):
+        raise OperationalError(
+            "[MIGRATION 015] Refusing staging inspection because the configured "
+            "session staging root is on the LTFS drive")
+    try:
+        _assert_plain_local_directory(root)
+    except OperationalError:
+        if strict:
+            raise
+        return {
+            "root_accessible": False,
+            "root_state": "unreadable",
+            "evidence_state": "unknown",
+            "checked_chunk_indexes": sorted(
+                {int(index) for index in chunk_indexes}),
+            "entry_count": None,
+            "unreadable_count": None,
+            "chunks": [],
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    try:
+        with os.scandir(root) as entries:
+            root_entries = {entry.name.casefold(): entry for entry in entries}
+    except OSError as exc:
+        if strict:
+            raise OperationalError(
+                "[MIGRATION 015] Session staging root is unreadable; evidence "
+                "is indeterminate") from exc
+        return {
+            "root_accessible": False,
+            "root_state": "unreadable",
+            "evidence_state": "unknown",
+            "checked_chunk_indexes": sorted(
+                {int(index) for index in chunk_indexes}),
+            "entry_count": None,
+            "unreadable_count": None,
+            "chunks": [],
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    checked = sorted({int(index) for index in chunk_indexes})
+    observations = []
+    found = 0
+    unreadable = 0
+    for chunk_index in checked:
+        fetch_name = f"_fetch_s{int(session_id):04d}_{chunk_index:03d}"
+        pack_name = f"_pack_s{int(session_id):04d}_{chunk_index:03d}"
+        fetch_present = fetch_name.casefold() in root_entries
+        pack_entry = root_entries.get(pack_name.casefold())
+        pack_present = pack_entry is not None
+        found += int(fetch_present) + int(pack_present)
+        marker = {
+            "marker_state": "unknown_pack_absent",
+            "inventory_state": "unknown",
+            "pack_file_count": None,
+            "packaging_format": None,
+        }
+        if pack_present:
+            try:
+                if not pack_entry.is_dir(follow_symlinks=False):
+                    marker["marker_state"] = "pack_directory_unreadable"
+                else:
+                    marker = inspect_resume_pack_marker(
+                        os.path.join(root, pack_entry.name),
+                        int(session_id), chunk_index)
+            except OSError:
+                marker["marker_state"] = "pack_directory_unreadable"
+            if marker["marker_state"] in (
+                    "unreadable", "pack_directory_unreadable"):
+                unreadable += 1
+        observations.append({
+            "chunk_index": chunk_index,
+            "fetch_entry_present": fetch_present,
+            "pack_entry_present": pack_present,
+            "resume_marker": marker,
+        })
+
+    evidence = {
+        "root_accessible": True,
+        "checked_chunk_indexes": checked,
+        "entry_count": found,
+        "unreadable_count": unreadable,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if include_details:
+        evidence.update({
+            "root_state": "accessible",
+            "evidence_state": "observed",
+            "chunks": observations,
+        })
+    return evidence
+
+
+def _run_container_format_schema_report(cfg, *, validate=False):
+    """Read-only migration-015 report/validation."""
+    db = _open_read_only_db(cfg)
+    try:
+        report = (db.validate_container_format_schema() if validate
+                  else db.container_format_schema_report())
+    finally:
+        db.close()
+    _print_json(report)
+    return 0
+
+
+def _run_stored_tar_plan_schema_report(cfg, *, validate=False):
+    """Read-only migrations 016/017 report/validation."""
+    db = _open_read_only_db(cfg)
+    try:
+        report = (db.validate_stored_tar_plan_schema() if validate
+                  else db.stored_tar_plan_schema_report())
+    finally:
+        db.close()
+    _print_json(report)
+    return 0
+
+
+def _run_manifest_directory_catalog_schema_report(cfg, *, validate=False):
+    """Read-only migration-018 report/validation; never initializes schema."""
+    db = _open_read_only_db(cfg)
+    try:
+        report = (db.validate_manifest_directory_catalog_schema()
+                  if validate
+                  else db.manifest_directory_catalog_schema_report())
+    finally:
+        db.close()
+    _print_json(report)
+    return 0
+
+
+def _backfill_legacy_chunk_membership(cfg, args, parser):
+    """Guarded sealing of pre-frontier legacy_db chunks (bounded, derived)."""
+    if args.dry_run and args.execute:
+        parser.error(
+            "--backfill-legacy-chunk-membership accepts only one of --dry-run "
+            "or --execute")
+    session_id = int(args.session_id[0] if args.session_id else 37)
+    if not args.chunk_index:
+        parser.error(
+            "--backfill-legacy-chunk-membership requires at least one "
+            "--chunk-index")
+    indexes = [int(i) for i in args.chunk_index]
+
+    db = _open_read_only_db(cfg)
+    try:
+        preview = db.backfill_legacy_chunk_membership(
+            session_id, indexes, dry_run=True)
+    finally:
+        db.close()
+    preflight = {
+        "database": cfg.pg_dbname,
+        "session_id": session_id,
+        "chunk_indexes": indexes,
+        "preview": preview,
+        "requested": {"execute": bool(args.execute)},
+    }
+
+    if not args.execute:
+        preflight["note"] = (
+            "read-only preflight; execute requires --execute --yes and a "
+            "verified --backup-file")
+        _print_json(preflight)
+        return 0
+
+    if not args.yes:
+        parser.error(
+            "--backfill-legacy-chunk-membership --execute requires --yes")
+    if not args.backup_file:
+        parser.error(
+            "--backfill-legacy-chunk-membership --execute requires "
+            "--backup-file naming a PostgreSQL backup this tool can verify")
+
+    holders = archiver_lock_status(_conninfo(cfg))
+    if holders:
+        raise OperationalError(
+            f"[SEAL] Refusing while the archiver lock is held: {holders}")
+    processes = active_archive_processes()
+    if processes:
+        raise OperationalError(
+            "[SEAL] Refusing while archive/transfer processes are running "
+            f"({len(processes)} detected)")
+    preflight["backup"] = verify_backup_receipt(cfg, args.backup_file)
+
+    db = _open_no_init_db(cfg)
+    try:
+        db.acquire_archiver_lock()
+        processes = active_archive_processes()
+        if processes:
+            raise OperationalError(
+                "[SEAL] Refusing after final liveness check "
+                f"({len(processes)} archive/transfer process(es) detected)")
+        locked_backup = verify_backup_receipt(cfg, args.backup_file)
+        if locked_backup["receipt_id"] != preflight["backup"]["receipt_id"]:
+            raise OperationalError(
+                "[SEAL] Backup receipt changed before locked apply")
+        preflight["result"] = db.backfill_legacy_chunk_membership(
+            session_id, indexes, dry_run=False, require_archiver_lock=True)
+    finally:
+        db.close()
+    _print_json(preflight)
+    return 0
+
+
+def _repoint_session_tape_generation(cfg, args, parser):
+    """Guarded correction of a session's stale target-cartridge generation.
+
+    Not a bypass of ``_verify_session_tape_generation``: the underlying
+    operation proves, inside its own transaction, that the session has no
+    archived evidence on the target tape, so the reformat it crossed cannot
+    have destroyed anything. The gate afterwards passes on true state.
+    """
+    if args.dry_run and args.execute:
+        parser.error(
+            "--repoint-session-tape-generation accepts only one of --dry-run "
+            "or --execute")
+    session_id = int(args.session_id[0] if args.session_id else 37)
+    if args.to_generation is None:
+        parser.error(
+            "--repoint-session-tape-generation requires --to-generation")
+
+    db = _open_read_only_db(cfg)
+    try:
+        session = db.get_remote_session(session_id) or {}
+        tape_label = session.get("tape_label")
+        tape = db.get_tape(tape_label) if tape_label else None
+        evidence = {
+            "files_index": db.count_rows(
+                "files_index", remote_session_id=session_id,
+                tape_label=tape_label) if hasattr(db, "count_rows") else None,
+        }
+    finally:
+        db.close()
+
+    preflight = {
+        "database": cfg.pg_dbname,
+        "session_id": session_id,
+        "tape_label": tape_label,
+        "session_generation": session.get("tape_generation"),
+        "catalog_current_generation": (
+            tape.get("current_generation") if tape else None),
+        "requested_to_generation": int(args.to_generation),
+        "requested": {"execute": bool(args.execute)},
+    }
+    preflight.pop("files_index", None)
+    evidence.pop("files_index", None)
+
+    if not args.execute:
+        preflight["note"] = (
+            "read-only preflight; execute requires --execute --yes, "
+            "--approval-identity and a verified --backup-file. The no-evidence "
+            "proof is re-run inside the write transaction.")
+        _print_json(preflight)
+        return 0
+
+    if not args.yes:
+        parser.error(
+            "--repoint-session-tape-generation --execute requires --yes")
+    if not args.approval_identity:
+        parser.error(
+            "--repoint-session-tape-generation --execute requires "
+            "--approval-identity")
+    if not args.backup_file:
+        parser.error(
+            "--repoint-session-tape-generation --execute requires "
+            "--backup-file naming a PostgreSQL backup this tool can verify")
+
+    holders = archiver_lock_status(_conninfo(cfg))
+    if holders:
+        raise OperationalError(
+            f"[REPOINT] Refusing while the archiver lock is held: {holders}")
+    processes = active_archive_processes()
+    if processes:
+        raise OperationalError(
+            "[REPOINT] Refusing while archive/transfer processes are running "
+            f"({len(processes)} detected)")
+    preflight["backup"] = verify_backup_receipt(cfg, args.backup_file)
+
+    db = _open_no_init_db(cfg)
+    try:
+        db.acquire_archiver_lock()
+        processes = active_archive_processes()
+        if processes:
+            raise OperationalError(
+                "[REPOINT] Refusing after final liveness check "
+                f"({len(processes)} archive/transfer process(es) detected)")
+        locked_backup = verify_backup_receipt(cfg, args.backup_file)
+        if locked_backup["receipt_id"] != preflight["backup"]["receipt_id"]:
+            raise OperationalError(
+                "[REPOINT] Backup receipt changed before locked apply")
+        preflight["result"] = db.repoint_session_tape_generation(
+            session_id, tape_label=tape_label,
+            from_generation=int(preflight["session_generation"]),
+            to_generation=int(args.to_generation),
+            approval_identity=args.approval_identity,
+            require_archiver_lock=True)
+    finally:
+        db.close()
+    _print_json(preflight)
+    return 0
+
+
+def _persist_session_transition(cfg, args, parser):
+    """Guarded Plan 3 Task 3.1 execute mode: persist one planning boundary.
+
+    Same operator contract as the migration commands. The proposal is rebuilt
+    read-only for the preflight, and ``persist_session_transition`` re-derives
+    the audit again inside its own transaction, so a boundary approved against
+    evidence that moved in between is refused rather than persisted.
+    """
+    from src.session_transition import build_transition_proposal
+
+    if args.dry_run and args.execute:
+        parser.error(
+            "--persist-session-transition accepts only one of --dry-run or "
+            "--execute")
+    session_id = int(args.session_id[0] if args.session_id else 37)
+
+    db = _open_read_only_db(cfg)
+    try:
+        proposal = build_transition_proposal(db, session_id)
+    finally:
+        db.close()
+    blockers = list(getattr(proposal, "blockers", ()) or ())
+    preflight = {
+        "database": cfg.pg_dbname,
+        "session_id": session_id,
+        "proposal": {
+            "existing_chunk_count": proposal.existing_chunk_count,
+            "last_legacy_planned_chunk": proposal.last_legacy_planned_chunk,
+            "first_manifest_first_chunk": proposal.first_manifest_first_chunk,
+            "frontier_generation": proposal.frontier_generation,
+        },
+        "blockers": blockers,
+        "requested": {"execute": bool(args.execute)},
+    }
+
+    if not args.execute:
+        preflight["note"] = (
+            "read-only preflight; execute requires --execute --yes, "
+            "--approval-identity, --evidence-locator and a verified "
+            "--backup-file")
+        _print_json(preflight)
+        return 0
+
+    if not args.yes:
+        parser.error("--persist-session-transition --execute requires --yes")
+    for flag in ("approval_identity", "evidence_locator"):
+        if not getattr(args, flag, None):
+            parser.error(
+                "--persist-session-transition --execute requires "
+                f"--{flag.replace('_', '-')}")
+    if not args.backup_file:
+        parser.error(
+            "--persist-session-transition --execute requires --backup-file "
+            "naming a PostgreSQL backup this tool can verify")
+    if blockers:
+        raise OperationalError(
+            "[TRANSITION] Refusing to activate a blocked proposal: "
+            + "; ".join(blockers))
+
+    holders = archiver_lock_status(_conninfo(cfg))
+    if holders:
+        raise OperationalError(
+            f"[TRANSITION] Refusing while the archiver lock is held: {holders}")
+    processes = active_archive_processes()
+    if processes:
+        raise OperationalError(
+            "[TRANSITION] Refusing while archive/transfer processes are "
+            f"running ({len(processes)} detected)")
+    preflight["backup"] = verify_backup_receipt(cfg, args.backup_file)
+
+    db = _open_no_init_db(cfg)
+    try:
+        db.acquire_archiver_lock()
+        processes = active_archive_processes()
+        if processes:
+            raise OperationalError(
+                "[TRANSITION] Refusing after final liveness check "
+                f"({len(processes)} archive/transfer process(es) detected)")
+        locked_backup = verify_backup_receipt(cfg, args.backup_file)
+        if locked_backup["receipt_id"] != preflight["backup"]["receipt_id"]:
+            raise OperationalError(
+                "[TRANSITION] Backup receipt changed before locked apply")
+
+        locked_proposal = build_transition_proposal(db, session_id)
+        locked_blockers = list(
+            getattr(locked_proposal, "blockers", ()) or ())
+        if locked_blockers:
+            raise OperationalError(
+                "[TRANSITION] Final locked preflight refused: "
+                + "; ".join(locked_blockers))
+        preflight["result"] = db.persist_session_transition(
+            session_id, proposal=locked_proposal,
+            approval_identity=args.approval_identity,
+            evidence_locator=args.evidence_locator,
+            state="active")
+    finally:
+        db.close()
+    _print_json(preflight)
+    return 0
+
+
+def _apply_container_format_schema_authority_v2(cfg, args, parser):
+    """Guarded, explicit migration-019 entry point: additive v2 authority.
+
+    Purely additive over migrations 015-017; see migration 019's own header
+    for why v1's authority can never validate again once 016/017 are
+    installed, and why the fix must be a new row rather than an edit.
+    """
+    if args.dry_run and args.execute:
+        parser.error(
+            "--apply-container-format-schema-authority-v2 accepts only one "
+            "of --dry-run or --execute")
+
+    db = _open_read_only_db(cfg)
+    try:
+        v1_report = db.container_format_schema_report()
+        stored_tar_report = db.stored_tar_plan_schema_report()
+        v2_report = db.container_format_schema_authority_v2_report()
+    finally:
+        db.close()
+    blocking = []
+    if v1_report.get("installation_state") != "installed":
+        blocking.append("migration 015 is not installed")
+    if stored_tar_report.get("installation_state") != "installed":
+        blocking.append("migrations 016/017 are not installed")
+    preflight = {
+        "database": cfg.pg_dbname,
+        "v1_report": v1_report,
+        "stored_tar_plan_report": stored_tar_report,
+        "v2_report": v2_report,
+        "blocking": blocking,
+        "requested": {"execute": bool(args.execute)},
+    }
+
+    if not args.execute:
+        preflight["applied"] = []
+        preflight["note"] = (
+            "read-only preflight; execute requires --execute --yes and a "
+            "verified --backup-file")
+        _print_json(preflight)
+        return 0
+
+    if not args.yes:
+        parser.error(
+            "--apply-container-format-schema-authority-v2 --execute requires "
+            "--yes")
+    if not args.backup_file:
+        parser.error(
+            "--apply-container-format-schema-authority-v2 --execute requires "
+            "--backup-file naming a PostgreSQL backup this tool can verify")
+    if blocking:
+        raise OperationalError(
+            "[MIGRATION 019] Refusing migration: " + "; ".join(blocking))
+
+    holders = archiver_lock_status(_conninfo(cfg))
+    if holders:
+        raise OperationalError(
+            f"[MIGRATION 019] Refusing while the archiver lock is held: "
+            f"{holders}")
+    processes = active_archive_processes()
+    if processes:
+        raise OperationalError(
+            "[MIGRATION 019] Refusing while archive/transfer processes are "
+            f"running ({len(processes)} detected)")
+    preflight["backup"] = verify_backup_receipt(cfg, args.backup_file)
+
+    db = _open_no_init_db(cfg)
+    try:
+        db.acquire_archiver_lock()
+        processes = active_archive_processes()
+        if processes:
+            raise OperationalError(
+                "[MIGRATION 019] Refusing after final liveness check "
+                f"({len(processes)} archive/transfer process(es) detected)")
+        locked_backup = verify_backup_receipt(cfg, args.backup_file)
+        if locked_backup["receipt_id"] != preflight["backup"]["receipt_id"]:
+            raise OperationalError(
+                "[MIGRATION 019] Backup receipt changed before locked apply")
+        preflight["applied"] = db.apply_container_format_schema_authority_v2(
+            require_archiver_lock=True)
+        preflight["validation"] = (
+            db.validate_container_format_schema_authority_v2())
+    finally:
+        db.close()
+    _print_json(preflight)
+    return 0
+
+
+def _run_container_format_schema_authority_v2_report(cfg, *, validate=False):
+    """Read-only migration-019 (v2 authority) report/validation."""
+    db = _open_read_only_db(cfg)
+    try:
+        report = (db.validate_container_format_schema_authority_v2()
+                  if validate else
+                  db.container_format_schema_authority_v2_report())
+    finally:
+        db.close()
+    _print_json(report)
+    return 0
+
+
+def _apply_stored_tar_plan_schema(cfg, args, parser):
+    """Guarded, explicit migrations 016+017 entry point (Plan 2 Tasks 2.1-2.4).
+
+    Same operator contract as migrations 015 and 018: database identity in the
+    report, a read-only preflight by default, and for an execute an explicit
+    ``--execute --yes``, a verified backup receipt, proven quiescence before
+    and again under the archiver lock, then post-apply validation.  Both
+    migrations land in one transaction inside
+    :meth:`apply_stored_tar_plan_schema`.
+    """
+    if args.dry_run and args.execute:
+        parser.error(
+            "--apply-stored-tar-plan-schema accepts only one of "
+            "--dry-run or --execute")
+
+    db = _open_read_only_db(cfg)
+    try:
+        schema_report = db.stored_tar_plan_schema_report()
+    finally:
+        db.close()
+    preflight = {
+        "database": cfg.pg_dbname,
+        "schema": schema_report,
+        "blocking": list(schema_report.get("apply_blocking", ())),
+        "requested": {"execute": bool(args.execute)},
+    }
+
+    if not args.execute:
+        preflight["applied"] = []
+        preflight["note"] = (
+            "read-only preflight; execute requires --execute --yes and a "
+            "verified --backup-file")
+        _print_json(preflight)
+        return 0
+
+    if not args.yes:
+        parser.error(
+            "--apply-stored-tar-plan-schema --execute requires --yes")
+    if not args.backup_file:
+        parser.error(
+            "--apply-stored-tar-plan-schema --execute requires --backup-file "
+            "naming a PostgreSQL backup this tool can verify")
+    if preflight["blocking"]:
+        raise OperationalError(
+            "[MIGRATION 016/017] Refusing migration: "
+            + "; ".join(preflight["blocking"]))
+
+    holders = archiver_lock_status(_conninfo(cfg))
+    if holders:
+        raise OperationalError(
+            "[MIGRATION 016/017] Refusing while the archiver lock is held: "
+            f"{holders}")
+    processes = active_archive_processes()
+    if processes:
+        raise OperationalError(
+            "[MIGRATION 016/017] Refusing while archive/transfer processes "
+            f"are running ({len(processes)} detected)")
+    preflight["backup"] = verify_backup_receipt(cfg, args.backup_file)
+
+    db = _open_no_init_db(cfg)
+    try:
+        db.acquire_archiver_lock()
+        processes = active_archive_processes()
+        if processes:
+            raise OperationalError(
+                "[MIGRATION 016/017] Refusing after final liveness check "
+                f"({len(processes)} archive/transfer process(es) detected)")
+        locked_backup = verify_backup_receipt(cfg, args.backup_file)
+        if locked_backup["receipt_id"] != preflight["backup"]["receipt_id"]:
+            raise OperationalError(
+                "[MIGRATION 016/017] Backup receipt changed before locked "
+                "apply")
+
+        final_report = db.stored_tar_plan_schema_report()
+        final_blocking = list(final_report.get("apply_blocking", ()))
+        if final_blocking:
+            raise OperationalError(
+                "[MIGRATION 016/017] Final locked preflight refused "
+                "migration: " + "; ".join(final_blocking))
+        preflight["applied"] = db.apply_stored_tar_plan_schema(
+            require_archiver_lock=True)
+        preflight["validation"] = db.validate_stored_tar_plan_schema()
+        preflight["final_locked_preflight"] = final_report
+    finally:
+        db.close()
+    _print_json(preflight)
+    return 0
+
+
+def _apply_manifest_directory_catalog_schema(cfg, args, parser):
+    """Guarded, explicit migration-018 entry point (Plan 3 Tasks 1.1/2.1)."""
+    if args.dry_run and args.execute:
+        parser.error(
+            "--apply-manifest-directory-catalog-schema accepts only one of "
+            "--dry-run or --execute")
+
+    db = _open_read_only_db(cfg)
+    try:
+        schema_report = db.manifest_directory_catalog_schema_report()
+    finally:
+        db.close()
+    preflight = {
+        "database": cfg.pg_dbname,
+        "schema": schema_report,
+        "blocking": list(schema_report.get("apply_blocking", ())),
+        "requested": {"execute": bool(args.execute)},
+    }
+
+    if not args.execute:
+        preflight["applied"] = []
+        preflight["note"] = (
+            "read-only preflight; execute requires --execute --yes and a "
+            "verified --backup-file")
+        _print_json(preflight)
+        return 0
+
+    if not args.yes:
+        parser.error(
+            "--apply-manifest-directory-catalog-schema --execute requires "
+            "--yes")
+    if not args.backup_file:
+        parser.error(
+            "--apply-manifest-directory-catalog-schema --execute requires "
+            "--backup-file naming a PostgreSQL backup this tool can verify")
+    if preflight["blocking"]:
+        raise OperationalError(
+            "[MIGRATION 018] Refusing migration: "
+            + "; ".join(preflight["blocking"]))
+
+    holders = archiver_lock_status(_conninfo(cfg))
+    if holders:
+        raise OperationalError(
+            "[MIGRATION 018] Refusing while the archiver lock is held: "
+            f"{holders}")
+    processes = active_archive_processes()
+    if processes:
+        raise OperationalError(
+            "[MIGRATION 018] Refusing while archive/transfer processes are "
+            f"running ({len(processes)} detected)")
+    preflight["backup"] = verify_backup_receipt(cfg, args.backup_file)
+
+    db = _open_no_init_db(cfg)
+    try:
+        db.acquire_archiver_lock()
+        processes = active_archive_processes()
+        if processes:
+            raise OperationalError(
+                "[MIGRATION 018] Refusing after final liveness check "
+                f"({len(processes)} archive/transfer process(es) detected)")
+        locked_backup = verify_backup_receipt(cfg, args.backup_file)
+        if locked_backup["receipt_id"] != preflight["backup"]["receipt_id"]:
+            raise OperationalError(
+                "[MIGRATION 018] Backup receipt changed before locked apply")
+
+        final_report = db.manifest_directory_catalog_schema_report()
+        final_blocking = list(final_report.get("apply_blocking", ()))
+        if final_blocking:
+            raise OperationalError(
+                "[MIGRATION 018] Final locked preflight refused migration: "
+                + "; ".join(final_blocking))
+        preflight["applied"] = (
+            db.apply_manifest_directory_catalog_schema(
+                require_archiver_lock=True))
+        preflight["validation"] = (
+            db.validate_manifest_directory_catalog_schema())
+        preflight["final_locked_preflight"] = final_report
+    finally:
+        db.close()
+    _print_json(preflight)
+    return 0
+
+
+def _run_session37_boundary_rehearsal(cfg, args):
+    """READ-ONLY Plan-2 Gate-5.5 format-boundary report.
+
+    The target is normally an isolated restored database selected with
+    ``--db``.  This command opens PostgreSQL read-only, does not inspect local
+    staging (through the read-only resume-marker parser), never LTFS, and cannot
+    persist the boundary.
+    """
+    session_id = int(args.session_id[0] if args.session_id else 37)
+    conninfo = _conninfo(cfg)
+    db = _open_read_only_db(cfg)
+    try:
+        report = db.classify_format_boundary(session_id)
+        boundary = report.get("derived_boundary")
+        indexes = ([row["chunk_index"] for row in report.get("chunks", [])
+                    if boundary is not None
+                    and row["chunk_index"] >= boundary])
+        staging_report = _inspect_container_format_staging(
+            cfg, db, session_id, indexes, strict=False,
+            include_details=True)
+    finally:
+        db.close()
+    _print_json({
+        "database": cfg.pg_dbname,
+        "session_id": session_id,
+        "mode": "read_only_rehearsal",
+        "liveness": liveness_evidence(
+            conninfo, getattr(cfg, "backup_log_dir", None)),
+        "stored_tar_write_enabled": bool(
+            getattr(cfg, "stored_tar_write_enabled", False)),
+        "boundary_report": report,
+        "staging_evidence": staging_report,
+        "session37_row_unchanged_by_command": True,
+    })
+    return 0
+
+
+def _apply_container_format_schema(cfg, args, parser):
+    """Guarded, explicit migration-015 entry point (Plan 2 Task 0.1)."""
+    if args.dry_run and args.execute:
+        parser.error(
+            "--apply-container-format-schema accepts only one of --dry-run "
+            "or --execute")
+    exception_session_id = args.stored_tar_exception_session_id
+    if (args.execute and exception_session_id is not None
+            and getattr(cfg, "stored_tar_write_enabled", False) is not True):
+        raise OperationalError(
+            "[MIGRATION 015] Refusing Stored TAR boundary persistence while "
+            "stored_tar_write_enabled is false")
+    db = _open_read_only_db(cfg)
+    try:
+        preflight = db.container_format_schema_preflight(exception_session_id)
+        staging_evidence = None
+        if exception_session_id is not None:
+            exception = preflight.get("exception") or {}
+            boundary = exception.get("derived_boundary")
+            if boundary is not None:
+                indexes = [
+                    row["chunk_index"] for row in exception.get("chunks", [])
+                    if row["chunk_index"] >= boundary]
+                staging_evidence = _inspect_container_format_staging(
+                    cfg, db, exception_session_id, indexes)
+                if staging_evidence["entry_count"]:
+                    preflight["blocking"].append(
+                        "candidate chunks have deterministic fetch/pack staging "
+                        "evidence")
+                if staging_evidence["unreadable_count"]:
+                    preflight["blocking"].append(
+                        "candidate staging evidence is unreadable")
+    finally:
+        db.close()
+
+    preflight["requested"] = {
+        "execute": bool(args.execute),
+        "database": cfg.pg_dbname,
+        "stored_tar_exception_session_id": exception_session_id,
+        "expected_format_boundary": args.expected_format_boundary,
+        "format_approval_id": args.format_approval_id,
+    }
+    preflight["staging_evidence"] = staging_evidence
+
+    if not args.execute:
+        preflight["applied"] = []
+        preflight["note"] = (
+            "read-only preflight; execute requires --execute --yes and a "
+            "verified --backup-file")
+        _print_json(preflight)
+        return 0
+
+    if not args.yes:
+        parser.error("--apply-container-format-schema --execute requires --yes")
+    if not args.backup_file:
+        parser.error(
+            "--apply-container-format-schema --execute requires --backup-file "
+            "naming a PostgreSQL backup this tool can verify")
+    if preflight["blocking"]:
+        raise OperationalError(
+            "[MIGRATION 015] Refusing migration: "
+            + "; ".join(preflight["blocking"]))
+
+    if exception_session_id is None:
+        extras = (args.expected_format_boundary, args.format_approval_id,
+                  args.format_approval_reason)
+        if any(value is not None for value in extras):
+            parser.error(
+                "boundary/approval flags require "
+                "--stored-tar-exception-session-id")
+    else:
+        required = (args.expected_format_boundary, args.format_approval_id,
+                    args.format_approval_reason)
+        if any(value is None for value in required):
+            parser.error(
+                "an approved Stored TAR exception requires "
+                "--expected-format-boundary, --format-approval-id, and "
+                "--format-approval-reason")
+        derived = preflight["exception"]["derived_boundary"]
+        if int(args.expected_format_boundary) != int(derived):
+            raise OperationalError(
+                f"[MIGRATION 015] Expected boundary "
+                f"{args.expected_format_boundary} differs from the read-only "
+                f"derived boundary {derived}")
+        if staging_evidence is None:
+            raise OperationalError(
+                "[MIGRATION 015] Local staging evidence is absent")
+
+    holders = archiver_lock_status(_conninfo(cfg))
+    if holders:
+        raise OperationalError(
+            "[MIGRATION 015] Refusing while the archiver lock is held: "
+            f"{holders}")
+    processes = active_archive_processes()
+    if processes:
+        raise OperationalError(
+            "[MIGRATION 015] Refusing while archive/transfer processes are "
+            f"running ({len(processes)} detected)")
+    preflight["backup"] = verify_backup_receipt(cfg, args.backup_file)
+
+    # Pin the same cluster-wide lock used by production for the final evidence
+    # window. A worker starting after this point cannot acquire its run lock.
+    # The final DB classification and root-only staging scan are intentionally
+    # repeated under that lock immediately before the single SQL transaction.
+    db = _open_no_init_db(cfg)
+    try:
+        db.acquire_archiver_lock()
+        processes = active_archive_processes()
+        if processes:
+            raise OperationalError(
+                "[MIGRATION 015] Refusing after final liveness check "
+                f"({len(processes)} archive/transfer process(es) detected)")
+        locked_backup = verify_backup_receipt(cfg, args.backup_file)
+        if locked_backup["receipt_id"] != preflight["backup"]["receipt_id"]:
+            raise OperationalError(
+                "[MIGRATION 015] Backup receipt changed before locked apply")
+        processes = active_archive_processes()
+        if processes:
+            raise OperationalError(
+                "[MIGRATION 015] A transfer process appeared during final "
+                f"backup verification ({len(processes)} detected)")
+        final_preflight = db.container_format_schema_preflight(
+            exception_session_id, ignore_archiver_lock=True)
+        if final_preflight["blocking"]:
+            raise OperationalError(
+                "[MIGRATION 015] Final locked preflight refused migration: "
+                + "; ".join(final_preflight["blocking"]))
+
+        staging_evidence = None
+        if exception_session_id is not None:
+            final_exception = final_preflight["exception"]
+            final_boundary = final_exception["derived_boundary"]
+            if int(args.expected_format_boundary) != int(final_boundary):
+                raise OperationalError(
+                    "[MIGRATION 015] Evidence boundary changed before apply")
+            indexes = [
+                row["chunk_index"] for row in final_exception["chunks"]
+                if row["chunk_index"] >= final_boundary]
+            staging_evidence = _inspect_container_format_staging(
+                cfg, db, exception_session_id, indexes)
+            if (staging_evidence["entry_count"]
+                    or staging_evidence["unreadable_count"]):
+                raise OperationalError(
+                    "[MIGRATION 015] Final staging evidence is not empty and "
+                    "readable")
+
+        preflight["applied"] = db.apply_container_format_schema(
+            exception_session_id=exception_session_id,
+            expected_boundary=args.expected_format_boundary,
+            approval_id=args.format_approval_id,
+            approval_reason=args.format_approval_reason,
+            staging_evidence=staging_evidence,
+            require_archiver_lock=True)
+        preflight["validation"] = db.validate_container_format_schema()
+        preflight["final_locked_preflight"] = final_preflight
+        preflight["staging_evidence"] = staging_evidence
     finally:
         db.close()
     _print_json(preflight)
@@ -478,6 +1513,12 @@ def _build_parser():
                         help="Skip supported interactive confirmations.")
     parser.add_argument("--print-db-target", action="store_true",
                         help="Print configured target and read-only DB identity.")
+    parser.add_argument("--schema-provenance-audit", action="store_true",
+                        help="Read-only installed-schema/catalog-provenance audit; "
+                             "never applies migrations or reads LTFS.")
+    parser.add_argument("--json", action="store_true",
+                        help="Render supported reports as JSON (the default for "
+                             "machine-readable maintenance commands).")
     parser.add_argument("--backup-postgres", action="store_true",
                         help="Create and verify a custom-format PostgreSQL dump.")
     parser.add_argument("--create-migrated-db", action="store_true",
@@ -517,6 +1558,97 @@ def _build_parser():
                         help="With --apply-incremental-scan-schema: also apply "
                              "the legacy membership audit and the final unique "
                              "constraints. Refuses on duplicate ordinals.")
+    parser.add_argument("--apply-container-format-schema", action="store_true",
+                        help="Migration 015. Read-only preflight unless "
+                             "--execute --yes --backup-file are supplied.")
+    parser.add_argument("--validate-container-format-schema",
+                        action="store_true",
+                        help="Fail-closed read-only validation of migration 015.")
+    parser.add_argument("--container-format-schema-report",
+                        action="store_true",
+                        help="Read-only migration-015 schema/format report.")
+    parser.add_argument("--backfill-legacy-chunk-membership",
+                        action="store_true",
+                        help="Seal named pre-frontier legacy_db chunks with "
+                             "the expectation DERIVED from their existing "
+                             "membership rows. Read-only preflight unless "
+                             "--execute --yes --backup-file are supplied.")
+    parser.add_argument("--chunk-index", type=int, action="append",
+                        help="Chunk index to act on; repeat for several.")
+    parser.add_argument("--apply-container-format-schema-authority-v2",
+                        action="store_true",
+                        help="Migration 019: additive v2 container-format "
+                             "schema authority covering 015+016+017. "
+                             "Read-only preflight unless --execute --yes "
+                             "--backup-file are supplied.")
+    parser.add_argument("--validate-container-format-schema-authority-v2",
+                        action="store_true",
+                        help="Fail-closed read-only validation of the v2 "
+                             "authority (migration 019).")
+    parser.add_argument("--container-format-schema-authority-v2-report",
+                        action="store_true",
+                        help="Read-only migration-019 (v2 authority) report.")
+    parser.add_argument("--repoint-session-tape-generation",
+                        action="store_true",
+                        help="Correct a session's stale target-cartridge "
+                             "generation. Proves the session has no archived "
+                             "evidence on that tape before updating. Read-only "
+                             "preflight unless --execute --yes "
+                             "--approval-identity --backup-file are supplied.")
+    parser.add_argument("--to-generation", type=int,
+                        help="Target active tape generation for "
+                             "--repoint-session-tape-generation.")
+    parser.add_argument("--persist-session-transition", action="store_true",
+                        help="Plan 3 Task 3.1 execute mode: persist one "
+                             "legacy_db -> manifest planning boundary through "
+                             "draft/rehearsed/approved/active. Read-only "
+                             "preflight unless --execute --yes "
+                             "--approval-identity --evidence-locator "
+                             "--backup-file are supplied.")
+    parser.add_argument("--approval-identity",
+                        help="Operator approval identity recorded on the "
+                             "persisted transition.")
+    parser.add_argument("--evidence-locator",
+                        help="Locator of the evidence report the transition "
+                             "was rehearsed against.")
+    parser.add_argument("--apply-stored-tar-plan-schema",
+                        action="store_true",
+                        help="Migrations 016+017, applied together in one "
+                             "transaction. Read-only preflight unless "
+                             "--execute --yes --backup-file are supplied.")
+    parser.add_argument("--validate-stored-tar-plan-schema",
+                        action="store_true",
+                        help="Fail-closed read-only validation of migrations "
+                             "016 and 017.")
+    parser.add_argument("--stored-tar-plan-schema-report",
+                        action="store_true",
+                        help="Read-only migrations 016/017 schema report.")
+    parser.add_argument("--apply-manifest-directory-catalog-schema",
+                        action="store_true",
+                        help="Migration 018. Read-only preflight unless "
+                             "--execute --yes --backup-file are supplied.")
+    parser.add_argument("--validate-manifest-directory-catalog-schema",
+                        action="store_true",
+                        help="Fail-closed read-only validation of migration 018 "
+                             "schema, manifest authority, and boundaries.")
+    parser.add_argument("--manifest-directory-catalog-schema-report",
+                        action="store_true",
+                        help="Read-only migration-018 schema/authority report.")
+    parser.add_argument("--session37-boundary-rehearsal", action="store_true",
+                        help="READ-ONLY Plan-2 Gate-5.5 chunk classification "
+                             "and proposed Stored TAR boundary. Defaults to "
+                             "session 37; override with --session-id.")
+    parser.add_argument("--stored-tar-exception-session-id", type=int,
+                        help="Individually approved legacy mixed-format session "
+                             "for the migration-015 evidence gate.")
+    parser.add_argument("--expected-format-boundary", type=int,
+                        help="Expected first Stored TAR chunk index; execute "
+                             "refuses if the evidence-derived value differs.")
+    parser.add_argument("--format-approval-id",
+                        help="Durable operator/review approval identifier for "
+                             "the legacy-session exception.")
+    parser.add_argument("--format-approval-reason",
+                        help="Durable explanation for the approved exception.")
     parser.add_argument("--backfill-directory-catalog", action="store_true",
                         help="Backfill directory catalog from legacy files_index.")
     parser.add_argument("--dry-run", action="store_true",
@@ -609,7 +1741,31 @@ def _dispatch(parser, args):
 
     if args.backup_postgres:
         print(f"[DB BACKUP] Target: {cfg.db_display_ref}")
-        _print_json(create_verified_production_backup(cfg))
+        if active_archive_processes():
+            raise OperationalError(
+                "[DB BACKUP] Refusing while archive/transfer processes run")
+        lock_db = _open_no_init_db(cfg)
+        try:
+            lock_db.acquire_archiver_lock()
+            if active_archive_processes():
+                raise OperationalError(
+                    "[DB BACKUP] A transfer process appeared after the "
+                    "archiver lock was acquired")
+            _print_json(create_verified_production_backup(cfg))
+        finally:
+            lock_db.close()
+        return 0
+
+    if args.schema_provenance_audit:
+        db = _open_read_only_db(cfg)
+        try:
+            report = audit_manager(db)
+        finally:
+            db.close()
+        if args.json:
+            _print_json(report)
+        else:
+            print(render_schema_audit(report))
         return 0
 
     if args.create_migrated_db:
@@ -640,6 +1796,58 @@ def _dispatch(parser, args):
 
     if args.apply_incremental_scan_schema:
         return _apply_incremental_scan_schema(cfg, args, parser)
+
+    if args.apply_container_format_schema:
+        return _apply_container_format_schema(cfg, args, parser)
+
+    if args.validate_container_format_schema:
+        return _run_container_format_schema_report(cfg, validate=True)
+
+    if args.container_format_schema_report:
+        return _run_container_format_schema_report(cfg, validate=False)
+
+    if args.backfill_legacy_chunk_membership:
+        return _backfill_legacy_chunk_membership(cfg, args, parser)
+
+    if args.apply_container_format_schema_authority_v2:
+        return _apply_container_format_schema_authority_v2(cfg, args, parser)
+
+    if args.validate_container_format_schema_authority_v2:
+        return _run_container_format_schema_authority_v2_report(
+            cfg, validate=True)
+
+    if args.container_format_schema_authority_v2_report:
+        return _run_container_format_schema_authority_v2_report(
+            cfg, validate=False)
+
+    if args.repoint_session_tape_generation:
+        return _repoint_session_tape_generation(cfg, args, parser)
+
+    if args.persist_session_transition:
+        return _persist_session_transition(cfg, args, parser)
+
+    if args.apply_stored_tar_plan_schema:
+        return _apply_stored_tar_plan_schema(cfg, args, parser)
+
+    if args.validate_stored_tar_plan_schema:
+        return _run_stored_tar_plan_schema_report(cfg, validate=True)
+
+    if args.stored_tar_plan_schema_report:
+        return _run_stored_tar_plan_schema_report(cfg, validate=False)
+
+    if args.apply_manifest_directory_catalog_schema:
+        return _apply_manifest_directory_catalog_schema(cfg, args, parser)
+
+    if args.validate_manifest_directory_catalog_schema:
+        return _run_manifest_directory_catalog_schema_report(
+            cfg, validate=True)
+
+    if args.manifest_directory_catalog_schema_report:
+        return _run_manifest_directory_catalog_schema_report(
+            cfg, validate=False)
+
+    if args.session37_boundary_rehearsal:
+        return _run_session37_boundary_rehearsal(cfg, args)
 
     if args.validate_directory_catalog:
         _print_json(validate_directory_catalog(_conninfo(cfg)))

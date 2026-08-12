@@ -169,12 +169,14 @@ class OverlapRehearsalTests(_Rehearsal):
                 pass
 
             def _stage_chunk(self, session_id, chunk_index, files):
-                from src.pipeline_types import StagedChunk
+                from src.pipeline_types import ContainerFormat, StagedChunk
                 events.append(("stage", chunk_index))
                 return StagedChunk(chunk_index=chunk_index,
                                    fetch_dir=f"/tmp/_f{chunk_index}",
                                    pack_dir=f"/tmp/_p{chunk_index}",
-                                   metadata=[], staged_bytes=GiB)
+                                   metadata=[], staged_bytes=GiB,
+                                   session_id=session_id,
+                                   packaging_format=ContainerFormat.ZIP)
 
             def _write_chunk_group(self, session_id, descs, tape, eject, stop):
                 events.append(("write", tuple(d.chunk_index for d in descs)))
@@ -289,6 +291,8 @@ class FiniteGroupRehearsalTests(unittest.TestCase):
         orch.skipped_tracker = mock.MagicMock()
         orch.db = mock.MagicMock()
         orch.db.get_chunk_size_summary.return_value = {}
+        from src.pipeline_types import ContainerFormat
+        orch.db.get_chunk_packaging_format.return_value = ContainerFormat.ZIP
         orch._consumer_chunk = None
         orch._ownership_acquisitions = 0
         orch._readiness_checks = 0
@@ -318,7 +322,9 @@ class FiniteGroupRehearsalTests(unittest.TestCase):
 
         descs = [StagedChunk(chunk_index=i, fetch_dir=f"/tmp/_f{i}",
                              pack_dir=f"/tmp/_p{i}", metadata=[],
-                             staged_bytes=GiB, source_missing_files=[])
+                             staged_bytes=GiB, source_missing_files=[],
+                             session_id=37,
+                             packaging_format=ContainerFormat.ZIP)
                  for i in range(5)]
 
         generation_before = own.OWNERSHIP.generation
@@ -358,13 +364,28 @@ class ProductionGateTests(unittest.TestCase):
         self.assertNotIn("014", startup)
 
     def test_stored_tar_creation_is_still_disabled(self):
-        """Plan 1 must not enable anything Plan 2 owns."""
+        """Plan 2 Phase 0 exposes truth but cannot create a TAR yet."""
+        import configparser
+        import inspect
+        from src.pg_containers import stored_tar_reader_contract_version
+        from src.pg_sessions import PgSessionMixin
+
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        for name in ("remote_writer.py", "remote_staging.py",
-                     "scan_frontier.py", "remote_pipeline.py"):
-            with open(os.path.join(root, "src", name), encoding="utf-8") as h:
-                source = h.read()
-            self.assertNotIn("stored_tar", source.lower(), name)
+        parser = configparser.ConfigParser()
+        parser.read(os.path.join(root, "config.example.ini"), encoding="utf-8")
+        self.assertFalse(parser.getboolean(
+            "FEATURES", "stored_tar_write_enabled"))
+        # Plan 2 Phase 1 installs the dormant consumer contract.  The writer
+        # remains disabled by the feature gate asserted immediately above.
+        self.assertEqual(stored_tar_reader_contract_version(), 1)
+        assignment = inspect.getsource(
+            PgSessionMixin.append_remote_streaming_chunk)
+        self.assertIn("if stored_tar_write_enabled", assignment)
+        with open(os.path.join(root, "src", "remote_staging.py"),
+                  encoding="utf-8") as handle:
+            staging = handle.read()
+        self.assertIn("get_chunk_packaging_format", staging)
+        self.assertIn("_stage_stored_tar_chunk", staging)
 
     def test_no_postgresql_pruning_happens_in_plan_1(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

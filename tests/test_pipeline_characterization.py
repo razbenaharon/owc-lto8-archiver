@@ -22,7 +22,7 @@ from unittest import mock
 from src import remote_orchestrator as ro
 from src import scan_frontier as sf
 from src.exit_codes import ExitCode
-from src.pipeline_types import StagedChunk
+from src.pipeline_types import ContainerFormat, StagedChunk
 from src.ready_queue import ReadyQueueLimits
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -113,7 +113,10 @@ class FakeStreamingDB(FakeFrontierCatalog):
         self.existing_paths_queries.append(list(paths))
         return set()
 
-    def append_remote_streaming_chunk(self, session_id, chunk_index, rows):
+    def append_remote_streaming_chunk(
+            self, session_id, chunk_index, rows, *,
+            stored_tar_write_enabled=False, reader_contract_version=None,
+            require_container_format_schema=False):
         self.calls.append("append_remote_streaming_chunk")
         rows = list(rows)
         self.appended.append((chunk_index, rows))
@@ -124,6 +127,9 @@ class FakeStreamingDB(FakeFrontierCatalog):
             "inserted_files": len(rows),
             "inserted_bytes": sum(int(r[3]) for r in rows),
         }
+
+    def get_chunk_packaging_format(self, session_id, chunk_index):
+        return ContainerFormat.ZIP
 
     # -- tape ------------------------------------------------------------
     def get_tape(self, label):
@@ -262,7 +268,9 @@ def build_streaming_orchestrator(db, *, prefetch_ahead=1, chunk_budget=4096,
         return StagedChunk(chunk_index=chunk_index,
                            fetch_dir=f"/tmp/_fetch_{chunk_index}",
                            pack_dir=f"/tmp/_pack_{chunk_index}",
-                           metadata=[], staged_bytes=1024)
+                           metadata=[], staged_bytes=1024,
+                           session_id=session_id,
+                           packaging_format=ContainerFormat.ZIP)
     orch._stage_chunk = _stage
     return orch
 
@@ -471,7 +479,9 @@ class ScannerPlannerCharacterizationTests(unittest.TestCase):
             return StagedChunk(chunk_index=chunk_index,
                                fetch_dir=f"/tmp/_fetch_{chunk_index}",
                                pack_dir=f"/tmp/_pack_{chunk_index}",
-                               metadata=[], staged_bytes=1024)
+                               metadata=[], staged_bytes=1024,
+                               session_id=session_id,
+                               packaging_format=ContainerFormat.ZIP)
         orch._stage_chunk = blocking_stage
 
         try:
@@ -909,6 +919,192 @@ class DataBoundaryCharacterizationTests(unittest.TestCase):
         for name in ("run", "_restore_many", "_restore_loose"):
             self.assertTrue(hasattr(LTORetriever, name),
                             f"LTORetriever.{name} moved")
+
+
+class BoundedWriteGroupRunTests(unittest.TestCase):
+    """`max_write_groups_per_run` must end the run ON a chunk boundary.
+
+    The runbook requires that the next finite group never starts by itself.
+    The limit is checked after a group commits and before the next is
+    selected, so the writer is never interrupted mid-group.
+    """
+
+    def _coordinator(self, groups, *, max_write_groups):
+        from src.remote_pipeline import RemotePipelineCoordinator
+
+        written = []
+
+        def wait_for_group(stop_event=None, poll=0.5, timeout=None):
+            if not groups:
+                return [], "producer_closed_empty"
+            indexes = groups.pop(0)
+            return ([SimpleNamespace(chunk_index=i, prepared_bytes=1,
+                                     desc=SimpleNamespace(chunk_index=i))
+                     for i in indexes], "max_ready_chunks_reached")
+
+        ready_q = mock.MagicMock()
+        ready_q.wait_for_group.side_effect = wait_for_group
+        ready_q.ready_chunks = 0
+
+        host = SimpleNamespace(
+            db=FakeStreamingDB(pending=[]),
+            _write_chunk_group=lambda *a, **k: (
+                written.append(a[1]) or None))
+
+        coordinator = RemotePipelineCoordinator(
+            host=host, session_id=37, tape_label="T", ready_q=ready_q,
+            stop_event=threading.Event(), metrics=mock.MagicMock(),
+            max_write_groups=max_write_groups)
+        coordinator._observe_start = lambda items, reason: (None, None, 0.0)
+        coordinator._observe_finish = lambda *a, **k: None
+        coordinator._run_stager = lambda: None
+        coordinator._scanner_done.set()
+        return coordinator, written
+
+    def test_a_limit_of_one_stops_after_the_first_group(self):
+        coordinator, written = self._coordinator(
+            [[49], [50], [51]], max_write_groups=1)
+        coordinator.run()
+        self.assertEqual(coordinator.outcome.groups_written, [(49,)])
+        self.assertEqual(coordinator.outcome.completed_chunks, 1)
+        self.assertEqual(
+            coordinator.outcome.stopped_reason, "max_write_groups_reached")
+        self.assertEqual(len(written), 1, "a second group was written")
+
+    def test_zero_means_unbounded(self):
+        coordinator, written = self._coordinator(
+            [[49], [50]], max_write_groups=0)
+        coordinator.run()
+        self.assertEqual(
+            coordinator.outcome.groups_written, [(49,), (50,)])
+        self.assertIsNone(coordinator.outcome.stopped_reason)
+
+    def test_the_limit_never_truncates_a_group_in_progress(self):
+        # A group of three chunks still writes all three; the bound applies
+        # between groups, never inside one.
+        coordinator, written = self._coordinator(
+            [[49, 50, 51], [52]], max_write_groups=1)
+        coordinator.run()
+        self.assertEqual(coordinator.outcome.groups_written, [(49, 50, 51)])
+        self.assertEqual(coordinator.outcome.completed_chunks, 3)
+        self.assertEqual(len(written), 1)
+
+    def test_config_default_is_unbounded(self):
+        from src.config import ConfigManager
+
+        self.assertEqual(
+            ConfigManager.max_write_groups_per_run.fget(
+                SimpleNamespace(_get_int=lambda *a, **k: a[2])), 0)
+
+
+class WriteOnlyResumeTests(unittest.TestCase):
+    """Write-only resume must not scan and must not create a chunk.
+
+    The mode exists so a bounded write group does not depend on traversal
+    being healthy. Its whole value is the guarantee that no discovery runs, so
+    these tests assert the absence of scanning rather than the presence of
+    writing.
+    """
+
+    def _coordinator(self, *, write_only, chunks=None, scan_coordinator=None):
+        from src.remote_pipeline import RemotePipelineCoordinator
+
+        chunks = chunks or {}
+        db = FakeStreamingDB(pending=sorted(chunks))
+        for index in chunks:
+            db.statuses[index] = "pending"
+        db.get_remote_chunk = lambda _s, index: chunks.get(index)
+
+        coordinator = RemotePipelineCoordinator(
+            host=SimpleNamespace(db=db), session_id=37, tape_label="T",
+            ready_q=mock.MagicMock(), stop_event=threading.Event(),
+            metrics=mock.MagicMock(), scan_coordinator=scan_coordinator)
+        coordinator.write_only = write_only
+        return coordinator
+
+    @staticmethod
+    def _chunk(**overrides):
+        row = {"membership_state": "sealed", "plan_source": "legacy_db",
+               "status": "pending"}
+        row.update(overrides)
+        return row
+
+    def test_a_sealed_legacy_chunk_is_admitted(self):
+        coordinator = self._coordinator(
+            write_only=True, chunks={49: self._chunk()})
+        self.assertEqual(coordinator.next_chunk_to_stage(), 49)
+
+    def test_an_unsealed_chunk_is_refused(self):
+        coordinator = self._coordinator(
+            write_only=True,
+            chunks={49: self._chunk(membership_state=None)})
+        self.assertIsNone(coordinator.next_chunk_to_stage())
+
+    def test_a_manifest_chunk_is_refused(self):
+        coordinator = self._coordinator(
+            write_only=True,
+            chunks={49: self._chunk(plan_source="manifest")})
+        self.assertIsNone(coordinator.next_chunk_to_stage())
+
+    def test_an_unreadable_chunk_fails_closed(self):
+        from src.remote_pipeline import RemotePipelineCoordinator
+
+        db = FakeStreamingDB(pending=[49])
+        db.statuses[49] = "pending"
+
+        def explode(_session_id, _chunk_index):
+            raise RuntimeError("connection lost")
+
+        db.get_remote_chunk = explode
+        coordinator = RemotePipelineCoordinator(
+            host=SimpleNamespace(db=db), session_id=37, tape_label="T",
+            ready_q=mock.MagicMock(), stop_event=threading.Event(),
+            metrics=mock.MagicMock())
+        coordinator.write_only = True
+        self.assertIsNone(coordinator.next_chunk_to_stage())
+
+    def test_the_refusal_only_applies_in_write_only_mode(self):
+        coordinator = self._coordinator(
+            write_only=False,
+            chunks={49: self._chunk(membership_state=None,
+                                    plan_source="manifest")})
+        self.assertEqual(coordinator.next_chunk_to_stage(), 49)
+
+    def test_run_refuses_to_start_a_scanner_in_write_only_mode(self):
+        coordinator = self._coordinator(
+            write_only=True, scan_coordinator=mock.MagicMock())
+        with self.assertRaisesRegex(RuntimeError, "refusing to start the scanner"):
+            coordinator.run()
+
+    def test_no_scanner_thread_is_started_without_a_coordinator(self):
+        coordinator = self._coordinator(write_only=True)
+        coordinator.ready_q.wait_for_group.return_value = (
+            [], "producer_closed_empty")
+        coordinator._run_stager = lambda: None
+        coordinator.run()
+        self.assertIsNone(getattr(coordinator, "_scanner_thread", None))
+        self.assertTrue(coordinator._scanner_done.is_set())
+        self.assertEqual(coordinator.outcome.groups_written, [])
+
+    def test_orchestrator_builds_no_scan_coordinator_when_write_only(self):
+        # The guarantee is structural: the source must make the coordinator
+        # conditional on the flag, not build one and then disable it.
+        import inspect
+
+        from src import remote_orchestrator
+
+        source = inspect.getsource(
+            remote_orchestrator.RemoteOrchestrator._run_streaming_session)
+        self.assertIn(
+            "None if write_only else FrontierScanCoordinator(", source,
+            "write-only must not construct a FrontierScanCoordinator")
+
+    def test_config_default_is_off(self):
+        from src.config import ConfigManager
+
+        self.assertFalse(
+            ConfigManager.write_only_resume.fget(
+                SimpleNamespace(_get_bool=lambda *a, **k: a[2])))
 
 
 if __name__ == "__main__":

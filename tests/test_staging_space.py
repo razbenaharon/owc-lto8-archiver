@@ -3,9 +3,16 @@ import json
 import tempfile
 import unittest
 from collections import namedtuple
+from types import SimpleNamespace
 from unittest import mock
 
 from src import packer
+from src.pipeline_types import ContainerFormat
+from src.remote_staging import (
+    stored_tar_staging_reservation,
+    zip_staging_reservation,
+)
+from src.stored_tar_planning import build_stored_tar_chunk_plan
 from src.skipped import SkippedFileTracker
 
 try:
@@ -15,6 +22,56 @@ except ImportError:  # pragma: no cover - dependency test environment issue
 
 
 class StagingSpaceTests(unittest.TestCase):
+    def _tar_host(self, *, fixed=100, per_member=10):
+        cfg = SimpleNamespace(
+            stored_tar_sidecar_fixed_reserve_bytes=fixed,
+            stored_tar_sidecar_member_reserve_bytes=per_member,
+        )
+        return SimpleNamespace(
+            cfg=cfg,
+            _physical_estimate=lambda logical, count: int(logical) + int(count),
+        )
+
+    def test_direct_tar_reserve_counts_tar_sidecar_loose_and_pack_copy(self):
+        rows = [
+            {"manifest_id": 1, "remote_path": "/r/small-a", "file_size_bytes": 10},
+            {"manifest_id": 2, "remote_path": "/r/large", "file_size_bytes": 200},
+            {"manifest_id": 3, "remote_path": "/r/small-b", "file_size_bytes": 20},
+        ]
+        plan = build_stored_tar_chunk_plan(
+            1, 0, rows, loose_threshold_bytes=100, max_size_bytes=10**9)
+        reserve = stored_tar_staging_reservation(plan, self._tar_host())
+        tar_bytes = sum(c.estimated_archive_bytes for c in plan.containers)
+        sidecar = 3 * (100 + 10 * 2)
+        loose = 2 * (200 + 1)
+        self.assertEqual(reserve.packaging_format, ContainerFormat.STORED_TAR)
+        self.assertEqual(reserve.tar_stream_bytes, tar_bytes)
+        self.assertEqual(reserve.sidecar_bytes, sidecar)
+        self.assertEqual(reserve.loose_bytes, loose)
+        self.assertEqual(
+            reserve.needed_bytes, tar_bytes + sidecar + loose + tar_bytes)
+
+    def test_direct_tar_reserve_does_not_count_extracted_small_files(self):
+        rows = [
+            {"manifest_id": idx, "remote_path": f"/r/small-{idx}",
+             "file_size_bytes": 1}
+            for idx in range(1000)
+        ]
+        plan = build_stored_tar_chunk_plan(
+            1, 0, rows, loose_threshold_bytes=100, max_size_bytes=10**9)
+        host = self._tar_host(fixed=0, per_member=0)
+        host._physical_estimate = (
+            lambda logical, count: int(logical) + int(count) * 4096)
+        reserve = stored_tar_staging_reservation(plan, host)
+        zip_reserve = zip_staging_reservation(1000, 1000, host)
+        self.assertLess(reserve.needed_bytes, zip_reserve.needed_bytes)
+
+    def test_zip_reserve_keeps_two_materialized_tree_estimate(self):
+        host = self._tar_host()
+        reserve = zip_staging_reservation(123, 7, host)
+        self.assertEqual(reserve.packaging_format, ContainerFormat.ZIP)
+        self.assertEqual(reserve.needed_bytes, 2 * (123 + 7))
+
     def test_ensure_staging_space_uses_current_free_space(self):
         usage = namedtuple("usage", "total used free")
         original_disk_usage = packer.shutil.disk_usage

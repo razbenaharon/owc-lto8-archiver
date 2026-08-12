@@ -41,6 +41,7 @@ class LocalOrchestrator:
             notifier=self.notifier,
             governor=self.governor,
             index_min_file_mb=self.cfg.index_min_file_mb,
+            index_packed_small_files=self.cfg.index_packed_small_files,
         )
 
     def run(self):

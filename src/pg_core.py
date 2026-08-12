@@ -4,6 +4,9 @@ Foundation shared by the method-group mixins (:mod:`src.pg_catalog`,
 :mod:`src.pg_sessions`, :mod:`src.pg_tapes`) that together form
 :class:`src.pg_db.PgDatabaseManager`.
 """
+import hashlib
+import json
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -129,6 +132,496 @@ class PgConnectionCore:
             with conn.cursor() as cur:
                 cur.execute(sql_path.read_text(encoding="utf-8"))
             conn.commit()
+
+    # ------------------------------------------------------------------
+    # Migration 015 - per-chunk/container packaging formats (Plan 2)
+    # ------------------------------------------------------------------
+
+    CONTAINER_FORMAT_MIGRATION = "015_postgres_container_formats.sql"
+    STORED_TAR_PLAN_MIGRATION = "016_postgres_stored_tar_plans.sql"
+    STORED_TAR_PUBLICATION_MIGRATION = (
+        "017_postgres_stored_tar_publication.sql")
+    MANIFEST_DIRECTORY_CATALOG_MIGRATION = (
+        "018_postgres_manifest_directory_catalog.sql")
+    CONTAINER_FORMAT_AUTHORITY_V2_MIGRATION = (
+        "019_postgres_container_format_schema_authority_v2.sql")
+
+    @classmethod
+    def container_format_authority_v2_migration_path(cls):
+        return (Path(PROJECT_ROOT) / "scripts" / "sql"
+                / cls.CONTAINER_FORMAT_AUTHORITY_V2_MIGRATION)
+
+    @classmethod
+    def container_format_authority_v2_migration_checksum(cls):
+        """SHA-256 identity of the explicit migration file (read-only)."""
+        return hashlib.sha256(
+            cls.container_format_authority_v2_migration_path().read_bytes()
+        ).hexdigest()
+
+    def apply_container_format_schema_authority_v2(
+            self, *, require_archiver_lock=False):
+        """Atomically apply migration 019: the additive v2 schema authority.
+
+        Purely additive.  Migration 015's row and function are untouched; this
+        inserts one new, permanently immutable authority row covering
+        015+016+017 together, after the migration's own completeness check
+        (every required table/column/constraint/index/trigger/function)
+        passes.  The three prerequisite migrations' checksums are supplied as
+        GUCs, the same idiom migrations 015 and 018 use, so the row records
+        exactly which file contents were verified.  Idempotent: re-running
+        this after the row exists changes nothing.
+        """
+        sql_path = self.container_format_authority_v2_migration_path()
+        settings = {
+            "lto.container_format_authority_v2_checksum_015":
+                self.container_format_migration_checksum(),
+            "lto.container_format_authority_v2_checksum_016":
+                self.stored_tar_plan_migration_checksums()[
+                    self.STORED_TAR_PLAN_MIGRATION],
+            "lto.container_format_authority_v2_checksum_017":
+                self.stored_tar_plan_migration_checksums()[
+                    self.STORED_TAR_PUBLICATION_MIGRATION],
+        }
+
+        def apply_on(conn):
+            with conn.transaction():
+                if require_archiver_lock:
+                    owned = conn.execute(
+                        """SELECT EXISTS (
+                               SELECT 1 FROM pg_locks
+                               WHERE locktype='advisory' AND granted
+                                 AND pid=pg_backend_pid()
+                                 AND classid=%s AND objid=%s
+                                 AND objsubid=1) AS owned""",
+                        (self.ARCHIVER_LOCK_KEY >> 32,
+                         self.ARCHIVER_LOCK_KEY & 0xFFFFFFFF),
+                    ).fetchone()["owned"]
+                    if not owned:
+                        raise RuntimeError(
+                            "[DB] Refusing migration 019 without the archiver "
+                            "advisory lock on this session")
+                for name, value in settings.items():
+                    conn.execute("SELECT set_config(%s, %s, true)",
+                                 (name, value))
+                with conn.cursor() as cur:
+                    cur.execute(sql_path.read_text(encoding="utf-8"))
+
+        if require_archiver_lock:
+            if self._lock_conn is None:
+                raise RuntimeError(
+                    "[DB] Migration 019 requires a pinned archiver lock")
+            apply_on(self._lock_conn)
+        else:
+            with self._pool.connection() as conn:
+                apply_on(conn)
+        return [self.CONTAINER_FORMAT_AUTHORITY_V2_MIGRATION]
+
+    @classmethod
+    def container_format_migration_path(cls):
+        return (Path(PROJECT_ROOT) / "scripts" / "sql"
+                / cls.CONTAINER_FORMAT_MIGRATION)
+
+    @classmethod
+    def container_format_migration_checksum(cls):
+        """SHA-256 identity of the explicit migration file (read-only)."""
+        return hashlib.sha256(
+            cls.container_format_migration_path().read_bytes()).hexdigest()
+
+    def apply_container_format_schema(
+            self, *, exception_session_id=None, expected_boundary=None,
+            approval_id=None, approval_reason=None, staging_evidence=None,
+            require_archiver_lock=False):
+        """Atomically apply migration 015, optionally with one proved exception.
+
+        Migration 015 is never part of startup.  The normal call backfills every
+        pre-existing chunk as immutable ZIP.  The optional arguments are the
+        deliberately narrow operator-approved exception required for a legacy
+        mixed-format session: all five values must be present together, and the
+        SQL transaction independently re-runs the database evidence query before
+        assigning a never-started suffix directly to ``stored_tar``.
+
+        ``staging_evidence`` is produced by the guarded CLI immediately before
+        this call, while process/advisory-lock checks prove quiescence.  It never
+        contains a source filename or staging-root path.
+        """
+        supplied = (
+            exception_session_id, expected_boundary, approval_id,
+            approval_reason, staging_evidence)
+        if any(value is not None for value in supplied) and not all(
+                value is not None for value in supplied):
+            raise ValueError(
+                "container-format exception requires session, expected "
+                "boundary, approval id/reason, and staging evidence")
+        if exception_session_id is not None:
+            if int(exception_session_id) <= 0 or int(expected_boundary) < 0:
+                raise ValueError("invalid container-format exception identity")
+            approval_id = str(approval_id).strip()
+            approval_reason = str(approval_reason).strip()
+            if (not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", approval_id)
+                    or not approval_reason or len(approval_reason) > 512
+                    or any(not char.isprintable()
+                           for char in approval_reason)):
+                raise ValueError(
+                    "approval id/reason are blank, malformed, or too long")
+            self._validate_container_format_staging_evidence(staging_evidence)
+
+        reporter = getattr(self, "container_format_schema_report", None)
+        if callable(reporter):
+            report = reporter()
+            state = report.get("installation_state")
+            if state == "partial" or (report.get("metadata")
+                                       and not report.get("ready")):
+                raise RuntimeError(
+                    "[DB] Refusing to apply migration 015 over a partial or "
+                    "drifted installation: " + "; ".join(report["issues"]))
+
+        sql_path = self.container_format_migration_path()
+        checksum = self.container_format_migration_checksum()
+        settings = {
+            "lto.container_format_migration_checksum": checksum,
+            "lto.container_format_exception_session_id": (
+                "" if exception_session_id is None
+                else str(int(exception_session_id))),
+            "lto.container_format_expected_boundary": (
+                "" if expected_boundary is None
+                else str(int(expected_boundary))),
+            "lto.container_format_approval_id": (
+                "" if approval_id is None else str(approval_id).strip()),
+            "lto.container_format_approval_reason": (
+                "" if approval_reason is None else str(approval_reason).strip()),
+            "lto.container_format_staging_evidence": (
+                "" if staging_evidence is None else json.dumps(
+                    staging_evidence, sort_keys=True, separators=(",", ":"))),
+        }
+
+        def apply_on(conn):
+            # One transaction owns both authorization and every DDL/backfill
+            # statement.  When the guarded CLI holds the archiver lock, this is
+            # deliberately the *same PostgreSQL session*: losing that session
+            # loses both the lock and the migration transaction.
+            with conn.transaction():
+                if require_archiver_lock:
+                    owned = conn.execute(
+                        """SELECT EXISTS (
+                               SELECT 1 FROM pg_locks
+                               WHERE locktype='advisory' AND granted
+                                 AND pid=pg_backend_pid()
+                                 AND classid=%s AND objid=%s
+                                 AND objsubid=1) AS owned""",
+                        (self.ARCHIVER_LOCK_KEY >> 32,
+                         self.ARCHIVER_LOCK_KEY & 0xFFFFFFFF),
+                    ).fetchone()["owned"]
+                    if not owned:
+                        raise RuntimeError(
+                            "[DB] Migration 015 requires the current database "
+                            "session to own the archiver advisory lock")
+                for name, value in settings.items():
+                    conn.execute("SELECT set_config(%s, %s, true)",
+                                 (name, value))
+                with conn.cursor() as cur:
+                    cur.execute(sql_path.read_text(encoding="utf-8"))
+
+        if require_archiver_lock:
+            if self._lock_conn is None:
+                raise RuntimeError(
+                    "[DB] Migration 015 requires a pinned archiver lock")
+            apply_on(self._lock_conn)
+        else:
+            with self._pool.connection() as conn:
+                apply_on(conn)
+        return [self.CONTAINER_FORMAT_MIGRATION]
+
+    # Exactly what migrations 016 and 017 install, used both to report
+    # installation state read-only and to validate an apply afterwards.
+    STORED_TAR_PLAN_TABLES = ("archive_container_members",)
+    STORED_TAR_PLAN_COLUMNS = {
+        "remote_chunks": ("stored_tar_max_size_bytes",),
+        "archive_containers": ("estimated_archive_bytes",),
+    }
+    STORED_TAR_PUBLICATION_COLUMNS = {
+        "archive_containers": (
+            "validated_part_locator", "validation_summary",
+            "disposition_counts"),
+    }
+    # Only constraints 017 ADDS.  `archive_containers_observed_ck` is
+    # deliberately absent: migration 015 already creates it and 017 merely
+    # drops and redefines it, so its presence says nothing about whether
+    # 016/017 ran -- counting it made a 015-only database report "partial".
+    STORED_TAR_PUBLICATION_CONSTRAINTS = (
+        "archive_containers_validated_part_ck",
+        "archive_containers_ready_pair_ck",
+    )
+    STORED_TAR_PLAN_INDEXES = ("idx_archive_container_members_container",)
+
+    @classmethod
+    def stored_tar_plan_migration_paths(cls):
+        sql_dir = Path(PROJECT_ROOT) / "scripts" / "sql"
+        return (sql_dir / cls.STORED_TAR_PLAN_MIGRATION,
+                sql_dir / cls.STORED_TAR_PUBLICATION_MIGRATION)
+
+    @classmethod
+    def stored_tar_plan_migration_checksums(cls):
+        """SHA-256 identity of migrations 016 and 017 (read-only)."""
+        return {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in cls.stored_tar_plan_migration_paths()}
+
+    @staticmethod
+    def _constraint_exists_conn(conn, table_name, constraint_name):
+        return conn.execute(
+            """SELECT 1 FROM pg_constraint c
+               JOIN pg_class t ON t.oid=c.conrelid
+               JOIN pg_namespace n ON n.oid=t.relnamespace
+               WHERE n.nspname='public' AND t.relname=%s AND c.conname=%s""",
+            (table_name, constraint_name),
+        ).fetchone() is not None
+
+    def _stored_tar_plan_schema_report_conn(self, conn):
+        report = {
+            "database": conn.execute(
+                "SELECT current_database() AS db").fetchone()["db"],
+            "expected_migration_checksums":
+                self.stored_tar_plan_migration_checksums(),
+            "installation_state": "absent",
+            "issues": [],
+            "apply_blocking": [],
+        }
+        issues = report["issues"]
+
+        # 016 and 017 both RAISE unless migration 015 is present.  Reporting
+        # that as a blocker keeps the ordering failure readable instead of
+        # surfacing as a raw PostgreSQL exception mid-apply.
+        prerequisites = ("archive_containers", "remote_chunks",
+                         "remote_plan_files", "archive_artifacts")
+        missing_prerequisites = [name for name in prerequisites
+                                 if not self._table_exists_conn(conn, name)]
+        if missing_prerequisites:
+            report["apply_blocking"].append(
+                "migrations 016/017 require migration 015 first; missing: "
+                + ", ".join(missing_prerequisites))
+
+        present = 0
+        expected = 0
+        for table in self.STORED_TAR_PLAN_TABLES:
+            expected += 1
+            if self._table_exists_conn(conn, table):
+                present += 1
+            else:
+                issues.append(f"missing table: {table}")
+        for group in (self.STORED_TAR_PLAN_COLUMNS,
+                      self.STORED_TAR_PUBLICATION_COLUMNS):
+            for table, columns in group.items():
+                for column in columns:
+                    expected += 1
+                    if self._column_exists_conn(conn, table, column):
+                        present += 1
+                    else:
+                        issues.append(f"missing column: {table}.{column}")
+        for constraint in self.STORED_TAR_PUBLICATION_CONSTRAINTS:
+            expected += 1
+            if self._constraint_exists_conn(
+                    conn, "archive_containers", constraint):
+                present += 1
+            else:
+                issues.append(f"missing constraint: {constraint}")
+        for index in self.STORED_TAR_PLAN_INDEXES:
+            expected += 1
+            if conn.execute(
+                    """SELECT 1 FROM pg_indexes
+                       WHERE schemaname='public' AND indexname=%s""",
+                    (index,)).fetchone() is not None:
+                present += 1
+            else:
+                issues.append(f"missing index: {index}")
+
+        if present == 0:
+            report["installation_state"] = "absent"
+        elif present == expected:
+            report["installation_state"] = "installed"
+        else:
+            report["installation_state"] = "partial"
+            report["apply_blocking"].append(
+                f"migrations 016/017 are partially installed "
+                f"({present}/{expected} objects): "
+                + "; ".join(issues))
+        report["objects_present"] = present
+        report["objects_expected"] = expected
+        report["ready"] = not issues
+        return report
+
+    def stored_tar_plan_schema_report(self):
+        """Exact, read-only migrations 016+017 report."""
+        return self._run_read(
+            self._stored_tar_plan_schema_report_conn,
+            "stored tar plan schema report")
+
+    def validate_stored_tar_plan_schema(self):
+        report = self.stored_tar_plan_schema_report()
+        if not report["ready"]:
+            raise RuntimeError(
+                "[DB] Stored-TAR plan schema missing or drifted: "
+                + "; ".join(report["issues"]))
+        return report
+
+    def apply_stored_tar_plan_schema(self, *, require_archiver_lock=False):
+        """Explicitly install Tasks 2.1-2.4 Stored-TAR persistence.
+
+        Migrations 016 and 017 are explicit-only and deliberately absent from
+        :meth:`_init_schema`.  Both are applied inside ONE transaction, in
+        order, so a failure in 017 cannot leave 016 half-committed.  Each
+        migration re-checks its own prerequisites in SQL, so the ordering
+        guarantee does not depend on this method.  The guarded inspector
+        command pins the archiver advisory lock to this same database session;
+        isolated tests may apply directly without that operational
+        precondition.
+        """
+        migrations = (
+            self.STORED_TAR_PLAN_MIGRATION,
+            self.STORED_TAR_PUBLICATION_MIGRATION,
+        )
+        paths = self.stored_tar_plan_migration_paths()
+
+        def apply_on(conn):
+            with conn.transaction():
+                if require_archiver_lock:
+                    owned = conn.execute(
+                        """SELECT EXISTS (
+                               SELECT 1 FROM pg_locks
+                               WHERE locktype='advisory' AND granted
+                                 AND pid=pg_backend_pid()
+                                 AND classid=%s AND objid=%s
+                                 AND objsubid=1) AS owned""",
+                        (self.ARCHIVER_LOCK_KEY >> 32,
+                         self.ARCHIVER_LOCK_KEY & 0xFFFFFFFF),
+                    ).fetchone()["owned"]
+                    if not owned:
+                        raise RuntimeError(
+                            "[DB] Refusing migrations 016/017 without the "
+                            "archiver advisory lock on this session")
+                with conn.cursor() as cur:
+                    for path in paths:
+                        cur.execute(path.read_text(encoding="utf-8"))
+
+        # The advisory lock lives on ONE pinned connection. Taking a fresh
+        # pooled connection here would run the assertion against a different
+        # backend pid and fail even while the lock is genuinely held, so the
+        # DDL must land on the lock-holding session itself (as migration 018
+        # does).
+        if require_archiver_lock:
+            if self._lock_conn is None:
+                raise RuntimeError(
+                    "[DB] Migrations 016/017 require a pinned archiver lock")
+            apply_on(self._lock_conn)
+        else:
+            with self._pool.connection() as conn:
+                apply_on(conn)
+        return list(migrations)
+
+    @classmethod
+    def manifest_directory_catalog_migration_path(cls):
+        return (Path(PROJECT_ROOT) / "scripts" / "sql"
+                / cls.MANIFEST_DIRECTORY_CATALOG_MIGRATION)
+
+    @classmethod
+    def manifest_directory_catalog_migration_checksum(cls):
+        """SHA-256 identity of explicit migration 018 (read-only)."""
+        return hashlib.sha256(
+            cls.manifest_directory_catalog_migration_path().read_bytes()
+        ).hexdigest()
+
+    def apply_manifest_directory_catalog_schema(
+            self, *, require_archiver_lock=False):
+        """Atomically apply migration 018 through its checksum guard.
+
+        Migration 018 is explicit-only and is deliberately absent from
+        :meth:`_init_schema`.  A single PostgreSQL transaction owns its
+        checksum authorization, all DDL, and the legacy ``plan_source``
+        backfill.  The guarded inspector command pins the archiver advisory
+        lock to this same database session; isolated tests may apply directly
+        without that operational precondition.
+        """
+        reporter = getattr(
+            self, "manifest_directory_catalog_schema_report", None)
+        if callable(reporter):
+            report = reporter()
+            state = report.get("installation_state")
+            if state == "partial" or (
+                    state == "installed"
+                    and not report.get("ready")):
+                raise RuntimeError(
+                    "[DB] Refusing to apply migration 018 over a partial or "
+                    "drifted installation: "
+                    + "; ".join(report.get("schema_issues")
+                                or report.get("issues") or ("unknown drift",)))
+
+        sql_path = self.manifest_directory_catalog_migration_path()
+        checksum = self.manifest_directory_catalog_migration_checksum()
+
+        def apply_on(conn):
+            with conn.transaction():
+                if require_archiver_lock:
+                    owned = conn.execute(
+                        """SELECT EXISTS (
+                               SELECT 1 FROM pg_locks
+                               WHERE locktype='advisory' AND granted
+                                 AND pid=pg_backend_pid()
+                                 AND classid=%s AND objid=%s
+                                 AND objsubid=1) AS owned""",
+                        (self.ARCHIVER_LOCK_KEY >> 32,
+                         self.ARCHIVER_LOCK_KEY & 0xFFFFFFFF),
+                    ).fetchone()["owned"]
+                    if not owned:
+                        raise RuntimeError(
+                            "[DB] Migration 018 requires the current database "
+                            "session to own the archiver advisory lock")
+                conn.execute(
+                    "SELECT set_config(%s, %s, true)",
+                    ("lto.manifest_directory_catalog_migration_checksum",
+                     checksum))
+                with conn.cursor() as cur:
+                    cur.execute(sql_path.read_text(encoding="utf-8"))
+
+        if require_archiver_lock:
+            if self._lock_conn is None:
+                raise RuntimeError(
+                    "[DB] Migration 018 requires a pinned archiver lock")
+            apply_on(self._lock_conn)
+        else:
+            with self._pool.connection() as conn:
+                apply_on(conn)
+        return [self.MANIFEST_DIRECTORY_CATALOG_MIGRATION]
+
+    @staticmethod
+    def _validate_container_format_staging_evidence(evidence):
+        """Accept only a fresh, path-free local-staging attestation."""
+        expected_keys = {
+            "root_accessible", "checked_chunk_indexes", "entry_count",
+            "unreadable_count", "checked_at"}
+        if not isinstance(evidence, dict) or set(evidence) != expected_keys:
+            raise ValueError(
+                "staging evidence must contain only the approved aggregate "
+                "fields")
+        if evidence["root_accessible"] is not True:
+            raise ValueError("staging root was not proved accessible")
+        indexes = evidence["checked_chunk_indexes"]
+        if (not isinstance(indexes, list)
+                or any(isinstance(value, bool) or not isinstance(value, int)
+                       or value < 0 for value in indexes)
+                or indexes != sorted(set(indexes))):
+            raise ValueError("staging chunk indexes are not canonical")
+        for name in ("entry_count", "unreadable_count"):
+            value = evidence[name]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"staging evidence {name} is invalid")
+        try:
+            checked_at = datetime.fromisoformat(str(evidence["checked_at"]))
+            if checked_at.tzinfo is None:
+                raise ValueError
+            age = (datetime.now(timezone.utc)
+                   - checked_at.astimezone(timezone.utc)).total_seconds()
+        except (TypeError, ValueError) as exc:
+            raise ValueError("staging evidence timestamp is invalid") from exc
+        if age < -5 or age > 300:
+            raise ValueError("staging evidence is stale or from the future")
 
     # ------------------------------------------------------------------
     # Migration 014 — incremental scan frontier (Plan 1, Task 2.1)

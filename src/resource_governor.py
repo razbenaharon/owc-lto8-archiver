@@ -102,6 +102,12 @@ class ResourceGovernor:
     def tape_write_exclusive(self):
         return _bool_config(self.cfg, "tape_write_exclusive", True)
 
+    @property
+    def staging_reserve_bytes(self):
+        return int(getattr(
+            self.cfg, "local_staging_reserve_bytes",
+            LOCAL_STAGING_RESERVE_BYTES))
+
     def _virtual_memory(self):
         if psutil is None:
             return None
@@ -169,7 +175,7 @@ class ResourceGovernor:
 
     def _staging_ok(self, needed_bytes=0, queued_bytes=0):
         needed = max(0, int(needed_bytes or 0)) + max(0, int(queued_bytes or 0))
-        return (self._disk_free() - needed) >= LOCAL_STAGING_RESERVE_BYTES
+        return (self._disk_free() - needed) >= self.staging_reserve_bytes
 
     def _effective_fetch_min_free_bytes(self, wait_seconds=0):
         target = self.fetch_min_free_ram_bytes

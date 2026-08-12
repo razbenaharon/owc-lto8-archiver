@@ -2,6 +2,7 @@
 import os
 import re
 import shutil
+import tarfile
 import uuid
 import zipfile
 import posixpath
@@ -9,12 +10,20 @@ import ntpath
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
+from .archive_artifacts import (TAR_SIDECAR_VERSION, ArtifactError,
+                                is_ltfs_locator,
+                                resolve_local_metadata_locator,
+                                search_tar_sidecar)
 from .db import _fmt_ts
 from .ltfs import get_volume_label
 from .local_manifest_archive import find_manifest_record, search_manifests
 from .packer import StagingSpaceError, ensure_staging_space
 from .robocopy import _robocopy_file
 from .runtime import CANCEL, _acquire_tape_io_lock, _release_tape_io_lock
+from .pipeline_types import ContainerFormat
+from .tar_container import (STORED_TAR_DIALECT, STORED_TAR_FORMAT_VERSION,
+                            StoredTarError, StoredTarReader,
+                            validate_tar_member_name)
 
 if TYPE_CHECKING:
     from .pg_db import PgDatabaseManager
@@ -133,6 +142,66 @@ class LTORetriever:
             rel_path = mod.relpath(original, restore_base)
         safe_rel = self._safe_restore_relpath(rel_path or record['file_name'])
         return self._unique_dest_path(os.path.join(self.restore_dir, safe_rel))
+
+    @staticmethod
+    def _route_container_format(record):
+        """Return persisted container format, ``None`` for a loose file.
+
+        The one compatibility exception is an unlinked legacy packed row.  It
+        is adapted explicitly to ZIP only when it has the historical bundle
+        locator; extensions are never inspected.
+        """
+        value = (record.get("container_format")
+                 or record.get("restore_container_format")
+                 or record.get("bundle_container_format"))
+        if value:
+            try:
+                return ContainerFormat(value)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"[RESTORE] Unsupported persisted container format: {value!r}") from exc
+        if record.get("container_id") is not None:
+            raise RuntimeError(
+                "[RESTORE] Linked container has no persisted format; refusing "
+                "to guess from packing state or filename")
+        # Legacy adapter only: schemas predating migration 015 genuinely have
+        # no durable format column.  A packed row linked to a historical bundle
+        # locator is ZIP; this branch must never override persisted metadata.
+        if record.get("is_packed") is True and (
+                record.get("bundle_id") is not None
+                or record.get("container_name")
+                or record.get("tape_container_locator")):
+            return ContainerFormat.ZIP
+        if record.get("is_packed") is False:
+            return None
+        raise RuntimeError(
+            "[RESTORE] Record has neither a container format nor an explicit "
+            "loose-file identity")
+
+    def _local_container_path(self, record):
+        locator = record.get("local_container_locator")
+        if not locator or is_ltfs_locator(
+                locator, tape_root=self.tape_drive,
+                tape_locator=record.get("tape_container_locator")):
+            return None
+        return os.path.abspath(str(locator))
+
+    def _record_needs_tape(self, record):
+        route = self._route_container_format(record)
+        if route is None or route is ContainerFormat.ZIP:
+            return True
+        # TAR routing first proves local sidecar availability.  If the data
+        # container is not local, _restore_container verifies the tape only
+        # after that proof; callers must not probe LTFS earlier.
+        return False
+
+    def _restore_record(self, record, restore_base=None):
+        route = self._route_container_format(record)
+        if route is None:
+            return self._restore_loose(record, restore_base=restore_base)
+        if route is ContainerFormat.ZIP:
+            return self._restore_packed(record, restore_base=restore_base)
+        return self._restore_container([record], restore_base=restore_base)
 
     @staticmethod
     def _copy_file_to(src, dst):
@@ -302,11 +371,9 @@ class LTORetriever:
             if not record:
                 print("[RETRIEVER] File ID not found.")
                 continue
-            self._verify_tape(record['tape_label'])
-            if record['is_packed']:
-                self._restore_packed(record, restore_base=restore_base)
-            else:
-                self._restore_loose(record, restore_base=restore_base)
+            if self._record_needs_tape(record):
+                self._verify_tape(record['tape_label'])
+            self._restore_record(record, restore_base=restore_base)
             return
 
     @staticmethod
@@ -361,11 +428,9 @@ class LTORetriever:
         if not record:
             print("[RETRIEVER] Manifest file ID not found.")
             return
-        self._verify_tape(record["tape_label"])
-        if record["is_packed"]:
-            self._restore_packed(record)
-        else:
-            self._restore_loose(record)
+        if self._record_needs_tape(record):
+            self._verify_tape(record["tape_label"])
+        self._restore_record(record)
 
     def _restore_all_pages(self, fetch_after, total_results, restore_base=None):
         # One tape at a time: a multi-tape restore used to interleave tapes
@@ -401,10 +466,14 @@ class LTORetriever:
 
         for tape_label, tape_records in by_tape.items():
             self._check_cancelled()
-            self._verify_tape(tape_label)
+            if any(self._record_needs_tape(r) for r in tape_records):
+                self._verify_tape(tape_label)
 
-            loose  = [r for r in tape_records if not r['is_packed']]
-            packed = [r for r in tape_records if r['is_packed']]
+            loose = []
+            contained = []
+            for record in tape_records:
+                route = self._route_container_format(record)
+                (loose if route is None else contained).append(record)
 
             for record in loose:
                 self._check_cancelled()
@@ -412,15 +481,27 @@ class LTORetriever:
                 done += 1
                 print(f"[RESTORE] Progress: {done}/{total}")
 
-            # Group packed files by ZIP bundle so each bundle is copied only once
+            # Group by persisted format + durable identity so one request can
+            # span legacy ZIP, Stored TAR and loose records safely.
             by_container = defaultdict(list)
-            for r in packed:
-                by_container[r['container_name']].append(r)
+            for r in contained:
+                route = self._route_container_format(r)
+                identity = (r.get("container_id")
+                            or r.get("tape_container_locator")
+                            or r.get("container_name"))
+                by_container[(route.value, identity)].append(r)
 
-            for container_path, container_records in by_container.items():
+            for (_format, _identity), container_records in by_container.items():
                 self._check_cancelled()
-                self._restore_packed_bulk(container_path, container_records,
-                                          restore_base=restore_base)
+                if self._route_container_format(
+                        container_records[0]) is ContainerFormat.ZIP:
+                    path = (container_records[0].get("tape_container_locator")
+                            or container_records[0].get("container_name"))
+                    self._restore_packed_bulk(
+                        path, container_records, restore_base=restore_base)
+                else:
+                    self._restore_container(
+                        container_records, restore_base=restore_base)
                 done += len(container_records)
                 print(f"[RESTORE] Progress: {done}/{total}")
 
@@ -443,7 +524,7 @@ class LTORetriever:
                     f"[RESTORE] Cancelled: tape '{required_label}' was not mounted.")
 
     def _bundle_staging_space_ok(self, tape_zip_path):
-        """Check the staging disk can hold a bundle ZIP before reading it off
+        """Check staging can hold a container before reading it off
         tape. The size probe is an LTFS metadata read, so it takes the tape
         lock like every other tape access."""
         _acquire_tape_io_lock(f"stat {os.path.basename(tape_zip_path)}")
@@ -502,6 +583,224 @@ class LTORetriever:
                             f"({len(base_matches)} entries share this name) and "
                             f"the stored path '{stored_in_zip}' is absent — "
                             "refusing to guess.")
+
+    def _sidecar_locator_for_record(self, record):
+        locator = (record.get("local_sidecar_locator")
+                   or record.get("permanent_local_metadata_locator"))
+        if locator:
+            return locator, record.get("sidecar_artifact_version")
+        container_id = record.get("container_id")
+        finder = getattr(self.db, "find_container_restore_sidecars", None)
+        if container_id is not None and finder is not None:
+            rows = finder([container_id])
+            if rows:
+                row = rows[0]
+                return (row.get("local_locator")
+                        or row.get("permanent_local_metadata_locator"),
+                        row.get("artifact_version"))
+        return None, None
+
+    def _load_tar_sidecar(self, record, *, directory=None, limit=1_000_000):
+        locator, artifact_version = self._sidecar_locator_for_record(record)
+        path = resolve_local_metadata_locator(
+            self.manifest_archive_root, locator,
+            tape_root=self.tape_drive,
+            tape_locator=(record.get("tape_sidecar_locator")
+                          or record.get("tape_container_locator")
+                          or record.get("container_name")))
+        # The artifact identity and JSON header carry the same contract
+        # version. Legacy/synthetic callers without the identity still have to
+        # satisfy the one Phase-1 sidecar version.
+        expected_version = artifact_version or TAR_SIDECAR_VERSION
+        try:
+            return search_tar_sidecar(
+                path, directory=directory, limit=limit,
+                expected_version=expected_version,
+                expected_container_id=record.get("container_id"),
+                expected_member_count=record.get("expected_member_count"))
+        except ArtifactError:
+            raise
+        except Exception as exc:
+            raise ArtifactError(
+                "local TAR sidecar is unreadable or structurally invalid; "
+                "restore will not fall back to scanning tape") from exc
+
+    @staticmethod
+    def _publish_temp_no_clobber(temp_path, candidate):
+        """Atomically publish a same-volume temp without replacing a file."""
+        base, ext = os.path.splitext(candidate)
+        counter = 0
+        while True:
+            target = candidate if counter == 0 else f"{base}_{counter}{ext}"
+            try:
+                os.link(temp_path, target)
+            except FileExistsError:
+                counter += 1
+                continue
+            except OSError as exc:
+                raise RuntimeError(
+                    "[RESTORE] Atomic no-clobber publication is unavailable "
+                    f"for {target!r}") from exc
+            os.remove(temp_path)
+            return target
+
+    def _copy_tar_stream(self, source, output, expected_size):
+        written = 0
+        while True:
+            self._check_cancelled()
+            chunk = source.read(min(1024 * 1024, expected_size - written + 1))
+            if not chunk:
+                break
+            output.write(chunk)
+            written += len(chunk)
+            if written > expected_size:
+                raise StoredTarError("extracted TAR member exceeds expected size")
+        if written != expected_size:
+            raise StoredTarError(
+                f"extracted TAR member size mismatch: {written} != {expected_size}")
+        return written
+
+    def _restore_tar_members(self, local_tar, records, restore_base=None,
+                             sidecar=None):
+        """Validate the full TAR, then extract selected members atomically."""
+        if not records:
+            return 0
+        first = records[0]
+        sidecar = sidecar or self._load_tar_sidecar(first)
+        format_version = first.get("format_version") or STORED_TAR_FORMAT_VERSION
+        tar_dialect = first.get("tar_dialect") or STORED_TAR_DIALECT
+        with open(local_tar, "rb") as tar_stream:
+            validated = StoredTarReader(
+                tar_stream, tar_dialect=tar_dialect,
+                format_version=format_version).validate(
+                    sidecar.expected_members,
+                    expected_member_count=first.get("expected_member_count"),
+                    expected_logical_bytes=first.get("expected_logical_bytes"))
+            expected_by_name = {item.name: item for item in validated.members}
+            wanted = {}
+            for record in records:
+                name = validate_tar_member_name(
+                    record.get("member_name") or record.get("stored_path"))
+                member = expected_by_name.get(name)
+                if member is None:
+                    raise StoredTarError(
+                        "selected TAR member is absent from validated sidecar: "
+                        f"{name!r}")
+                size = record.get("file_size_bytes")
+                if size is not None and int(size) != member.logical_size:
+                    raise StoredTarError(
+                        f"catalog/sidecar size mismatch for {name!r}")
+                wanted[name] = (record, member.logical_size)
+
+            restored = 0
+            seen = set()
+            tar_stream.seek(0)
+            tf = tarfile.open(fileobj=tar_stream, mode="r:")
+            try:
+                for info in tf:
+                    normalized = validate_tar_member_name(info.name)
+                    if normalized not in wanted:
+                        continue
+                    if not info.isfile():
+                        raise StoredTarError(
+                            "selected TAR member is not a regular file: "
+                            f"{info.name!r}")
+                    record, expected_size = wanted[normalized]
+                    if int(info.size) != int(expected_size):
+                        raise StoredTarError(
+                            f"TAR extraction size disagrees for {info.name!r}")
+                    source = tf.extractfile(info)
+                    if source is None:
+                        raise StoredTarError(
+                            f"TAR member cannot be opened: {info.name!r}")
+                    dst = self._destination_for_record(
+                        record, restore_base=restore_base)
+                    dst_dir = os.path.dirname(os.path.abspath(dst))
+                    os.makedirs(dst_dir, exist_ok=True)
+                    temp_path = os.path.join(
+                        dst_dir, f".restore_tar_{uuid.uuid4().hex}.part")
+                    try:
+                        with source, open(temp_path, "xb") as output:
+                            self._copy_tar_stream(source, output, expected_size)
+                        self._check_cancelled()
+                        published = self._publish_temp_no_clobber(temp_path, dst)
+                        print(f"[OK] {record['file_name']} -> {published}")
+                        restored += 1
+                        seen.add(normalized)
+                    finally:
+                        try:
+                            os.remove(temp_path)
+                        except FileNotFoundError:
+                            pass
+            finally:
+                tf.close()
+        missing = set(wanted) - seen
+        if missing:
+            raise StoredTarError(
+                f"validated TAR extraction did not encounter: {sorted(missing)!r}")
+        return restored
+
+    def _restore_container(self, records, restore_base=None, sidecar=None):
+        """Restore one explicitly selected persisted container."""
+        if not records:
+            return 0
+        route = self._route_container_format(records[0])
+        if route is ContainerFormat.ZIP:
+            locator = (records[0].get("tape_container_locator")
+                       or records[0].get("container_name"))
+            return self._restore_packed_bulk(
+                locator, records, restore_base=restore_base)
+        if route is not ContainerFormat.STORED_TAR:
+            raise RuntimeError("[RESTORE] A loose file is not a container")
+
+        record = records[0]
+        try:
+            sidecar = sidecar or self._load_tar_sidecar(record)
+        except ArtifactError as exc:
+            print(f"[ERROR] Stored TAR restore refused: {exc}")
+            return 0
+        local_tar = self._local_container_path(record)
+        owns_staged_copy = False
+        if not (local_tar and os.path.isfile(local_tar)):
+            self._verify_tape(record["tape_label"])
+            tape_path = self._resolve_tape_path(
+                record.get("tape_container_locator")
+                or record.get("container_name"))
+            if not tape_path:
+                raise RuntimeError(
+                    "[RESTORE] Stored TAR has neither an available local "
+                    "locator nor a tape locator")
+            os.makedirs(self.staging_dir, exist_ok=True)
+            local_tar = os.path.join(
+                self.staging_dir,
+                f"restore_{uuid.uuid4().hex}_{os.path.basename(tape_path)}")
+            if not self._bundle_staging_space_ok(tape_path):
+                return 0
+            _acquire_tape_io_lock(f"restore {os.path.basename(tape_path)}")
+            try:
+                ok = _robocopy_file(tape_path, local_tar)
+            finally:
+                _release_tape_io_lock()
+            if not ok:
+                print("[ERROR] Could not copy Stored TAR from tape: robocopy error")
+                return 0
+            owns_staged_copy = True
+        try:
+            return self._restore_tar_members(
+                local_tar, records, restore_base=restore_base,
+                sidecar=sidecar)
+        except (ArtifactError, StoredTarError, tarfile.TarError,
+                OSError, RuntimeError) as exc:
+            if CANCEL.is_set():
+                raise
+            print(f"[ERROR] Stored TAR restore refused: {exc}")
+            return 0
+        finally:
+            if owns_staged_copy:
+                try:
+                    os.remove(local_tar)
+                except OSError:
+                    pass
 
     def _restore_packed(self, record, restore_base=None):
         # Full path of the ZIP on tape, remapped to the current drive letter.
@@ -621,11 +920,12 @@ class LTORetriever:
         return bool(d) and (c == d or c.startswith(d + "/"))
 
     def _restore_directory_complete(self, dir_q):
-        """Restore a whole SOURCE directory — small files included — by pulling
-        each bundle ZIP that covers its subtree from tape and extracting ONLY
-        the entries under it. No per-file catalog lookup, no manifest read: the
-        007 directory catalog gives the bundle(s), and the ZIP's own entry list
-        (reconstructed to full source paths) decides what to extract."""
+        """Restore a SOURCE directory across ZIP and Stored TAR containers.
+
+        ZIP keeps its historical entry-list routing. Stored TAR uses only its
+        selected permanent local sidecar and therefore also restores members
+        that have no permanent ``files_index`` row.
+        """
         needle = (dir_q or "").strip().strip('"').replace("\\", "/").rstrip("/")
         if not needle:
             return
@@ -643,19 +943,63 @@ class LTORetriever:
         os.makedirs(self.restore_dir, exist_ok=True)
         by_tape = defaultdict(list)
         for bundle in bundles:
+            if not bundle.get("container_format"):
+                if bundle.get("container_id") is not None:
+                    print("[ERROR] Linked directory container has no persisted "
+                          "format; refusing to guess.")
+                    return
+                bundle = dict(bundle)
+                bundle.update({
+                    "container_format": ContainerFormat.ZIP.value,
+                    "format_version": "legacy-zip-v1",
+                    "is_packed": True,
+                    "container_name": bundle.get("stored_bundle_path"),
+                    "tape_container_locator": bundle.get(
+                        "stored_bundle_path"),
+                })
             by_tape[bundle["tape_label"]].append(bundle)
         print(f"\n[RESTORE] {len(bundles)} bundle(s) across "
               f"{len(by_tape)} tape(s) cover '{needle}'.")
         total = 0
         for tape_label, tape_bundles in by_tape.items():
             self._check_cancelled()
-            self._verify_tape(tape_label)
+            if any(self._record_needs_tape(b) for b in tape_bundles):
+                self._verify_tape(tape_label)
             for bundle in tape_bundles:
-                total += self._extract_bundle_subtree(
-                    bundle["stored_bundle_path"], bundle["base_path"],
-                    needle, restore_base)
+                total += self._extract_container_subtree(
+                    bundle, needle, restore_base)
         print(f"\n[RESTORE] Directory restore complete: {total} file(s) "
               f"extracted to {self.restore_dir}")
+
+    def _extract_container_subtree(self, bundle, dir_path, restore_base):
+        route = self._route_container_format(bundle)
+        if route is ContainerFormat.ZIP:
+            return self._extract_bundle_subtree(
+                bundle.get("tape_container_locator")
+                or bundle["stored_bundle_path"],
+                bundle.get("source_base_path") or bundle.get("base_path"),
+                dir_path, restore_base)
+        if route is not ContainerFormat.STORED_TAR:
+            raise RuntimeError("[RESTORE] Directory route is not a container")
+        try:
+            sidecar = self._load_tar_sidecar(
+                bundle, directory=dir_path, limit=1_000_000)
+        except ArtifactError as exc:
+            print(f"[ERROR] Stored TAR directory restore refused: {exc}")
+            return 0
+        if not sidecar.matches:
+            return 0
+        records = []
+        for match in sidecar.matches:
+            record = dict(bundle)
+            record.update(match)
+            record["is_packed"] = True
+            record["container_name"] = (
+                bundle.get("tape_container_locator")
+                or bundle.get("stored_bundle_path"))
+            records.append(record)
+        return self._restore_container(
+            records, restore_base=restore_base, sidecar=sidecar)
 
     def _extract_bundle_subtree(self, tape_zip_path, base_path, dir_path,
                                 restore_base):

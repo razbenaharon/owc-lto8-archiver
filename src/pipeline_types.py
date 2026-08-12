@@ -7,11 +7,13 @@ and :class:`FileRecord` annotates the packer/catalog metadata records
 (annotation only — the records stay plain dicts because the DB layer
 consumes them via ``.get()``).
 """
+import os
+import stat
 import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 
 class SessionStatus(str, Enum):
@@ -64,6 +66,22 @@ class FileTransferStatus(str, Enum):
     UNRESOLVED = "unresolved"
 
 
+class SourceDisposition(str, Enum):
+    """Observable disposition of one sealed Stored-TAR plan ordinal.
+
+    This is deliberately separate from ``remote_file_state.status``.  A TAR
+    sidecar describes what one immutable container attempt observed, while the
+    remote-file state machine describes the wider chunk workflow.
+    """
+
+    ARCHIVED = "archived"
+    SOURCE_MISSING = "source_missing"
+    SOURCE_PERMISSION_DENIED = "source_permission_denied"
+    SOURCE_UNREADABLE = "source_unreadable"
+    SOURCE_CHANGED = "source_changed"
+    UNRESOLVED = "unresolved"
+
+
 #: The subset legal on a database that has NOT applied migration 014.
 LEGACY_FILE_STATUSES = frozenset({
     FileTransferStatus.PENDING, FileTransferStatus.FETCHING,
@@ -89,6 +107,196 @@ class MembershipState(str, Enum):
 
     BUILDING = "building"
     SEALED = "sealed"
+
+
+class DirectoryBackupStatus(str, Enum):
+    """The five directory states, in strict precedence order.
+
+    Plan 3, Task 2.2. Order matters: :func:`resolve_directory_status` walks
+    these top to bottom, and the first match wins. ``AMBIGUOUS`` is first
+    because conflicting evidence must never be resolved by a later, more
+    optimistic rule.
+    """
+
+    AMBIGUOUS = "ambiguous"
+    PROVISIONAL = "provisional"
+    INCOMPLETE = "incomplete"
+    COMPLETE_WITH_SOURCE_EXCEPTIONS = "complete_with_source_exceptions"
+    COMPLETE = "complete"
+
+
+class ContainerFormat(str, Enum):
+    """Durable ``remote_chunks`` / ``archive_containers`` format authority.
+
+    A filename extension is intentionally not represented here: readers route
+    from this persisted value, never from ``.zip``/``.tar`` spelling.
+    """
+
+    ZIP = "zip"
+    STORED_TAR = "stored_tar"
+
+
+class ArtifactKind(str, Enum):
+    """Versioned metadata artifacts reserved by migration 015."""
+
+    ZIP_MANIFEST = "zip_manifest"
+    TAR_SIDECAR = "tar_sidecar"
+    PLAN_MANIFEST = "plan_manifest"
+    TERMINAL_MANIFEST = "terminal_manifest"
+
+
+class ArtifactReadiness(str, Enum):
+    """Publication state of one local/tape metadata artifact."""
+
+    PLANNED = "planned"
+    WRITING = "writing"
+    VALIDATED = "validated"
+    READY = "ready"
+    FAILED = "failed"
+    BLOCKED = "blocked"
+
+
+class ContainerValidationState(str, Enum):
+    """Local validation state of one container data file."""
+
+    PLANNED = "planned"
+    BUILDING = "building"
+    VALIDATED_PART = "validated_part"
+    READY = "ready"
+    FAILED = "failed"
+    BLOCKED = "blocked"
+
+
+class ContainerWriterState(str, Enum):
+    """Physical copy state, deliberately separate from catalog state."""
+
+    NOT_STARTED = "not_started"
+    WRITING = "writing"
+    COPIED = "copied"
+    FAILED = "failed"
+    AMBIGUOUS = "ambiguous"
+
+
+class ContainerCatalogState(str, Enum):
+    """Catalog commit state after a successful physical copy."""
+
+    NOT_STARTED = "not_started"
+    COMMITTING = "committing"
+    COMMITTED = "committed"
+    FAILED = "failed"
+    AMBIGUOUS = "ambiguous"
+
+
+class ContainerRecord(TypedDict, total=False):
+    """Typed database-facing archive-container record."""
+
+    container_id: int
+    session_id: int
+    chunk_index: int
+    container_ordinal: int
+    container_format: str
+    format_version: str
+    tar_dialect: Optional[str]
+    storage_class: str
+    container_name: str
+    temporary_data_locator: Optional[str]
+    permanent_local_metadata_locator: Optional[str]
+    expected_member_count: int
+    expected_logical_bytes: int
+    observed_member_count: Optional[int]
+    observed_logical_bytes: Optional[int]
+    actual_artifact_bytes: Optional[int]
+    validated_part_locator: Optional[str]
+    validation_summary: Optional[Dict[str, Any]]
+    disposition_counts: Optional[Dict[str, int]]
+    validation_state: str
+    writer_state: str
+    catalog_state: str
+
+
+class ArtifactRecord(TypedDict, total=False):
+    """Typed database-facing local/tape artifact record."""
+
+    artifact_id: int
+    session_id: int
+    chunk_index: int
+    container_id: Optional[int]
+    artifact_kind: str
+    artifact_version: str
+    local_locator: Optional[str]
+    tape_locator: Optional[str]
+    artifact_size_bytes: Optional[int]
+    readiness_state: str
+
+
+@dataclass(frozen=True)
+class StoredTarExpectedMember:
+    """One immutable plan/sidecar expectation for a Stored TAR member.
+
+    ``source_exception`` is evidence about a planned source entry that was not
+    archived.  Such a record may omit ``name`` because Plan 2 sidecars must not
+    invent a TAR member name for an absent source.  The TAR reader accepts only
+    the three explicit source outcomes that Plan 2 permits; it never infers one
+    from the TAR's contents.
+    """
+
+    name: Optional[str]
+    logical_size: int
+    ordinal: int
+    source_exception: Optional[FileTransferStatus] = None
+
+
+@dataclass(frozen=True)
+class StoredTarMember:
+    """Observed regular-file member returned by the strict streaming reader."""
+
+    name: str
+    normalized_name: str
+    logical_size: int
+    stored_size: int
+    ordinal: int
+    sparse: bool = False
+    sparse_extent_count: int = 0
+
+
+@dataclass(frozen=True)
+class StoredTarContainer:
+    """Successful full-container validation result.
+
+    ``archive_size`` includes the two end blocks and GNU ``-b 512`` zero
+    padding.  Content hashes are intentionally absent from this contract.
+    """
+
+    container_format: ContainerFormat
+    format_version: str
+    tar_dialect: str
+    members: Tuple[StoredTarMember, ...]
+    member_count: int
+    logical_bytes: int
+    archive_size: int
+
+
+@dataclass(frozen=True)
+class StoredTarSourceDiagnostic:
+    """Machine-attributed source evidence captured by direct TAR transport."""
+
+    plan_ordinal: int
+    path: str
+    disposition: SourceDisposition
+    evidence: str
+
+
+@dataclass(frozen=True)
+class StoredTarValidationSummary:
+    """Owner-scoped proof that a still-unpublished TAR part matches its plan."""
+
+    container_ordinal: int
+    member_count: int
+    logical_bytes: int
+    archive_size: int
+    plan_ordinal_count: int
+    disposition_counts: Dict[str, int]
+    members: Tuple[StoredTarMember, ...]
 
 
 #: Allowed chunk transitions. Anything not listed is refused and leaves the old
@@ -303,6 +511,15 @@ class FileRecord(TypedDict, total=False):
     manifest_format: Optional[str]
     manifest_compression: Optional[str]
     original_root_dir: Optional[str]
+    container_id: Optional[int]
+    container_format: str
+    container_ordinal: Optional[int]
+    artifact_id: Optional[int]
+    artifact_kind: Optional[str]
+    artifact_version: Optional[str]
+    actual_artifact_bytes: Optional[int]
+    tape_generation_id: Optional[int]
+    archive_run_id: Optional[int]
 
 
 class ScanMetrics:
@@ -440,6 +657,152 @@ class ScanMetrics:
             }
 
 
+@dataclass(frozen=True)
+class StagedContainer:
+    """One database-identified container ready in local staging.
+
+    ``data_path`` is the concrete file copied by the writer;
+    ``temporary_data_locator`` is the locator persisted in
+    ``archive_containers``.  They are kept explicit because later phases may
+    store locators relative to a configured root while staging uses an absolute
+    path.  ``database_validation_state`` is the state read back from PostgreSQL,
+    so the in-memory handoff cannot claim readiness the database does not.
+    """
+
+    container_id: int
+    session_id: int
+    chunk_index: int
+    container_ordinal: int
+    container_format: ContainerFormat
+    format_version: str
+    storage_class: str
+    container_name: str
+    data_path: str
+    temporary_data_locator: str
+    data_size_bytes: int
+    expected_member_count: int
+    expected_logical_bytes: int
+    observed_member_count: int
+    observed_logical_bytes: int
+    permanent_local_metadata_locator: Optional[str] = None
+    validation_state: ContainerValidationState = ContainerValidationState.READY
+    database_validation_state: ContainerValidationState = (
+        ContainerValidationState.READY)
+    tar_dialect: Optional[str] = None
+
+    def __post_init__(self):
+        object.__setattr__(
+            self, "container_format", ContainerFormat(self.container_format))
+        object.__setattr__(
+            self, "validation_state",
+            ContainerValidationState(self.validation_state))
+        object.__setattr__(
+            self, "database_validation_state",
+            ContainerValidationState(self.database_validation_state))
+        numeric = (
+            self.container_id, self.session_id, self.chunk_index,
+            self.container_ordinal, self.data_size_bytes,
+            self.expected_member_count, self.expected_logical_bytes,
+            self.observed_member_count, self.observed_logical_bytes,
+        )
+        if any(int(value) < 0 for value in numeric):
+            raise ValueError("staged container identities/counts cannot be negative")
+        if (not self.format_version or not self.storage_class
+                or not self.container_name or not self.data_path
+                or not self.temporary_data_locator):
+            raise ValueError(
+                "staged container format/storage/name/data locators are required")
+        if self.container_format is ContainerFormat.STORED_TAR:
+            if not self.tar_dialect:
+                raise ValueError("Stored TAR container requires a persisted dialect")
+        elif self.tar_dialect is not None:
+            raise ValueError("ZIP container cannot carry a TAR dialect")
+
+    def assert_writer_ready(self):
+        if self.validation_state is not ContainerValidationState.READY:
+            raise RuntimeError(
+                f"container {self.container_id} is not locally ready: "
+                f"{self.validation_state.value}")
+        if self.database_validation_state is not self.validation_state:
+            raise RuntimeError(
+                f"container {self.container_id} readiness disagrees with the "
+                "database")
+        if self.data_path.lower().endswith(".part"):
+            raise RuntimeError(
+                f"container {self.container_id} still has a .part name")
+        if int(self.expected_member_count) != int(self.observed_member_count):
+            raise RuntimeError(
+                f"container {self.container_id} member count disagrees with "
+                "its expected count")
+        if int(self.expected_logical_bytes) != int(self.observed_logical_bytes):
+            raise RuntimeError(
+                f"container {self.container_id} logical bytes disagree with "
+                "its expected bytes")
+        actual = _readable_regular_file_size(
+            self.data_path, f"container {self.container_id}")
+        if actual != int(self.data_size_bytes):
+            raise RuntimeError(
+                f"container {self.container_id} size changed: expected "
+                f"{self.data_size_bytes}, found {actual}")
+
+
+@dataclass(frozen=True)
+class StagedArtifact:
+    """One database-identified artifact copied beside a staged container."""
+
+    artifact_id: int
+    session_id: int
+    chunk_index: int
+    artifact_kind: ArtifactKind
+    artifact_version: str
+    staged_path: str
+    local_locator: str
+    staged_size_bytes: int
+    readiness_state: ArtifactReadiness = ArtifactReadiness.READY
+    database_readiness_state: ArtifactReadiness = ArtifactReadiness.READY
+    container_id: Optional[int] = None
+
+    def __post_init__(self):
+        object.__setattr__(self, "artifact_kind", ArtifactKind(self.artifact_kind))
+        object.__setattr__(
+            self, "readiness_state", ArtifactReadiness(self.readiness_state))
+        object.__setattr__(
+            self, "database_readiness_state",
+            ArtifactReadiness(self.database_readiness_state))
+        if any(int(value) < 0 for value in (
+                self.artifact_id, self.session_id, self.chunk_index,
+                self.staged_size_bytes)):
+            raise ValueError("staged artifact identities/sizes cannot be negative")
+        if self.container_id is not None and int(self.container_id) < 0:
+            raise ValueError("staged artifact container identity cannot be negative")
+        if not self.artifact_version or not self.staged_path or not self.local_locator:
+            raise ValueError("staged artifact version and locators are required")
+        container_scoped = self.artifact_kind in {
+            ArtifactKind.ZIP_MANIFEST, ArtifactKind.TAR_SIDECAR}
+        if container_scoped != (self.container_id is not None):
+            raise ValueError(
+                f"artifact {self.artifact_kind.value} has the wrong scope")
+
+    def assert_writer_ready(self):
+        if self.readiness_state is not ArtifactReadiness.READY:
+            raise RuntimeError(
+                f"artifact {self.artifact_id} is not locally ready: "
+                f"{self.readiness_state.value}")
+        if self.database_readiness_state is not self.readiness_state:
+            raise RuntimeError(
+                f"artifact {self.artifact_id} readiness disagrees with the "
+                "database")
+        if self.staged_path.lower().endswith(".part"):
+            raise RuntimeError(
+                f"artifact {self.artifact_id} still has a .part name")
+        actual = _readable_regular_file_size(
+            self.staged_path, f"artifact {self.artifact_id}")
+        if actual != int(self.staged_size_bytes):
+            raise RuntimeError(
+                f"artifact {self.artifact_id} size changed: expected "
+                f"{self.staged_size_bytes}, found {actual}")
+
+
 @dataclass
 class StagedChunk:
     """A fetched-and-packed chunk, queued for the tape writer.
@@ -464,6 +827,425 @@ class StagedChunk:
     scan_stats: dict = field(default_factory=dict)
     source_missing_files: list = field(default_factory=list)
     skip_tape: bool = False
+    session_id: Optional[int] = None
+    packaging_format: ContainerFormat = ContainerFormat.ZIP
+    containers: List[StagedContainer] = field(default_factory=list)
+    artifacts: List[StagedArtifact] = field(default_factory=list)
+    writer_state: ContainerWriterState = ContainerWriterState.NOT_STARTED
+    catalog_state: ContainerCatalogState = ContainerCatalogState.NOT_STARTED
+
+    def __post_init__(self):
+        self.packaging_format = ContainerFormat(self.packaging_format)
+        self.writer_state = ContainerWriterState(self.writer_state)
+        self.catalog_state = ContainerCatalogState(self.catalog_state)
+        if int(self.staged_bytes) < 0:
+            raise ValueError("staged_bytes cannot be negative")
+        if self.skip_tape:
+            self._assert_skip_tape_contract()
+        elif self.packaging_format is ContainerFormat.STORED_TAR:
+            if self.containers or self.artifacts:
+                self._assert_container_identity_contract(require_readable=False)
+            else:
+                self._assert_loose_only_tar_contract(require_readable=False)
+        elif self.containers or self.artifacts:
+            # Historical ZIP descriptors intentionally have no migration-015
+            # identity objects.  Once a ZIP descriptor does carry them, it is
+            # subject to the same strict identity/state contract as TAR.
+            self._assert_container_identity_contract(require_readable=False)
+        else:
+            self._assert_queued_states()
+
+    @property
+    def container_bytes(self):
+        return sum(int(item.data_size_bytes) for item in self.containers)
+
+    @property
+    def artifact_bytes(self):
+        return sum(int(item.staged_size_bytes) for item in self.artifacts)
+
+    @property
+    def loose_file_bytes(self):
+        return sum(int(item.get("file_size_bytes", 0) or 0)
+                   for item in self.metadata if not item.get("is_packed"))
+
+    @property
+    def prepared_bytes(self):
+        """Actual files the writer admits: data + metadata + loose files."""
+        if self.packaging_format is ContainerFormat.STORED_TAR:
+            return self.container_bytes + self.artifact_bytes + self.loose_file_bytes
+        return int(self.staged_bytes)
+
+    def _assert_queued_states(self):
+        if self.writer_state is not ContainerWriterState.NOT_STARTED:
+            raise ValueError("queued chunk must not have started writing")
+        if self.catalog_state is not ContainerCatalogState.NOT_STARTED:
+            raise ValueError("queued chunk must not have started cataloging")
+
+    def _assert_container_identity_contract(self, *, require_readable):
+        if self.session_id is None:
+            raise ValueError("identified StagedChunk requires session_id")
+        if not self.containers:
+            raise ValueError("identified StagedChunk requires container records")
+        if not self.artifacts:
+            raise ValueError("identified StagedChunk requires ready artifacts")
+
+        container_ids = set()
+        container_ordinals = set()
+        container_by_id = {}
+        declared_paths = {}
+        for container in self.containers:
+            if container.session_id != int(self.session_id):
+                raise ValueError("staged container belongs to another session")
+            if container.chunk_index != int(self.chunk_index):
+                raise ValueError("staged container belongs to another chunk")
+            if container.container_format is not self.packaging_format:
+                raise ValueError(
+                    "staged container format disagrees with its chunk")
+            if container.container_id in container_ids:
+                raise ValueError("duplicate staged container identity")
+            if container.container_ordinal in container_ordinals:
+                raise ValueError("duplicate staged container ordinal")
+            _assert_path_below(
+                self.pack_dir, container.data_path,
+                f"container {container.container_id}")
+            _declare_staged_path(
+                declared_paths, container.data_path, container.data_size_bytes,
+                f"container {container.container_id}")
+            container_ids.add(container.container_id)
+            container_ordinals.add(container.container_ordinal)
+            container_by_id[container.container_id] = container
+
+        required_kind = (ArtifactKind.TAR_SIDECAR
+                         if self.packaging_format is ContainerFormat.STORED_TAR
+                         else ArtifactKind.ZIP_MANIFEST)
+        container_artifacts = {
+            container_id: 0 for container_id in container_ids}
+        artifact_ids = set()
+        for artifact in self.artifacts:
+            if artifact.session_id != int(self.session_id):
+                raise ValueError("staged artifact belongs to another session")
+            if artifact.chunk_index != int(self.chunk_index):
+                raise ValueError("staged artifact belongs to another chunk")
+            if artifact.artifact_id in artifact_ids:
+                raise ValueError("duplicate staged artifact identity")
+            artifact_ids.add(artifact.artifact_id)
+            if artifact.container_id is not None:
+                if artifact.container_id not in container_ids:
+                    raise ValueError("staged artifact references an unknown container")
+                if artifact.artifact_kind is required_kind:
+                    container_artifacts[artifact.container_id] += 1
+                else:
+                    raise ValueError(
+                        "container artifact kind disagrees with chunk format")
+            _assert_path_below(
+                self.pack_dir, artifact.staged_path,
+                f"artifact {artifact.artifact_id}")
+            _declare_staged_path(
+                declared_paths, artifact.staged_path,
+                artifact.staged_size_bytes, f"artifact {artifact.artifact_id}")
+        if any(count != 1 for count in container_artifacts.values()):
+            raise ValueError(
+                f"each {self.packaging_format.value} container requires "
+                f"exactly one {required_kind.value} artifact")
+
+        expected = self.container_bytes + self.artifact_bytes + self.loose_file_bytes
+        if int(self.staged_bytes) != expected:
+            raise ValueError(
+                f"staged byte total {self.staged_bytes} does not match "
+                f"container/artifact/loose total {expected}")
+
+        self._assert_queued_states()
+
+        loose_paths = self._assert_file_records(
+            container_by_id, require_readable)
+        for path, size in loose_paths.items():
+            _declare_staged_path(
+                declared_paths, path, size, "loose staged file")
+
+        if require_readable:
+            for container in self.containers:
+                container.assert_writer_ready()
+            for artifact in self.artifacts:
+                artifact.assert_writer_ready()
+            _assert_exact_pack_inventory(self.pack_dir, declared_paths)
+
+    def _assert_file_records(self, container_by_id, require_readable):
+        """Validate packed/loose metadata using the chunk's durable format."""
+        loose_paths = {}
+        for record in self.metadata:
+            is_packed = record.get("is_packed")
+            if not isinstance(is_packed, bool):
+                raise ValueError(
+                    "identified file metadata requires a boolean is_packed")
+            if is_packed:
+                try:
+                    record_format = ContainerFormat(record.get(
+                        "container_format"))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "packed metadata requires container_format") \
+                        from exc
+                if record_format is not self.packaging_format:
+                    raise ValueError(
+                        "packed metadata format disagrees with its chunk")
+                container_id = record.get("container_id")
+                if container_id not in container_by_id:
+                    raise ValueError(
+                        "packed metadata references an unknown container")
+                ordinal = record.get("container_ordinal")
+                if (ordinal is not None and int(ordinal) !=
+                        int(container_by_id[container_id].container_ordinal)):
+                    raise ValueError(
+                        "packed Stored TAR metadata has a conflicting "
+                        "container ordinal")
+                continue
+
+            if record.get("container_id") is not None:
+                raise ValueError(
+                    "loose-file metadata cannot reference a container")
+            try:
+                logical_size = int(record["file_size_bytes"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    "loose-file metadata requires a non-negative size") from exc
+            if logical_size < 0:
+                raise ValueError(
+                    "loose-file metadata requires a non-negative size")
+            stored_path = record.get("stored_path")
+            if not stored_path:
+                raise ValueError("loose-file metadata requires stored_path")
+            local_path = (stored_path if os.path.isabs(stored_path) else
+                          os.path.join(self.pack_dir, stored_path))
+            _assert_path_below(self.pack_dir, local_path, "loose staged file")
+            path_key = os.path.normcase(os.path.abspath(local_path))
+            if path_key in loose_paths:
+                raise ValueError("duplicate loose staged file path")
+            loose_paths[path_key] = (local_path, logical_size)
+            if require_readable:
+                actual = _readable_regular_file_size(
+                    local_path, "loose staged file")
+                if actual != logical_size:
+                    raise RuntimeError(
+                        "loose staged file size changed: expected "
+                        f"{logical_size}, found {actual}")
+        return {
+            path: size for path, size in loose_paths.values()}
+
+    def _assert_skip_tape_contract(self):
+        """Prove that the no-write shortcut contains no archive object."""
+        if self.session_id is None:
+            raise ValueError("skip_tape StagedChunk requires session_id")
+        if int(self.staged_bytes) != 0 or self.prepared_bytes != 0:
+            raise ValueError("skip_tape chunk cannot contain staged bytes")
+        if self.metadata or self.containers or self.artifacts:
+            raise ValueError("skip_tape chunk cannot contain archive objects")
+        if not self.source_missing_files:
+            raise ValueError(
+                "skip_tape requires explicit source-missing evidence")
+        if self.writer_state is not ContainerWriterState.NOT_STARTED:
+            raise ValueError("skip_tape chunk cannot have writer state")
+        if self.catalog_state is not ContainerCatalogState.NOT_STARTED:
+            raise ValueError("skip_tape chunk cannot have catalog state")
+
+    def assert_writer_ready(self):
+        """Fail before LTFS ownership if the staged handoff is incomplete."""
+        if self.skip_tape:
+            self._assert_skip_tape_contract()
+            return True
+        if (self.packaging_format is ContainerFormat.STORED_TAR
+                and not (self.containers or self.artifacts)):
+            self._assert_loose_only_tar_contract(require_readable=True)
+        elif (self.packaging_format is ContainerFormat.STORED_TAR
+                or self.containers or self.artifacts):
+            self._assert_container_identity_contract(require_readable=True)
+        else:
+            self._assert_queued_states()
+        return True
+
+    def _assert_loose_only_tar_contract(self, *, require_readable):
+        if self.session_id is None:
+            raise ValueError("identified StagedChunk requires session_id")
+        if not self.metadata:
+            raise ValueError("Stored TAR chunk requires container records or loose files")
+        if any(item.get("is_packed") for item in self.metadata):
+            raise ValueError("packed Stored TAR metadata requires container records")
+        loose_paths = self._assert_file_records({}, require_readable)
+        expected = sum(int(item.get("file_size_bytes", 0) or 0)
+                       for item in self.metadata)
+        if int(self.staged_bytes) != expected:
+            raise ValueError(
+                f"staged byte total {self.staged_bytes} does not match "
+                f"loose-file total {expected}")
+        if require_readable:
+            declared = {
+                os.path.normcase(os.path.abspath(path)): int(size)
+                for path, size in loose_paths.items()}
+            _assert_exact_pack_inventory(self.pack_dir, declared)
+        self._assert_queued_states()
+
+
+def _readable_regular_file_size(path, label):
+    """Open one local staged file and return its size, rejecting links/dirs."""
+    try:
+        path_stat = os.lstat(path)
+        if not stat.S_ISREG(path_stat.st_mode):
+            raise RuntimeError(f"{label} is not a regular file")
+        with open(path, "rb") as handle:
+            opened_stat = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened_stat.st_mode):
+                raise RuntimeError(f"{label} is not a regular file")
+            return int(opened_stat.st_size)
+    except RuntimeError:
+        raise
+    except OSError as exc:
+        raise RuntimeError(f"{label} is not readable: {exc}") from exc
+
+
+def _assert_path_below(root, candidate, label):
+    """Require a staged object to live under the declared local pack root."""
+    if not root:
+        raise ValueError(f"{label} requires a pack directory")
+    root_abs = os.path.abspath(root)
+    candidate_abs = os.path.abspath(candidate)
+    try:
+        contained = os.path.commonpath((root_abs, candidate_abs)) == root_abs
+    except ValueError:
+        contained = False
+    if not contained:
+        raise ValueError(f"{label} is outside the staged pack directory")
+
+
+def _declare_staged_path(declared, path, expected_size, label):
+    """Add one copied object, rejecting cross-namespace path aliases."""
+    key = os.path.normcase(os.path.abspath(path))
+    if key in declared:
+        raise ValueError(
+            f"{label} reuses a staged path already owned by another object")
+    declared[key] = int(expected_size)
+
+
+def _assert_exact_pack_inventory(pack_dir, declared):
+    """Prove Robocopy's complete source tree equals the declared handoff.
+
+    The writer copies the whole pack directory.  Summing descriptor fields is
+    therefore insufficient: an undeclared stale file would be written without
+    being admitted or accounted.  Reparse points are rejected so lexical
+    containment cannot escape the pack root.
+    """
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    try:
+        root_stat = os.lstat(pack_dir)
+        if (not stat.S_ISDIR(root_stat.st_mode)
+                or getattr(root_stat, "st_file_attributes", 0) & reparse_flag):
+            raise RuntimeError("staged pack root is not a plain directory")
+        actual = {}
+        for root, dirs, files in os.walk(pack_dir, followlinks=False):
+            for name in dirs:
+                info = os.lstat(os.path.join(root, name))
+                if (not stat.S_ISDIR(info.st_mode)
+                        or getattr(info, "st_file_attributes", 0)
+                        & reparse_flag):
+                    raise RuntimeError(
+                        "staged pack contains a reparse/non-directory entry")
+            for name in files:
+                path = os.path.join(root, name)
+                key = os.path.normcase(os.path.abspath(path))
+                if key in actual:
+                    raise RuntimeError("staged pack contains a duplicate path")
+                actual[key] = _readable_regular_file_size(
+                    path, "staged pack file")
+    except RuntimeError:
+        raise
+    except OSError as exc:
+        raise RuntimeError(f"staged pack inventory is unreadable: {exc}") from exc
+
+    missing = set(declared) - set(actual)
+    extra = set(actual) - set(declared)
+    mismatched = {
+        path for path in set(declared) & set(actual)
+        if int(declared[path]) != int(actual[path])}
+    if missing or extra or mismatched:
+        raise RuntimeError(
+            "staged pack inventory disagrees with declared objects "
+            f"(missing={len(missing)}, extra={len(extra)}, "
+            f"size_mismatch={len(mismatched)})")
+
+
+def validate_staged_chunk_writer_admission(
+        staged_chunk, db, *, expected_session_id=None):
+    """Validate one staged descriptor before any tape ownership/readiness.
+
+    ZIP compatibility remains deliberately light-weight, but it must be
+    explicit: an object with no format authority is not guessed to be ZIP.
+    Stored TAR additionally requires the database comparison method; local
+    readiness alone cannot prove that the in-memory identities are durable.
+    """
+    assert_ready = getattr(staged_chunk, "assert_writer_ready", None)
+    if callable(assert_ready):
+        assert_ready()
+
+    if getattr(staged_chunk, "skip_tape", False) and not callable(assert_ready):
+        if (int(getattr(staged_chunk, "staged_bytes", -1)) != 0
+                or getattr(staged_chunk, "metadata", None)
+                or getattr(staged_chunk, "containers", None)
+                or getattr(staged_chunk, "artifacts", None)
+                or not getattr(staged_chunk, "source_missing_files", None)):
+            raise RuntimeError(
+                "legacy skip_tape descriptor lacks empty/source-missing proof")
+
+    raw_format = getattr(staged_chunk, "packaging_format", None)
+    if raw_format is None:
+        reader = getattr(db, "get_chunk_packaging_format", None)
+        session_id = getattr(staged_chunk, "session_id", None)
+        chunk_index = getattr(staged_chunk, "chunk_index", None)
+        if not callable(reader) or session_id is None or chunk_index is None:
+            raise RuntimeError(
+                "staged chunk has no durable packaging-format authority")
+        raw_format = reader(session_id, chunk_index)
+    try:
+        packaging_format = ContainerFormat(raw_format)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("staged chunk has an unknown packaging format") \
+            from exc
+
+    descriptor_session = getattr(staged_chunk, "session_id", None)
+    chunk_index = getattr(staged_chunk, "chunk_index", None)
+    if (expected_session_id is not None
+            and descriptor_session != int(expected_session_id)):
+        raise RuntimeError(
+            "staged chunk session identity disagrees with its finite group")
+
+    # Every remote descriptor is compared with the durable per-chunk format.
+    # This prevents a TAR-assigned chunk from being reinterpreted as legacy ZIP
+    # by a stale or forged in-memory descriptor.
+    if descriptor_session is not None and chunk_index is not None:
+        reader = getattr(db, "get_chunk_packaging_format", None)
+        if not callable(reader):
+            raise RuntimeError(
+                "staged chunk has no durable packaging-format reader")
+        try:
+            durable_format = ContainerFormat(
+                reader(int(descriptor_session), int(chunk_index)))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "durable chunk packaging format is absent or unknown") from exc
+        if durable_format is not packaging_format:
+            raise RuntimeError(
+                "staged descriptor disagrees with durable chunk format")
+
+    identity_aware = bool(
+        getattr(staged_chunk, "containers", None)
+        or getattr(staged_chunk, "artifacts", None))
+    if packaging_format is ContainerFormat.STORED_TAR or identity_aware:
+        if not callable(assert_ready):
+            raise RuntimeError(
+                "identified descriptor has no local readiness validator")
+        validate_db = getattr(db, "validate_staged_chunk_readiness", None)
+        if not callable(validate_db):
+            raise RuntimeError(
+                "identified descriptor has no database readiness validator")
+        validate_db(staged_chunk)
+    return packaging_format
 
 
 @dataclass

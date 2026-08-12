@@ -17,6 +17,7 @@ import threading
 import unittest
 import uuid
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, TYPE_CHECKING, cast
 from unittest import mock
 
@@ -37,6 +38,7 @@ else:
 from src.inspector_repository import InspectorRepository
 from src.local_manifest_archive import (
     dry_run_export, execute_export, prune_export, validate_export)
+from src.schema_audit import audit_schema_provenance
 from pg_test_guard import (SKIP_REASON, create_test_database,
                            drop_test_database, pg_available)
 
@@ -96,6 +98,107 @@ class PgIntegrationTests(unittest.TestCase):
 
     def test_directory_catalog_schema_is_not_auto_applied_on_startup(self):
         self.assertFalse(self.directory_schema_was_auto_installed)
+
+    def test_schema_provenance_audit_reports_installed_vs_repository_ddl(self):
+        from src.constants import PROJECT_ROOT
+
+        with _connect(self.conninfo, autocommit=True,
+                      row_factory=cast(Any, dict_row)) as conn:
+            report = audit_schema_provenance(conn, repository_root=PROJECT_ROOT)
+        self.assertTrue(report["read_only"])
+        self.assertTrue(report["repository_ddl"]["migrations"])
+        self.assertIn("007_postgres_directory_catalog.sql",
+                      [m["file"] for m in report["repository_ddl"]["migrations"]])
+        self.assertIn("directory_archive_bundles",
+                      report["installed_schema"]["tables"])
+        self.assertEqual(
+            report["facts"][[f["name"] for f in report["facts"]].index(
+                "independent_bundle_registries")]["status"], "PASS")
+        self.assertIn("directory_archive_bundles", report["row_sets"])
+        self.assertIn("session_37_legacy_export",
+                      report["capabilities"]["remote_plan_files"]["can_support"])
+        self.assertEqual(report["historical_dry_run"]["writes_performed"], 0)
+
+    def test_schema_provenance_dry_run_flags_transient_root_and_null_chunk(self):
+        self.db.register_tape("TAUD")
+        records = [{
+            "original_path": "/remote/root/dir/a.txt",
+            "canonical_source_path": "/remote/root/dir/a.txt",
+            "original_root_dir": r"C:\\staging\\_pack_s0042_007",
+            "file_size_bytes": 7,
+            "tape_label": "TAUD",
+            "source_host": "srv02",
+            "is_packed": True,
+            "container_name": "Bundle_A.zip",
+            "stored_path": "dir/a.txt",
+        }]
+        self.db.bulk_upsert_directory_catalog(
+            records, "TAUD", "srv02", local_session_id=None,
+            local_chunk_index=2, tape_root="TROOT")
+        self._exec(
+            "UPDATE directory_archive_bundles "
+            "SET original_dir_path=%s WHERE tape_label=%s",
+            (r"C:\\staging\\_pack_s0042_007", "TAUD"))
+        self._exec(
+            "UPDATE directory_tree_index SET chunk_index=NULL "
+            "WHERE tape_label=%s", ("TAUD",))
+        before = self._query(
+            "SELECT COUNT(*) AS n FROM directory_tree_index "
+            "WHERE tape_label=%s AND chunk_index IS NULL", ("TAUD",))[0]["n"]
+        with _connect(self.conninfo, autocommit=True,
+                      row_factory=cast(Any, dict_row)) as conn:
+            report = audit_schema_provenance(conn)
+        counts = report["provenance_counts"]
+        self.assertGreaterEqual(
+            counts["directory_tree_index_chunk_null"]["count"], before)
+        self.assertGreaterEqual(
+            counts["directory_archive_bundles_transient_root"]["count"], 1)
+        dry = report["historical_dry_run"]
+        self.assertGreaterEqual(len(dry["repairable"]), 1)
+        self.assertGreaterEqual(len(dry["flagged"]), 1)
+        self.assertIn(r"C:\\staging\\_pack_s0042_007",
+                      dry["blocking_directories"])
+        self.assertEqual(dry["writes_performed"], 0)
+
+    def test_directory_catalog_remote_chunk_root_multi_tape_all_small(self):
+        sessions = []
+        for tape, session_label, chunk in (
+                ("TAR1", "audit-remote-1", 7),
+                ("TAR2", "audit-remote-2", 11)):
+            self.db.register_tape(tape)
+            session = self.db.create_remote_session(
+                session_label, "host.example", "user", "/remote/root",
+                tape, r"C:\\staging")
+            sessions.append((tape, session, chunk))
+        for tape, session, chunk in sessions:
+            records = [{
+                "original_path": "/remote/root/dir/small.txt",
+                "canonical_source_path": "/remote/root/dir/small.txt",
+                "original_root_dir": r"C:\\staging\\_fetch_s9999_999",
+                "file_size_bytes": 3,
+                "tape_label": tape,
+                "source_host": "remote",
+                "is_packed": True,
+                "container_name": "Bundle_small.zip",
+                "stored_path": "dir/small.txt",
+                "catalog_policy": "manifest_only",
+            }]
+            self.db.bulk_upsert_directory_catalog(
+                records, tape, "remote", remote_session_id=session,
+                remote_chunk_index=chunk, tape_root="TAPE_ROOT",
+                index_min_file_mb=10)
+            row = self._query(
+                "SELECT original_dir_path, remote_session_id, chunk_index "
+                "FROM directory_archive_bundles WHERE tape_label=%s",
+                (tape,))[0]
+            self.assertEqual(row["original_dir_path"], "/remote/root/dir")
+            self.assertEqual(row["remote_session_id"], session)
+            self.assertEqual(row["chunk_index"], chunk)
+            self.assertFalse(str(row["original_dir_path"]).startswith("C:"))
+        self.assertEqual(
+            self._query(
+                "SELECT COUNT(*) AS n FROM directory_archive_bundles "
+                "WHERE tape_label IN ('TAR1','TAR2')")[0]["n"], 2)
 
     # -- §1.1 ILIKE escaping -------------------------------------------------
 
@@ -692,6 +795,115 @@ class PgIntegrationTests(unittest.TestCase):
 
 
 @unittest.skipUnless(_pg_available(), SKIP_REASON)
+class PgSchemaAuditMigrationTests(unittest.TestCase):
+    """The audit must distinguish absent, complete and partial optional DDL."""
+
+    def setUp(self):
+        from src.pg_db import PgDatabaseManager
+
+        self.dbname, self.conninfo = create_test_database("lto_audit")
+        self.db = PgDatabaseManager(self.conninfo)
+
+    def tearDown(self):
+        try:
+            self.db.close()
+        finally:
+            drop_test_database(self.dbname)
+
+    def _audit(self):
+        with _connect(self.conninfo, autocommit=True,
+                      row_factory=cast(Any, dict_row)) as conn:
+            return audit_schema_provenance(conn)
+
+    def test_optional_007_absent_is_unavailable(self):
+        report = self._audit()
+        table_checks = {
+            item["object"]: item for item in report["schema_checks"]
+            if item["kind"] == "table"
+        }
+        self.assertEqual(table_checks["directory_archive_bundles"]["status"],
+                         "UNAVAILABLE")
+        self.assertEqual(
+            report["provenance_counts"]["directory_archive_bundles_transient_root"]["status"],
+            "UNAVAILABLE")
+
+    def test_optional_007_present_is_tested_as_installed(self):
+        self.db.apply_directory_catalog_schema()
+        report = self._audit()
+        table_checks = {
+            item["object"]: item for item in report["schema_checks"]
+            if item["kind"] == "table"
+        }
+        self.assertEqual(table_checks["directory_archive_bundles"]["status"],
+                         "PASS")
+        self.assertEqual(table_checks["directory_tree_index"]["status"],
+                         "PASS")
+
+    def test_partial_007_is_not_treated_as_proof(self):
+        self._exec("CREATE TABLE directory_archive_bundles (bundle_id BIGINT)")
+        report = self._audit()
+        table_checks = {
+            item["object"]: item for item in report["schema_checks"]
+            if item["kind"] == "table"
+        }
+        self.assertEqual(table_checks["directory_archive_bundles"]["status"],
+                         "PASS")
+        column_checks = {
+            item["object"]: item for item in report["schema_checks"]
+            if item["kind"] == "column"
+        }
+        self.assertEqual(
+            column_checks["directory_archive_bundles.original_dir_path"]["status"],
+            "UNAVAILABLE")
+        self.assertEqual(
+            report["provenance_counts"]["directory_archive_bundles_transient_root"]["status"],
+            "UNAVAILABLE")
+
+    def _exec(self, sql, params=()):
+        with _connect(self.conninfo, autocommit=True) as conn:
+            conn.execute(sql, params)
+
+
+@unittest.skipUnless(_pg_available(), SKIP_REASON)
+class PgSchemaAuditFrontierDefectTests(unittest.TestCase):
+    def setUp(self):
+        from src.pg_db import PgDatabaseManager
+
+        self.dbname, self.conninfo = create_test_database("lto_frontier_audit")
+        self.db = PgDatabaseManager(self.conninfo)
+        self.db.apply_directory_catalog_schema()
+        self.db.apply_incremental_scan_schema()
+
+    def tearDown(self):
+        try:
+            self.db.close()
+        finally:
+            drop_test_database(self.dbname)
+
+    def test_membership_null_and_missing_segment_consumption_are_failures(self):
+        self.db.register_tape("TFRONT")
+        session = self.db.create_remote_session(
+            "frontier-audit", "host.example", "user", "/remote",
+            "TFRONT", r"C:\\staging")
+        self._exec(
+            "INSERT INTO remote_chunks(session_id, chunk_index, status, "
+            "updated_at, membership_state) VALUES (%s, 0, 'pending', now(), NULL)",
+            (session,))
+        with _connect(self.conninfo, autocommit=True,
+                      row_factory=cast(Any, dict_row)) as conn:
+            report = audit_schema_provenance(conn)
+        self.assertEqual(
+            report["provenance_counts"]["remote_chunks_membership_null"]["count"], 1)
+        self.assertEqual(
+            report["provenance_counts"]["remote_chunk_scan_segments_missing"]["count"], 1)
+        self.assertEqual(report["historical_dry_run"]["writes_performed"], 0)
+
+    def _exec(self, sql, params=()):
+        with _connect(self.conninfo, autocommit=True) as conn:
+            conn.execute(sql, params)
+
+
+@unittest.skipUnless(_pg_available(), SKIP_REASON)
 class PgArchiveRunsMigrationTests(unittest.TestCase):
     """Exercise the production upgrade path of migration 004 on legacy data."""
 
@@ -957,6 +1169,7 @@ class IncrementalScanMigrationTests(unittest.TestCase):
             """UPDATE remote_chunks SET status='done'
                WHERE session_id=%s AND chunk_index=0""", (session_id,))
         self.db.apply_incremental_scan_schema(finalize=True)
+        self.db.apply_container_format_schema()
 
         existing_chunk_before = self._query(
             """SELECT * FROM remote_chunks
@@ -2074,6 +2287,1513 @@ class RealConcurrencyTests(unittest.TestCase):
             claimed["scan_directory_id"])
         self.assertFalse(final)
         self.assertIn("unresolved", reason)
+
+
+@unittest.skipUnless(_pg_available(), SKIP_REASON)
+class ContainerFormatMigrationTests(unittest.TestCase):
+    """Plan 2 Phase 0 / migration 015 against disposable PostgreSQL only."""
+
+    def setUp(self):
+        from src.pg_db import PgDatabaseManager
+
+        self.dbname, self.conninfo = create_test_database("lto_formats")
+        self.db = PgDatabaseManager(self.conninfo)
+        self.staging = tempfile.TemporaryDirectory()
+        self.addCleanup(self._drop)
+
+    def _drop(self):
+        try:
+            self.db.close()
+        except Exception:
+            pass
+        try:
+            self.staging.cleanup()
+        except Exception:
+            pass
+        drop_test_database(self.dbname)
+
+    def _query(self, sql, params=()):
+        with _connect(self.conninfo, autocommit=True,
+                      row_factory=cast(Any, dict_row)) as conn:
+            return conn.execute(sql, params).fetchall()
+
+    def _exec(self, sql, params=()):
+        with _connect(self.conninfo, autocommit=True) as conn:
+            conn.execute(sql, params)
+
+    def _ready_014(self, *, finalize=True):
+        self.db.apply_incremental_scan_schema(finalize=finalize)
+
+    def _session(self, label="FORMAT_SESSION", tape="FORMAT_TAPE"):
+        self.db.register_tape(tape, 12000)
+        return self.db.create_remote_streaming_session(
+            session_label=label, remote_host="fixture.example",
+            remote_user="fixture", remote_path="/fixture",
+            tape_label=tape, staging_dir=self.staging.name)
+
+    def _append(self, session_id, chunk_index, member_count=2, **gate):
+        rows = [
+            (chunk_index,
+             f"/fixture/chunk_{chunk_index:03d}/member_{ordinal:03d}.bin",
+             f"member_{ordinal:03d}.bin", ordinal + 1)
+            for ordinal in range(member_count)
+        ]
+        return self.db.append_remote_streaming_chunk(
+            session_id, chunk_index, rows, **gate)
+
+    def _catalog_chunks(self, session_id, indexes, tape="FORMAT_TAPE", *,
+                        archive_run_id=None):
+        records = []
+        for chunk_index in indexes:
+            path = f"/fixture/chunk_{chunk_index:03d}/member_000.bin"
+            record = {
+                "original_path": path,
+                "canonical_source_path": path,
+                "file_size_bytes": 1,
+                "tape_label": tape,
+                "source_host": "fixture",
+                "is_packed": False,
+                "container_name": None,
+                "stored_path": f"chunks/{chunk_index:03d}/member_000.bin",
+                "remote_session_id": session_id,
+                "remote_chunk_index": chunk_index,
+            }
+            if archive_run_id is not None:
+                record["archive_run_id"] = archive_run_id
+            records.append(record)
+        self.db.bulk_upsert_files(records)
+
+    def _catalog_done_prefix(self, session_id, last_index, tape="FORMAT_TAPE"):
+        self._catalog_chunks(session_id, range(last_index + 1), tape)
+        self._exec(
+            """UPDATE remote_chunks SET status='done', updated_at=now()
+               WHERE session_id=%s AND chunk_index<=%s""",
+            (session_id, last_index))
+
+    def _insert_direct_directory_evidence(self, session_id, chunk_index):
+        self._exec(
+            """INSERT INTO directory_archive_stats
+                   (source_host,original_dir_path,tape_label,remote_session_id,
+                    chunk_index,direct_file_count,direct_bytes,
+                    recursive_file_count,recursive_bytes,small_file_count,
+                    small_file_bytes,large_file_count,large_file_bytes,
+                    packed_bundle_count,backup_date,record_key)
+               VALUES ('fixture','/fixture/direct/stats','FORMAT_TAPE',%s,%s,
+                       0,0,0,0,0,0,0,0,0,now(),decode(
+                       repeat('11',32),'hex'))""",
+            (session_id, chunk_index))
+        self._exec(
+            """INSERT INTO directory_archive_bundles
+                   (source_host,original_dir_path,tape_label,remote_session_id,
+                    chunk_index,stored_bundle_path,file_count,byte_count,
+                    small_file_count,small_file_bytes,large_file_count,
+                    large_file_bytes,backup_date,record_key)
+               VALUES ('fixture','/fixture/direct/bundle','FORMAT_TAPE',%s,%s,
+                       'direct.zip',0,0,0,0,0,0,now(),decode(
+                       repeat('22',32),'hex'))""",
+            (session_id, chunk_index))
+        self._exec(
+            """INSERT INTO directory_tree_index
+                   (source_host,original_dir_path,dir_name,depth,tape_label,
+                    remote_session_id,chunk_index,direct_file_count,direct_bytes,
+                    recursive_file_count,recursive_bytes,
+                    direct_small_file_count,direct_small_file_bytes,
+                    recursive_small_file_count,recursive_small_file_bytes,
+                    direct_large_file_count,direct_large_file_bytes,
+                    recursive_large_file_count,recursive_large_file_bytes,
+                    backup_date,record_key)
+               VALUES ('fixture','/fixture/direct/tree','tree',0,'FORMAT_TAPE',
+                       %s,%s,0,0,0,0,0,0,0,0,0,0,0,0,now(),decode(
+                       repeat('33',32),'hex'))""",
+            (session_id, chunk_index))
+
+    @staticmethod
+    def _staging_evidence(indexes):
+        from datetime import datetime, timezone
+        return {
+            "root_accessible": True,
+            "checked_chunk_indexes": list(indexes),
+            "entry_count": 0,
+            "unreadable_count": 0,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def _stored_tar_planning_session(self, rows, *, directory_catalog=False):
+        session_id = self._session(label="TAR_PLAN_FIXTURE")
+        self._append(session_id, 0, member_count=1)
+        self.db.append_remote_streaming_chunk(session_id, 1, rows)
+        self._catalog_done_prefix(session_id, 0)
+        self._ready_014()
+        if directory_catalog:
+            self.db.apply_directory_catalog_schema()
+        self.db.apply_container_format_schema(
+            exception_session_id=session_id,
+            expected_boundary=1,
+            approval_id="task-2-1-plan-test",
+            approval_reason="synthetic never-started suffix for planning",
+            staging_evidence=self._staging_evidence([1]))
+        self.db.apply_stored_tar_plan_schema()
+        self.db.seal_remote_chunk(
+            session_id, 1, expected_file_count=len(rows),
+            expected_bytes=sum(int(row[3]) for row in rows))
+        return session_id
+
+    # -- migration 015 run-attribution evidence ---------------------------
+    #
+    # Production forensics (2026-08-04) showed the original predicate demanded
+    # every archive run own at least one `files_index` row naming a chunk. That
+    # is unsatisfiable by construction: `files_index` indexes only files at or
+    # above `index_min_file_mb`, so a chunk built entirely from small files
+    # produces none. Session 37 had 7 of 9 runs flagged - 3 healthy small-file
+    # runs and 4 whose output had been destroyed and redone after the 2026-07-15
+    # restart. The predicate now asks the question it meant to ask: does output
+    # exist that cannot be attributed to this session?
+
+    def _exception_session_with_runs(self, *, boundary=1):
+        """A done prefix + never-started suffix, with no catalog rows yet."""
+        session_id = self._session(label="RUN_EVIDENCE")
+        for index in range(boundary + 1):
+            self._append(session_id, index, member_count=1)
+        self._exec(
+            """UPDATE remote_chunks SET status='done', updated_at=now()
+               WHERE session_id=%s AND chunk_index<%s""",
+            (session_id, boundary))
+        self._ready_014()
+        self.db.apply_directory_catalog_schema()
+        return session_id
+
+    def _apply_exception(self, session_id, boundary=1):
+        return self.db.apply_container_format_schema(
+            exception_session_id=session_id, expected_boundary=boundary,
+            approval_id="run-evidence-test",
+            approval_reason="corrected run attribution evidence",
+            staging_evidence=self._staging_evidence([boundary]))
+
+    def _archive_run(self, session_id):
+        return self._query(
+            """INSERT INTO archive_runs
+                   (run_label,tape_label,session_kind,started_at,completed_at,
+                    remote_session_id)
+               VALUES ('run:FORMAT_TAPE','FORMAT_TAPE','remote',now(),now(),%s)
+               RETURNING run_id""", (session_id,))[0]["run_id"]
+
+    def _bundle_for_run(self, run_id, session_id, *, key="44"):
+        self._exec(
+            """INSERT INTO directory_archive_bundles
+                   (source_host,original_dir_path,tape_label,archive_run_id,
+                    remote_session_id,stored_bundle_path,file_count,byte_count,
+                    small_file_count,small_file_bytes,large_file_count,
+                    large_file_bytes,backup_date,record_key)
+               VALUES ('fixture','/fixture/small','FORMAT_TAPE',%s,%s,
+                       'small.zip',200000,1000,200000,1000,0,0,now(),
+                       decode(repeat(%s,32),'hex'))""",
+            (run_id, session_id, key))
+
+    def test_small_file_run_is_attributable_through_directory_bundles(self):
+        """A run whose chunks held only small files leaves no files_index row."""
+        session_id = self._exception_session_with_runs()
+        run_id = self._archive_run(session_id)
+        self._bundle_for_run(run_id, session_id)
+        self.assertEqual(
+            self._query("SELECT count(*) AS n FROM files_index")[0]["n"], 0)
+        self._apply_exception(session_id)
+        formats = {row["chunk_index"]: row["packaging_format"]
+                   for row in self._query(
+                       """SELECT chunk_index,packaging_format FROM remote_chunks
+                          WHERE session_id=%s ORDER BY chunk_index""",
+                       (session_id,))}
+        self.assertEqual(formats, {0: "zip", 1: "stored_tar"})
+
+    def test_run_with_no_output_at_all_is_superseded_not_ambiguous(self):
+        """The 2026-07-15 shape: a run whose work was destroyed and redone."""
+        session_id = self._exception_session_with_runs()
+        self._catalog_chunks(session_id, [0])
+        self._archive_run(session_id)          # deliberately no output rows
+        self._apply_exception(session_id)
+        self.assertEqual(self._query(
+            """SELECT packaging_format FROM remote_chunks
+               WHERE session_id=%s AND chunk_index=1""",
+            (session_id,))[0]["packaging_format"], "stored_tar")
+
+    def test_run_output_naming_a_foreign_session_is_still_refused(self):
+        session_id = self._exception_session_with_runs()
+        foreign_id = self._session(label="FOREIGN_SESSION")
+        run_id = self._archive_run(session_id)
+        self._catalog_chunks(session_id, [0])   # gives us a real directory row
+        self._exec(
+            """INSERT INTO files_index
+                   (original_path,file_size_bytes,tape_label,source_host,
+                    is_packed,stored_path,record_key,archive_run_id,
+                    remote_session_id,remote_chunk_index,directory_id,
+                    catalog_name,catalog_backup_date)
+               SELECT '/foreign/f',1,'FORMAT_TAPE','fixture',false,'f',
+                      decode(repeat('55',32),'hex'),%s,%s,0,
+                      (SELECT directory_id FROM catalog_directories LIMIT 1),
+                      'fixture',now()""",
+            (run_id, foreign_id))
+        with self.assertRaisesRegex(
+                Exception, "without trustworthy remote chunk provenance"):
+            self._apply_exception(session_id)
+
+    def test_run_output_without_chunk_identity_is_still_refused(self):
+        session_id = self._exception_session_with_runs()
+        self._catalog_chunks(session_id, [0])
+        run_id = self._archive_run(session_id)
+        self._exec(
+            """INSERT INTO files_index
+                   (original_path,file_size_bytes,tape_label,source_host,
+                    is_packed,stored_path,record_key,archive_run_id,
+                    remote_session_id,remote_chunk_index,directory_id,
+                    catalog_name,catalog_backup_date)
+               SELECT '/chunkless/f',1,'FORMAT_TAPE','fixture',false,'f',
+                      decode(repeat('66',32),'hex'),%s,%s,NULL,
+                      (SELECT directory_id FROM catalog_directories LIMIT 1),
+                      'fixture',now()""",
+            (run_id, session_id))
+        with self.assertRaisesRegex(
+                Exception, "without trustworthy remote chunk provenance"):
+            self._apply_exception(session_id)
+
+    def test_bundle_naming_a_foreign_session_is_still_refused(self):
+        session_id = self._exception_session_with_runs()
+        foreign_id = self._session(label="FOREIGN_BUNDLE_SESSION")
+        run_id = self._archive_run(session_id)
+        self._bundle_for_run(run_id, foreign_id, key="77")
+        with self.assertRaisesRegex(
+                Exception, "without trustworthy remote chunk provenance"):
+            self._apply_exception(session_id)
+
+    # -- migration 015 directory-provenance evidence -----------------------
+    #
+    # The isolated rehearsal (2026-08-05) showed clause 5 firing on 2,731 rows
+    # because it assumed one archive run == one chunk. This writer archives a
+    # finite GROUP per run, so a run covering chunks 0..9 legitimately has
+    # min<>max. The clause now blocks only when such a range REACHES the
+    # approved suffix, which would be genuine evidence a suffix chunk started.
+
+    def test_a_multi_chunk_group_in_the_prefix_is_not_contradictory(self):
+        session_id = self._exception_session_with_runs(boundary=3)
+        run_id = self._archive_run(session_id)
+        # One run, several prefix chunks: the normal finite-group shape.
+        self._catalog_chunks(session_id, [0, 1, 2], archive_run_id=run_id)
+        self._insert_direct_directory_evidence(session_id, None)
+        self._apply_exception(session_id, boundary=3)
+        self.assertEqual(self._query(
+            """SELECT packaging_format FROM remote_chunks
+               WHERE session_id=%s AND chunk_index=3""",
+            (session_id,))[0]["packaging_format"], "stored_tar")
+
+    def test_a_file_range_reaching_the_suffix_still_blocks(self):
+        session_id = self._exception_session_with_runs(boundary=3)
+        run_id = self._archive_run(session_id)
+        # This run's catalog rows reach INTO the approved suffix: real
+        # evidence a suffix chunk was started, and it must still refuse.
+        self._catalog_chunks(session_id, [0, 1, 2, 3], archive_run_id=run_id)
+        self._insert_direct_directory_evidence(session_id, None)
+        with self.assertRaises(Exception):
+            self._apply_exception(session_id, boundary=3)
+
+    def test_015_is_explicit_and_requires_finalized_014(self):
+        self.assertFalse(self.db.container_format_schema_installed())
+        with self.assertRaisesRegex(Exception, "requires migrations 013 and 014"):
+            self.db.apply_container_format_schema()
+        self.assertEqual(self._query(
+            """SELECT count(*) AS n FROM information_schema.columns
+               WHERE table_schema='public' AND table_name='remote_chunks'
+                 AND column_name='packaging_format'""")[0]["n"], 0)
+
+        self._ready_014(finalize=False)
+        with self.assertRaisesRegex(Exception, "requires finalized migration 014"):
+            self.db.apply_container_format_schema()
+        self.assertFalse(self.db.container_format_schema_installed())
+
+    def test_zip_backfill_is_idempotent_immutable_and_preserves_legacy_bundle(self):
+        session_id = self._session()
+        self._append(session_id, 0)
+        bundle = self._query(
+            """INSERT INTO archive_bundles(tape_label,tape_path)
+               VALUES ('FORMAT_TAPE','legacy/original.zip')
+               RETURNING bundle_id,tape_label,tape_path""")[0]
+        self._ready_014()
+
+        self.assertEqual(
+            self.db.apply_container_format_schema(),
+            ["015_postgres_container_formats.sql"])
+        report = self.db.validate_container_format_schema()
+        self.assertTrue(report["ready"])
+        self.assertEqual(report["format_counts"], {"zip": 1, "stored_tar": 0})
+        chunk = self._query(
+            """SELECT packaging_format, packaging_assigned_at
+               FROM remote_chunks WHERE session_id=%s AND chunk_index=0""",
+            (session_id,))[0]
+        self.assertEqual(chunk["packaging_format"], "zip")
+        self.assertIsNotNone(chunk["packaging_assigned_at"])
+        after = self._query(
+            """SELECT bundle_id,tape_label,tape_path,container_id,container_format
+               FROM archive_bundles WHERE bundle_id=%s""",
+            (bundle["bundle_id"],))[0]
+        self.assertEqual(
+            (after["bundle_id"], after["tape_label"], after["tape_path"]),
+            (bundle["bundle_id"], bundle["tape_label"], bundle["tape_path"]))
+        self.assertIsNone(after["container_id"])
+        self.assertEqual(after["container_format"], "zip")
+
+        with self.assertRaisesRegex(Exception, "write-once"):
+            self._exec(
+                """UPDATE remote_chunks SET packaging_format='stored_tar'
+                   WHERE session_id=%s AND chunk_index=0""", (session_id,))
+        with self.assertRaisesRegex(Exception, "immutable"):
+            self._exec(
+                """UPDATE archive_bundles SET container_format='stored_tar'
+                   WHERE bundle_id=%s""", (bundle["bundle_id"],))
+
+        # Re-apply with the same checksum/schema: no identities or formats move.
+        self.db.apply_container_format_schema()
+        self.assertTrue(self.db.validate_container_format_schema()["ready"])
+        self.assertEqual(self._query(
+            "SELECT count(*) AS n FROM archive_bundles")[0]["n"], 1)
+
+    def test_016_persists_stored_tar_partition_cap_and_member_ordinals(self):
+        from src.stored_tar_planning import GNU_TAR_RECORD_SIZE
+
+        rows = [
+            (1, "/fixture/chunk_001/small_a.bin", "small_a.bin", 9),
+            (1, "/fixture/chunk_001/large.bin", "large.bin", 10),
+            (1, "/fixture/chunk_001/small_b.bin", "small_b.bin", 8),
+        ]
+        session_id = self._stored_tar_planning_session(rows)
+        chunk_files = self.db.get_chunk_files(session_id, 1)
+        plan = self.db.get_or_create_stored_tar_chunk_plan(
+            session_id, 1, chunk_files, loose_threshold_bytes=10,
+            max_size_bytes=GNU_TAR_RECORD_SIZE)
+
+        self.assertEqual(plan.max_size_bytes, GNU_TAR_RECORD_SIZE)
+        self.assertEqual(
+            [(m.plan_ordinal, m.storage_class, m.container_ordinal)
+             for m in plan.members],
+            [(0, "small_files", 0), (1, "loose_files", None),
+             (2, "small_files", 1)])
+        self.assertEqual(
+            [(c.container_ordinal, c.expected_member_count,
+              c.expected_logical_bytes, c.max_size_bytes)
+             for c in plan.containers],
+            [(0, 1, 9, GNU_TAR_RECORD_SIZE),
+             (1, 1, 8, GNU_TAR_RECORD_SIZE)])
+        row = self._query(
+            """SELECT stored_tar_max_size_bytes FROM remote_chunks
+               WHERE session_id=%s AND chunk_index=1""",
+            (session_id,))[0]
+        self.assertEqual(row["stored_tar_max_size_bytes"], GNU_TAR_RECORD_SIZE)
+        stored = self._query(
+            """SELECT plan_ordinal,storage_class,container_ordinal
+               FROM archive_container_members
+               WHERE session_id=%s AND chunk_index=1
+               ORDER BY plan_ordinal""", (session_id,))
+        self.assertEqual(
+            [(r["plan_ordinal"], r["storage_class"], r["container_ordinal"])
+             for r in stored],
+            [(0, "small_files", 0), (1, "loose_files", None),
+             (2, "small_files", 1)])
+
+    def test_stored_tar_plan_is_reused_across_restart_and_config_change(self):
+        rows = [
+            (1, f"/fixture/chunk_001/small_{i}.bin", f"small_{i}.bin", 1)
+            for i in range(5)
+        ]
+        session_id = self._stored_tar_planning_session(rows)
+        chunk_files = self.db.get_chunk_files(session_id, 1)
+        first = self.db.get_or_create_stored_tar_chunk_plan(
+            session_id, 1, chunk_files, loose_threshold_bytes=10,
+            max_size_bytes=512 * 512)
+        self.db.close()
+        from src.pg_db import PgDatabaseManager
+        self.db = PgDatabaseManager(self.conninfo)
+        second = self.db.get_or_create_stored_tar_chunk_plan(
+            session_id, 1, self.db.get_chunk_files(session_id, 1),
+            loose_threshold_bytes=2, max_size_bytes=512 * 512 * 9)
+        self.assertEqual(second.max_size_bytes, first.max_size_bytes)
+        self.assertEqual(second.members, first.members)
+        self.assertEqual(second.containers, first.containers)
+
+    def test_stored_tar_plan_records_source_missing_without_container(self):
+        rows = [
+            (1, "/fixture/chunk_001/missing.bin", "missing.bin", 1),
+            (1, "/fixture/chunk_001/small.bin", "small.bin", 1),
+        ]
+        session_id = self._stored_tar_planning_session(rows)
+        missing_id = self._query(
+            """SELECT pf.plan_file_id FROM remote_sessions s
+               JOIN remote_plan_files pf ON pf.plan_id=s.plan_id
+               WHERE s.session_id=%s AND pf.chunk_index=1
+               ORDER BY pf.ordinal LIMIT 1""", (session_id,))[0]["plan_file_id"]
+        self.db.update_manifest_row(
+            missing_id, session_id=session_id, status="source_missing",
+            error_msg="fixture")
+        plan = self.db.get_or_create_stored_tar_chunk_plan(
+            session_id, 1, self.db.get_chunk_files(session_id, 1),
+            loose_threshold_bytes=10, max_size_bytes=512 * 512)
+        self.assertEqual(
+            [(m.plan_ordinal, m.storage_class, m.container_ordinal)
+             for m in plan.members],
+            [(0, "source_missing", None), (1, "small_files", 0)])
+
+    def test_stored_tar_plan_bulk_copy_persists_identical_rows_idempotently(self):
+        """The COPY-based member persistence writes exactly the plan's rows and
+        re-creating the plan neither duplicates nor alters them.
+
+        Guards the executemany->COPY change (src/pg_containers.py): at real
+        member volume the persisted archive_container_members must equal
+        plan.members field-for-field, and a second get_or_create must reuse the
+        stored plan without inserting a single extra row.
+        """
+        from src.stored_tar_planning import GNU_TAR_RECORD_SIZE
+
+        rows = [
+            (1, f"/fixture/chunk_001/small_{i:04d}.bin",
+             f"small_{i:04d}.bin", 7 + (i % 5))
+            for i in range(300)
+        ]
+        session_id = self._stored_tar_planning_session(rows)
+        chunk_files = self.db.get_chunk_files(session_id, 1)
+        plan = self.db.get_or_create_stored_tar_chunk_plan(
+            session_id, 1, chunk_files, loose_threshold_bytes=1024,
+            max_size_bytes=GNU_TAR_RECORD_SIZE * 4096)
+
+        expected = [
+            (int(m.plan_ordinal), m.storage_class,
+             None if m.container_ordinal is None else int(m.container_ordinal),
+             m.remote_path, int(m.file_size_bytes), int(m.estimated_tar_bytes))
+            for m in plan.members
+        ]
+        self.assertEqual(len(expected), 300)
+
+        def _stored():
+            return [
+                (r["plan_ordinal"], r["storage_class"], r["container_ordinal"],
+                 r["remote_path"], r["expected_logical_bytes"],
+                 r["estimated_tar_bytes"])
+                for r in self._query(
+                    """SELECT plan_ordinal, storage_class, container_ordinal,
+                              remote_path, expected_logical_bytes,
+                              estimated_tar_bytes
+                       FROM archive_container_members
+                       WHERE session_id=%s AND chunk_index=1
+                       ORDER BY plan_ordinal""", (session_id,))
+            ]
+
+        self.assertEqual(_stored(), expected)
+        # every small-file member landed with a non-null container binding
+        self.assertTrue(all(
+            r["container_id"] is not None for r in self._query(
+                """SELECT container_id FROM archive_container_members
+                   WHERE session_id=%s AND chunk_index=1""", (session_id,))))
+
+        # Idempotent re-create: reuses the stored plan, inserts nothing new.
+        again = self.db.get_or_create_stored_tar_chunk_plan(
+            session_id, 1, self.db.get_chunk_files(session_id, 1),
+            loose_threshold_bytes=1, max_size_bytes=GNU_TAR_RECORD_SIZE * 99)
+        self.assertEqual(again.members, plan.members)
+        self.assertEqual(_stored(), expected)
+
+    def test_approved_session37_shape_assigns_only_never_started_suffix(self):
+        """Session-37's provenance gaps still yield the approved boundary."""
+        session_id = self._session(label="MIXED_FORMAT_FIXTURE")
+        self.db.apply_directory_catalog_schema()
+        for chunk_index in range(113):
+            self._append(session_id, chunk_index)
+        # Real shape: all 49 prefix chunks are done, but only six have catalog
+        # rows; every legacy chunk expectation/membership marker remains NULL.
+        self._catalog_chunks(session_id, range(6))
+        self._exec(
+            """UPDATE remote_chunks SET status='done', updated_at=now()
+               WHERE session_id=%s AND chunk_index<=48""", (session_id,))
+        # Real shape: 134 migration-007 rows carry no trustworthy remote chunk
+        # or run provenance. Their absence cannot grant TAR and is accepted only
+        # as a conservative ZIP-prefix provenance gap.
+        self._exec(
+            """INSERT INTO directory_archive_bundles
+                   (source_host,original_dir_path,tape_label,archive_run_id,
+                    remote_session_id,chunk_index,stored_bundle_path,
+                    file_count,byte_count,small_file_count,small_file_bytes,
+                    large_file_count,large_file_bytes,backup_date,record_key)
+               SELECT 'fixture', '/fixture/legacy_' || g, 'FORMAT_TAPE', NULL,
+                      %s, NULL, 'legacy/' || g || '.zip', 1, 1, 1, 1, 0, 0,
+                      now(), decode(md5(g::text) || md5(g::text), 'hex')
+               FROM generate_series(1,134) AS g""", (session_id,))
+        self._ready_014()
+
+        shape = self._query(
+            """SELECT count(*) AS chunks,
+                      count(*) FILTER (WHERE status='done') AS done,
+                      count(*) FILTER (WHERE status='pending') AS pending,
+                      count(*) FILTER (WHERE membership_state IS NULL
+                                        AND expected_file_count IS NULL
+                                        AND expected_bytes IS NULL) AS null_shape,
+                      count(*) FILTER (WHERE owner_token IS NULL
+                                        AND lease_expires_at IS NULL
+                                        AND attempt_id IS NULL
+                                        AND error_msg IS NULL) AS unclaimed
+               FROM remote_chunks WHERE session_id=%s""", (session_id,))[0]
+        self.assertEqual(tuple(shape.values()), (113, 49, 64, 113, 113))
+        self.assertEqual(self._query(
+            """SELECT count(DISTINCT remote_chunk_index) AS chunks
+               FROM files_index WHERE remote_session_id=%s""",
+            (session_id,))[0]["chunks"], 6)
+        self.assertEqual(self._query(
+            """SELECT count(*) AS rows,
+                      count(*) FILTER (WHERE chunk_index IS NULL) AS null_chunks
+               FROM directory_archive_bundles WHERE remote_session_id=%s""",
+            (session_id,))[0], {"rows": 134, "null_chunks": 134})
+
+        before = self._query(
+            """SELECT pf.chunk_index,pf.ordinal,sf.remote_path,
+                      sf.file_size_bytes
+               FROM remote_sessions s
+               JOIN remote_plan_files pf ON pf.plan_id=s.plan_id
+               JOIN remote_snapshot_files sf
+                 ON sf.snapshot_file_id=pf.snapshot_file_id
+               WHERE s.session_id=%s
+               ORDER BY pf.chunk_index,pf.ordinal""", (session_id,))
+        classification = self.db.classify_format_boundary(session_id)
+        self.assertEqual(classification["derived_boundary"], 49)
+        self.assertEqual(classification["blocking"], [])
+        self.assertEqual(classification["prefix_evidence_counts"], {
+            "corroborated": 6, "status_only": 43})
+        self.assertEqual(classification["directory_evidence_summary"], {
+            "state": "installed", "row_count": 134,
+            "attributed_row_count": 0, "unattributed_row_count": 134,
+            "suffix_blocker_count": 0, "unattributed_blocker_count": 0,
+            "unattributed_disposition":
+                "reported_legacy_rows_without_tar_suffix_provenance",
+        })
+        self.assertTrue(all(
+            row["directory_evidence_count"] == 0
+            for row in classification["chunks"][49:]))
+
+        self.db.apply_container_format_schema(
+            exception_session_id=session_id,
+            expected_boundary=49,
+            approval_id="phase0-test-approval",
+            approval_reason=(
+                "synthetic fixture proves fixed membership and no operational "
+                "evidence for the pending suffix"),
+            staging_evidence=self._staging_evidence(range(49, 113)))
+
+        formats = self._query(
+            """SELECT chunk_index,packaging_format,status
+               FROM remote_chunks WHERE session_id=%s ORDER BY chunk_index""",
+            (session_id,))
+        self.assertEqual(len(formats), 113)
+        self.assertTrue(all(row["packaging_format"] == "zip"
+                            for row in formats[:49]))
+        self.assertTrue(all(row["packaging_format"] == "stored_tar"
+                            for row in formats[49:]))
+        self.assertTrue(all(row["status"] == "done" for row in formats[:49]))
+        self.assertTrue(all(row["status"] == "pending"
+                            for row in formats[49:]))
+        session = self.db.get_remote_session(session_id)
+        self.assertEqual(session["default_packaging_format"], "stored_tar")
+
+        after = self._query(
+            """SELECT pf.chunk_index,pf.ordinal,sf.remote_path,
+                      sf.file_size_bytes
+               FROM remote_sessions s
+               JOIN remote_plan_files pf ON pf.plan_id=s.plan_id
+               JOIN remote_snapshot_files sf
+                 ON sf.snapshot_file_id=pf.snapshot_file_id
+               WHERE s.session_id=%s
+               ORDER BY pf.chunk_index,pf.ordinal""", (session_id,))
+        self.assertEqual(after, before)
+        suffix_ordinals = self._query(
+            """SELECT chunk_index,count(*) AS members,min(ordinal) AS first,
+                      max(ordinal) AS last,count(DISTINCT ordinal) AS distinct_n
+               FROM remote_plan_files
+               WHERE plan_id=(SELECT plan_id FROM remote_sessions
+                              WHERE session_id=%s)
+                 AND chunk_index BETWEEN 49 AND 112
+               GROUP BY chunk_index ORDER BY chunk_index""", (session_id,))
+        self.assertEqual(len(suffix_ordinals), 64)
+        self.assertTrue(all((row["members"], row["first"], row["last"],
+                             row["distinct_n"]) == (2, 0, 1, 2)
+                            for row in suffix_ordinals))
+        evidence = self._query(
+            """SELECT classification,assigned_format,prefix_evidence_basis,
+                      count(*) AS n
+               FROM remote_packaging_boundary_chunks WHERE session_id=%s
+               GROUP BY classification,assigned_format,prefix_evidence_basis""",
+            (session_id,))
+        self.assertEqual({
+            (row["classification"], row["assigned_format"],
+             row["prefix_evidence_basis"]): row["n"]
+            for row in evidence}, {
+                ("immutable_zip", "zip", "corroborated"): 6,
+                ("immutable_zip", "zip", "status_only"): 43,
+                ("approved_stored_tar_exception", "stored_tar", None): 64,
+            })
+        report = self.db.validate_container_format_schema()
+        self.assertEqual(report["prefix_evidence_counts"], {
+            "corroborated": 6, "status_only": 43})
+        boundary_evidence = self._query(
+            """SELECT database_evidence FROM remote_packaging_boundaries
+               WHERE session_id=%s""", (session_id,))[0]["database_evidence"]
+        self.assertEqual(boundary_evidence["corroborated_prefix_count"], 6)
+        self.assertEqual(boundary_evidence["status_only_prefix_count"], 43)
+        self.assertEqual(boundary_evidence["directory_row_count"], 134)
+        self.assertEqual(
+            boundary_evidence["unattributed_directory_count"], 134)
+        self.assertEqual(
+            boundary_evidence["unattributed_directory_disposition"],
+            "reported_legacy_rows_without_tar_suffix_provenance")
+
+        # Same approved application is a no-op: neither format nor immutable
+        # audit evidence changes.
+        formats_before_reapply = [(row["chunk_index"], row["packaging_format"])
+                                  for row in formats]
+        self.db.apply_container_format_schema(
+            exception_session_id=session_id, expected_boundary=49,
+            approval_id="phase0-test-approval",
+            approval_reason=(
+                "synthetic fixture proves fixed membership and no operational "
+                "evidence for the pending suffix"),
+            staging_evidence=self._staging_evidence(range(49, 113)))
+        formats_after_reapply = self._query(
+            """SELECT chunk_index,packaging_format FROM remote_chunks
+               WHERE session_id=%s ORDER BY chunk_index""", (session_id,))
+        self.assertEqual(
+            [(row["chunk_index"], row["packaging_format"])
+             for row in formats_after_reapply], formats_before_reapply)
+        with self.assertRaisesRegex(Exception, "write-once"):
+            self._exec(
+                """UPDATE remote_chunks SET packaging_format='stored_tar'
+                   WHERE session_id=%s AND chunk_index=0""", (session_id,))
+
+        # Future chunks inherit TAR, but disabled/mismatched gates cannot create
+        # one and their plan membership rolls back with the failed transaction.
+        with self.assertRaisesRegex(Exception, "assignment is disabled"):
+            self._append(session_id, 113)
+        with self.assertRaisesRegex(Exception, "reader contract mismatch"):
+            self._append(
+                session_id, 113, stored_tar_write_enabled=True,
+                reader_contract_version=99)
+        with self.assertRaisesRegex(Exception, "assignment is disabled"):
+            self._append(
+                session_id, 113, stored_tar_write_enabled="true",
+                reader_contract_version=1)
+        self.assertEqual(self._query(
+            """SELECT count(*) AS n FROM remote_chunks
+               WHERE session_id=%s AND chunk_index=113""",
+            (session_id,))[0]["n"], 0)
+        self._append(
+            session_id, 113, stored_tar_write_enabled=True,
+            reader_contract_version=1)
+        future = self._query(
+            """SELECT packaging_format FROM remote_chunks
+               WHERE session_id=%s AND chunk_index=113""", (session_id,))[0]
+        self.assertEqual(future["packaging_format"], "stored_tar")
+        self.assertTrue(self.db.require_existing_stored_tar_recovery(
+            session_id, 49, reader_contract_version=1))
+
+    def test_session37_boundary_rehearsal_is_read_only(self):
+        """Gate 5.5: report the real shape without persisting the boundary."""
+        session_id = self._session(label="SESSION37_REHEARSAL_FIXTURE")
+        self.db.apply_directory_catalog_schema()
+        for chunk_index in range(113):
+            self._append(session_id, chunk_index)
+        self._catalog_chunks(session_id, range(6))
+        self._exec(
+            """UPDATE remote_chunks SET status='done', updated_at=now()
+               WHERE session_id=%s AND chunk_index<=48""", (session_id,))
+        self._exec(
+            """INSERT INTO directory_archive_bundles
+                   (source_host,original_dir_path,tape_label,archive_run_id,
+                    remote_session_id,chunk_index,stored_bundle_path,
+                    file_count,byte_count,small_file_count,small_file_bytes,
+                    large_file_count,large_file_bytes,backup_date,record_key)
+               SELECT 'fixture', '/fixture/legacy_' || g, 'FORMAT_TAPE', NULL,
+                      %s, NULL, 'legacy/' || g || '.zip', 1, 1, 1, 1, 0, 0,
+                      now(), decode(md5('rehearsal-' || g::text) ||
+                                    md5('rehearsal-' || g::text), 'hex')
+               FROM generate_series(1,134) AS g""", (session_id,))
+        self._ready_014()
+        before = dict(self._query(
+            "SELECT * FROM remote_sessions WHERE session_id=%s",
+            (session_id,))[0])
+
+        report = self.db.classify_format_boundary(session_id)
+
+        after = dict(self._query(
+            "SELECT * FROM remote_sessions WHERE session_id=%s",
+            (session_id,))[0])
+        self.assertEqual(after, before)
+        self.assertEqual(report["derived_boundary"], 49)
+        self.assertEqual(report["blocking"], [])
+        self.assertEqual(report["prefix_evidence_counts"], {
+            "corroborated": 6, "status_only": 43})
+        self.assertEqual(len(report["chunks"]), 113)
+        self.assertTrue(all(
+            row["classification"] == "immutable_zip"
+            and row["inferred_legacy_zip_format"]["format"] == "zip"
+            for row in report["chunks"][:49]))
+        self.assertTrue(all(
+            row["classification"] == "eligible_stored_tar_exception"
+            and row["category_rule"]["eligible_stored_tar_exception"]
+            for row in report["chunks"][49:]))
+        self.assertIsNone(self._query(
+            "SELECT to_regclass('remote_packaging_boundaries') AS r")[0]["r"])
+
+    def test_contradictory_evidence_rolls_back_the_entire_migration(self):
+        session_id = self._session(label="CONTRADICTORY_FIXTURE")
+        self._append(session_id, 0)
+        self._append(session_id, 1)
+        self._catalog_done_prefix(session_id, 0)
+        self._ready_014()
+        plan_file_id = self._query(
+            """SELECT pf.plan_file_id FROM remote_sessions s
+               JOIN remote_plan_files pf ON pf.plan_id=s.plan_id
+               WHERE s.session_id=%s AND pf.chunk_index=1 LIMIT 1""",
+            (session_id,))[0]["plan_file_id"]
+        self._exec(
+            """INSERT INTO remote_file_state
+                   (session_id,plan_file_id,status,updated_at)
+               VALUES (%s,%s,'pending',now())""", (session_id, plan_file_id))
+
+        with self.assertRaisesRegex(Exception, "no evidence-proven"):
+            self.db.apply_container_format_schema(
+                exception_session_id=session_id,
+                expected_boundary=1,
+                approval_id="must-rollback",
+                approval_reason="contradictory synthetic evidence",
+                staging_evidence=self._staging_evidence([1]))
+        columns = self._query(
+            """SELECT count(*) AS n FROM information_schema.columns
+               WHERE table_schema='public' AND table_name='remote_chunks'
+                 AND column_name='packaging_format'""")[0]["n"]
+        self.assertEqual(columns, 0)
+        self.assertEqual(self._query(
+            "SELECT count(*) AS n FROM remote_packaging_boundaries")[0]["n"]
+            if self._query("SELECT to_regclass('remote_packaging_boundaries') AS r")[0]["r"]
+            else 0, 0)
+
+    def test_pending_chunk_with_any_claim_evidence_blocks_migration(self):
+        self._ready_014()
+        cases = (
+            ("owner", "owner_token='fixture-owner'"),
+            ("lease", "lease_expires_at=now() + interval '1 hour'"),
+            ("attempt", "attempt_id='fixture-attempt'"),
+            ("error", "error_msg='fixture-error'"),
+        )
+        for case_index, (name, assignment) in enumerate(cases):
+            with self.subTest(evidence=name):
+                session_id = self._session(
+                    label=f"PENDING_EVIDENCE_{name}_{case_index}")
+                self._append(session_id, 0)
+                self._append(session_id, 1)
+                self._exec(
+                    """UPDATE remote_chunks SET status='done', updated_at=now()
+                       WHERE session_id=%s AND chunk_index=0""", (session_id,))
+                self._exec(
+                    f"""UPDATE remote_chunks SET {assignment}, updated_at=now()
+                        WHERE session_id=%s AND chunk_index=1""", (session_id,))
+                classification = self.db.classify_format_boundary(session_id)
+                self.assertIsNone(classification["derived_boundary"])
+                with self.assertRaisesRegex(Exception, "no evidence-proven"):
+                    self.db.apply_container_format_schema(
+                        exception_session_id=session_id, expected_boundary=1,
+                        approval_id=f"pending-evidence-{name}",
+                        approval_reason=(
+                            "every pending claim/error evidence kind must keep "
+                            "the Stored TAR suffix fail-closed"),
+                        staging_evidence=self._staging_evidence([1]))
+                self.assertIsNone(self._query(
+                    "SELECT to_regclass('archive_containers') AS r")[0]["r"])
+
+    def test_non_done_fixed_prefix_still_blocks_exception(self):
+        session_id = self._session(label="NON_DONE_PREFIX_FIXTURE")
+        self._append(session_id, 0)
+        self._append(session_id, 1)
+        self._exec(
+            """UPDATE remote_chunks SET status='packing', updated_at=now()
+               WHERE session_id=%s AND chunk_index=0""", (session_id,))
+        self._ready_014()
+
+        classification = self.db.classify_format_boundary(session_id)
+        self.assertEqual(classification["derived_boundary"], 1)
+        self.assertTrue(any("indeterminate chunks: 0" in item
+                            for item in classification["blocking"]))
+        with self.assertRaisesRegex(Exception, "indexes.*0"):
+            self.db.apply_container_format_schema(
+                exception_session_id=session_id, expected_boundary=1,
+                approval_id="non-done-prefix",
+                approval_reason="a non-done prefix cannot receive ZIP by exception",
+                staging_evidence=self._staging_evidence([1]))
+        self.assertIsNone(self._query(
+            "SELECT to_regclass('archive_containers') AS r")[0]["r"])
+
+    def test_all_migration007_tables_contribute_measured_chunk_evidence(self):
+        session_id = self._session(label="DIRECT_DIRECTORY_EVIDENCE")
+        self.db.apply_directory_catalog_schema()
+        self._append(session_id, 0)
+        self._append(session_id, 1)
+        self._exec(
+            """UPDATE remote_chunks SET status='done', updated_at=now()
+               WHERE session_id=%s AND chunk_index=0""", (session_id,))
+        self._insert_direct_directory_evidence(session_id, 1)
+        self._ready_014()
+
+        classification = self.db.classify_format_boundary(session_id)
+        suffix = classification["chunks"][1]
+        self.assertEqual(suffix["directory_evidence_count"], 3)
+        self.assertFalse(suffix["eligible_stored_tar"])
+        self.assertEqual(
+            classification["directory_evidence_summary"]["row_count"], 3)
+        self.assertEqual(
+            classification["directory_evidence_summary"]
+            ["attributed_row_count"], 3)
+        self.assertEqual(
+            classification["directory_evidence_summary"]
+            ["unattributed_row_count"], 0)
+        with self.assertRaisesRegex(Exception, "no evidence-proven"):
+            self.db.apply_container_format_schema(
+                exception_session_id=session_id, expected_boundary=1,
+                approval_id="direct-directory-evidence",
+                approval_reason=(
+                    "all three migration-007 tables must block the suffix"),
+                staging_evidence=self._staging_evidence([1]))
+
+    def test_directory_row_proven_for_suffix_still_blocks_exception(self):
+        session_id = self._session(label="DIRECTORY_SUFFIX_FIXTURE")
+        self.db.apply_directory_catalog_schema()
+        for chunk_index in range(3):
+            self._append(session_id, chunk_index)
+        self._exec(
+            """UPDATE remote_chunks SET status='done', updated_at=now()
+               WHERE session_id=%s AND chunk_index=0""", (session_id,))
+        run_id = self._query(
+            """INSERT INTO archive_runs
+                   (run_label,tape_label,session_kind,remote_session_id,started_at)
+               VALUES ('directory-suffix-run','FORMAT_TAPE','remote',%s,now())
+               RETURNING run_id""", (session_id,))[0]["run_id"]
+        self._catalog_chunks(session_id, [2], archive_run_id=run_id)
+        self._exec(
+            """INSERT INTO directory_archive_bundles
+                   (source_host,original_dir_path,tape_label,archive_run_id,
+                    remote_session_id,chunk_index,stored_bundle_path,
+                    file_count,byte_count,small_file_count,small_file_bytes,
+                    large_file_count,large_file_bytes,backup_date,record_key)
+               VALUES ('fixture','/fixture/suffix','FORMAT_TAPE',%s,%s,NULL,
+                       'legacy/suffix.zip',1,1,1,1,0,0,now(),decode(
+                       md5('directory-suffix') || md5('directory-suffix'),'hex'))""",
+            (run_id, session_id))
+        self._ready_014()
+
+        classification = self.db.classify_format_boundary(session_id)
+        self.assertEqual(classification["derived_boundary"], 1)
+        self.assertEqual(
+            classification["chunks"][2]["directory_evidence_count"], 1)
+        self.assertTrue(any("TAR-suffix provenance" in item
+                            for item in classification["blocking"]))
+        with self.assertRaisesRegex(Exception, "TAR-suffix provenance"):
+            self.db.apply_container_format_schema(
+                exception_session_id=session_id, expected_boundary=1,
+                approval_id="directory-suffix",
+                approval_reason=(
+                    "linked directory provenance at or after the boundary "
+                    "must abort"),
+                staging_evidence=self._staging_evidence([1, 2]))
+        self.assertIsNone(self._query(
+            "SELECT to_regclass('archive_containers') AS r")[0]["r"])
+
+    def test_plain_zip_backfill_permanently_closes_exception(self):
+        session_id = self._session(label="ZIP_FIRST_FIXTURE")
+        self._append(session_id, 0)
+        self._append(session_id, 1)
+        self._exec(
+            """UPDATE remote_chunks SET status='done', updated_at=now()
+               WHERE session_id=%s AND chunk_index=0""", (session_id,))
+        self._ready_014()
+        self.db.apply_container_format_schema()
+
+        with self.assertRaisesRegex(Exception, "already backfilled"):
+            self.db.apply_container_format_schema(
+                exception_session_id=session_id, expected_boundary=1,
+                approval_id="too-late",
+                approval_reason="normal ZIP assignment is permanently write-once",
+                staging_evidence=self._staging_evidence([1]))
+        self.assertEqual(self._query(
+            """SELECT array_agg(packaging_format ORDER BY chunk_index) AS formats
+               FROM remote_chunks WHERE session_id=%s""", (session_id,)
+        )[0]["formats"], ["zip", "zip"])
+        self.assertEqual(self._query(
+            """SELECT count(*) AS n FROM remote_packaging_boundaries
+               WHERE session_id=%s""", (session_id,))[0]["n"], 0)
+
+    def test_container_artifact_and_generation_constraints_fail_closed(self):
+        session_id = self._session()
+        self._append(session_id, 0)
+        self._ready_014()
+        self.db.apply_container_format_schema()
+
+        container = self.db.create_archive_container({
+            "session_id": session_id, "chunk_index": 0,
+            "container_ordinal": 0, "container_format": "zip",
+            "format_version": "zip-v1", "tar_dialect": None,
+            "storage_class": "small_files", "container_name": "legacy.zip",
+            "expected_member_count": 2, "expected_logical_bytes": 3,
+        })
+        self.assertGreater(container["container_id"], 0)
+        with self.assertRaises(Exception):
+            self.db.create_archive_container({
+                "session_id": session_id, "chunk_index": 0,
+                "container_ordinal": 0, "container_format": "zip",
+                "format_version": "zip-v2", "tar_dialect": None,
+                "storage_class": "small_files",
+                "container_name": "conflict.zip",
+                "expected_member_count": 2, "expected_logical_bytes": 3,
+            })
+        with self.assertRaises(Exception):
+            self.db.create_archive_container({
+                "session_id": session_id, "chunk_index": 0,
+                "container_ordinal": 1, "container_format": "stored_tar",
+                "format_version": "stored-tar-v1",
+                "tar_dialect": "gnu-pax-sparse-v1",
+                "storage_class": "small_files", "container_name": "bad.tar",
+                "expected_member_count": 2, "expected_logical_bytes": 3,
+            })
+
+        with self.assertRaises(errors.CheckViolation):
+            self._exec(
+                """INSERT INTO archive_artifacts
+                       (session_id,chunk_index,container_id,artifact_kind,
+                        artifact_version,readiness_state)
+                   VALUES (%s,0,%s,'zip_manifest','v1','ready')""",
+                (session_id, container["container_id"]))
+        artifact = self.db.create_archive_artifact({
+            "session_id": session_id, "chunk_index": 0,
+            "container_id": container["container_id"],
+            "artifact_kind": "zip_manifest", "artifact_version": "v1",
+            "local_locator": "metadata/legacy.jsonl.zst",
+            "artifact_size_bytes": 7, "readiness_state": "ready",
+            "published_at": self._query("SELECT now() AS n")[0]["n"],
+        })
+        self.assertEqual(artifact["readiness_state"], "ready")
+        with self.assertRaisesRegex(Exception, "conflicting fields"):
+            self.db.create_archive_artifact({
+                "session_id": session_id, "chunk_index": 0,
+                "container_id": container["container_id"],
+                "artifact_kind": "zip_manifest", "artifact_version": "v1",
+                "local_locator": "metadata/conflict.jsonl.zst",
+                "artifact_size_bytes": 7,
+            })
+        with self.assertRaisesRegex(Exception, "identity is immutable"):
+            self._exec(
+                """UPDATE archive_containers SET expected_member_count=3
+                   WHERE container_id=%s""", (container["container_id"],))
+
+        self.db.register_tape("OTHER_TAPE", 12000)
+        other_generation = self._query(
+            """SELECT generation_id FROM tape_generations
+               WHERE volume_label='OTHER_TAPE' AND state='active'""")[0]
+        with self.assertRaisesRegex(Exception, "does not match"):
+            self._exec(
+                """INSERT INTO archive_containers
+                       (session_id,chunk_index,container_ordinal,
+                        container_format,format_version,storage_class,
+                        container_name,tape_label,tape_path,tape_generation_id,
+                        expected_member_count,expected_logical_bytes)
+                   VALUES (%s,0,2,'zip','zip-v1','small_files','other.zip',
+                           'OTHER_TAPE','other.zip',%s,1,1)""",
+                (session_id, other_generation["generation_id"]))
+
+    def test_optional_007_is_augmented_but_never_silently_installed(self):
+        self._ready_014()
+        self.db.apply_container_format_schema()
+        self.assertFalse(self.db.directory_catalog_schema_installed())
+        self.assertEqual(
+            self.db.container_format_schema_report()["optional_007_state"],
+            "absent")
+
+    def test_installed_007_receives_nullable_compatibility_columns(self):
+        self.db.apply_directory_catalog_schema()
+        self._ready_014()
+        self.db.apply_container_format_schema()
+        columns = {row["column_name"] for row in self._query(
+            """SELECT column_name FROM information_schema.columns
+               WHERE table_schema='public'
+                 AND table_name='directory_archive_bundles'""")}
+        self.assertTrue({
+            "container_id", "container_format", "tape_generation_id",
+            "actual_artifact_bytes"}.issubset(columns))
+        self.assertEqual(
+            self.db.container_format_schema_report()["optional_007_state"],
+            "installed")
+
+    def test_partial_007_blocks_and_rolls_back_015(self):
+        self._exec("CREATE TABLE directory_archive_stats(dummy INTEGER)")
+        self._ready_014()
+        with self.assertRaisesRegex(Exception, "partially installed"):
+            self.db.apply_container_format_schema()
+        self.assertIsNone(self._query(
+            "SELECT to_regclass('archive_containers') AS r")[0]["r"])
+
+    def test_remote_archive_run_identity_and_schema_drift_validation(self):
+        session_id = self._session()
+        self._append(session_id, 0)
+        self._ready_014()
+        self.db.apply_container_format_schema()
+        generation = self._query(
+            """SELECT generation_id FROM tape_generations
+               WHERE volume_label='FORMAT_TAPE' AND state='active'""")[0]
+        self._exec(
+            """INSERT INTO archive_runs
+                   (run_label,tape_label,session_kind,remote_session_id,
+                    remote_chunk_index,tape_generation_id,started_at)
+               VALUES ('stable-run-1','FORMAT_TAPE','remote',%s,0,%s,now())""",
+            (session_id, generation["generation_id"]))
+        with self.assertRaises(errors.UniqueViolation):
+            self._exec(
+                """INSERT INTO archive_runs
+                       (run_label,tape_label,session_kind,remote_session_id,
+                        remote_chunk_index,tape_generation_id,started_at)
+                   VALUES ('stable-run-2','FORMAT_TAPE','remote',%s,0,%s,now())""",
+                (session_id, generation["generation_id"]))
+
+        self._exec(
+            "DROP TRIGGER trg_remote_chunks_packaging_write_once "
+            "ON remote_chunks")
+        report = self.db.container_format_schema_report()
+        self.assertFalse(report["ready"])
+        self.assertIn(
+            "missing trigger: trg_remote_chunks_packaging_write_once",
+            report["issues"])
+        with self.assertRaisesRegex(RuntimeError, "missing or drifted"):
+            self.db.validate_container_format_schema()
+
+    def test_partial_015_is_rejected_instead_of_adopted(self):
+        self._ready_014()
+        self._exec(
+            "ALTER TABLE remote_chunks ADD COLUMN packaging_format TEXT")
+        report = self.db.container_format_schema_report()
+        self.assertEqual(report["installation_state"], "partial")
+        with self.assertRaisesRegex(RuntimeError, "partial or drifted"):
+            self.db.apply_container_format_schema()
+        self.assertIsNone(self._query(
+            "SELECT to_regclass('container_format_schema_metadata') AS r"
+        )[0]["r"])
+
+    def test_boundary_approval_and_audit_rows_are_immutable(self):
+        session_id = self._session(label="IMMUTABLE_BOUNDARY_FIXTURE")
+        self._append(session_id, 0)
+        self._append(session_id, 1)
+        self._catalog_done_prefix(session_id, 0)
+        self._ready_014()
+        self.db.apply_container_format_schema(
+            exception_session_id=session_id, expected_boundary=1,
+            approval_id="immutable-boundary",
+            approval_reason="synthetic immutable boundary fixture",
+            staging_evidence=self._staging_evidence([1]))
+
+        for statement, params in (
+            ("UPDATE remote_packaging_boundaries SET approval_id='changed' "
+             "WHERE session_id=%s", (session_id,)),
+            ("DELETE FROM remote_packaging_boundary_chunks "
+             "WHERE session_id=%s AND chunk_index=1", (session_id,)),
+            ("UPDATE remote_sessions SET default_packaging_format='zip' "
+             "WHERE session_id=%s", (session_id,)),
+        ):
+            with self.subTest(statement=statement):
+                with self.assertRaisesRegex(Exception, "immutable"):
+                    self._exec(statement, params)
+
+        other_session = self._session(
+            label="FABRICATED_BOUNDARY_FIXTURE", tape="FORMAT_TAPE_2")
+        with self.assertRaisesRegex(Exception, "immutable"):
+            self._exec(
+                """INSERT INTO remote_packaging_boundaries
+                       (session_id,first_stored_tar_chunk_index,
+                        last_existing_chunk_index,approval_id,approval_reason,
+                        database_evidence,local_staging_evidence,
+                        evidence_checked_at)
+                   VALUES (%s,0,0,'fabricated','fabricated','{}','{}',now())""",
+                (other_session,))
+
+    def test_stale_or_noncanonical_staging_attestation_is_rejected(self):
+        from datetime import datetime, timedelta, timezone
+
+        session_id = self._session(label="STALE_EVIDENCE_FIXTURE")
+        self._append(session_id, 0)
+        self._ready_014()
+        stale = self._staging_evidence([0])
+        stale["checked_at"] = (
+            datetime.now(timezone.utc) - timedelta(minutes=6)).isoformat()
+        with self.assertRaisesRegex(ValueError, "stale"):
+            self.db.apply_container_format_schema(
+                exception_session_id=session_id, expected_boundary=0,
+                approval_id="stale-evidence",
+                approval_reason="synthetic stale evidence fixture",
+                staging_evidence=stale)
+        extra = self._staging_evidence([0])
+        extra["local_path"] = "must-not-be-persisted"
+        with self.assertRaisesRegex(ValueError, "aggregate fields"):
+            self.db.apply_container_format_schema(
+                exception_session_id=session_id, expected_boundary=0,
+                approval_id="extra-evidence",
+                approval_reason="synthetic extra evidence fixture",
+                staging_evidence=extra)
+
+    def test_ambiguous_catalog_provenance_blocks_exception(self):
+        session_id = self._session(label="AMBIGUOUS_PROVENANCE_FIXTURE")
+        self._append(session_id, 0)
+        self._append(session_id, 1)
+        self._catalog_done_prefix(session_id, 0)
+        self._exec(
+            """UPDATE files_index SET remote_chunk_index=NULL
+               WHERE remote_session_id=%s""", (session_id,))
+        self._ready_014()
+        classification = self.db.classify_format_boundary(session_id)
+        self.assertTrue(any("lack trustworthy remote chunk provenance" in item
+                            for item in classification["blocking"]))
+        with self.assertRaisesRegex(Exception, "trustworthy remote chunk"):
+            self.db.apply_container_format_schema(
+                exception_session_id=session_id, expected_boundary=1,
+                approval_id="ambiguous-provenance",
+                approval_reason="synthetic ambiguous provenance fixture",
+                staging_evidence=self._staging_evidence([1]))
+
+    def test_definition_fingerprint_detects_disabled_trigger(self):
+        session_id = self._session(label="FINGERPRINT_FIXTURE")
+        self._append(session_id, 0)
+        self._ready_014()
+        self.db.apply_container_format_schema()
+        self._exec(
+            "ALTER TABLE remote_chunks DISABLE TRIGGER "
+            "trg_remote_chunks_packaging_write_once")
+        report = self.db.container_format_schema_report()
+        self.assertFalse(report["ready"])
+        self.assertIn(
+            "container format catalog-definition fingerprint drift",
+            report["issues"])
+
+    def _validated_tar_publication_fixture(self, *, directory_catalog=False):
+        rows = [
+            (1, "/fixture/a.bin", "a.bin", 3),
+            (1, "/fixture/missing.bin", "missing.bin", 5),
+        ]
+        session_id = self._stored_tar_planning_session(
+            rows, directory_catalog=directory_catalog)
+        plan = self.db.get_or_create_stored_tar_chunk_plan(
+            session_id, 1, self.db.get_chunk_files(session_id, 1),
+            loose_threshold_bytes=100, max_size_bytes=512 * 512)
+        container = self.db.get_archive_containers(session_id, 1)[0]
+        part = os.path.join(
+            self.staging.name, "container.tar.owner.part")
+        owner = "task-2-4-owner"
+        self.db.claim_stored_tar_container_build(
+            container["container_id"], owner, part)
+        summary = {
+            "container_ordinal": 0,
+            "member_count": 1,
+            "logical_bytes": 3,
+            "archive_size": 262144,
+            "plan_ordinal_count": 2,
+            "disposition_counts": {
+                "archived": 1, "source_missing": 1,
+                "source_permission_denied": 0, "source_unreadable": 0,
+                "source_changed": 0, "unresolved": 0,
+            },
+            "members": [],
+        }
+        diagnostics = [{
+            "plan_ordinal": 1, "path": "missing.bin",
+            "disposition": "source_missing", "evidence": "lstat_missing",
+        }]
+        self.db.mark_stored_tar_validated_part(
+            container["container_id"], owner, part, summary, diagnostics)
+        return session_id, plan, container, part, owner, summary
+
+    def test_017_two_build_owners_cannot_adopt_the_same_part(self):
+        rows = [(1, "/fixture/a.bin", "a.bin", 3)]
+        session_id = self._stored_tar_planning_session(rows)
+        self.db.get_or_create_stored_tar_chunk_plan(
+            session_id, 1, self.db.get_chunk_files(session_id, 1),
+            loose_threshold_bytes=100, max_size_bytes=512 * 512)
+        container = self.db.get_archive_containers(session_id, 1)[0]
+        part = os.path.join(self.staging.name, "same.tar.part")
+        first = self.db.claim_stored_tar_container_build(
+            container["container_id"], "owner-one", part)
+        self.assertEqual(first["owner_token"], "owner-one")
+        with self.assertRaisesRegex(RuntimeError, "another builder"):
+            self.db.claim_stored_tar_container_build(
+                container["container_id"], "owner-two", part)
+        replay = self.db.claim_stored_tar_container_build(
+            container["container_id"], "owner-one", part)
+        self.assertEqual(replay["validated_part_locator"], part)
+
+    def test_017_preserves_preexisting_ready_zip_container_contract(self):
+        session_id = self._session(label="READY_ZIP_BEFORE_017")
+        self._append(session_id, 0, member_count=1)
+        self._ready_014()
+        self.db.apply_container_format_schema()
+        created = self.db.create_archive_container({
+            "session_id": session_id, "chunk_index": 0,
+            "container_ordinal": 0, "container_format": "zip",
+            "format_version": "zip-v1", "tar_dialect": None,
+            "storage_class": "small_files", "container_name": "one.zip",
+            "expected_member_count": 1, "expected_logical_bytes": 1,
+            "observed_member_count": 1, "observed_logical_bytes": 1,
+            "actual_artifact_bytes": 10, "validation_state": "ready",
+        })
+        self.db.apply_stored_tar_plan_schema()
+        row = self.db.get_archive_containers(session_id, 0)[0]
+        self.assertEqual(row["container_id"], created["container_id"])
+        self.assertEqual(row["validation_state"], "ready")
+        self.assertIsNone(row["validation_summary"])
+        self.assertIsNone(row["disposition_counts"])
+
+    def test_017_validated_part_persists_no_final_or_ready_locator(self):
+        _session, _plan, container, part, owner, summary = (
+            self._validated_tar_publication_fixture())
+        row = self.db.get_archive_containers(
+            container["session_id"], container["chunk_index"])[0]
+        self.assertEqual(row["validation_state"], "validated_part")
+        self.assertEqual(row["validated_part_locator"], part)
+        self.assertIsNone(row["temporary_data_locator"])
+        self.assertIsNone(row["permanent_local_metadata_locator"])
+        self.assertEqual(row["validation_summary"]["member_count"], 1)
+        replay = self.db.mark_stored_tar_validated_part(
+            container["container_id"], owner, part, summary,
+            [{"plan_ordinal": 1, "path": "missing.bin",
+              "disposition": "source_missing", "evidence": "lstat_missing"}])
+        self.assertEqual(replay["validation_state"], "validated_part")
+
+    def test_017_pair_becomes_ready_in_one_owner_checked_transaction(self):
+        session, _plan, container, _part, owner, _summary = (
+            self._validated_tar_publication_fixture())
+        values = {
+            "container_id": container["container_id"],
+            "owner_token": owner,
+            "sidecar_locator": "tar_sidecars/s/c.jsonl.zst",
+            "sidecar_version": "tar-sidecar-v1",
+            "sidecar_size_bytes": 123,
+            "temporary_data_locator": os.path.join(
+                self.staging.name, "container.tar"),
+            "tar_size_bytes": 262144,
+            "observed_member_count": 1,
+            "observed_logical_bytes": 3,
+            "disposition_counts": {
+                "archived": 1, "source_missing": 1,
+                "source_permission_denied": 0, "source_unreadable": 0,
+                "source_changed": 0, "unresolved": 0,
+            },
+        }
+        published = self.db.publish_stored_tar_pair(**values)
+        self.assertEqual(
+            published["container"]["validation_state"], "ready")
+        self.assertEqual(
+            published["artifact"]["readiness_state"], "ready")
+        self.assertIsNone(published["container"]["owner_token"])
+        artifacts = self.db.get_archive_artifacts(session, 1)
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(artifacts[0]["local_locator"], values["sidecar_locator"])
+        replay = self.db.publish_stored_tar_pair(**{
+            **values, "owner_token": "recovery-owner"})
+        self.assertEqual(replay["container"]["validation_state"], "ready")
+
+    def test_017_conflicting_sidecar_rolls_back_the_pair(self):
+        session, _plan, container, _part, owner, _summary = (
+            self._validated_tar_publication_fixture())
+        self.db.create_archive_artifact({
+            "session_id": session, "chunk_index": 1,
+            "container_id": container["container_id"],
+            "artifact_kind": "tar_sidecar",
+            "artifact_version": "tar-sidecar-v1",
+            "local_locator": "conflicting/sidecar.jsonl.zst",
+        })
+        with self.assertRaisesRegex(RuntimeError, "conflicts on local_locator"):
+            self.db.publish_stored_tar_pair(
+                container_id=container["container_id"], owner_token=owner,
+                sidecar_locator="tar_sidecars/s/c.jsonl.zst",
+                sidecar_version="tar-sidecar-v1", sidecar_size_bytes=123,
+                temporary_data_locator=os.path.join(
+                    self.staging.name, "container.tar"),
+                tar_size_bytes=262144, observed_member_count=1,
+                observed_logical_bytes=3,
+                disposition_counts={
+                    "archived": 1, "source_missing": 1,
+                    "source_permission_denied": 0, "source_unreadable": 0,
+                    "source_changed": 0, "unresolved": 0})
+        row = self.db.get_archive_containers(session, 1)[0]
+        self.assertEqual(row["validation_state"], "validated_part")
+        artifact = self.db.get_archive_artifacts(session, 1)[0]
+        self.assertEqual(artifact["readiness_state"], "planned")
+        self.assertEqual(
+            artifact["local_locator"], "conflicting/sidecar.jsonl.zst")
+
+    def test_017_reconciliation_owner_reset_and_ready_block_are_cas_guarded(self):
+        session, _plan, container, part, owner, summary = (
+            self._validated_tar_publication_fixture())
+        adopted = self.db.reconcile_stored_tar_build_owner(
+            container["container_id"], owner, "validated_part",
+            "startup-reconciler")
+        self.assertEqual(adopted["owner_token"], "startup-reconciler")
+        with self.assertRaisesRegex(RuntimeError, "owner/state CAS failed"):
+            self.db.reconcile_stored_tar_build_owner(
+                container["container_id"], owner, "validated_part",
+                "racing-reconciler")
+        reset = self.db.reset_reconciled_stored_tar_build(
+            container["container_id"], "startup-reconciler",
+            "validated_part")
+        self.assertEqual(reset["validation_state"], "planned")
+        self.assertIsNone(reset["owner_token"])
+        self.assertIsNone(reset["validated_part_locator"])
+
+        ready_session = session
+        ready_container = container
+        ready_owner = "ready-after-reconcile"
+        self.db.claim_stored_tar_container_build(
+            ready_container["container_id"], ready_owner, part)
+        self.db.mark_stored_tar_validated_part(
+            ready_container["container_id"], ready_owner, part, summary,
+            [{"plan_ordinal": 1, "path": "missing.bin",
+              "disposition": "source_missing",
+              "evidence": "lstat_missing"}])
+        values = {
+            "container_id": ready_container["container_id"],
+            "owner_token": ready_owner,
+            "sidecar_locator": "tar_sidecars/reconcile/ready.jsonl.zst",
+            "sidecar_version": "tar-sidecar-v1",
+            "sidecar_size_bytes": 123,
+            "temporary_data_locator": os.path.join(
+                self.staging.name, "ready-container.tar"),
+            "tar_size_bytes": 262144,
+            "observed_member_count": 1,
+            "observed_logical_bytes": 3,
+            "disposition_counts": {
+                "archived": 1, "source_missing": 1,
+                "source_permission_denied": 0,
+                "source_unreadable": 0, "source_changed": 0,
+                "unresolved": 0,
+            },
+        }
+        self.db.publish_stored_tar_pair(**values)
+        blocked = self.db.block_stored_tar_container(
+            ready_container["container_id"], "ready", None)
+        self.assertEqual(blocked["validation_state"], "blocked")
+        artifacts = self.db.get_archive_artifacts(ready_session, 1)
+        self.assertEqual(artifacts[0]["readiness_state"], "blocked")
+        replay = self.db.block_stored_tar_container(
+            ready_container["container_id"], "ready", None)
+        self.assertEqual(replay["validation_state"], "blocked")
+
+    def test_phase3_tar_copy_catalog_provenance_and_actual_accounting(self):
+        session, _plan, container, _part, owner, _summary = (
+            self._validated_tar_publication_fixture(directory_catalog=True))
+        published = self.db.publish_stored_tar_pair(
+            container_id=container["container_id"], owner_token=owner,
+            sidecar_locator="tar_sidecars/phase3/c0.jsonl.zst",
+            sidecar_version="tar-sidecar-v1", sidecar_size_bytes=123,
+            temporary_data_locator=os.path.join(
+                self.staging.name, "phase3.tar"),
+            tar_size_bytes=262144, observed_member_count=1,
+            observed_logical_bytes=3,
+            disposition_counts={
+                "archived": 1, "source_missing": 1,
+                "source_permission_denied": 0, "source_unreadable": 0,
+                "source_changed": 0, "unresolved": 0})
+        container = published["container"]
+        artifact = published["artifact"]
+        staged = SimpleNamespace(
+            containers=[SimpleNamespace(
+                container_id=container["container_id"],
+                container_name=container["container_name"])],
+            artifacts=[SimpleNamespace(
+                artifact_id=artifact["artifact_id"],
+                staged_path=os.path.join(self.staging.name, "c0.jsonl.zst"))])
+
+        self.db.mark_remote_chunk_writer_started(
+            session, 1, "FORMAT_TAPE", "TROOT", staged)
+        writing = self.db.get_archive_containers(session, 1)[0]
+        self.assertEqual(writing["writer_state"], "writing")
+        self.assertIsNotNone(writing["writer_started_at"])
+
+        context = self.db.mark_remote_chunk_copy_succeeded(
+            session, 1, "FORMAT_TAPE", "TROOT", staged)
+        self.db.mark_remote_chunk_catalog_committing(session, 1)
+        packed = {
+            "file_name": "a.bin", "original_path": "/fixture/a.bin",
+            "canonical_source_path": "/fixture/a.bin",
+            "original_root_dir": self.staging.name,
+            "file_size_bytes": 3, "tape_label": "FORMAT_TAPE",
+            "source_host": "fixture", "is_packed": True,
+            "container_name": os.path.join("TROOT", container["container_name"]),
+            "stored_path": "a.bin", "catalog_policy": "index",
+            "manifest_name": "c0.jsonl.zst",
+            "manifest_format": "jsonl", "manifest_compression": "zstd",
+            "container_id": container["container_id"],
+            "container_format": "stored_tar",
+            "actual_artifact_bytes": 262144,
+            "remote_session_id": session, "remote_chunk_index": 1,
+            "tape_generation_id": context["tape_generation_id"],
+            "archive_run_id": context["archive_run_id"],
+        }
+        self.db.bulk_upsert_directory_catalog(
+            [packed], "FORMAT_TAPE", "fixture",
+            remote_session_id=session, remote_chunk_index=1,
+            tape_generation_id=context["tape_generation_id"],
+            archive_run_id=context["archive_run_id"], tape_root="")
+        # Simulate a process loss after the compatibility row was created but
+        # before its migration-015 container identity was linked. Reconciliation
+        # must adopt the stable row without writing tape again.
+        self._exec(
+            """INSERT INTO archive_bundles
+                   (tape_label, tape_path, container_format)
+               VALUES (%s,%s,'stored_tar') ON CONFLICT DO NOTHING""",
+            ("FORMAT_TAPE", packed["container_name"]))
+        self.db.bulk_upsert_files([packed], update_existing=False)
+        loose = dict(packed)
+        loose.update({
+            "file_name": "large.bin", "original_path": "/fixture/large.bin",
+            "canonical_source_path": "/fixture/large.bin",
+            "file_size_bytes": 50, "is_packed": False,
+            "container_name": None, "stored_path": "TROOT/large.bin",
+            "container_id": None, "container_format": None,
+            "actual_artifact_bytes": None,
+        })
+        self.db.bulk_upsert_files([loose], update_existing=False)
+        self.db.mark_remote_chunk_catalog_committed(session, 1)
+
+        container = self.db.get_archive_containers(session, 1)[0]
+        self.assertEqual(container["writer_state"], "copied")
+        self.assertEqual(container["catalog_state"], "committed")
+        run = self._query(
+            "SELECT * FROM archive_runs WHERE run_id=%s",
+            (context["archive_run_id"],))[0]
+        self.assertEqual(run["remote_session_id"], session)
+        self.assertEqual(run["remote_chunk_index"], 1)
+        self.assertEqual(run["tape_generation_id"],
+                         context["tape_generation_id"])
+        bundle = self._query(
+            "SELECT * FROM archive_bundles WHERE container_id=%s",
+            (container["container_id"],))[0]
+        self.assertEqual(bundle["container_format"], "stored_tar")
+        directory = self._query(
+            "SELECT * FROM directory_archive_bundles WHERE container_id=%s",
+            (container["container_id"],))[0]
+        self.assertEqual(directory["chunk_index"], 1)
+        self.assertEqual(directory["original_dir_path"], "/fixture")
+        self.assertEqual(directory["actual_artifact_bytes"], 262144)
+        self.assertEqual(
+            self.db.recalculate_tape_used_space("FORMAT_TAPE"),
+            1 + 262144 + 123 + 50)
+
+        # Idempotent replay cannot add a second run, bundle or byte.
+        self.db.bulk_upsert_directory_catalog(
+            [packed], "FORMAT_TAPE", "fixture",
+            remote_session_id=session, remote_chunk_index=1,
+            tape_generation_id=context["tape_generation_id"],
+            archive_run_id=context["archive_run_id"], tape_root="")
+        self.db.bulk_upsert_files([packed], update_existing=False)
+        self.assertEqual(self.db.recalculate_tape_used_space("FORMAT_TAPE"),
+                         1 + 262144 + 123 + 50)
 
 
 if __name__ == "__main__":

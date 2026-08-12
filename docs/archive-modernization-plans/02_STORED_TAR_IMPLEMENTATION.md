@@ -11,15 +11,25 @@
 7. Record the residual risk that corruption preserving the same path, size, and readable structure is not detected.
 8. Never add automatic tape reads. All validation in this plan uses staging or permanent local metadata.
 
+> **Operator-approved Session 37 override (authoritative):** The generic rule
+> below says pre-existing chunks backfill to ZIP. The operator explicitly
+> approved the Task 4.2 exception for Session 37 after individual evidence
+> review: completed chunks 0-48 remain ZIP, while never-started pending chunks
+> 49-112 are assigned `stored_tar` by migration 015. This is not a conversion of
+> written data. It is the one proved existing-identity exception allowed by Task
+> 4.2's acceptance clause. Do not revert it or weaken its eligibility predicate.
+> Persisting that boundary additionally requires
+> `stored_tar_write_enabled=true`; rehearsal and ordinary ZIP backfill do not.
+
 ## Phase 0 — Add explicit, immutable format and artifact state
 
 ### Task 0.1 — Add migration 015 for chunk/container format truth
 
-- **Change:** Add `scripts/sql/015_postgres_container_formats.sql` and an explicit schema apply/validate command. Backfill every pre-existing remote chunk as ZIP; do not derive format from a filename at restore time. Do not treat optional/disabled migration 012 or `src.sealed_batch_repository.SealedBatchRepository.FORMAT_GENERATION=1` as per-chunk format authority; it models legacy ZIP batches and is not wired into scheduling.
+- **Change:** Add `scripts/sql/015_postgres_container_formats.sql` and an explicit schema apply/validate command. Normally backfill every pre-existing remote chunk as ZIP; the operator-approved Session 37 exception above assigns its individually proved never-started suffix directly to Stored TAR. Do not derive format from a filename at restore time. Do not treat optional/disabled migration 012 or `src.sealed_batch_repository.SealedBatchRepository.FORMAT_GENERATION=1` as per-chunk format authority; it models legacy ZIP batches and is not wired into scheduling.
 - **Database:** Apply these additive changes:
   - Add `remote_sessions.default_packaging_format` with values `zip` or `stored_tar`, default/backfill `zip`.
   - Add `remote_chunks.packaging_format`, `packaging_assigned_at`, `writer_started_at`, `writer_completed_at`, and `catalog_committed_at`; backfill existing rows to `zip` and make format non-null.
-  - Make a non-null chunk format write-once. Reject every later update, including an update before fetch/pack/write. Existing chunks become permanently ZIP at backfill; only chunks created after an approved boundary may receive TAR on their initial insert.
+  - Make a non-null chunk format write-once. Reject every later update, including an update before fetch/pack/write. Existing chunks normally become permanently ZIP at backfill. The Session 37 exception assigns the evidence-proven pending suffix on its first assignment; future chunks after the approved boundary may then receive TAR on their initial insert.
   - Add `archive_containers` keyed by `(session_id, chunk_index, container_ordinal)` with immutable `container_format`, persisted TAR dialect/version, storage class, container name, temporary data-staging locator, permanent local metadata locator, tape label/path and `tape_generation_id` when written, expected/observed member counts and bytes, actual artifact bytes, validation state, writer state, and catalog state. Link `tape_generation_id` to migration-013 `tape_generations.generation_id` and verify it matches the session/tape at write time.
   - Add `archive_artifacts` keyed by container/chunk plus artifact kind/version, with distinct local and tape locators, recorded artifact size, readiness state, and publication timestamps. Reserve kinds for `zip_manifest`, `tar_sidecar`, `plan_manifest`, and `terminal_manifest` without requiring Plans 3–4 to populate all kinds yet.
   - Add nullable `container_id` and explicit legacy `container_format='zip'` compatibility columns to `archive_bundles`; do not merge or renumber existing bundle identities.
@@ -29,7 +39,7 @@
 - **Dependencies:** Plan 1 migration 014 and sealed-membership semantics.
 - **Tests:** Add isolated PostgreSQL tests to `tests/test_pg_integration.py` for idempotent apply, ZIP backfill, immutable format, unique container ordinal, artifact readiness, optional-007 behavior, and legacy `archive_bundles` compatibility.
 - **Failure/recovery:** Schema is additive. Feature startup fails closed on missing/drifted schema. A failed backfill cannot leave null or inferred formats.
-- **Acceptance gate:** Every existing chunk reports permanently assigned `zip`; no existing tape/container row changes location or identity; every attempted format mutation is rejected.
+- **Acceptance gate:** Every existing chunk reports a durable, write-once format; all are ZIP except an individually proved and approved Task 4.2 exception such as Session 37 chunks 49-112. No existing tape/container row changes location or identity; every attempted format mutation is rejected.
 - **Rollback:** Disable all new format-aware paths and continue reading backfilled ZIP rows. Do not drop populated container/artifact tables.
 
 ### Task 0.2 — Extend the in-memory staging contract
@@ -298,7 +308,7 @@
 ### Gate 5.1 — TAR reader support
 
 - [ ] Migration 015 is validated in an isolated PostgreSQL database.
-- [ ] All existing rows route explicitly to ZIP.
+- [ ] All existing rows route from persisted format metadata: ZIP by normal backfill, with only the documented, individually proved Session 37 suffix exception routing to Stored TAR.
 - [ ] Strict TAR parser handles all supported fixtures and rejects unsafe/unsupported members.
 - [ ] TAR creation flags remain off.
 

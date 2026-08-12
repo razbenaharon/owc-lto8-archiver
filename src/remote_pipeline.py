@@ -63,6 +63,8 @@ class PipelineOutcome:
     failed: bool = False
     scanner_finished: bool = False
     groups_written: List[tuple] = field(default_factory=list)
+    #: Set when a bounded run ended itself at a group boundary.
+    stopped_reason: Optional[str] = None
 
 
 class RemotePipelineCoordinator:
@@ -77,7 +79,8 @@ class RemotePipelineCoordinator:
     def __init__(self, *, host, session_id, tape_label, ready_q, stop_event,
                  metrics, scan_coordinator=None, backlog_limit=64,
                  poll_seconds=DEFAULT_POLL_SECONDS, observation_worker=None,
-                 writer_path="pipeline", scan_complete=False):
+                 writer_path="pipeline", scan_complete=False,
+                 max_write_groups=0):
         self.host = host
         self.session_id = session_id
         self.tape_label = tape_label
@@ -90,6 +93,14 @@ class RemotePipelineCoordinator:
         self.observation_worker = observation_worker
         self.writer_path = writer_path
         self.scan_complete = scan_complete
+        #: Stop after this many successfully committed write groups; 0 means
+        #: drain normally. A bounded run uses this rather than a mid-run kill,
+        #: so the stop always lands on a chunk boundary.
+        self.max_write_groups = max(0, int(max_write_groups or 0))
+        #: Write-only resume: drain already-planned, already-sealed legacy_db
+        #: chunks and do no discovery. Set by the orchestrator, which also
+        #: declines to construct a scan coordinator at all.
+        self.write_only = False
 
         #: Chunks this process has already picked up for staging. Purely
         #: in-process de-duplication on top of authoritative status — never a
@@ -134,6 +145,44 @@ class RemotePipelineCoordinator:
         with self._taken_lock:
             return sum(1 for ci in pending if ci not in self._taken)
 
+    def _write_only_admits(self, chunk_index):
+        """In write-only resume, a chunk must already be sealed legacy_db work.
+
+        Write-only exists to drain chunks planned by an earlier run. It must
+        never be a back door into writing something whose membership is not
+        already frozen and persisted, so a chunk is admitted only when its
+        durable state says so. Anything unreadable, unsealed, or
+        manifest-planned is refused and left alone: a manifest chunk's
+        membership lives in a local artifact, which is the scanner's business,
+        not this mode's.
+        """
+        reader = getattr(self.host.db, 'get_remote_chunk', None)
+        if not callable(reader):
+            return True
+        try:
+            chunk = reader(self.session_id, chunk_index)
+        except Exception:
+            get_logger().warning(
+                "write_only_chunk_unreadable: chunk=%s -- refusing",
+                chunk_index, exc_info=True)
+            return False
+        if not chunk:
+            return False
+        if chunk.get('membership_state') != 'sealed':
+            get_logger().info(
+                "write_only_refused_unsealed: chunk=%s membership_state=%r",
+                chunk_index, chunk.get('membership_state'))
+            return False
+        plan_source = chunk.get('plan_source')
+        # A pre-015/018 row may predate the column entirely; absent means the
+        # only planning source that existed then, which is the legacy one.
+        if plan_source is not None and plan_source != 'legacy_db':
+            get_logger().info(
+                "write_only_refused_plan_source: chunk=%s plan_source=%r",
+                chunk_index, plan_source)
+            return False
+        return True
+
     def next_chunk_to_stage(self):
         """The lowest-indexed sealed chunk this process has not taken yet."""
         try:
@@ -143,9 +192,15 @@ class RemotePipelineCoordinator:
             return None
         with self._taken_lock:
             for chunk_index in pending:
-                if chunk_index not in self._taken:
+                if chunk_index in self._taken:
+                    continue
+                if self.write_only and not self._write_only_admits(chunk_index):
+                    # Mark it taken so the loop does not re-check it forever;
+                    # it is skipped for this run, not altered in any way.
                     self._taken.add(chunk_index)
-                    return chunk_index
+                    continue
+                self._taken.add(chunk_index)
+                return chunk_index
         return None
 
     # ------------------------------------------------------------------
@@ -190,6 +245,22 @@ class RemotePipelineCoordinator:
         return (self.scan_coordinator is not None
                 and not self._scanner_done.is_set())
 
+    def _plan_source_for(self, chunk_index):
+        """The membership reader for one chunk (Plan 3, Task 1.3).
+
+        Resolved here rather than through a host hook so that every caller -
+        production orchestrator and test double alike - gets the same selection
+        rule without having to reimplement it.
+        """
+        from .plan_source import plan_source_for_chunk
+
+        host = self.host
+        cfg = getattr(host, "cfg", None)
+        return plan_source_for_chunk(
+            host.db, self.session_id, chunk_index,
+            archive_root=getattr(cfg, "local_manifest_archive_root", None),
+            exception_states=getattr(host, "_chunk_exception_states", None))
+
     def _run_stager(self):
         """Take sealed chunks in index order, stage them, enqueue them."""
         host = self.host
@@ -204,20 +275,25 @@ class RemotePipelineCoordinator:
                     self.stop_event.wait(self.poll_seconds)
                     continue
 
-                summary = host.db.get_chunk_size_summary(
-                    self.session_id, chunk_index).get(chunk_index, (0, 0, 0))
-                planned_bytes, _, planned_files = summary
+                # Plan 3, Task 1.3: membership arrives through ONE typed
+                # stream. Which adapter answers is decided by the chunk's
+                # persisted plan_source and nothing else, so a legacy chunk and
+                # a manifest chunk in the same session are both just "a chunk".
+                plan_source, chunk_ref = self._plan_source_for(chunk_index)
+                summary = plan_source.summary(chunk_ref)
+                planned_bytes, _, planned_files = summary.as_tuple()
                 host._validate_chunk_file_limit(
                     self.session_id, chunk_index, planned_files)
+                chunk_files = plan_source.iter_chunk_entries(chunk_ref)
                 host._await_staging_capacity(
                     planned_bytes, planned_files, self.stop_event,
-                    ready_q=self.ready_q)
+                    ready_q=self.ready_q, session_id=self.session_id,
+                    chunk_index=chunk_index, chunk_files=chunk_files)
                 if self._stopping():
                     break
 
                 desc = host._stage_chunk(
-                    self.session_id, chunk_index,
-                    host.db.get_chunk_files(self.session_id, chunk_index))
+                    self.session_id, chunk_index, chunk_files)
                 if desc is None:
                     if not CANCEL.is_set():
                         host._producer_err = (
@@ -259,6 +335,13 @@ class RemotePipelineCoordinator:
     def run(self):
         """Start the producers and drain finite write groups until done."""
         host = self.host
+        if self.write_only and self.scan_coordinator is not None:
+            # Belt and braces: the orchestrator does not build a coordinator in
+            # this mode, so reaching here means the two disagree. Refuse rather
+            # than start discovery a write-only run promised not to do.
+            raise RuntimeError(
+                "[PIPELINE] write-only resume was given a scan coordinator; "
+                "refusing to start the scanner")
         if self.scan_coordinator is not None:
             self._scanner_thread = threading.Thread(
                 target=self._run_scanner, name='streaming-scanner', daemon=True)
@@ -307,6 +390,24 @@ class RemotePipelineCoordinator:
                     for item in items:
                         self.ready_q.mark_written(item)
                     outcome.completed_chunks += len(items)
+                    # A bounded run stops after N successful groups instead of
+                    # draining every ready chunk.  The runbook requires that
+                    # the next group never starts automatically, and the stop
+                    # lands here -- AFTER a group committed and BEFORE the next
+                    # is selected -- which is exactly a chunk boundary, so LTFS
+                    # has synced and the session stays resumable.
+                    if (self.max_write_groups
+                            and len(outcome.groups_written)
+                            >= self.max_write_groups):
+                        _status('TAPE',
+                                f"Bounded run: {self.max_write_groups} write "
+                                "group(s) completed; stopping instead of "
+                                "starting another.")
+                        get_logger().info(
+                            "bounded_run_group_limit_reached: groups=%d",
+                            len(outcome.groups_written))
+                        outcome.stopped_reason = "max_write_groups_reached"
+                        break
                     continue
 
                 self._settle_aborted_group(items, stop_block)

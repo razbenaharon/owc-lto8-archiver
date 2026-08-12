@@ -15,6 +15,8 @@ from unittest import mock
 from src import retriever as retriever_mod
 from src import local_manifest_archive as manifest_archive
 from src.retriever import LTORetriever
+from src.pg_catalog import PgCatalogMixin
+from src.pipeline_types import ContainerFormat
 from src.runtime import CANCEL
 
 
@@ -98,6 +100,68 @@ class RestoreCollisionTests(unittest.TestCase):
                  "stored_path": "x", "file_name": "x",
                  "original_path": "/x"},
             ])
+
+    def test_persisted_format_routes_without_extension_or_packing_guess(self):
+        record = {
+            "container_id": 8, "container_format": "stored_tar",
+            "is_packed": False, "container_name": "opaque.zip",
+        }
+        self.assertIs(
+            self.retriever._route_container_format(record),
+             ContainerFormat.STORED_TAR)
+
+    def test_bundle_persisted_format_precedes_legacy_is_packed_adapter(self):
+        sql = PgCatalogMixin._catalog_select(container_schema=True)
+        persisted = sql.index("WHEN b.container_format IS NOT NULL")
+        legacy = sql.index("WHEN f.is_packed AND b.bundle_id IS NOT NULL")
+        self.assertLess(persisted, legacy)
+        hydrated = PgCatalogMixin._hydrate_file_row({
+            "stored_path": "opaque/member", "original_path": "/srv/member",
+            "restore_container_format": "stored_tar",
+            "restore_container_id": None,
+            "restore_format_version": "stored-tar-v1",
+            "restore_tar_dialect": "gnu-pax-sparse-v1",
+            "tape_container_locator": "opaque.container",
+            "is_packed": True,
+        })
+        self.assertIs(
+            self.retriever._route_container_format(hydrated),
+            ContainerFormat.STORED_TAR)
+
+    def test_legacy_no_format_bundle_falls_back_to_zip(self):
+        record = {
+            "container_format": None, "container_id": None,
+            "bundle_id": 9, "is_packed": True,
+            "tape_container_locator": "legacy/opaque.bundle",
+        }
+        self.assertIs(
+            self.retriever._route_container_format(record),
+            ContainerFormat.ZIP)
+
+
+class CanonicalBundleBaseTests(unittest.TestCase):
+    class _Result:
+        def __init__(self, row):
+            self.row = row
+
+        def fetchone(self):
+            return self.row
+
+    def test_persisted_canonical_root_wins_without_remote_session_lookup(self):
+        statements = []
+
+        class _Conn:
+            @staticmethod
+            def execute(sql, params):
+                statements.append(sql)
+                return CanonicalBundleBaseTests._Result({
+                    "original_dir_path": "/canonical/root"})
+
+        result = PgCatalogMixin._derive_bundle_base_path(
+            _Conn(), "Z:/opaque.container", 37)
+
+        self.assertEqual(result, "/canonical/root")
+        self.assertFalse(any("remote_sessions" in sql for sql in statements))
 
 
 class LocalManifestRestoreDispatchTests(unittest.TestCase):

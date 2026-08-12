@@ -116,6 +116,12 @@ def validate_remote_posix_relpath(path):
     text = path if isinstance(path, str) else str(path or '')
     if not text:
         raise ValueError("empty remote relative path")
+    if '\0' in text:
+        raise ValueError("remote relative path contains NUL")
+    try:
+        text.encode('utf-8', 'strict')
+    except UnicodeError as exc:
+        raise ValueError("remote relative path is not valid UTF-8 text") from exc
     if text.startswith('/') or re.match(r'^[A-Za-z]:[/\\]', text):
         raise ValueError(f"remote relative path must not be absolute: {path!r}")
     parts = text.split('/')
@@ -124,6 +130,51 @@ def validate_remote_posix_relpath(path):
             f"remote relative path has an empty or traversal component: "
             f"{path!r}")
     return text
+
+
+def remote_store_base_and_rel(configured_remote_path, remote_fpath):
+    """Map a canonical remote path to a faithful Stored-TAR base/member pair.
+
+    Unlike the legacy extraction helper below, this function never treats a
+    Linux backslash as a separator and never rewrites the member spelling.
+    """
+    remote_root = str(configured_remote_path or '')
+    scanned_path = str(remote_fpath or '')
+    if not remote_root:
+        raise ValueError("empty configured remote path")
+    if not scanned_path:
+        raise ValueError("empty scanned remote path")
+    for label, value, allow_trailing in (
+            ("configured remote path", remote_root, True),
+            ("scanned remote path", scanned_path, False)):
+        if '\0' in value:
+            raise ValueError(f"{label} contains NUL")
+        try:
+            value.encode('utf-8', 'strict')
+        except UnicodeError as exc:
+            raise ValueError(f"{label} is not valid UTF-8 text") from exc
+        if re.match(r'^[A-Za-z]:[/\\]', value):
+            raise ValueError(f"{label} is drive-qualified")
+        body = value[1:] if value.startswith('/') else value
+        if allow_trailing:
+            body = body[:-1] if body.endswith('/') else body
+        parts = body.split('/') if body else []
+        if any(part in ('', '.', '..') for part in parts):
+            raise ValueError(f"{label} has empty/traversal components")
+    root = remote_root.rstrip('/') or '/'
+    source = scanned_path
+    if source == root:
+        base = posixpath.dirname(root) or '.'
+        rel = posixpath.basename(root)
+    elif root == '/':
+        base = '/'
+        rel = source.lstrip('/')
+    elif source.startswith(root.rstrip('/') + '/'):
+        base = root
+        rel = source[len(root.rstrip('/') + '/'):]
+    else:
+        raise ValueError(f"remote path outside base: {remote_fpath}")
+    return base, validate_remote_posix_relpath(rel)
 
 
 def remote_path_is_legacy_safe(path):

@@ -164,7 +164,9 @@ class RemoteScanCoordinator:
                  stop_event, budget_bytes, alloc_unit, padding_factor,
                  max_files, scanner_factory=None, on_budget_exceeded=None,
                  on_scan_error=None, on_chunk_published=None,
-                 publication_gate=None, on_finished=None):
+                 publication_gate=None, on_finished=None,
+                 stored_tar_write_enabled=False,
+                 stored_tar_reader_contract_version=None):
         self.db = db
         self.session_id = session_id
         self.scan_paths = list(scan_paths)
@@ -184,6 +186,9 @@ class RemoteScanCoordinator:
         #: renewed exploration queue behind the whole resumed backlog.
         self._publication_gate = publication_gate
         self._on_finished = on_finished
+        self._stored_tar_write_enabled = stored_tar_write_enabled is True
+        self._stored_tar_reader_contract_version = (
+            stored_tar_reader_contract_version)
 
     def _stopping(self):
         return CANCEL.is_set() or self.stop_event.is_set()
@@ -246,9 +251,15 @@ class RemoteScanCoordinator:
 
         chunk_index = state.next_chunk_index
         insert_started = time.monotonic()
+        gate_kwargs = {
+            "stored_tar_write_enabled": self._stored_tar_write_enabled,
+            "reader_contract_version":
+                self._stored_tar_reader_contract_version,
+            "require_container_format_schema": True,
+        }
         result = self.db.append_remote_streaming_chunk(
             self.session_id, chunk_index,
-            self._chunk_rows(chunk_index, chunk_files))
+            self._chunk_rows(chunk_index, chunk_files), **gate_kwargs)
         inserted_files = int(result.get('inserted_files', 0))
         inserted_bytes = int(result.get('inserted_bytes', 0))
         state.metrics.note_plan_insert(
@@ -643,7 +654,8 @@ class SegmentChunkPublisher:
 
     def __init__(self, *, db, session_id, archive_root, builder_factory,
                  legacy_session=False, publication_gate=None, on_sealed=None,
-                 budget_guard=None):
+                 budget_guard=None, stored_tar_write_enabled=False,
+                 stored_tar_reader_contract_version=None):
         self.db = db
         self.session_id = session_id
         self.archive_root = archive_root
@@ -660,6 +672,9 @@ class SegmentChunkPublisher:
         self._publication_gate = publication_gate
         self._on_sealed = on_sealed
         self._budget_guard = budget_guard
+        self._stored_tar_write_enabled = stored_tar_write_enabled is True
+        self._stored_tar_reader_contract_version = (
+            stored_tar_reader_contract_version)
         #: Set when a gate or the budget stopped publication mid-way, so the
         #: caller can stop claiming directories instead of spinning.
         self.halted = False
@@ -851,11 +866,25 @@ class SegmentChunkPublisher:
         The production coordinator needs the counts to advance the pipeline's
         remaining-tape budget and scan metrics; the unit tests only need the
         next index, which is what :meth:`_seal` keeps returning.
+
+        Plan 3, Task 3.3: when a persisted transition epoch says this index is
+        at or past the manifest boundary, the chunk is sealed from a local plan
+        manifest instead of per-file rows. The decision is read from the
+        database, never inferred - a chunk below the boundary keeps its legacy
+        membership exactly as before.
         """
+        if self._manifest_boundary_covers(chunk_index):
+            return self._seal_manifest_first(chunk_files, chunk_index, segment)
         rows = [(chunk_index, path, os.path.basename(path), size)
                 for path, size in chunk_files]
+        gate_kwargs = {
+            "stored_tar_write_enabled": self._stored_tar_write_enabled,
+            "reader_contract_version":
+                self._stored_tar_reader_contract_version,
+            "require_container_format_schema": True,
+        }
         result = self.db.append_remote_streaming_chunk(
-            self.session_id, chunk_index, rows)
+            self.session_id, chunk_index, rows, **gate_kwargs)
         inserted = int(result.get("inserted_files", 0))
         inserted_bytes = int(result.get("inserted_bytes", 0))
         if inserted == 0:
@@ -874,6 +903,80 @@ class SegmentChunkPublisher:
             scan_segment_id=(segment or {}).get("scan_segment_id"),
             first_scan_ordinal=first, last_scan_ordinal=last)
         return chunk_index + 1, inserted, inserted_bytes
+
+    # -- Plan 3, Task 3.3: manifest-first continuation ------------------
+
+    def _manifest_boundary_covers(self, chunk_index):
+        """Is this index at or past an ACTIVE manifest transition boundary?
+
+        Fails closed in both directions: without the schema, without an active
+        epoch, or on any read error the answer is False and the chunk is sealed
+        exactly the way it has always been. Manifest planning is opt-in through
+        persisted, approved evidence - never a default.
+        """
+        if self.archive_root is None:
+            return False
+        reader = getattr(self.db, "active_manifest_boundary", None)
+        if not callable(reader):
+            return False
+        try:
+            boundary = reader(self.session_id)
+            if boundary is None:
+                return False
+            # Coerce INSIDE the guard. A reader that answers with something
+            # that is not an index (a test double, a driver returning an
+            # unexpected shape) must fail closed to legacy planning, not
+            # escape as a TypeError from the middle of sealing a chunk.
+            return int(chunk_index) >= int(boundary)
+        except (TypeError, ValueError):
+            get_logger().warning(
+                "manifest_boundary_not_an_index: session=%s; sealing this "
+                "chunk through legacy planning", self.session_id)
+            return False
+        except Exception:                        # pragma: no cover - defensive
+            get_logger().warning(
+                "manifest_boundary_unreadable: session=%s; sealing this chunk "
+                "through legacy planning", self.session_id)
+            return False
+
+    def _seal_manifest_first(self, chunk_files, chunk_index, segment):
+        """Seal one chunk from a published plan manifest.
+
+        No ``remote_snapshot_files`` or ``remote_plan_files`` row is written:
+        the artifact is the membership. Large files still reach ``files_index``
+        later through the existing successful catalog path.
+        """
+        from .manifest_first import ManifestChunkSealer, PendingChunk
+
+        session = self.db.get_remote_session(self.session_id) or {}
+        label = session.get("session_label")
+        if not label:
+            raise RuntimeError(
+                f"[SCAN] session {self.session_id} has no stable label; "
+                "manifest planning cannot name its artifacts")
+
+        pending = PendingChunk(session_label=label, chunk_index=chunk_index,
+                               packaging_format="stored_tar")
+        segment_id = (segment or {}).get("scan_segment_id")
+        base = int((segment or {}).get("first_scan_ordinal") or 0)
+        for offset, (path, size) in enumerate(chunk_files):
+            pending.add(path=path, size=size, scan_segment_id=segment_id,
+                        scan_ordinal=base + offset)
+        if segment_id is not None and pending.members:
+            pending.note_consumption(segment_id, base,
+                                     base + len(pending.members) - 1)
+
+        sealer = ManifestChunkSealer(self.db, self.archive_root,
+                                     self.session_id, label)
+        result = sealer.seal(pending)
+        if segment is not None:
+            self.db.consume_segment_range(
+                segment_id, self.session_id, chunk_index,
+                result["file_count"])
+        get_logger().info(
+            "manifest_first_chunk_sealed: session=%s chunk=%s files=%d",
+            self.session_id, chunk_index, result["file_count"])
+        return (chunk_index + 1, result["file_count"], result["byte_total"])
 
 
 class FrontierScanCoordinator:
@@ -919,7 +1022,9 @@ class FrontierScanCoordinator:
                  legacy_session=False, publication_gate=None,
                  on_chunk_published=None, on_budget_exceeded=None,
                  on_scan_error=None, on_finished=None, ui=None,
-                 max_directories=None, owner_token=None):
+                 max_directories=None, owner_token=None,
+                 stored_tar_write_enabled=False,
+                 stored_tar_reader_contract_version=None):
         self.db = db
         self.session_id = session_id
         self.state = state
@@ -939,7 +1044,10 @@ class FrontierScanCoordinator:
             db=db, session_id=session_id, archive_root=archive_root,
             builder_factory=builder_factory, legacy_session=legacy_session,
             publication_gate=publication_gate,
-            budget_guard=self._budget_guard, on_sealed=self._on_sealed)
+            budget_guard=self._budget_guard, on_sealed=self._on_sealed,
+            stored_tar_write_enabled=stored_tar_write_enabled,
+            stored_tar_reader_contract_version=(
+                stored_tar_reader_contract_version))
 
     def _stopping(self):
         return CANCEL.is_set() or self.stop_event.is_set()

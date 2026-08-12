@@ -13,10 +13,13 @@ except ImportError:  # optional dependency; priority/affinity degrade gracefully
     psutil = None
 
 from .constants import BACKUP_LOG_DIR, LTFS_WRITE_WARNING
+from .container_catalog import TarCatalogAdapter
 from .logsetup import get_logger
 from .ltfs import _ensure_lto_drive_ready, eject_tape_drive, note_tape_io_error
 from .ram_telemetry import RamStageSampler, TapeWriteProfiler
 from .reporting import append_backup_summary_row
+from .pipeline_types import (ContainerFormat,
+                             validate_staged_chunk_writer_admission)
 from .robocopy import (
     _parse_robocopy_summary, _run_robocopy_tuned, classify_robocopy_result,
     RobocopyVerdict)
@@ -26,6 +29,27 @@ from .telegram_notify import notify_backup_summary
 
 if TYPE_CHECKING:
     from .pg_db import PgDatabaseManager
+
+
+@contextlib.contextmanager
+def _remote_catalog_commit_state(db, session_id, chunk_index):
+    """Advance migration-015 catalog state around all legacy catalog calls."""
+    enabled = (session_id is not None and chunk_index is not None
+               and hasattr(db, "mark_remote_chunk_catalog_committing"))
+    if not enabled:
+        yield
+        return
+    db.mark_remote_chunk_catalog_committing(session_id, chunk_index)
+    try:
+        yield
+        db.mark_remote_chunk_catalog_committed(session_id, chunk_index)
+    except BaseException:
+        try:
+            db.mark_remote_chunk_catalog_failed(session_id, chunk_index)
+        except Exception:
+            get_logger().exception(
+                "could not persist failed remote catalog state")
+        raise
 
 
 def _tape_destination_root(source, tape_drive, tape_parent_dir=None):
@@ -43,7 +67,8 @@ def _tape_destination_root(source, tape_drive, tape_parent_dir=None):
 class LTOBackup:
     def __init__(self, db: "PgDatabaseManager", ibm_eject_cmd: str,
                  tape_priority=None, tape_affinity=None, log_dir=None,
-                 notifier=None, governor=None, index_min_file_mb=10):
+                 notifier=None, governor=None, index_min_file_mb=10,
+                 index_packed_small_files=False):
         self.db            = db
         self.ibm_eject_cmd = ibm_eject_cmd
         self.tape_priority = tape_priority   # psutil priority class for robocopy
@@ -52,6 +77,7 @@ class LTOBackup:
         self.notifier      = notifier
         self.governor      = governor
         self.index_min_file_mb = index_min_file_mb
+        self.index_packed_small_files = bool(index_packed_small_files)
 
     def _write_backup_log(self, details, packer_metadata, loose_map,
                           recovered_direct_existing, skipped_existing,
@@ -80,6 +106,13 @@ class LTOBackup:
             tape_parent_dir=None, source_host='local', skipped_tracker=None,
             remote_session_id=None, remote_chunk_index=None,
             on_write_start=None):
+        if stage_stats is not None:
+            # A direct caller must fail on local/DB descriptor disagreement
+            # before Global LTFS ownership is acquired.  _run_locked repeats
+            # this for callers that deliberately enter below this wrapper.
+            validate_staged_chunk_writer_admission(
+                stage_stats, self.db,
+                expected_session_id=remote_session_id)
         print(f"[WARNING] {LTFS_WRITE_WARNING}")
         _acquire_tape_io_lock(f"backup write to {tape_drive}")
         try:
@@ -138,6 +171,13 @@ class LTOBackup:
             Empty for local/direct runs and for any producer that did not scan.
             """
             return dict(getattr(stage_stats, "scan_stats", None) or {})
+        if stage_stats is not None:
+            # Defense in depth for callers that bypass RemoteChunkWriter. This
+            # is deliberately before _ensure_lto_drive_ready: incomplete local
+            # TAR/sidecar state must cause zero tape interaction.
+            validate_staged_chunk_writer_admission(
+                stage_stats, self.db,
+                expected_session_id=remote_session_id)
         print(f"\n[BACKUP] Starting... Tape: {tape_label} | Drive: {tape_drive}")
         if not _ensure_lto_drive_ready(tape_drive, prefix="[BACKUP]"):
             raise RuntimeError("LTO drive is not ready for backup.")
@@ -392,6 +432,17 @@ class LTOBackup:
             self.log_dir or BACKUP_LOG_DIR, log_session_id, log_chunk_index,
             tape_label, source, tape_root, robocopy_cmd,
             expected_files=expected_files, expected_bytes=total_bytes)
+        catalog_context = {}
+
+        def _mark_writer_started_durably():
+            if (stage_stats is not None and remote_session_id is not None
+                    and remote_chunk_index is not None
+                    and hasattr(self.db, "mark_remote_chunk_writer_started")):
+                self.db.mark_remote_chunk_writer_started(
+                    remote_session_id, remote_chunk_index, tape_label,
+                    tape_root, stage_stats)
+            if on_write_start is not None:
+                on_write_start()
         try:
             try:
                 with RamStageSampler("tape", _ram_interval()) as tape_sampler:
@@ -404,8 +455,7 @@ class LTOBackup:
                             # tape may be touched, so signal the caller that the
                             # write has STARTED — a failure past this point is
                             # physically ambiguous (data may be partly on tape).
-                            if on_write_start is not None:
-                                on_write_start()
+                            _mark_writer_started_durably()
                             rc = _run_robocopy_tuned(
                                 robocopy_cmd,
                                 priority=self.tape_priority,
@@ -507,6 +557,18 @@ class LTOBackup:
                     msg += f" | CSV summary: {log_path}"
                 print(f"[ERROR] {msg}")
                 raise RuntimeError(msg)
+
+            # Robust Robocopy success is the first point at which a tape
+            # locator may be treated as copied.  Persist it before any file or
+            # directory catalog rows; a later DB failure remains a blocked
+            # copy-success/catalog-failure, never an automatic rewrite.
+            if (stage_stats is not None and remote_session_id is not None
+                    and remote_chunk_index is not None
+                    and hasattr(self.db, "mark_remote_chunk_copy_succeeded")):
+                catalog_context = self.db.mark_remote_chunk_copy_succeeded(
+                    remote_session_id, remote_chunk_index, tape_label,
+                    tape_root, stage_stats, started_at=started_at,
+                    completed_at=datetime.now()) or {}
         except BaseException as exc:
             # Any propagating failure/interrupt: annotate the durable log so the
             # evidence is never lost, then re-raise unchanged. Classification
@@ -529,10 +591,32 @@ class LTOBackup:
             db_guard = contextlib.nullcontext()
         db_sync_start = time.perf_counter()
 
+        if (stage_stats is not None
+                and ContainerFormat(getattr(
+                    stage_stats, "packaging_format", ContainerFormat.ZIP))
+                is ContainerFormat.STORED_TAR):
+            # Sequentially validate the permanent sidecar against the sealed
+            # DB plan and adapt it to the canonical ZIP-era catalog contract.
+            # Member files are never extracted or materialized.
+            try:
+                packer_metadata = TarCatalogAdapter(
+                    self.db, stage_stats,
+                    index_min_file_mb=self.index_min_file_mb,
+                    index_packed_small_files=self.index_packed_small_files,
+                ).materialize()
+            except BaseException:
+                if (remote_session_id is not None
+                        and remote_chunk_index is not None
+                        and hasattr(
+                            self.db, "mark_remote_chunk_catalog_failed")):
+                    self.db.mark_remote_chunk_catalog_failed(
+                        remote_session_id, remote_chunk_index)
+                raise
+
         def catalog_record(file_name, original_path, file_size_bytes,
                            is_packed, container_name, stored_path,
-                           canonical_source_path=None):
-            return {
+                           canonical_source_path=None, metadata=None):
+            record = {
                 'file_name': file_name,
                 'original_path': canonical_source_path or original_path,
                 'canonical_source_path': canonical_source_path,
@@ -546,7 +630,20 @@ class LTOBackup:
                 'local_chunk_index': local_chunk_index,
                 'remote_session_id': remote_session_id,
                 'remote_chunk_index': remote_chunk_index,
+                'tape_generation_id': catalog_context.get(
+                    'tape_generation_id'),
+                'archive_run_id': catalog_context.get('archive_run_id'),
             }
+            if metadata:
+                for key in (
+                        'catalog_policy', 'manifest_name', 'manifest_path',
+                        'manifest_format', 'manifest_compression',
+                        'container_id', 'container_format',
+                        'container_ordinal', 'artifact_id', 'artifact_kind',
+                        'artifact_version', 'actual_artifact_bytes'):
+                    if key in metadata:
+                        record[key] = metadata.get(key)
+            return record
 
         def _db_checkpoint():
             if self.governor:
@@ -556,7 +653,9 @@ class LTOBackup:
         # recalculate_tape_used_space, and is released by ``with`` even if a
         # bulk upsert raises; otherwise a failed sync would leave
         # db_sync_active=True and block later fetch/pack/tape work.
-        with RamStageSampler("db_sync", _ram_interval()) as db_sampler:
+        with _remote_catalog_commit_state(
+                self.db, remote_session_id, remote_chunk_index), \
+                RamStageSampler("db_sync", _ram_interval()) as db_sampler:
             with db_guard:
                 if packer_metadata is None:
                     _db_checkpoint()
@@ -594,6 +693,10 @@ class LTOBackup:
                             local_session_id=local_session_id,
                             local_chunk_index=local_chunk_index,
                             remote_session_id=remote_session_id,
+                            remote_chunk_index=remote_chunk_index,
+                            tape_generation_id=catalog_context.get(
+                                'tape_generation_id'),
+                            archive_run_id=catalog_context.get('archive_run_id'),
                             tape_root=tape_root,
                             backup_date=started_at,
                             index_min_file_mb=self.index_min_file_mb,
@@ -644,9 +747,9 @@ class LTOBackup:
                     _db_checkpoint()
                     packed_stats = self.db.bulk_upsert_files(
                         (catalog_record(
-                            m['file_name'], m['original_path'], m['file_size_bytes'],
-                            True, os.path.join(tape_root, m['container_name']),
-                            m['stored_path'], m.get('canonical_source_path'))
+                             m['file_name'], m['original_path'], m['file_size_bytes'],
+                             True, os.path.join(tape_root, m['container_name']),
+                             m['stored_path'], m.get('canonical_source_path'), m)
                          for m in packer_metadata
                          if m['is_packed']
                          and m.get('catalog_policy') != 'manifest_only'),

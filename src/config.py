@@ -98,6 +98,7 @@ class ConfigManager:
         self.config['SETTINGS'] = {
             'zip_threshold_mb': '100',
             'max_zip_size_gb':  '100',
+            'stored_tar_max_size_gb': '100',
         }
         self.config['CATALOG'] = {
             'index_min_file_mb': '10',
@@ -173,6 +174,8 @@ class ConfigManager:
             'mbuffer_size':          '512M',
             'staging_padding_factor':      '1.15',
             'fetch_overrun_abort_factor':  '2.0',
+            'stored_tar_sidecar_fixed_reserve_bytes': '4096',
+            'stored_tar_sidecar_member_reserve_bytes': '1024',
         }
         self.config['TELEGRAM'] = {
             'enabled': 'false',
@@ -189,6 +192,11 @@ class ConfigManager:
             'block_on_pending_reboot': 'true',
         }
         self.config['FEATURES'] = {
+            # Plan 2 Stored TAR creation/initial assignment.  The reader is a
+            # separate permanent compatibility path; this flag controls only
+            # NEW TAR assignment/production and fails closed when absent or
+            # malformed.
+            'stored_tar_write_enabled': 'false',
             # Phase 5 sealed tape-write batches. FAIL-CLOSED: default false, and
             # the production runtime queries/mutates no batch table while false.
             # Enabling it without the applied 012 schema must fail at startup.
@@ -334,6 +342,10 @@ class ConfigManager:
     @property
     def max_zip_size_gb(self):
         return self._get_float('SETTINGS', 'max_zip_size_gb', 100)
+    @property
+    def stored_tar_max_size_gb(self):
+        return self._get_float(
+            'SETTINGS', 'stored_tar_max_size_gb', self.max_zip_size_gb)
     @property
     def index_min_file_mb(self):
         return self._get_float('CATALOG', 'index_min_file_mb', 10)
@@ -511,6 +523,42 @@ class ConfigManager:
         """
         return self._get_int('PIPELINE', 'max_unstaged_backlog_chunks', 64,
                              minimum=1)
+
+    @property
+    def max_write_groups_per_run(self):
+        """Stop a run after this many committed write groups. 0 = unbounded.
+
+        The runbook requires that the next finite group never starts by
+        itself, and there was no way to express that: a run drained every
+        ready chunk. Setting this to 1 makes a bounded group self-terminating,
+        which is safer than letting it continue and stopping it by hand -- the
+        limit is checked AFTER a group commits and BEFORE the next is
+        selected, so the run always ends on a chunk boundary with the LTFS
+        index synced and the session resumable.
+        """
+        return self._get_int('PIPELINE', 'max_write_groups_per_run', 0,
+                             minimum=0)
+
+    @property
+    def write_only_resume(self):
+        """Drain already-planned sealed chunks; run no scanner at all.
+
+        Writing a chunk that was planned and sealed by an earlier run needs no
+        discovery, but the resume path always started the frontier scanner
+        alongside the stager, so a healthy write depended on traversal being
+        healthy too. On a pre-frontier session it is not: the resumed scanner
+        collides on ``remote_scan_directories`` traversal ordinals.
+
+        With this set the orchestrator does not construct a scan coordinator,
+        so nothing can traverse, publish a scan segment, mutate the frontier or
+        create a chunk. The stager additionally admits only chunks whose
+        durable state is already ``membership_state='sealed'`` and
+        ``plan_source='legacy_db'``. Every tape, generation, ownership, lease,
+        capacity, writer-ambiguity and crash-recovery gate is unchanged.
+
+        Default off: a normal session must keep scanning.
+        """
+        return self._get_bool('PIPELINE', 'write_only_resume', False)
 
     def validated_ready_queue_limits(self):
         """Ready-queue limits proven to leave room for fetch/pack (Phase 4.5).
@@ -781,6 +829,18 @@ class ConfigManager:
         return max(0.0, value)
 
     @property
+    def stored_tar_sidecar_fixed_reserve_bytes(self):
+        return self._get_int(
+            'PERFORMANCE', 'stored_tar_sidecar_fixed_reserve_bytes',
+            4096, minimum=0)
+
+    @property
+    def stored_tar_sidecar_member_reserve_bytes(self):
+        return self._get_int(
+            'PERFORMANCE', 'stored_tar_sidecar_member_reserve_bytes',
+            1024, minimum=0)
+
+    @property
     def telegram_bot_token(self):
         return _strip_quotes(
             os.environ.get('TELEGRAM_BOT_TOKEN')
@@ -817,6 +877,16 @@ class ConfigManager:
     def windows_update_block_on_pending_reboot(self):
         return self._get_bool(
             'WINDOWS_UPDATE', 'block_on_pending_reboot', True)
+
+    @property
+    def stored_tar_write_enabled(self):
+        """Allow new Stored TAR assignment/production; fail-closed by default.
+
+        Reader/restore support is intentionally independent so turning this off
+        after the first TAR exists cannot strand an immutable archive object.
+        """
+        return self._get_bool(
+            'FEATURES', 'stored_tar_write_enabled', False)
 
     @property
     def sealed_tape_write_batches_enabled(self):

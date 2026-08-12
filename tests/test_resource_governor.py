@@ -5,7 +5,10 @@ from types import SimpleNamespace
 from unittest import mock
 
 from src.backup import LTOBackup
+from src.constants import LOCAL_STAGING_RESERVE_BYTES
+from src.pipeline_types import ContainerFormat
 from src.resource_governor import ResourceGovernor
+from src.remote_staging import StagingReservation
 
 
 def _cfg(**overrides):
@@ -123,6 +126,37 @@ class ResourceGovernorTests(unittest.TestCase):
         self.assertIn("hard_ram_limit", decision.reasons)
         self.assertIn("fetch_min_free_ram", decision.reasons)
         self.assertIn("tape_active", decision.reasons)
+        self.assertIn("staging_reserve", decision.reasons)
+
+    def test_direct_tar_reservation_feeds_existing_staging_gate(self):
+        reservation = StagingReservation(ContainerFormat.STORED_TAR, 500)
+        gov, patches = self._governor(
+            cfg=_cfg(governor_fetch_target_free_ram_gb=0.5,
+                     governor_fetch_min_free_floor_gb=0.5),
+            disk=_disk(free=LOCAL_STAGING_RESERVE_BYTES + 500))
+        with patches[0], patches[1]:
+            self.assertTrue(gov.decision(
+                "fetch", "start",
+                needed_bytes=reservation.needed_bytes).allowed)
+
+        gov, patches = self._governor(
+            cfg=_cfg(governor_fetch_target_free_ram_gb=0.5,
+                     governor_fetch_min_free_floor_gb=0.5),
+            disk=_disk(free=LOCAL_STAGING_RESERVE_BYTES + 499))
+        with patches[0], patches[1]:
+            decision = gov.decision(
+                "fetch", "start", needed_bytes=reservation.needed_bytes)
+        self.assertFalse(decision.allowed)
+        self.assertIn("staging_reserve", decision.reasons)
+
+    def test_staging_reserve_can_be_injected_for_tests(self):
+        gov, patches = self._governor(
+            cfg=_cfg(local_staging_reserve_bytes=250),
+            disk=_disk(free=749))
+        with patches[0], patches[1]:
+            decision = gov.decision("fetch", "start", needed_bytes=500)
+        self.assertEqual(gov.staging_reserve_bytes, 250)
+        self.assertFalse(decision.allowed)
         self.assertIn("staging_reserve", decision.reasons)
 
 class TapeGateAsymmetryTests(unittest.TestCase):

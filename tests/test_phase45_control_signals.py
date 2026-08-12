@@ -26,6 +26,7 @@ from src import remote_orchestrator as ro
 from src.config import ConfigManager
 from src.exit_codes import ExitCode, REASON_LTFS_OWNERSHIP_UNAVAILABLE
 from src.ltfs_ownership import LtfsOwnershipError, FAILURE_CROSS_SESSION_UNAVAILABLE
+from src.pipeline_types import ContainerFormat
 from src.ready_queue import ReadyItem, ReadyQueue, ReadyQueueLimits
 
 GiB = 1024 ** 3
@@ -386,6 +387,7 @@ class GroupBoundaryProofTests(unittest.TestCase):
         orch.cfg = SimpleNamespace(lto_drive="X:\\", backup_log_dir=None)
         orch.db = mock.MagicMock()
         orch.db.get_chunk_size_summary.return_value = {}
+        orch.db.get_chunk_packaging_format.return_value = ContainerFormat.ZIP
         orch.notifier = None
         orch.remote_host = "host.example"
         orch.remote_session_path = "/strg"
@@ -438,6 +440,8 @@ class GroupBoundaryProofTests(unittest.TestCase):
     def _descs(self, indices):
         return [SimpleNamespace(chunk_index=i, pack_dir=f"/tmp/_pack_{i}",
                                 staged_bytes=int(1.7 * GiB), skip_tape=False,
+                                session_id=37,
+                                packaging_format=ContainerFormat.ZIP,
                                 metadata=[], fetch_dir=f"/tmp/_fetch_{i}",
                                 source_missing_files=[])
                 for i in indices]

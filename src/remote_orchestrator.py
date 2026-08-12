@@ -157,6 +157,7 @@ from .paths import (_LEGACY_PATH_LIMIT, _dir_tree_size,
                     _reserved_name_component, _volume_cluster_size,
                     _winsafe_extracted_rel)
 from .pipeline_types import ScanMetrics, StagedChunk, StreamState
+from .pg_containers import stored_tar_reader_contract_version
 from .ready_queue import ReadyQueue
 from .remote_pipeline import RemotePipelineCoordinator
 from .ram_telemetry import RamStageSampler
@@ -185,6 +186,34 @@ from .remote_staging import (                                    # noqa: E402
     _classify_fetch_error, _fetch_watchdog_action,
     _is_transient_fetch_error)
 from .remote_writer import RemoteChunkWriter                     # noqa: E402
+
+
+def _canonical_tape_label(label):
+    """Comparison-only key for a tape label; never used as the label itself.
+
+    LTFS reports the mounted volume label in whatever case it was formatted
+    with (observed uppercase, e.g. ``TAPE_03``), while the catalog's own
+    convention is mixed-case (``Tape_03``). Neither the LTFS volume nor the
+    catalog row is ever renamed to make them agree -- this exists purely so
+    ``_tape_labels_match`` can tell "same cartridge, different case" apart
+    from "different cartridge".
+    """
+    return (label or "").strip().casefold()
+
+
+def _tape_labels_match(mounted, tape_label):
+    """True only when both labels name the same cartridge, case-insensitively.
+
+    Blank/whitespace-only input on either side is never treated as a match
+    -- even if both sides happen to normalize to the same empty string --
+    so a missing or unreadable label always falls through to the caller's
+    fail-closed refusal instead of being silently normalized into "equal".
+    """
+    canonical_mounted = _canonical_tape_label(mounted)
+    canonical_expected = _canonical_tape_label(tape_label)
+    if not canonical_mounted or not canonical_expected:
+        return False
+    return canonical_mounted == canonical_expected
 
 
 class RemoteOrchestrator:
@@ -345,6 +374,7 @@ class RemoteOrchestrator:
             notifier=self.notifier,
             governor=self.governor,
             index_min_file_mb=self.cfg.index_min_file_mb,
+            index_packed_small_files=self.cfg.index_packed_small_files,
         )
 
     # ------------------------------------------------------------------
@@ -418,9 +448,10 @@ class RemoteOrchestrator:
         return self._stager()._fetch_collisions(
             session_id, collisions, fetch_dir, fetch_abort, *args, **kwargs)
 
-    def _start_fetch_monitor(self, stop_evt, abort_evt, fetch_dir, total_bytes):
+    def _start_fetch_monitor(self, stop_evt, abort_evt, fetch_dir, total_bytes,
+                             **kwargs):
         return self._stager()._start_fetch_monitor(
-            stop_evt, abort_evt, fetch_dir, total_bytes)
+            stop_evt, abort_evt, fetch_dir, total_bytes, **kwargs)
 
     def _cleanup_remote_staging_dirs(self):
         return self._stager()._cleanup_remote_staging_dirs()
@@ -442,10 +473,10 @@ class RemoteOrchestrator:
         return self._writer()._write_one_chunk_owned(
             session_id, desc, tape_label, eject_after)
 
-    def _ensure_remote_chunk_fits_tape(self, tape_label, planned_bytes,
-                                       chunk_index):
+    def _ensure_remote_chunk_fits_tape(self, tape_label, staged_bytes,
+                                       chunk_indices):
         return self._writer()._ensure_remote_chunk_fits_tape(
-            tape_label, planned_bytes, chunk_index)
+            tape_label, staged_bytes, chunk_indices)
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -1012,6 +1043,7 @@ class RemoteOrchestrator:
             observation_worker=self._build_observation_worker(),
             writer_path=writer_path,
             scan_complete=scan_complete,
+            max_write_groups=getattr(self.cfg, 'max_write_groups_per_run', 0),
         )
 
     def _run_streaming_session(self, session_id):
@@ -1151,6 +1183,30 @@ class RemoteOrchestrator:
                 'scan_complete')),
             writer_path='streaming')
 
+        # Write-only resume: drain chunks that were planned and sealed in an
+        # earlier run, and do no discovery at all. The scanner is not
+        # constructed -- not disabled at the last moment, not started and told
+        # to stop -- so no traversal, no scan segment, no frontier row and no
+        # new chunk can be produced by this run. Pipeline.run() sees
+        # scan_coordinator=None and marks scanning done immediately.
+        #
+        # This exists because writing an already-planned chunk needs no
+        # discovery whatsoever, while the resumed scanner currently cannot run
+        # on a pre-frontier session at all (see the ordinal-collision blocker
+        # in docs/SESSION_37_CONTINUATION_RUNBOOK.md). Making the two
+        # independent means a bounded write group no longer depends on
+        # traversal being healthy.
+        write_only = bool(getattr(self.cfg, 'write_only_resume', False))
+        if write_only:
+            pipeline.write_only = True
+            _status('PIPELINE',
+                    "Write-only resume: the frontier scanner is DISABLED. "
+                    "Only chunks already planned and sealed are written; no "
+                    "scanning, no frontier mutation, no new chunks.")
+            get_logger().info(
+                "write_only_resume_enabled: session=%s scanner=absent",
+                session_id)
+
         # Plan 1 completion: the frontier scanner is THE production scanner.
         # There is no legacy fallback here on purpose — a runtime fallback is
         # how two scanners end up running against one frontier. Git history and
@@ -1165,7 +1221,14 @@ class RemoteOrchestrator:
                 budget_bytes, alloc_unit=alloc_unit,
                 padding_factor=padding_factor, max_files=max_files)
 
-        scan_coordinator = FrontierScanCoordinator(
+        # In write-only resume the scanner is never CONSTRUCTED -- not built
+        # and disabled, not started and stopped. Nothing can traverse, publish
+        # a scan segment, mutate the frontier or seal a new chunk, because the
+        # object that does those things does not exist. `pipeline.run()` sees
+        # scan_coordinator=None and marks scanning done immediately. Every
+        # tape, generation, ownership, lease, capacity, writer-ambiguity and
+        # crash-recovery gate downstream is untouched.
+        scan_coordinator = None if write_only else FrontierScanCoordinator(
             db=self.db,
             session_id=session_id,
             scan_paths=self.remote_scan_paths,
@@ -1190,6 +1253,10 @@ class RemoteOrchestrator:
             on_scan_error=_on_scan_error,
             publication_gate=pipeline.publication_gate,
             on_finished=pipeline.note_scanner_finished,
+            stored_tar_write_enabled=(getattr(
+                self.cfg, "stored_tar_write_enabled", False) is True),
+            stored_tar_reader_contract_version=(
+                stored_tar_reader_contract_version()),
         )
         pipeline.scan_coordinator = scan_coordinator
 
@@ -1508,6 +1575,17 @@ class RemoteOrchestrator:
         cluster = _volume_cluster_size(self.staging_dir)
         return int((logical_bytes + file_count * cluster) * self.staging_padding)
 
+    def _chunk_exception_states(self, chunk_ref):
+        """Per-ordinal outcomes a manifest chunk still keeps in PostgreSQL.
+
+        Only failures become rows for a manifest chunk, so this is a handful of
+        entries, never the whole membership.
+        """
+        reader = getattr(self.db, "get_manifest_chunk_exception_states", None)
+        if not callable(reader):
+            return {}
+        return reader(chunk_ref.session_id, chunk_ref.chunk_index) or {}
+
     def _validate_chunk_file_limit(self, session_id, chunk_index, file_count):
         limit = int(getattr(self, 'chunk_max_files', 100000))
         if int(file_count) <= limit:
@@ -1619,7 +1697,9 @@ class RemoteOrchestrator:
                           "may drain")
 
     def _await_staging_capacity(self, planned_bytes, planned_files, stop_evt,
-                                ready_q=None):
+                                ready_q=None, **kwargs):
+        return self._stager()._await_staging_capacity(
+            planned_bytes, planned_files, stop_evt, ready_q=ready_q, **kwargs)
         """Block until there is room to stage another chunk without breaching the
         staging cap or starving the disk. Accounts for the ~2x transient
         footprint while a chunk is packed (fetch_dir + pack_dir coexist),
@@ -2316,7 +2396,7 @@ class RemoteOrchestrator:
                 reason=REASON_UNEXPECTED_TAPE_OR_DB_STATE, resumable=False,
                 source="gate", detailed_reason=msg)
 
-        if mounted != tape_label:
+        if not _tape_labels_match(mounted, tape_label):
             msg = (f"The mounted cartridge is '{mounted}' but this session "
                    f"writes to '{tape_label}'. Refusing to write: the chunks "
                    f"would land on '{mounted}' and be cataloged under "
