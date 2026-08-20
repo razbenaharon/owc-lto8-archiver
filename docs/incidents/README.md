@@ -11,10 +11,16 @@ tagged **PHYSICAL** and is treated as a design defect, not just an outage.
 
 ## Last documented production state
 
-**Snapshot: `EXAMPLE-HOST`, as observed 2026-07-25. This is not live status.**
-Before acting, verify the production host directly with read-only process,
-PostgreSQL, current-mount, and LTFS-log checks. Do not infer production state
-from a synchronized clone on another computer.
+**Superseded — current state lives in
+[../tape-and-archive-state.md](../tape-and-archive-state.md) (snapshot
+2026-08-20).**
+
+### Historical snapshot (2026-07-25)
+
+**Snapshot: the production archive host, as observed 2026-07-25. This is not
+live status.** Before acting, verify the production host directly with
+read-only process, PostgreSQL, current-mount, and LTFS-log checks. Do not infer
+production state from a synchronized clone on another computer.
 
 | Item | Last documented state |
 | --- | --- |
@@ -25,7 +31,8 @@ from a synchronized clone on another computer.
 | Remaining work | About 73 GB |
 | Data integrity in incident 010 | No loss found; chunk 49 was empty on tape and was not committed |
 
-Open decisions and risks:
+Open decisions and risks as of 2026-07-25 (historical — see the current
+snapshot for their outcomes):
 
 - Incident [010](010-20260724-ltfs-write-perm-readonly.md): diagnose the drive,
   then explicitly choose repair or read-only retirement for Tape_02.
@@ -37,8 +44,9 @@ Open decisions and risks:
   host-local config overrides still require re-verification/revert at session
   37 completion.
 
-When production state changes, update this section's date and facts, then update
-the relevant open incident. Preserve older evidence inside the incident file.
+When production state changes, update
+[../tape-and-archive-state.md](../tape-and-archive-state.md), then update the
+relevant open incident. Preserve older evidence inside the incident file.
 
 ## Summary table
 
@@ -50,15 +58,19 @@ the relevant open incident. Preserve older evidence inside the incident file.
 | [004](004-20260714-postgres-pool-timeout.md) | 2026-07-14 | `[PIPELINE] STOPPED: couldn't get a connection after 5.00 sec` | Docker Desktop down → `lto_pg` gone; **plus** streaming-thread reads had no retry | Start Docker; added `PgConnectionCore._run_read` retry | no |
 | [005](005-20260715-sccm-forced-restart-data-loss.md) | 2026-07-15 | ~126 GB lost (chunks 18–91 of Tape_02) | SCCM (`CcmExec.exe`) restart with 60 s warning **+** `sync_type=unmount` (index only written at unmount) | `_pre_tape_write_reboot_check`; mount verified `time@5`; escalate to IT for SCCM window | **yes** |
 | [006](006-20260716-drive-letter-and-conf-drift.md) | 2026-07-16 | Run fails at drive-ready check | LTFS mount letter moved `E:` → `Z:`; MSI reinstall silently reset `ltfs.conf.local` | Verify `lto_drive` with `Test-Path` before every run; verify `sync_type` from the *mount*, not the file | **yes** |
-| [007](007-20260717-dns-blip-3-day-idle.md) | 2026-07-17 | Run stopped at chunk 25, sat idle ~3 days | Momentary ExampleOrg DNS failure (`could not resolve srv01`); monitor ran on the host that lost the network; no auto-relaunch | `_fetch_one_batch` transient retry + backoff. Monitor placement & auto-relaunch still open | no |
+| [007](007-20260717-dns-blip-3-day-idle.md) | 2026-07-17 | Run stopped at chunk 25, sat idle ~3 days | Momentary campus-network DNS failure (`could not resolve SRC-01`, source-host name redacted); monitor ran on the host that lost the network; no auto-relaunch | `_fetch_one_batch` transient retry + backoff. Monitor placement & auto-relaunch still open | no |
 | [008](008-20260717-fetch-overrun-abort-trap.md) | 2026-07-17 | Run aborts: "fetched exceeds 2.0x the planned" | Partial resume plans only remaining bytes, but tar re-pulls whole batches | `fetch_overrun_abort_factor` override (**pending revert**); abort is self-healing — plain relaunch replans | no |
 | [009](009-20260724-robocopy-exit0-lie.md) | 2026-07-24 | Chunk 49 "succeeded" with 0 files copied | Robocopy returned exit 0 after `RETRY LIMIT EXCEEDED`, emitting no trustworthy summary | Durable raw logs + conservative classifier (`efda427`, `04dc841`, `19106f3`) | no |
 | [010](010-20260724-ltfs-write-perm-readonly.md) | 2026-07-24 | All writes fail `ERROR 19 — media is write protected` | Drive/media WRITE-PERM error → LTFS latched the volume read-only; **not** the WP switch | Tape_02 retired read-only; Session 37 re-pointed to Tape_03, but no Session 37 archive work landed there | **yes** |
 | [011](011-20260726-tape-swap-blockers.md) | 2026-07-26 | Three blockers on the first cartridge swap | Dead mount passed `Test-Path`; health window anchored to a stale GUI process; a resumed session never checked which cartridge was loaded | Anchor on `LtfsMain`; `_verify_mounted_cartridge()` fails closed; `include_soft` reboot markers | no |
+| [012](012-20260805-ltfs-mount-absent-blocks-backup.md) | 2026-08-05 | LTFS mount absent + duplicated device symlink blocks backup | No cartridge mounted after host restart; the duplicated DOS device symlink is normal, not the fault | Reboot remounted the volume; mount-verification guard corrected (`GetDiskFreeSpaceEx` + event `11031`, never WMI) | no |
+| [013](013-20260809-tape03-servo-drive-failure.md) | 2026-08-09 | Servo PWE + drive cannot thread a cartridge | Drive hardware fault (Track Following / servo), not media | RMA / drive replacement | **yes** |
+| [014](014-20260819-campaign-write-servo-halt.md) | 2026-08-18/19 | Campaign one-copy writes halt at chunk 82 on two cartridges | Drive fault confirmed (same servo signature on both cartridges) | Campaign suspended until a replacement drive passes a pilot | **yes** |
+| [015](015-20260820-campaign-drive-instability.md) | 2026-08-20 | Campaign drive NTFS corruption warnings + disconnects | External campaign drive unstable; sole complete copy of the campaign store | Evacuation + receipt SHA-256 verification required | no |
 
 ## Conventions
 
-- Dates are local host time (`EXAMPLE-HOST`, Asia/Jerusalem) unless a UTC stamp is
+- Dates are host local time unless a UTC stamp is
   quoted from Postgres, which stores `timestamptz` in UTC. The DB is ~3 h behind
   local wall-clock in summer — `07:16 UTC` in `remote_chunks.updated_at` is
   `10:16` on the console.

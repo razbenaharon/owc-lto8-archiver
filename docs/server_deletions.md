@@ -45,11 +45,8 @@ backup of them**.
 The archiver account **cannot** delete these directories directly: the
 `shared-sets` trees are owned by individual lab users, mode `drwxr-xr-x`, with
 no group write. Deletion needs `sudo`, which *is* available — `sudo -l` on both
-servers returns:
-
-```text
-(root) NOPASSWD: /usr/bin/du, /usr/bin/ncdu, /usr/bin/rsync, /bin/ls, /bin/rm, /bin/chmod
-```
+servers returns a minimal read+delete command set approved per server (exact
+list in private records).
 
 **Test sudo with `sudo -l`, never with an arbitrary command.** A command outside
 that list (e.g. `sudo -n true`) makes sudo demand a password, which reads as

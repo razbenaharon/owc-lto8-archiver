@@ -8,11 +8,13 @@ in a PostgreSQL catalog (see `docker-compose.yml` and `scripts/sql/`).
 ## Documentation Routing & Sources of Truth
 
 Start with `docs/README.md` for task routing and the source-of-truth hierarchy.
-Before live operation or recovery, read `docs/incidents/README.md` and the newest
-incident marked **OPEN**. Operational status in Markdown is always a dated
-snapshot: verify live state on production host `EXAMPLE-HOST`. A synced clone on
-another computer is not evidence of production process, DB, staging, or tape
-state.
+The consolidated doc set is: `docs/architecture.md` (current system),
+`docs/operations.md` (runbook), `docs/testing-and-validation.md` (test recipes),
+and `docs/tape-and-archive-state.md` (the dated state snapshot). Before live
+operation or recovery, read `docs/incidents/README.md` and the newest incident
+marked **OPEN**. Operational status in Markdown is always a dated snapshot:
+verify live state on the production archive host. A synced clone on another
+computer is not evidence of production process, DB, staging, or tape state.
 
 For conflicts: current code/tests define behavior; the production host's
 untracked `config.ini` defines active configuration; PostgreSQL defines
@@ -88,11 +90,10 @@ Three rules the code now enforces rather than documents:
   `backing → done`; an unreadable chunk status now *stops the run* instead of
   being treated as clear.
 
-Plan 1 is **COMPLETE AND ACTIVATED** (2026-08-03). Start here:
-`docs/plan1_handoff.md` — one page, what changes for an operator and what is
-still outstanding. Evidence and the task matrix: `docs/plan1_completion_gate.md`
-(§14 is the completion record). Every session was audited:
-`docs/session_health_report.md`.
+Plan 1 is **COMPLETE AND ACTIVATED** (2026-08-03). The handoff page, completion
+gate, and per-session health audit are retired historical documents kept outside
+the public tree (private records); `docs/architecture.md` carries the surviving
+architecture facts.
 
 Current production state — verify, don't assume:
 
@@ -162,7 +163,7 @@ small staged dataset before a full remote archive run.
 ### PostgreSQL tests need an explicit disposable server
 
 `python -m pytest -q` on its own is safe and complete except for the PostgreSQL
-suites, which **skip** (1312 passed, 149 skipped, 12 subtests passed; 2 warnings)
+suites, which **skip** (as of 2026-08-20: 1743+ passed, ~290 skipped)
 because they refuse to guess a server. They used to fall back to
 `build_conninfo`'s defaults — `localhost:5432`,
 which is exactly where the **production** `lto_pg` container listens.
@@ -177,7 +178,7 @@ docker run -d --name lto_pg_test -e POSTGRES_DB=postgres -e POSTGRES_USER=lto `
 
 $env:LTO_TEST_PG_DSN = "postgresql://lto:<pw>@127.0.0.1:15432/postgres"
 $env:LTO_PG_SEALED_BATCH_IT = "1"
-python -m pytest tests/ -q            # 1461 passed, 0 skipped; 12 subtests passed
+python -m pytest tests/ -q            # PostgreSQL suites now run instead of skipping
 
 docker rm -f lto_pg_test              # tmpfs: the server vanishes with it
 ```
@@ -406,7 +407,8 @@ hardware/manual verification if relevant, and any database/config changes. For
   planned chunks keep their old plan) and need a `run.py` restart to be read.
   LTFS `sync_type` needs a physical remount. Neither is retroactive.
 - **A transient network/DNS blip retries; it no longer kills the run.** On
-  2026-07-17 a momentary `ssh: Could not resolve hostname srv01` (a ExampleOrg DNS
+  2026-07-17 a momentary `ssh: Could not resolve hostname SRC-01`
+  (source-host name redacted; a campus-network DNS
   hiccup — Telegram failed the same instant with `getaddrinfo failed`, and the
   machine never rebooted) stopped the streaming session at chunk 25. Because the
   monitor was offline **on the same host that lost the network**, nothing
@@ -538,13 +540,6 @@ code change
 Do not combine major refactoring, database changes, scheduling changes, a
 hardware pilot, and a full production resume into one step.
 
-Current production assumptions as of 2026-08-03:
-
-- Authoritative catalog: `lto_archive_directory_catalog_20260710_103359`.
-- Chunks 0-48 are done on Tape_02.
-- Chunks 49-112 are pending. `remote_sessions.tape_label = Tape_03` names their
-  next write target; it does not attribute any completed Session 37 work there.
-- Sealed batches and production observation remain disabled.
-- Tape_03 already contains the 24 GiB Phase 5E synthetic pilot data.
-- Do not resume Session 37 until code changes, tests, and a new bounded pilot
-  are reviewed.
+Current production state: see **`docs/tape-and-archive-state.md`** (dated
+snapshot; verify live evidence before acting) and the newest OPEN incidents in
+`docs/incidents/README.md`.

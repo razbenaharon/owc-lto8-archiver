@@ -40,13 +40,13 @@ overwritten" — **cancel**.
 
 ## Facts you will need
 
-These are the last documented production facts from `EXAMPLE-HOST`, as observed
-2026-07-25; re-verify them at handover.
+These are the last documented production facts from the production archive
+host, as observed 2026-07-25; re-verify them at handover.
 
 | Item | Value |
 |---|---|
-| Drive | IBM ULTRIUM-HH8, serial **0000000000** |
-| Device ID | `SCSI\SEQUENTIAL&VEN_IBM&PROD_ULTRIUM-HH8\7&1EDBF2CE&0&000000` |
+| Drive | IBM ULTRIUM-HH8 (LTO-8) — drive identity: see private records |
+| Device ID | (drive identity: see private records) |
 | Cartridge | Tape_02, last confirmed mounted read-only on `Z:` |
 | ITDT | `C:\Program Files\IBM\ITDT Graphical Edition\itdt-ge.exe` |
 | LTFS log | `C:\Program Files\IBM\LTFS\log\LogFile.csv` |
@@ -62,8 +62,8 @@ if any time has passed — never do this while a write is live.
 
 1. Close the LTFS GUI if open. ITDT needs the device; LTFS holding it can block
    ITDT, and vice versa.
-2. Launch `itdt-ge.exe`, scan for devices, select the ULTRIUM-HH8 (serial
-   `0000000000`).
+2. Launch `itdt-ge.exe`, scan for devices, select the ULTRIUM-HH8 (drive
+   identity: see private records).
 3. Record, and keep the output:
    - **TapeAlert flags** — the decisive ones are *Clean now / Clean periodic*
      (points at the drive/head), *Media / Read-write failure*, *Hard error*,

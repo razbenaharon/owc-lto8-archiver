@@ -1,10 +1,11 @@
-# 010 — LTFS latched Tape_02 read-only after a WRITE-PERM error **OPEN**
+# 010 — LTFS latched Tape_02 read-only after a WRITE-PERM error
 
 - **When:** first failure 2026-07-24 ~07:00; confirmed still read-only
   2026-07-25 16:36 (session 37, chunk 49)
 - **Physical intervention required:** **yes so far** — and the physical attempt
   on 2026-07-25 **did not fix it**, because the cause is not the WP switch
-- **Status:** **OPEN.** Diagnosed; recovery not yet applied. Production is stopped.
+- **Status:** **CLOSED 2026-07-26 — Tape_02 retired read-only; superseded by
+  incidents 013/014 for the drive verdict.**
 
 ## Symptom
 
@@ -173,7 +174,7 @@ local-only `_resume_pack.json` marker.
 
 ## Production state snapshot
 
-**As observed on `EXAMPLE-HOST` on 2026-07-25.** This table is not a live
+**As observed on the production archive host on 2026-07-25.** This table is not a live
 dashboard. Re-verify production processes, PostgreSQL, the current mount, and
 LTFS logs before acting; a synced repository clone cannot confirm or invalidate
 this state.

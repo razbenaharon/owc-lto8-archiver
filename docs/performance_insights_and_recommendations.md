@@ -3,9 +3,9 @@
 > Self-contained context document for an LLM or engineer picking up performance
 > work on this repo. It captures everything measured and reasoned about during a
 > 2026-07-10 deep-dive on the 15.6 GB Windows host while archiving remote session
-> 37 to LTO-8. Every number here was measured live, not estimated. Companion to
-> `docs/pipeline_ram_context.md` (RAM deep-dive) and the memory files
-> `archive-pipeline-ram-phantom-cache` and `tape-write-speed-ltfs-sync`.
+> 37 to LTO-8. Every number here was measured live, not estimated. The RAM
+> deep-dive companion (`pipeline_ram_context.md`) is a retired historical
+> document kept outside the public tree.
 >
 > **Current safety correction:** this document preserves historical experiments,
 > but `sync_type=unmount` is not a valid recommendation. The production pipeline
@@ -192,7 +192,7 @@ with `tar=3` confirmed live. `use_mbuffer=true` also enabled to smooth the burst
 tar→ssh handoff (falls back if mbuffer absent on the server).
 
 ### 4.3 Ceiling
-Peaks ~30 MB/s; the WAN to ExampleOrg / server small-file read is likely the real
+Peaks ~30 MB/s; the WAN to the campus network / server small-file read is likely the real
 ceiling near there. More streams may help marginally if the server allows; the
 mobile 4C/8T CPU and the fetch-core split (0-5) comfortably run 3.
 

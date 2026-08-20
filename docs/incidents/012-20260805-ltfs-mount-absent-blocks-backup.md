@@ -118,7 +118,7 @@ A **full host reboot at 17:54:34** fixed it. At 17:55:57 the LTFS log recorded:
 ```text
 Tape attribute: Medium Label = TAPE_03.
 Tape attribute: Volume Lock Status = 0x00.
-11031 Volume mounted successfully. AAAAAA : Gen = 1 / (a,5) -> (b,5) / 0000000000.
+11031 Volume mounted successfully. AAAAAA : Gen = 1 / (a,5) -> (b,5) / (drive identity: see private records).
 ```
 
 `GetDiskFreeSpaceEx('Z:\')` then returned 11,711,538,003,968 total /
@@ -137,8 +137,9 @@ Emptiness there proves nothing.
 This is the exact mirror of the [incident 011](011-20260726-tape-swap-blockers.md)
 trap: there, `Test-Path` said *alive* about a dead mount; here, WMI said *dead*
 about a live one. Use `GetDiskFreeSpaceEx` plus LTFS event `11031`, never WMI.
-`docs/SESSION_37_CONTINUATION_RUNBOOK.md` §1.3 has been corrected — it
-previously instructed the operator to stop on exactly this false negative.
+The Session 37 continuation runbook (retired; its operative content now lives
+in [docs/operations.md](../operations.md)) was corrected — it previously
+instructed the operator to stop on exactly this false negative.
 
 ### Correction 2 — the duplicated symlink is normal, and did not block the mount
 

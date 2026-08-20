@@ -7,7 +7,8 @@
 ## What happened
 
 The streaming session stopped at chunk 25 with
-`ssh: Could not resolve hostname srv01`. It was a ExampleOrg DNS hiccup, not a real
+`ssh: Could not resolve hostname SRC-01` (source-host name redacted). It was a
+campus-network DNS hiccup, not a real
 outage: Telegram failed in the same instant with `getaddrinfo failed`, and the
 machine never rebooted. Nothing relaunched the run, so it **sat idle for about
 three days**.

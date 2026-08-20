@@ -40,4 +40,6 @@ itself was tiny (`process_rss` 44 MB) — it was never the consumer.
 
 `config.ini [PERFORMANCE]` must **not** be "restored to defaults" — the tuned
 thresholds plus the 8.8 GB pagefile are the correct, crash-safe configuration for
-this host. See [docs/pipeline_ram_context.md](../pipeline_ram_context.md).
+this host. The RAM deep-dive (`pipeline_ram_context.md`) is a retired historical
+document kept outside the public tree; the surviving guidance lives in
+[docs/performance_insights_and_recommendations.md](../performance_insights_and_recommendations.md).

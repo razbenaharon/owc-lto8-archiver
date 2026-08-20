@@ -69,19 +69,15 @@ python inspect_db.py --manifest-search "*.mov" --limit 100
 Manifest records contain the tape label, bundle path, ZIP member path, and
 original path needed by the normal restore code.
 
-## 7. Retire the legacy cold database
+## 7. Validate the end state
 
-First create and verify a final custom-format dump of `lto_cold_manifest`.
-Then make a read-only local export:
+After a prune completes, run the reconciliation validator; it must pass
+before any run that changes tape state:
 
 ```powershell
-python inspect_db.py --export-legacy-cold-db --execute --yes `
-  --legacy-cold-dsn "postgresql://.../lto_cold_manifest" `
-  --cold-backup-path <cold.dump>
+python scripts/validate_archive_reconciliation.py --heavy
 ```
 
-Do not remove the old container or volume unless
-`LOCAL_MANIFEST_ARCHIVE/cold_db_export/export_report.json` says `passed: true`,
-the compressed manifest checksum has been copied to the operations record, and
-both cold backup files are stored with the local manifest archive. Container
-and volume deletion is deliberately manual and is not performed by this repo.
+(The one-time `--export-legacy-cold-db` helper used to retire the historical
+`lto_cold_manifest` database was removed in 2026-08 after that retirement
+completed; its export artifact lives with the local manifest archive.)

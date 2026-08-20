@@ -10,8 +10,13 @@ Licensed under the [MIT License](LICENSE) — © 2026 Raz Ben Aharon. Free to us
   for engineers and LLMs.
 - [Repository and safety guidance](AGENTS.md) — read before changing code or
   operating a live tape run.
-- [Incident index and last documented production state](docs/incidents/README.md)
-  — read before recovery or troubleshooting.
+- [Architecture](docs/architecture.md) — the canonical local-first pipeline
+  (remote source → local staging → validation → tape → verify → commit) and
+  the source-of-truth boundaries.
+- [Operations runbook](docs/operations.md) and
+  [tape/archive state](docs/tape-and-archive-state.md).
+- [Incident index](docs/incidents/README.md) — read before recovery or
+  troubleshooting.
 
 ## Features
 
@@ -39,6 +44,7 @@ them from the vendors and, if you wish, keep them in a local `Framework & Driver
 folder (gitignored):
 
 - IBM LTFS SDE — from IBM support (link above)
+- IBM ITDT (IBM Tape Diagnostic Tool Standard Edition) — `install_itdt_se_WindowsX86_64_9.6.3.20250314.exe`
 - ThunderLink SH-3128 HBA driver + release notes — from ATTO
 - Visual C++ redistributable and .NET Framework 4.0 — from Microsoft (LTFS dependencies)
 
@@ -230,10 +236,13 @@ smaller than 10 MiB may be pruned after permanent local export
   `archive_runs`.
 
 **Local small-file archive** — immutable `jsonl.zst` segments under the
-configured `[LOCAL_MANIFEST_ARCHIVE] root`. PostgreSQL retains segment
-checksums and direct/recursive folder count and byte aggregates, but no
-per-file snapshot rows after pruning. See
-`docs/local_small_file_manifest_runbook.md`.
+configured `[LOCAL_MANIFEST_ARCHIVE] root`. After a validated export is
+pruned, these manifests are the per-file source of truth for packed small
+files: PostgreSQL retains segment checksums and direct/recursive folder count
+and byte aggregates, but no per-file snapshot rows. See
+`docs/local_small_file_manifest_runbook.md`, and run
+`python scripts/validate_archive_reconciliation.py` to prove the catalog,
+manifests, and Storage Map agree.
 
 The CLI also creates session tables for resumable work:
 

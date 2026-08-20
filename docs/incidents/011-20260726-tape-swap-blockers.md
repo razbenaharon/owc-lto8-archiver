@@ -137,9 +137,9 @@ Between 04:13 and 13:19, with no `python.exe` or `robocopy` running, something
 walked the LTFS volume and read Bundle zips:
 
 ```text
-09:54:47  Read data fail (path:/LOCAL_Recordings_.../Bundle_s0011_c001_b001_002.zip) (-1201)
-11:54:52  Read data fail (path:/LOCAL_Recordings_.../Bundle_s0011_c001_b001_003.zip) (-1201)
-13:19:34  Read data fail (path:/LOCAL_Recordings_.../Bundle_s0011_c001_b001_003.zip) (-1201)
+09:54:47  Read data fail (path:/<session-root>/Bundle_sNNNN_cNNN_bNNN_NNN.zip) (-1201)
+11:54:52  Read data fail (path:/<session-root>/Bundle_sNNNN_cNNN_bNNN_NNN.zip) (-1201)
+13:19:34  Read data fail (path:/<session-root>/Bundle_sNNNN_cNNN_bNNN_NNN.zip) (-1201)
 ```
 
 Each triggered a **49-minute** LOCATE timeout (`cmd 92h, difftime 2938.00`) —
