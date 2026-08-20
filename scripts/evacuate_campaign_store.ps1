@@ -57,11 +57,17 @@ function Test-RobocopySuccess([int]$code) { return $code -lt 8 }
 
 # Ordered irreplaceable-first. 'Files' limits a group to matching names so the
 # receipts can be lifted out ahead of the multi-gigabyte containers beside them.
+# Order is by irreplaceability, not by size or convenience. Receipts are
+# first because they are tiny and are what makes everything after them
+# provable. The bulk containers come next: they are the only copy of the
+# campaign. Vendor diagnostics and database dumps are LAST despite being
+# small, because both already exist elsewhere — spending a dying drive's
+# remaining working minutes on a duplicate would be the wrong trade.
 $groups = @(
     @{ Name = 'receipts';    Rel = 'LTO_METADATA'; Files = @('receipt.json', '*.jsonl.zst', '*.json') }
-    @{ Name = 'diagnostics'; Rel = 'LTO_DIAG';     Files = @() }
-    @{ Name = 'staging';     Rel = 'LTO_CAMPAIGN_STAGING'; Files = @() }
     @{ Name = 'containers';  Rel = 'LTO_METADATA'; Files = @() }
+    @{ Name = 'staging';     Rel = 'LTO_CAMPAIGN_STAGING'; Files = @() }
+    @{ Name = 'diagnostics'; Rel = 'LTO_DIAG';     Files = @() }
     @{ Name = 'db_backups';  Rel = 'DB_BACKUPS';   Files = @() }
 )
 
