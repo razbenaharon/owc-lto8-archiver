@@ -56,6 +56,39 @@ So as of the last readable moment the store was structurally intact. The full
 SHA-256 pass began but **could not complete** — the drive vanished partway
 through, and no container has yet been content-verified.
 
+## Evacuation findings (2026-08-21)
+
+Evacuation to healthy storage began while the drive was intermittently
+responsive. The receipt group — a few hundred kilobytes total, copied first
+precisely because it is what makes everything else provable — produced the
+most diagnostic result of the whole incident:
+
+- **147 of 168 receipts copied. 21 failed, and failed identically on every
+  retry.** Deterministic failure on a fixed set of files is damaged media,
+  not the transient bus dropouts seen on 2026-08-20.
+- **The failures are contiguous:** `chunk_000090`, then an unbroken run from
+  `chunk_000196` through `chunk_000216`. A contiguous failure set means one
+  damaged *region* of the platter rather than scattered bad sectors — and
+  chunks 196–216 were the last written (2026-08-11/12), so they are
+  physically adjacent.
+- **The damage is not uniform within that region.** `chunk_000217`'s 20 GiB
+  container copied out intact even though neighbouring receipts could not be
+  read, so a container in the damaged region is worth attempting rather than
+  writing off.
+
+Consequence: for any chunk whose receipt is lost, the container cannot be
+content-verified locally — its plan manifest and TAR sidecar live on the
+production host's metadata root, which is not reachable from this
+workstation. If both the receipt and the container are lost for a chunk, that
+chunk is recoverable only by re-fetching from the remote source and
+re-localizing.
+
+Recovery doctrine that follows: **copy the healthy region first and in full,
+then attempt the damaged region.** Reads against damaged sectors hang for a
+long time and stall everything queued behind them — which is exactly what the
+first evacuation attempt did when a small, already-duplicated diagnostics
+folder blocked 695 GiB of irreplaceable containers.
+
 ## Required procedure (operator)
 
 1. **Stop using the drive. Power it down.** Mechanical noise plus bus
