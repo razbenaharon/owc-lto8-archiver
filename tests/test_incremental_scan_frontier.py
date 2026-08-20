@@ -321,13 +321,13 @@ class ScopeCanonicalizationTests(unittest.TestCase):
         self.assertEqual(canonicalize_scopes(["\\vault\\a"]), ["/vault/a"])
 
     def test_a_relative_or_empty_root_is_refused(self):
-        for bad in ("", "   ", "strg/a", "./a", None):
+        for bad in ("", "   ", "vault-rel/a", "./a", None):
             with self.assertRaises(ScopeConfigurationError, msg=repr(bad)):
                 canonicalize_scopes([bad])
 
     def test_overlapping_roots_are_refused_not_merged(self):
         with self.assertRaises(ScopeConfigurationError) as caught:
-            canonicalize_scopes(["/strg", "/vault/a"])
+            canonicalize_scopes(["/vault", "/vault/a"])
         self.assertIn("overlapping scan roots", str(caught.exception))
 
     def test_a_duplicate_root_is_refused(self):
