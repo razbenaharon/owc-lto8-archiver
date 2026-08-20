@@ -38,8 +38,36 @@ Framework & Drivers/
 
 # Secrets — real credentials live here, never commit them
 .env
-.env.local
+.env.*
+!.env.example
+
+# Private operational data — real manifests, tape state, incident evidence,
+# infrastructure identities. This repo is PUBLIC; everything under private/
+# stays local by construction.
+private/
+
+# Databases and dumps — the catalog lives in PostgreSQL, never in the repo
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.backup
+*.bak
+*.restore_list.txt
+*.receipt.json
+
+# Logs and generated runtime state
+*.log
+logs/
+tmp/
+temp/
+cache/
+storage_map/coverage_baseline.json
 
 # Local scratch output from storage_map dev sessions
 storage_map/scratch_coverage.json
 storage_map/scratchpad_serve.log
+
+# Generated snapshots — regenerable, and they embed real inventory
+docs/storage_map_*.html
+deliverables/
