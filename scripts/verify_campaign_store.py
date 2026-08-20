@@ -39,9 +39,27 @@ _IO_ERRNOS = {errno.EIO, errno.ENODEV, getattr(errno, "ENOMEDIUM", -1)}
 _IO_WINERRORS = {21, 1117}
 
 
-def _is_drive_io_error(exc):
-    return (getattr(exc, "errno", None) in _IO_ERRNOS
-            or getattr(exc, "winerror", None) in _IO_WINERRORS)
+def _is_drive_io_error(exc, root=None):
+    """True when this failure is the medium disappearing, not bad data.
+
+    Errno alone is not enough. A volume that drops while still mounted keeps
+    serving cached directory metadata, so ``os.path.getsize`` succeeds and the
+    subsequent read fails as EACCES rather than any device errno — which would
+    otherwise be recorded as a data failure and read as corruption. Whenever
+    ``root`` is supplied, re-probe it: if the store root itself can no longer
+    be listed, the drive is gone and every failure under it is an I/O error
+    whatever errno claims.
+    """
+    if (getattr(exc, "errno", None) in _IO_ERRNOS
+            or getattr(exc, "winerror", None) in _IO_WINERRORS):
+        return True
+    if root is None:
+        return False
+    try:
+        os.listdir(root)
+    except OSError:
+        return True
+    return False
 
 
 def _now():
@@ -120,7 +138,7 @@ def verify_chunk(root, index, chunk_dir, *, full, already_ok):
                       detail="receipt.json absent; container is unverifiable")
         return result
     except OSError as exc:
-        result.update(status="io_error" if _is_drive_io_error(exc) else "fail",
+        result.update(status="io_error" if _is_drive_io_error(exc, root) else "fail",
                       detail=f"receipt unreadable: {exc}")
         return result
     except json.JSONDecodeError as exc:
@@ -145,7 +163,7 @@ def verify_chunk(root, index, chunk_dir, *, full, already_ok):
         try:
             actual_size = os.path.getsize(path)
         except OSError as exc:
-            entry.update(status="io_error" if _is_drive_io_error(exc) else "fail",
+            entry.update(status="io_error" if _is_drive_io_error(exc, root) else "fail",
                          detail=f"missing or unreadable: {exc}")
             result["containers"].append(entry)
             problems.append(f"{name}: {entry['detail']}")
@@ -165,7 +183,7 @@ def verify_chunk(root, index, chunk_dir, *, full, already_ok):
             try:
                 entry["sha_ok"] = _sha256(path) == container.get("tar_sha256")
             except OSError as exc:
-                entry.update(status="io_error" if _is_drive_io_error(exc) else "fail",
+                entry.update(status="io_error" if _is_drive_io_error(exc, root) else "fail",
                              detail=f"read failed: {exc}")
                 result["containers"].append(entry)
                 problems.append(f"{name}: {entry['detail']}")
