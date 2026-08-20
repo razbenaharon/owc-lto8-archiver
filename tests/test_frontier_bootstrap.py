@@ -170,7 +170,7 @@ class DryRunTests(_Bootstrap):
     def test_overlapping_roots_block_before_anything_happens(self):
         db = BootstrapDB()
         report = self._bootstrap(db, FakeSource(TREE),
-                                 scan_paths=("/strg", "/vault/a")).dry_run()
+                                 scan_paths=("/vault", "/vault/a")).dry_run()
         self.assertFalse(report["would_proceed"])
         self.assertTrue(any("overlapping" in b for b in report["blocking"]))
 
@@ -193,7 +193,7 @@ class DryRunTests(_Bootstrap):
     def test_execute_refuses_when_the_dry_run_blocks(self):
         db = BootstrapDB()
         bootstrap = self._bootstrap(db, FakeSource(TREE),
-                                    scan_paths=("/strg", "/vault/a"))
+                                    scan_paths=("/vault", "/vault/a"))
         with self.assertRaises(BootstrapRefused):
             bootstrap.execute(approved=True)
         self.assertEqual(db.scopes, [])

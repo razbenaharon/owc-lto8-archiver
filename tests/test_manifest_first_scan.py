@@ -78,7 +78,7 @@ class FakeDb:
 def pending(chunk_index=113, count=3, **kw):
     chunk = PendingChunk(session_label=LABEL, chunk_index=chunk_index, **kw)
     for i in range(count):
-        chunk.add(path=f"/vault/D/shared-sets/TSM/f{i}.npy", size=100 + i,
+        chunk.add(path=f"/vault/D/shared-sets/DSETB/f{i}.npy", size=100 + i,
                   scan_segment_id="seg-1", scan_ordinal=1000 + i)
     chunk.note_consumption("seg-1", 1000, 1000 + count - 1)
     return chunk

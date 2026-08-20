@@ -26,9 +26,9 @@ from src import plan_manifest as pm
 LABEL = "REMOTE_srv01_20260709_234150"
 
 MEMBERS = [
-    ("/vault/D/shared-sets/TSM/a.npy", 1024),
-    ("/vault/D/shared-sets/TSM/b.npy", 2048),
-    ("/vault/D/shared-sets/TSM/c.npy", 4096),
+    ("/vault/D/shared-sets/DSETB/a.npy", 1024),
+    ("/vault/D/shared-sets/DSETB/b.npy", 2048),
+    ("/vault/D/shared-sets/DSETB/c.npy", 4096),
 ]
 
 

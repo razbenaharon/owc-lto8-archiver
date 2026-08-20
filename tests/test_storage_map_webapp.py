@@ -132,7 +132,7 @@ class RowStatusTests(unittest.TestCase):
         self.assertEqual(cov._source_file_count(None, None, None), (None, False))
 
     def test_exact_count_catches_large_dir_gap_that_1pct_would_mask(self):
-        # APAS-style: a 3M-file dir missing 909 large files. du --inodes alone
+        # DSETA-style: a 3M-file dir missing 909 large files. du --inodes alone
         # (1% = 30k slack) would mask it; inodes − dirs gives the exact source
         # count (3,010,000 − 10,877 = 2,999,123), so 909 short reads partial.
         _pct, status = cov._row_status(

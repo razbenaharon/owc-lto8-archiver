@@ -225,22 +225,22 @@ class DirectoryCompleteRestoreTests(unittest.TestCase):
         os.makedirs(self.tape)
         os.makedirs(self.restore)
         tmp_drive = os.path.splitdrive(os.path.abspath(self.tmp))[0] + "\\"
-        # ZIP entries are relative to the source base (here '/strg'); mix two
+        # ZIP entries are relative to the source base (here '/vault'); mix two
         # tiny files under the requested dir with a sibling dir's file.
         import zipfile as _zip
         self.zip_path = os.path.join(self.tape, "Bundle_001.zip")
         with _zip.ZipFile(self.zip_path, "w") as zf:
-            zf.writestr("D/shared/APAS/feat/fold 1/a.npy", "AAA")
-            zf.writestr("D/shared/APAS/feat/fold 1/sub/b.npy", "BBB")
+            zf.writestr("D/shared/DSETA/feat/fold 1/a.npy", "AAA")
+            zf.writestr("D/shared/DSETA/feat/fold 1/sub/b.npy", "BBB")
             zf.writestr("D/shared/suture_1/other.png", "XXX")   # sibling — skip
-            zf.writestr("D/shared/APAS/feat_v2/c.npy", "CCC")    # prefix trap — skip
+            zf.writestr("D/shared/DSETA/feat_v2/c.npy", "CCC")    # prefix trap — skip
 
         class _DB:
             def find_directory_restore_bundles(_self, dir_path,
                                                source_host=None, tape_label=None):
                 return [{"tape_label": "T1",
                          "stored_bundle_path": self.zip_path,
-                         "base_path": "/strg"}]
+                         "base_path": "/vault"}]
         self.retriever = LTORetriever(
             db=cast(Any, _DB()), tape_drive=tmp_drive,
             staging_dir=os.path.join(self.tmp, "staging"),
@@ -261,7 +261,7 @@ class DirectoryCompleteRestoreTests(unittest.TestCase):
 
     def test_extracts_small_files_and_only_the_requested_subtree(self):
         self.retriever._restore_directory_complete(
-            "/vault/D/shared/APAS/feat")
+            "/vault/D/shared/DSETA/feat")
         restored = self._restored()
         # both tiny files under feat/ are restored (they have no DB row)...
         self.assertIn("feat/fold 1/a.npy", restored)

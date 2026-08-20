@@ -32,7 +32,7 @@ def rows(count=3, chunk_index=5, start_ordinal=0, size=1000):
         "original_ordinal": start_ordinal + i,
         "chunk_index": chunk_index,
         "snapshot_file_id": 500000 + i,
-        "remote_path": f"/vault/D/shared-sets/TSM/f{i}.npy",
+        "remote_path": f"/vault/D/shared-sets/DSETB/f{i}.npy",
         "file_size_bytes": size + i,
     } for i in range(count)]
 

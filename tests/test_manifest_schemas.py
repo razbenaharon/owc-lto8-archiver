@@ -489,7 +489,7 @@ class ScanStateSchemaTests(unittest.TestCase):
         with self.assertRaises(ArtifactError):
             self.write([{
                 "record_type": "scope", "session_label": LABEL,
-                "root_path": "/vault/D/shared-sets/TSM",
+                "root_path": "/vault/D/shared-sets/DSETB",
                 "coverage_state": "provisional"}], coverage_final=True)
 
     def test_scan_state_generations_are_append_only(self):
