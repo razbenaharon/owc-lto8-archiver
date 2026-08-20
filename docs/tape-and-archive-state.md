@@ -51,11 +51,19 @@ and `receipt.json` carrying container SHA-256, sidecar SHA-256, member count,
 logical bytes, and plan-manifest locators. Receipts exist for chunks 49–216;
 chunk 217 has none.
 
+Measured by `scripts/verify_campaign_store.py --mode structure`, 2026-08-20:
+**168 chunks / 184 containers / 695.3 GiB**, every container present at its
+receipted size, zero truncation, zero I/O errors. Content (SHA-256)
+verification has **not** completed — see below.
+
 > **URGENT ([incident 015](incidents/015-20260820-campaign-drive-instability.md)):
-> the external drive holding this store is unstable (NTFS "corruption may
-> occur" events, two disconnects on 2026-08-20). It is the only complete copy
-> of the campaign. Evacuate and verify it against the receipt SHA-256s before
-> any other work.**
+> the drive holding this store is failing — audible mechanical noise, 292
+> disk-51 events in one hour, NTFS "corruption may occur", and as of
+> 2026-08-21 its physical disk is no longer enumerated at all (while the
+> volume still reports Healthy from cached metadata). This is the only
+> complete copy of the campaign. Do not use the drive for anything except a
+> one-shot evacuation to healthy storage
+> (`scripts/evacuate_campaign_store.ps1`), then verify the *rescued* copy.**
 
 ## Catalogs and manifests
 
