@@ -489,7 +489,8 @@ class CliWiringTests(unittest.TestCase):
     def test_clean_host_pauses_and_reports_applied(self):
         from src import cli
         with mock.patch.object(cli, "restore_stale_guard", lambda: False), \
-             mock.patch.object(cli, "pending_reboot_reasons", lambda **_kw: []), \
+             mock.patch.object(cli, "assess_reboot_state",
+                               lambda **_kw: self._assessment()), \
              mock.patch.object(cli, "pause_windows_updates", lambda d: True):
             proceed, applied = cli._start_windows_update_guard(self._cfg())
         self.assertTrue(proceed)
@@ -501,7 +502,8 @@ class CliWiringTests(unittest.TestCase):
         calls = []
         with mock.patch.object(cli, "restore_stale_guard",
                                lambda: calls.append("restore")), \
-             mock.patch.object(cli, "pending_reboot_reasons", lambda **_kw: []), \
+             mock.patch.object(cli, "assess_reboot_state",
+                               lambda **_kw: self._assessment()), \
              mock.patch.object(cli, "pause_windows_updates",
                                lambda d: calls.append("pause") or True):
             cli._start_windows_update_guard(self._cfg())

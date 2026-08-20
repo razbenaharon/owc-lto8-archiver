@@ -18,7 +18,6 @@ from src.local_manifest_archive import (
     active_archive_processes,
     dry_run_export,
     execute_export,
-    export_legacy_cold_database,
     export_status,
     prune_export,
     pruned_manifest_paths,
@@ -1432,19 +1431,6 @@ def _run_manifest_prune(cfg, args):
     return 0
 
 
-def _run_legacy_cold_export(cfg, args):
-    root = _require_maintenance_safe(cfg)
-    if not args.execute or not args.yes:
-        raise OperationalError(
-            "--export-legacy-cold-db requires --execute --yes")
-    if not args.legacy_cold_dsn or not args.cold_backup_path:
-        raise OperationalError(
-            "--legacy-cold-dsn and --cold-backup-path are required")
-    _print_json(export_legacy_cold_database(
-        args.legacy_cold_dsn, root, args.cold_backup_path))
-    return 0
-
-
 def _cleanup_session_data(db, assume_yes, cfg=None):
     try:
         summary = db.get_unreferenced_remote_data_summary()
@@ -1677,14 +1663,8 @@ def _build_parser():
                         help="Prune only a validated immutable export snapshot.")
     parser.add_argument("--export-id", type=int,
                         help="Local manifest export id for validation/pruning.")
-    parser.add_argument("--export-legacy-cold-db", action="store_true",
-                        help="One-time read-only export before cold DB retirement.")
-    parser.add_argument("--legacy-cold-dsn",
-                        help="Explicit DSN for the legacy cold database.")
     parser.add_argument("--hot-backup-path",
                         help="Verified hot DB backup path.")
-    parser.add_argument("--cold-backup-path",
-                        help="Verified legacy cold DB backup path.")
     parser.add_argument("--limit", type=int, default=100,
                         help="Result limit for local-manifest search.")
     parser.add_argument("--prune-batch-size", type=int, default=100000,
@@ -1888,9 +1868,6 @@ def _dispatch(parser, args):
 
     if args.prune_exported_small_files:
         return _run_manifest_prune(cfg, args)
-
-    if args.export_legacy_cold_db:
-        return _run_legacy_cold_export(cfg, args)
 
     db = _open_db(cfg)
     from src.db_inspector_qt import run_qt_inspector

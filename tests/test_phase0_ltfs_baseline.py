@@ -690,9 +690,13 @@ class PipelineDepthBaselineTests(unittest.TestCase):
                              f"{key} should not exist before Phase 4")
 
     def test_staging_allowance_is_large_relative_to_one_chunk(self):
+        # The invariant is pipeline depth, not an absolute size: staging must
+        # hold at least 3.5 chunks so fetch/pack of the next chunks overlaps
+        # the current tape write (350 GB on the original 100 GB-chunk host).
         parser = self._config()
         staging_gb = float(parser.get("PERFORMANCE", "staging_max_gb"))
-        self.assertGreaterEqual(staging_gb, 350)
+        chunk_gb = float(parser.get("PERFORMANCE", "chunk_cap_gb"))
+        self.assertGreaterEqual(staging_gb, 3.5 * chunk_gb)
 
 
 # =============================================================================
