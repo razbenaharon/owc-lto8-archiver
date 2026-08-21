@@ -71,10 +71,10 @@ most diagnostic result of the whole incident:
   damaged *region* of the platter rather than scattered bad sectors — and
   chunks 196–216 were the last written (2026-08-11/12), so they are
   physically adjacent.
-- **The damage is not uniform within that region.** `chunk_000217`'s 20 GiB
-  container copied out intact even though neighbouring receipts could not be
-  read, so a container in the damaged region is worth attempting rather than
-  writing off.
+- A 20 GiB container in that region appeared to copy out while neighbouring
+  receipts could not be read. **That appearance was false** — see the outcome
+  section: the file was a pre-allocated placeholder containing nothing. No
+  container was recovered from the damaged region or anywhere else.
 
 Consequence: for any chunk whose receipt is lost, the container cannot be
 content-verified locally — its plan manifest and TAR sidecar live on the
@@ -88,6 +88,56 @@ then attempt the damaged region.** Reads against damaged sectors hang for a
 long time and stall everything queued behind them — which is exactly what the
 first evacuation attempt did when a small, already-duplicated diagnostics
 folder blocked 695 GiB of irreplaceable containers.
+
+## Outcome — what survived and what did not (2026-08-21)
+
+The drive left the bus for good partway through the evacuation and no longer
+resolves at all. Final accounting, measured rather than estimated:
+
+| | |
+| --- | --- |
+| Real data rescued | **198.3 KB** — 147 of 168 `receipt.json` files, plus 2 small diagnostic text files |
+| Containers rescued | **0 of 184** |
+| Archive payload lost from this drive | **695.3 GiB** |
+| Receipts lost | 21 (`chunk_000090`, `chunk_000196`–`chunk_000216`) |
+
+**A 20 GiB file on the rescue target was NOT rescued data.** Robocopy's
+restartable mode (`/Z`) pre-allocates the destination at full size, so the
+interrupted copy of `chunk_000217/container_0000.tar` left a full-length file
+containing nothing. A byte scan of all 21,474,574,336 bytes found **zero
+non-zero bytes**, and a streaming TAR parse reached end-of-archive with zero
+members in under three seconds. It has been renamed
+`…tar.EMPTY-PLACEHOLDER-NOT-DATA` so it cannot be mistaken for a rescued
+container. **Size is not evidence of content** — check bytes, not lengths,
+before recording anything as recovered.
+
+### What the 147 surviving receipts are actually worth
+
+They are 198 KB that describe **317,074,964,480 bytes (295.3 GiB) of
+containers and 29,354,756 archived files**, each with its container SHA-256,
+sidecar SHA-256, membership fingerprint and plan-manifest locator. So for 147
+of 169 chunks the exact expected content is still known: a re-localized copy
+can be proven byte-identical to what was lost. For the 21 chunks whose
+receipt is gone, even the inventory is gone.
+
+That is the entire argument for copying receipts first, and it held: the
+cheapest thing on the drive was the only thing worth saving that we managed
+to save.
+
+### What was never at risk
+
+The production archive itself is untouched. Tape_01 and Tape_02 are closed
+and physically elsewhere; their per-file manifests (145 `JSONL.zst` segments,
+242 MB) live on the internal NVMe; the PostgreSQL catalog and 2.5 GB of
+verified dumps are on the internal drive; the source code and documentation
+are in git. The vendor diagnostic package also survives in the repository's
+private area.
+
+**This was the loss of a staging copy, not of the backup.** Session 37 chunks
+49–216 were fetched from the remote source and had not yet been committed to
+tape. If that source data still exists, the recovery path is to re-fetch and
+re-localize — which makes *confirming the remote source is still intact* the
+most urgent action after the drive itself.
 
 ## Required procedure (operator)
 
