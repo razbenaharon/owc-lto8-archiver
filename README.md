@@ -29,6 +29,18 @@ Licensed under the [MIT License](LICENSE) — © 2026 Raz Ben Aharon. Free to us
 - **Database Inspector GUI** — standalone PySide6 app for lazy browsing, searching, and managing the tape/file index without touching the CLI
 - **Storage Map** - run `python storage_map/run_app.py --open-chrome` for the single local web app with scan, status, refresh, tape coverage, and HTML/PDF export
 
+## Manifest formats
+
+The per-file inventory and the container receipts are the archive's
+source-of-truth artifacts, and their formats are documented as JSON Schema in
+[`examples/`](examples/) alongside synthetic samples. Real manifests and
+receipts enumerate actual file names and source paths, so they are operational
+data and stay out of this repository.
+
+Before pushing, `python scripts/check_public_repo.py` fails loudly if a
+database, dump, log, real manifest, credential or infrastructure identity has
+become tracked; CI runs the same gate plus the test suite.
+
 ## Requirements
 
 - Windows (uses `vol`, `wmic`, and IBM LTFS executables)

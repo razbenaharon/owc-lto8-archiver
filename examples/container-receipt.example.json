@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "chunk_index": 7,
+  "session_id": 2,
+  "session_label": "REMOTE_EXAMPLEHOST_20260101_120000",
+  "plan_id": 2,
+  "completed_at": "2026-01-02T09:15:00Z",
+  "tool_version": "campaign-localizer/1.0",
+  "membership_fingerprint": "1111111111111111111111111111111111111111111111111111111111111111",
+  "missing_members": [],
+  "expected_totals": {"member_count": 1200, "logical_bytes": 4194304000},
+  "observed_totals": {"member_count": 1200, "logical_bytes": 4194304000},
+  "containers": [
+    {
+      "container_id": 1,
+      "container_ordinal": 0,
+      "tar_locator": "chunk_000007/container_0000.tar",
+      "tar_size": 4194816000,
+      "tar_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+      "sidecar_locator": "tar_sidecars/session_000002/chunk_000007/container_0000.jsonl.zst",
+      "sidecar_size": 20480,
+      "sidecar_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+      "member_count": 1200,
+      "logical_bytes": 4194304000,
+      "transport_mode": "plain_tar"
+    }
+  ]
+}

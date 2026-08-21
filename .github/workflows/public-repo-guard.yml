@@ -1,0 +1,49 @@
+# Keeps the repository publishable.
+#
+# The privacy gate is the point of this workflow. A month from now nobody will
+# remember that the manifest root, the catalog dumps and the campaign receipts
+# are operational data — the gate remembers, and fails the build rather than
+# letting a database, a real manifest, a log or an infrastructure identity get
+# committed. The test suite runs alongside it so a green check means both
+# "safe to publish" and "not broken".
+name: public-repo-guard
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The gate inspects git history, not just the working tree.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Privacy gate
+        run: python scripts/check_public_repo.py
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest zstandard psutil
+
+      # The PostgreSQL suites skip without LTO_TEST_PG_DSN, which is correct
+      # here: they need a disposable server and must never be pointed at a real
+      # catalog. Everything else runs.
+      - name: Offline test suite
+        run: python -m pytest tests/ -q
+
+      - name: Syntax sweep
+        run: |
+          python -m compileall -q src storage_map scripts run.py inspect_db.py

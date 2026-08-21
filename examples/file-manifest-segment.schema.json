@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/razbenaharon/owc-lto8-archiver/examples/file-manifest-segment.schema.json",
+  "title": "Per-file manifest segment row (one line of a JSONL.zst segment)",
+  "description": "After a validated export is pruned, these segments are the per-file source of truth for packed small files; PostgreSQL keeps only the export ledger and folder-level aggregates. One JSON object per line, zstd-compressed as a whole file.",
+  "type": "object",
+  "required": ["source_file_id", "original_path", "file_size_bytes", "tape_label"],
+  "additionalProperties": true,
+  "properties": {
+    "source_file_id": {"type": "integer", "description": "files_index.file_id at export time"},
+    "source_record_key": {"type": "string", "description": "Hex record key; identity check during pruning"},
+    "original_path": {"type": "string", "description": "Canonical source path"},
+    "file_size_bytes": {"type": "integer", "minimum": 0},
+    "file_name": {"type": "string"},
+    "tape_label": {"type": "string"},
+    "source_host": {"type": "string"},
+    "is_packed": {"type": "boolean", "description": "true when stored inside a container"},
+    "stored_path": {"type": "string", "description": "Member path within the container"},
+    "container_name": {"type": "string", "description": "On-tape container path"},
+    "bundle_id": {"type": ["integer", "null"]},
+    "archive_run_id": {"type": ["integer", "null"]},
+    "remote_session_id": {"type": ["integer", "null"]},
+    "remote_chunk_index": {"type": ["integer", "null"]},
+    "local_session_id": {"type": ["integer", "null"]},
+    "local_chunk_index": {"type": ["integer", "null"]},
+    "backup_date": {"type": ["string", "null"], "format": "date-time"},
+    "covered_by_directory_catalog": {"type": "boolean"}
+  }
+}
