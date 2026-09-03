@@ -1,9 +1,133 @@
 # OWC LTO-8 Archiver
 
-A Python CLI for archiving files to LTO tape using an OWC Mercury Pro LTO-8 drive and IBM LTFS on Windows.
+**A resumable, crash-safe pipeline that moves lab-server data onto LTO-8 tape and keeps a PostgreSQL catalog of exactly what ended up where.**
 
-Licensed under the [MIT License](LICENSE) — © 2026 Raz Ben Aharon. Free to use, modify, and distribute with attribution.
+Tape is unforgiving. A cartridge is linear, slow to seek, and expensive to rewrite; a drive can go read-only mid-write; `robocopy` can exit `0` on a copy that did not land. The hard part of tape archival is not writing bytes — it is being able to prove, months later, that a given file is on a given cartridge, and being able to resume a multi-day run from the exact chunk where the last one died.
 
+This repository is the tooling built around one OWC Mercury Pro LTO-8 drive doing that job for real research data.
+
+---
+
+## At a glance
+
+| | |
+|---|---|
+| **Scale** | ~47k lines in `src/` across 77 modules, ~36k lines of tests across 75 files |
+| **Validation** | 1,737 tests pass offline; CI runs the suite on a Python matrix plus a privacy gate over full git history |
+| **Persistence** | PostgreSQL 17 catalog, 19 ordered SQL migrations applied at startup |
+| **Operational record** | 16 written incident post-mortems in [`docs/incidents/`](docs/incidents/) |
+| **Platform** | Windows + IBM LTFS; PostgreSQL via Docker; SSH for remote sources |
+
+## The problem
+
+Research groups generate data faster than they can afford to keep it on spinning disk, but the data cannot simply be deleted — it has to be retrievable years later. LTO-8 tape is the standard answer at ~12 TB a cartridge. What tape does not come with is an answer to *"which cartridge is this file on, and did the write actually succeed?"*
+
+Three properties make that genuinely difficult:
+
+1. **A tape write is not atomic and not cheap to redo.** A run that dies 8 hours in must resume, not restart.
+2. **The copy tool lies.** `robocopy` has been observed exiting `0` on writes that did not complete ([incident 009](docs/incidents/009-20260724-robocopy-exit0-lie.md)); success has to be classified, not trusted.
+3. **Millions of small files destroy tape throughput.** They have to be packed into containers first — which means the per-file inventory now lives somewhere other than the filesystem.
+
+## What the system does
+
+```mermaid
+flowchart LR
+    R[("Remote lab server<br/>(SSH)")] -->|tar fetch| S["Local staging<br/>(internal NVMe)"]
+    S --> V{"Validate<br/>parse to trailer<br/>+ sidecar"}
+    V -->|"rejected"| X["Fail here.<br/>Costs disk, never tape state."]
+    V -->|"sealed plan"| W["Finite write group<br/>robocopy → LTFS"]
+    W --> C{"Classify exit<br/>(never read back<br/>from tape)"}
+    C -->|"not clean"| H["Stop the run.<br/>No automatic retry."]
+    C -->|"clean"| D[("PostgreSQL catalog<br/>+ JSONL.zst manifests")]
+
+    style X fill:#4a1f1f,stroke:#a33,color:#fff
+    style H fill:#4a1f1f,stroke:#a33,color:#fff
+    style D fill:#1f3a4a,stroke:#38a,color:#fff
+    style W fill:#3a2f14,stroke:#a83,color:#fff
+```
+
+**There is no code path that streams source data directly to tape.** The writer's only input is validated local staging. That single ordering constraint is what makes every failure recoverable without a person standing at the drive: a fetch or validation failure costs local disk, never tape state.
+
+## Key engineering challenges
+
+**Resumability across a multi-day run.** Sessions, chunks and per-file exception state are normalized in PostgreSQL, so an interrupted archive resumes from the first incomplete chunk rather than the beginning. `CHUNK_TRANSITIONS` permits only `backing → done`; an unreadable chunk status *stops the run* instead of being optimistically cleared.
+
+**Not trusting the copy tool.** Writes are verified by classifying the copy tool's output, deliberately *not* by reading back from tape — a read-back both costs a full pass over a linear medium and can itself change drive state. Incident 009 documents the exit-code-`0` failure this defends against.
+
+**Crash-safe artifacts.** Three versioned schemas (`plan-manifest-v1`, `tar-sidecar-v1`, `terminal-state-v1`) all publish through one protocol: write to a uniquely-named `.part` → flush and fsync → **reparse and re-validate the finished file against the sealed plan** → atomic `os.replace`. A crash leaves an orphan `.part`, never a truncated artifact a future reader would parse as complete. A catalog locator naming a `.part` is rejected in code, in `pg_scan`, *and* by a schema `CHECK`.
+
+**Concurrency against a single physical drive.** Two processes must never address the tape at once, and the LTFS mount letter is not stable — it has moved E: → Z:. Ownership is therefore a named Windows mutex keyed on the *physical drive identity* from config, never the drive letter ([incident 006](docs/incidents/006-20260716-drive-letter-and-conf-drift.md)). It fails closed: no configured identity means no tape access.
+
+**Keeping per-file detail off the catalog.** One PostgreSQL row per archived small file does not scale. Packed small files are inventoried in immutable `jsonl.zst` manifest segments; PostgreSQL keeps segment checksums and folder aggregates. `scripts/validate_archive_reconciliation.py` proves catalog, manifests and Storage Map agree.
+
+## Technical decisions worth defending
+
+| Decision | Why | Cost accepted |
+|---|---|---|
+| Local-first staging, never stream to tape | Makes every failure recoverable without touching tape state | Needs staging disk ≥ 3.5 chunks |
+| Classify the copy exit instead of reading back | A read-back costs a full linear pass and can change drive state | Residual risk is documented, not eliminated |
+| No content hashes in manifests | Hashing means reading every source byte back over SSH | Same-size-replacement risk is documented rather than papered over |
+| Fail closed on ownership identity | A wrong mutex name is worse than no mutex — two hosts would think they hold it | An unconfigured clone cannot touch tape at all |
+| Tape stores payload only | Nothing needed to *interpret* the archive lives only on tape | The catalog becomes critical infrastructure, hence `--backup-db` |
+
+## Source-of-truth boundaries
+
+Each store answers exactly one kind of question; none duplicates another. This is enforced by the layout, not by convention.
+
+| Store | Authoritative for |
+|---|---|
+| `jsonl.zst` manifests | Per-file inventory of packed small files |
+| PostgreSQL | Sessions, chunks, bundles, folder aggregates, tape accounting |
+| Receipts + sidecars | Container evidence — SHA-256s, member counts, logical bytes |
+| Tapes | Payload only |
+
+## Tech stack
+
+Python 3 · PostgreSQL 17 (psycopg 3, COPY bulk-load, `pg_trgm`/`btree_gin`) · IBM LTFS + `robocopy` · SSH/`tar` streaming · PySide6 (catalog inspector) · FastAPI + uvicorn (Storage Map) · Docker Compose · pytest · GitHub Actions
+
+## Repository structure
+
+```text
+src/                 77 modules, strictly downward dependencies
+  cli.py             menu entrypoint
+  remote_writer.py   THE only tape-writing entry path
+  scan_frontier.py   the sole production scanner
+  remote_staging.py  SSH fetch, retry classification, packing
+  pg_*.py            PostgreSQL layer (mixins → PgDatabaseManager facade)
+storage_map/         remote disk-usage mapper, decoupled from the tape pipeline
+scripts/sql/         19 ordered migrations (+ rollback variants), applied at startup
+scripts/             operational tooling + the public-repo privacy gate
+docs/incidents/      16 post-mortems
+examples/            JSON Schemas + synthetic samples for both manifest formats
+tests/               75 files
+```
+
+## Testing
+
+```bash
+pip install -r requirements.txt
+python -m pytest tests/ -q
+```
+
+The offline suite needs no tape, no drive and no database. PostgreSQL suites skip unless `LTO_TEST_PG_DSN` names a disposable server — they must never be pointed at a real catalog, and `pg_test_guard` refuses a DSN it cannot prove is safe.
+
+**Not covered by tests:** anything requiring the physical drive — LTFS mount/format/eject, real tape writes, and end-to-end restore from cartridge. Those paths are exercised by operating the system and are documented in [`docs/incidents/`](docs/incidents/).
+
+## Limitations
+
+- **Windows only.** The tool shells out to `vol`, `wmic`, `robocopy` and the IBM LTFS executables.
+- **One drive.** Ownership is a single mutex around a single physical drive; there is no drive pool.
+- **Vendor tooling is not bundled.** IBM LTFS SDE, ITDT and the ATTO HBA driver are proprietary and must be obtained from the vendors.
+- **No content hashes for fetched files** — see the decision table above.
+- **The catalog is critical.** Tape holds payload only, so losing PostgreSQL without a dump means losing the index. Back it up (`python run.py --backup-db`).
+
+## Future improvements
+
+- Read-back verification as an opt-in mode for high-value cartridges, accepting the extra pass.
+- Content hashing at the remote end so the same-size-replacement risk closes without a second SSH read.
+- A drive pool, which would turn the single ownership mutex into a lease per drive.
+
+---
 ## Documentation
 
 - [Documentation map](docs/README.md) — task routing and source-of-truth rules
