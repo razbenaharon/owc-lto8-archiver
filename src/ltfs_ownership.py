@@ -220,8 +220,14 @@ class LtfsOwnership:
             try:
                 self._ensure_handle()
             except Exception:
+                # Log the *unresolved* name on purpose. self.name is fail-closed
+                # and raises when [HARDWARE] ltfs_ownership_id is unset, so
+                # reading it here would turn this deliberately non-fatal branch
+                # into an import-time crash for every clean clone (config.ini is
+                # not tracked). acquire() still raises with the precise message.
                 get_logger().debug(
-                    "ltfs_ownership_handle_deferred: mutex=%s", self.name)
+                    "ltfs_ownership_handle_deferred: mutex=%s",
+                    self._name_override or "<unresolved>")
 
     # -- naming ------------------------------------------------------------
     @property
