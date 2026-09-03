@@ -591,6 +591,15 @@ def run_profile(spec: ProfileSpec, run_root: str, *,
     return record
 
 
+def _fmt_optional(value, spec: str = ".2f") -> str:
+    """Render an optional numeric cell, blank when the sample is missing.
+
+    ``peak_rss_mb`` is None whenever psutil was unavailable for a profile, and
+    a benchmark table must show that absence rather than invent a zero.
+    """
+    return "" if value is None else format(value, spec)
+
+
 def render_markdown(summary: dict) -> str:
     lines = []
     lines.append(f"# Stored TAR Offline Benchmark ({summary['version']})")
@@ -631,7 +640,7 @@ def render_markdown(summary: dict) -> str:
                 f"{row['logical_bytes'] / 1024**2:.2f} | "
                 f"{row['output_bytes'] / 1024**2:.2f} | "
                 f"{row['wall_seconds']:.3f} | {row['cpu_seconds']:.3f} | "
-                f"{'' if row['peak_rss_mb'] is None else f'{row['peak_rss_mb']:.2f}'} | "
+                f"{_fmt_optional(row['peak_rss_mb'])} | "
                 f"{row['peak_staging_bytes'] / 1024**2:.2f} | "
                 f"{row['final_staging_bytes'] / 1024**2:.2f} | "
                 f"{row['peak_entry_count']} | {row['final_entry_count']} | "
