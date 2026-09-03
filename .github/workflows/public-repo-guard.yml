@@ -18,7 +18,8 @@ permissions:
   contents: read
 
 jobs:
-  # The privacy gate inspects history, not the interpreter, so it runs once.
+  # The privacy gate reads git history with the standard library only, so it is
+  # platform-independent and runs once on the cheaper runner.
   guard:
     runs-on: ubuntu-latest
     steps:
@@ -34,10 +35,12 @@ jobs:
       - name: Privacy gate
         run: python scripts/check_public_repo.py
 
-  # Runs across the interpreter range the README advertises, so the support
-  # claim is something CI proves rather than something the README asserts.
+  # Windows, because the product is Windows: the suite exercises ctypes.windll
+  # mutexes, powershell.exe, robocopy exit classification and drive-letter
+  # paths. Running it on ubuntu-latest — as this workflow used to — could only
+  # ever fail, and did.
   tests:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     strategy:
       fail-fast: false
       matrix:
@@ -56,26 +59,30 @@ jobs:
       #
       # PySide6 is skipped on purpose: it is a ~150 MB desktop toolkit needed
       # only by the DB Inspector GUI, which has no headless test.
+      # httpx is a test-only dependency of starlette's TestClient, used by the
+      # Storage Map web app suite.
       - name: Install dependencies
+        shell: bash
         run: |
           python -m pip install --upgrade pip
-          grep -v '^PySide6' requirements.txt > /tmp/ci-requirements.txt
-          python -m pip install -r /tmp/ci-requirements.txt
-          python -m pip install pytest
+          grep -v '^PySide6' requirements.txt > ci-requirements.txt
+          python -m pip install -r ci-requirements.txt
+          python -m pip install pytest httpx
+          rm ci-requirements.txt
 
       # The PostgreSQL suites skip without LTO_TEST_PG_DSN, which is correct
       # here: they need a disposable server and must never be pointed at a real
-      # catalog. Everything else runs.
+      # catalog. Tape and LTFS paths need the physical drive and also skip.
       - name: Offline test suite
         run: python -m pytest tests/ -q
 
       - name: Syntax sweep
-        run: |
-          python -m compileall -q src storage_map scripts run.py inspect_db.py
+        run: python -m compileall -q src storage_map scripts run.py inspect_db.py
 
       # config.ini is untracked and the suite must never create one. A file
       # here means a test wrote into the operator's real configuration path.
       - name: Assert the suite left no config.ini behind
+        shell: bash
         run: |
           if [ -e config.ini ]; then
             echo "::error::the test suite created a config.ini in the repo root"
