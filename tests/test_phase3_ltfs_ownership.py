@@ -215,10 +215,14 @@ class OwnershipSemanticsTests(unittest.TestCase):
             self.own.release()
 
     def test_mutex_name_is_derived_from_stable_config(self):
-        name = own.default_mutex_name()
-        self.assertTrue(name.startswith("OWC_LTO8_LTFS_OWNERSHIP_"))
-        self.assertNotIn(str(os.getpid()), name)
-        self.assertEqual(name, own.default_mutex_name())   # deterministic
+        # Pin the identity so the property (stable, config-derived, PID-free)
+        # is asserted without depending on the operator's untracked config.ini.
+        with mock.patch.object(own, "configured_ownership_id",
+                               return_value="drive_0000000000"):
+            name = own.default_mutex_name()
+            self.assertTrue(name.startswith("OWC_LTO8_LTFS_OWNERSHIP_"))
+            self.assertNotIn(str(os.getpid()), name)
+            self.assertEqual(name, own.default_mutex_name())   # deterministic
 
     def test_generation_increments_on_each_acquisition(self):
         before = self.own.generation
