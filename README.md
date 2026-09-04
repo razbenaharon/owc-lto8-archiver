@@ -168,7 +168,7 @@ become tracked; CI runs the same gate plus the test suite.
 ## Requirements
 
 - Windows (uses `vol`, `wmic`, and IBM LTFS executables)
-- Python 3.8+
+- Python 3.11+ (CI proves 3.11, 3.12 and 3.13 on Windows; 3.9 and 3.10 fail)
 - [IBM LTFS SDE](https://www.ibm.com/support/pages/ibm-linear-tape-file-system-ltfs) installed to `C:\Program Files\IBM\LTFS\`
 - OWC Mercury Pro LTO-8 (or compatible LTFS-formatted LTO drive)
 - OpenSSH client tools for remote archive mode
