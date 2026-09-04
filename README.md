@@ -13,7 +13,7 @@ This repository is the tooling built around one OWC Mercury Pro LTO-8 drive doin
 | | |
 |---|---|
 | **Scale** | ~47k lines in `src/` across 77 modules, ~36k lines of tests across 75 files |
-| **Validation** | 1,737 tests pass offline; CI runs the suite on a Python matrix plus a privacy gate over full git history |
+| **Validation** | 1,752 tests pass offline; CI runs the suite on Python 3.11 and 3.13 plus a privacy gate over full git history |
 | **Persistence** | PostgreSQL 17 catalog, 19 ordered SQL migrations applied at startup |
 | **Operational record** | 16 written incident post-mortems in [`docs/incidents/`](docs/incidents/) |
 | **Platform** | Windows + IBM LTFS; PostgreSQL via Docker; SSH for remote sources |

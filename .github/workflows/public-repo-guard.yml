@@ -79,7 +79,9 @@ jobs:
       # here: they need a disposable server and must never be pointed at a real
       # catalog. Tape and LTFS paths need the physical drive and also skip.
       - name: Offline test suite
-        run: python -m pytest tests/ -q
+        run: >-
+          python -m pytest tests/ -q
+          -W error::pytest.PytestUnhandledThreadExceptionWarning
 
       - name: Syntax sweep
         run: python -m compileall -q src storage_map scripts run.py inspect_db.py
