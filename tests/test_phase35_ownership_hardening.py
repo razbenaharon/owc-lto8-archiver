@@ -161,9 +161,14 @@ class OwnershipIdentityTests(unittest.TestCase):
         self.assertIn("drive_0000000000", name_z)
 
     def test_mutex_name_does_not_contain_the_drive_letter(self):
-        name = own.default_mutex_name()
-        self.assertNotIn("_Z", name.replace("drive_", ""))
-        self.assertEqual(name, own.default_mutex_name())
+        # Pin the identity instead of reading the operator's untracked
+        # config.ini: the property under test is that the *name* carries no
+        # mount letter, which must hold on a clean clone too.
+        with mock.patch.object(own, "configured_ownership_id",
+                               return_value="drive_0000000000"):
+            name = own.default_mutex_name()
+            self.assertNotIn("_Z", name.replace("drive_", ""))
+            self.assertEqual(name, own.default_mutex_name())
 
     def test_different_ids_give_different_mutexes(self):
         with mock.patch.object(own, "configured_ownership_id",
@@ -192,16 +197,28 @@ class OwnershipIdentityTests(unittest.TestCase):
 
     def test_no_device_command_is_needed_to_build_the_name(self):
         """Computing the name must not run any subprocess."""
-        with mock.patch("subprocess.run",
+        with mock.patch.object(own, "configured_ownership_id",
+                               return_value="drive_0000000000"), \
+             mock.patch("subprocess.run",
                         side_effect=AssertionError("subprocess used")), \
              mock.patch("subprocess.Popen",
                         side_effect=AssertionError("subprocess used")):
             self.assertTrue(own.default_mutex_name())
 
     def test_production_config_declares_the_id(self):
+        """Operator-machine check: a real config.ini must declare the id.
+
+        config.ini is untracked by design, so this asserts nothing on a
+        clean clone or in CI. The identity *logic* is covered hermetically
+        by the tests above; this one only catches a locally misconfigured
+        drive.
+        """
         import configparser
+        config_path = os.path.join(PROJECT_ROOT, "config.ini")
+        if not os.path.exists(config_path):
+            self.skipTest("no local config.ini (expected on a clean clone/CI)")
         parser = configparser.ConfigParser()
-        parser.read(os.path.join(PROJECT_ROOT, "config.ini"), encoding="utf-8")
+        parser.read(config_path, encoding="utf-8")
         value = parser.get("HARDWARE", "ltfs_ownership_id", fallback="")
         self.assertEqual(own.validate_ownership_id(value), value.strip())
 

@@ -212,6 +212,26 @@ def _guarded_connect(original):
     return wrapper
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _config_file_outside_the_repo(tmp_path_factory):
+    """Point ConfigManager's default at a scratch directory for the whole run.
+
+    Several suites construct a bare ``ConfigManager()``. Without this, the first
+    of them writes a real ``config.ini`` into the repository root (it is
+    gitignored, so nothing complains) and every later test that reads that file
+    sees generated defaults instead of the operator's configuration. The result
+    was an order-dependent suite. Tests get their own throwaway config; the
+    operator's file is never read or written.
+    """
+    import src.config as _config
+    original = _config.CONFIG_FILE
+    _config.CONFIG_FILE = str(tmp_path_factory.mktemp("config") / "config.ini")
+    try:
+        yield _config.CONFIG_FILE
+    finally:
+        _config.CONFIG_FILE = original
+
+
 def pytest_configure(config):
     global _PSYCOPG_ORIGINAL_CONNECT
     try:

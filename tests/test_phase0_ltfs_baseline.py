@@ -664,8 +664,19 @@ class TapeLockBaselineTests(unittest.TestCase):
 # =============================================================================
 class PipelineDepthBaselineTests(unittest.TestCase):
     def _config(self):
+        """The operator's config when there is one, else the tracked example.
+
+        config.ini is untracked, so reading only that made these baselines
+        unverifiable on a clean clone and in CI - they passed solely because an
+        earlier test had left a generated config.ini in the repo root. The
+        example config carries the same documented baseline, so falling back to
+        it keeps the assertions meaningful everywhere while still catching drift
+        on a machine that has a real config.
+        """
         parser = configparser.ConfigParser()
-        parser.read(os.path.join(PROJECT_ROOT, "config.ini"), encoding="utf-8")
+        local = os.path.join(PROJECT_ROOT, "config.ini")
+        example = os.path.join(PROJECT_ROOT, "config.example.ini")
+        parser.read(local if os.path.exists(local) else example, encoding="utf-8")
         return parser
 
     def test_prefetch_depth_is_one_today(self):

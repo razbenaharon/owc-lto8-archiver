@@ -62,9 +62,15 @@ def _load_env_file(path):
 
 
 class ConfigManager:
-    def __init__(self, config_path=CONFIG_FILE):
+    def __init__(self, config_path=None):
+        # Resolved at call time, not at def time: binding CONFIG_FILE into
+        # the signature makes the path impossible to redirect, which is how
+        # the test suite ended up creating a real config.ini in the repo
+        # root. Production behaviour is unchanged - runners chdir to
+        # PROJECT_ROOT and the relative name resolves exactly as before.
         self.config      = configparser.ConfigParser(interpolation=None)
-        self.config_path = config_path
+        self.config_path = CONFIG_FILE if config_path is None else config_path
+        config_path      = self.config_path
 
         if not os.path.exists(config_path):
             self._create_default()

@@ -54,13 +54,19 @@ class MutexOverrideHardeningTests(unittest.TestCase):
     def test_production_default_name_ignores_the_env_var(self):
         # Even with the test env var set, a fresh production-style ownership
         # object (no explicit name) resolves the config identity, not the env.
-        with mock.patch.dict(os.environ, {"LTO_TEST_OWNERSHIP_ID": "sneaky"}):
+        # The identity is pinned rather than read from the operator's untracked
+        # config.ini, so the env-independence property is proved on a clean clone.
+        with mock.patch.object(own, "configured_ownership_id",
+                               return_value="drive_0000000000"), \
+             mock.patch.dict(os.environ, {"LTO_TEST_OWNERSHIP_ID": "sneaky"}):
             o = LtfsOwnership()
             self.assertEqual(o.name, own.default_mutex_name())
             self.assertNotIn("sneaky", o.name)
 
     def test_default_mutex_name_is_stable_and_env_free(self):
-        with mock.patch.dict(os.environ, {"LTO_TEST_OWNERSHIP_ID": "whatever"}):
+        with mock.patch.object(own, "configured_ownership_id",
+                               return_value="drive_0000000000"), \
+             mock.patch.dict(os.environ, {"LTO_TEST_OWNERSHIP_ID": "whatever"}):
             self.assertEqual(own.default_mutex_name(), own.default_mutex_name())
             self.assertNotIn("whatever", own.default_mutex_name())
 
