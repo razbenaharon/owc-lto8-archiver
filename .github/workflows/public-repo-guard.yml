@@ -22,6 +22,7 @@ jobs:
   # platform-independent and runs once on the cheaper runner.
   guard:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -41,10 +42,14 @@ jobs:
   # ever fail, and did.
   tests:
     runs-on: windows-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        python-version: ['3.11', '3.12', '3.13']
+        # Endpoints of the supported range only. 3.12 is dropped on purpose:
+        # Windows runners bill at 2x, and a version between two passing
+        # endpoints is the least likely to catch anything.
+        python-version: ['3.11', '3.13']
     steps:
       - uses: actions/checkout@v4
 
