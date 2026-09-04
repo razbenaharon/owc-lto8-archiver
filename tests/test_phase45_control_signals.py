@@ -165,19 +165,26 @@ class StagingPressureWiringTests(unittest.TestCase):
         stop = threading.Event()
         q = ReadyQueue(_limits())
 
-        t = threading.Thread(
-            target=orch._await_staging_capacity,
-            args=(1, 1, stop), kwargs={"ready_q": q}, daemon=True)
-        t.start()
-        try:
-            deadline = time.time() + 5
-            while time.time() < deadline and not orch._staging_pressure_active:
-                time.sleep(0.05)
-            self.assertTrue(orch._staging_pressure_active,
-                            "capacity gate did not engage staging pressure")
-        finally:
-            stop.set()
-            t.join(timeout=TIMEOUT)
+        # Keep the integration check independent of the host/CI runner's free
+        # disk. Without this patch, a runner below the production 20 GiB reserve
+        # raises inside the daemon thread and pytest can report the test as
+        # passing with only PytestUnhandledThreadExceptionWarning.
+        disk = SimpleNamespace(free=100 * GiB)
+        with mock.patch("src.remote_staging.shutil.disk_usage", return_value=disk):
+            t = threading.Thread(
+                target=orch._await_staging_capacity,
+                args=(1, 1, stop), kwargs={"ready_q": q}, daemon=True)
+            t.start()
+            try:
+                deadline = time.time() + 5
+                while time.time() < deadline and not orch._staging_pressure_active:
+                    time.sleep(0.05)
+                self.assertTrue(orch._staging_pressure_active,
+                                "capacity gate did not engage staging pressure")
+            finally:
+                stop.set()
+                t.join(timeout=TIMEOUT)
+        self.assertFalse(t.is_alive(), "capacity-gate worker did not stop")
 
 
 class DeadPressureConfigRemovedTests(unittest.TestCase):
