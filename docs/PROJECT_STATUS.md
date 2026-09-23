@@ -45,22 +45,23 @@ Every line carries one of three evidence labels:
 | M12 | 2026-08-21 | Campaign-store verifier and failing-drive evacuation tooling | `feat: verify campaign containers…` |
 | M13 | 2026-09-04 | Clean-clone green: 1,752 tests offline, CI on Python 3.11 and 3.13 | PR #1, PR #2 |
 | M14 | 2026-09-18 | Manifests moved off the Desktop into `LTO_METADATA/`; reconciliation `--heavy` PASS: disk = ledger = aggregates, 4,240,566 rows | [state](tape-and-archive-state.md) |
+| M15 | 2026-09-23 | Catalog reduced to the two production tapes: Tape_03/Tape_04 rows removed, reconciliation `--heavy` still PASS, fresh verified dump taken; incident-008 overrides confirmed absent from `config.ini` | this commit |
 
 ## Open — ordered by what unblocks what
 
 | ID | Item | Blocked by | Label |
 | --- | --- | --- | --- |
 | O1 | Replacement LTO-8 drive, then a synthetic pilot on a scratch cartridge | RMA (external) | Documented |
-| O4 | Tape_03 / Tape_04: reformat as scratch. Their partial Session 37 copies are no longer wanted | O1 | Documented |
 | O5 | **Second copy of `LTO_METADATA/` and `db_backups/`**. Both exist only in this repo folder on one drive, and a `git clean -x` would delete them | Operator decision on the target | Verified 2026-09-23 |
-| O6 | Fresh `pg_dump`. The newest dump is dated 2026-08-21, and the catalog is 139 MB live | — | Verified 2026-09-23 |
 | O7 | SCCM maintenance window or deployment exemption for the archive host | IT | Documented, incident 005 |
-| O8 | Revert the incident-008 `config.ini` overrides; Session 37 is abandoned, so nothing needs them | — | Documented |
 | O9 | Off-host monitoring. A restart watchdog exists (`scripts/archive_watchdog.ps1`), but the only monitor still runs on the host doing the work | — | Documented, incident 007 |
 | O10 | Two `[STORAGE_MAP:*]` host sections in the local `config.ini` still hold TODO placeholders | Real host details | Verified 2026-09-23 |
 
 ## Decisions
 
+- 2026-09-23: Tape_03 and Tape_04 removed from the catalog. Only Tape_01
+  and Tape_02 exist as far as this project is concerned; the two physical
+  cartridges are blank stock to reformat once a healthy drive exists.
 - 2026-09-23: Session 37 abandoned. Closes the former items "re-fetch
   chunks 49–216" and "copy the production host's metadata".
 
@@ -75,7 +76,7 @@ The repository is public. The following stay local on purpose (see
 | Path | What it is | Can it be regenerated? |
 | --- | --- | --- |
 | `LTO_METADATA/` | Per-file manifests for Tape_01/Tape_02 (145 segments, 241 MiB) | **No.** This is the only copy (see O5) |
-| `db_backups/` | `pg_dump` files, 2026-07-02 → 2026-08-21 | **No** |
+| `db_backups/` | `pg_dump` files, 2026-07-02 → 2026-09-23 | **No** |
 | PostgreSQL volume (Docker `lto_pg`) | The live catalog | Only from `db_backups/` |
 | `config.ini`, `.env` | Host configuration and secrets | By hand, from `config.example.ini` / `.env.example` |
 | `private/` | Pre-rewrite git bundle, archived design docs, retired scripts, vendor support logs | No (the bundle holds the unscrubbed history) |

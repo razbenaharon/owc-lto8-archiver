@@ -12,13 +12,15 @@ state (PostgreSQL, receipts, LTFS logs) before acting.
 | --- | --- | --- | --- |
 | **Tape_01** | **CLOSED production — immutable** | 4,255,539 files, 10,624,686,466,311 bytes (10.62 TB): 4,254,947 packed small files in 295 ZIP bundles + 592 loose files | Fully inventoried: per-file manifests (export 1, pruned) + `files_index` loose/large rows + folder aggregates |
 | **Tape_02** | **CLOSED production — immutable, read-only** (PWE latch, [incident 010](incidents/010-20260724-ltfs-write-perm-readonly.md)) | Pre-July: 12,965 files, 3,203,839,476,694 bytes (3.20 TB) in 20 bundles. Additionally: remote Session 37 chunks 0–48 (~710 GB, written 2026-07-09..24) | Pre-July content fully inventoried locally (as Tape_01). The Session 37 chunk 0–48 inventory lives in the **production-host catalog and its plan manifests**, which are not on this workstation — see "Known gaps" |
-| **Tape_03** | NOT production — scratch | Generation 3 carries the 24 GiB Phase 5E synthetic pilot + an **unverified, uncataloged** partial campaign copy (chunks 49–81, [incident 014](incidents/014-20260819-campaign-write-servo-halt.md)). Generations 1–2 retired | Zero `archive_runs`, zero `files_index` rows, `used_space = 0` — by design |
-| **Tape_04** | NOT production — scratch | Generation 1: an **unverified, uncataloged** partial campaign copy (chunks 49–81/82); 68-file LTFS index persisted at the servo fault | No catalog rows anywhere |
+
+Tape_03 and Tape_04 were **removed from the catalog on 2026-09-23** (operator
+decision, with Session 37 abandoned): they held only a synthetic pilot and
+partial, uncataloged Session 37 copies. The physical cartridges are blank
+stock to reformat once a healthy drive exists.
 
 **Production boundary: Tape_01 and Tape_02 are the only closed production
 tapes. Nothing may write to, reformat, or reinterpret them, and their catalog
-records and manifests must never be deleted or reset.** Tape_03/Tape_04
-content is scratch until a healthy drive verifies or rewrites it.
+records and manifests must never be deleted or reset.**
 
 ## Drive
 
@@ -66,7 +68,7 @@ verification has **not** completed — see below.
 >
 > **2026-09-23: Session 37 abandoned by operator decision.** Nothing is
 > re-fetched. Chunks 0–48 stay on Tape_02 as written; Tape_03/Tape_04 are
-> plain scratch to reformat. The local catalog holds zero Session 37 rows,
+> removed from the catalog. The local catalog holds zero Session 37 rows,
 > and Known gaps 1–2 below are accepted, not pending.
 
 ## Catalogs and manifests
@@ -108,6 +110,5 @@ verification has **not** completed — see below.
    are self-describing (a stored TAR carries its member inventory), so
    restore is possible without them, but the referenced artifacts should be
    recovered with the production metadata root.
-3. Tape_03/Tape_04 hold partial unverified campaign copies that no catalog
-   references; when a healthy drive exists, decide per tape: verify & adopt,
-   or rewrite from the (evacuated) campaign store.
+3. Closed 2026-09-23: Tape_03/Tape_04 removed from the catalog; their
+   partial campaign copies are not wanted.

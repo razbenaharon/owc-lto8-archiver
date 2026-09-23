@@ -2,7 +2,8 @@
 
 - **When:** 2026-07-17 (session 37, chunk 19)
 - **Physical intervention required:** no
-- **Status:** worked around; **config revert still pending**
+- **Status:** closed 2026-09-23. Both overrides are absent from `config.ini`, so
+  the code defaults apply; Session 37 was abandoned
 
 ## Symptom
 
