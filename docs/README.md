@@ -6,6 +6,8 @@ of reading every historical note.
 
 ## Read first
 
+0. [`PROJECT_STATUS.md`](PROJECT_STATUS.md) — what is done, open, and blocked,
+   with an evidence label on every line.
 1. [`AGENTS.md`](../AGENTS.md) — current repository rules, architecture,
    validation commands, and non-negotiable tape-safety constraints.
 2. [`incidents/README.md`](incidents/README.md) — incident index and links to

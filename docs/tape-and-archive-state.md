@@ -1,6 +1,7 @@
 # Tape and archive state
 
-**Snapshot: operator workstation, as observed 2026-08-20.** This is the single
+**Snapshot: operator workstation, as observed 2026-08-20; campaign outcome
+and manifest location updated 2026-09-18/23.** This is the single
 place tape/session/catalog state is recorded; every other document links here
 instead of restating counts. A dated document is a snapshot — verify live
 state (PostgreSQL, receipts, LTFS logs) before acting.
@@ -45,7 +46,7 @@ starts clean.
 ## The localization campaign store
 
 `LTO_METADATA/LOCAL_MANIFEST_ARCHIVE/campaign_tape03/` on the external
-campaign drive holds one directory per chunk (49–217), each with
+campaign drive held one directory per chunk (49–217), each with
 `container_0000.tar` (+ more ordinals where the chunk exceeded one container)
 and `receipt.json` carrying container SHA-256, sidecar SHA-256, member count,
 logical bytes, and plan-manifest locators. Receipts exist for chunks 49–216;
@@ -56,14 +57,15 @@ Measured by `scripts/verify_campaign_store.py --mode structure`, 2026-08-20:
 receipted size, zero truncation, zero I/O errors. Content (SHA-256)
 verification has **not** completed — see below.
 
-> **URGENT ([incident 015](incidents/015-20260820-campaign-drive-instability.md)):
-> the drive holding this store is failing — audible mechanical noise, 292
-> disk-51 events in one hour, NTFS "corruption may occur", and as of
-> 2026-08-21 its physical disk is no longer enumerated at all (while the
-> volume still reports Healthy from cached metadata). This is the only
-> complete copy of the campaign. Do not use the drive for anything except a
-> one-shot evacuation to healthy storage
-> (`scripts/evacuate_campaign_store.ps1`), then verify the *rescued* copy.**
+> **OUTCOME ([incident 015](incidents/015-20260820-campaign-drive-instability.md),
+> 2026-08-21): the campaign drive failed during evacuation and no longer
+> enumerates. Rescued: 147 of 168 receipts (198.3 KB) and 0 of 184
+> containers — 695.3 GiB of staged payload is gone.** This was a staging
+> copy, never the backup: Tape_01/Tape_02 and their manifests were not
+> affected. Recovery path: confirm the remote source still holds Session 37
+> chunks 49–216, then re-fetch and re-localize; the 147 surviving receipts
+> prove a re-localized copy byte-identical. Chunks 90 and 196–216 lost their
+> receipts too, so they cannot be proven identical, only re-fetched.
 
 ## Catalogs and manifests
 
@@ -73,10 +75,17 @@ verification has **not** completed — see below.
   inventory**: packed small files live in the per-file JSONL.zst manifests;
   the DB keeps the export ledger, folder aggregates, loose/large file rows,
   sessions/chunks/bundles/runs, and tape state.
-- **Per-file manifests**: `C:\LTO_METADATA\LOCAL_MANIFEST_ARCHIVE\` —
-  deliberately on the internal NVMe, not on the unstable external drive.
+- **Per-file manifests**:
+  `E:\Projects\owc-lto8-archiver\LTO_METADATA\LOCAL_MANIFEST_ARCHIVE\` —
+  on the internal fixed ReFS Dev Drive, not on the unstable external drive.
+  Relocated here 2026-09-18 from the operator's Desktop, where a full-disk
+  sweep found it was the **only** copy on the workstation; the tree is
+  git-ignored (`LTO_METADATA/`). 145 segments, 241 MiB compressed,
+  inventorying 1.34 TiB of source files.
   Layout: `<Tape_label>/<session>/bundle_<id>.jsonl.zst`, each segment
-  SHA-256-recorded in `local_manifest_segments`.
+  SHA-256-recorded in `local_manifest_segments`. Verified after the move by
+  `scripts/validate_archive_reconciliation.py --heavy`: disk == ledger ==
+  aggregates at 4,240,566 rows / 88,770 directories, all six checks PASS.
 - **Production-host catalog** (directory-catalog database, last authoritative
   2026-08-03..05): contains the full Session 36/37 planning rows (23.2M plan
   members) and the plan manifests / tar sidecars referenced by the campaign
