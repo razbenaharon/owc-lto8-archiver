@@ -62,10 +62,12 @@ verification has **not** completed — see below.
 > enumerates. Rescued: 147 of 168 receipts (198.3 KB) and 0 of 184
 > containers — 695.3 GiB of staged payload is gone.** This was a staging
 > copy, never the backup: Tape_01/Tape_02 and their manifests were not
-> affected. Recovery path: confirm the remote source still holds Session 37
-> chunks 49–216, then re-fetch and re-localize; the 147 surviving receipts
-> prove a re-localized copy byte-identical. Chunks 90 and 196–216 lost their
-> receipts too, so they cannot be proven identical, only re-fetched.
+> affected.
+>
+> **2026-09-23: Session 37 abandoned by operator decision.** Nothing is
+> re-fetched. Chunks 0–48 stay on Tape_02 as written; Tape_03/Tape_04 are
+> plain scratch to reformat. The local catalog holds zero Session 37 rows,
+> and Known gaps 1–2 below are accepted, not pending.
 
 ## Catalogs and manifests
 

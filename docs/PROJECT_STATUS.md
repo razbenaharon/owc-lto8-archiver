@@ -20,9 +20,10 @@ Every line carries one of three evidence labels:
 2. **All tape work is frozen.** The LTO-8 drive failed (servo fault) and is
    under RMA. No write is allowed until a replacement passes a synthetic pilot
    on a scratch cartridge. *Documented, incidents 013/014.*
-3. **The rest of Session 37 must be re-fetched.** Chunks 49–216 (695 GiB) had
-   been staged to an external drive that then died. It was a staging copy, not
-   the backup. *Documented, incident 015.*
+3. **Session 37 is abandoned.** Operator decision, 2026-09-23. Chunks 0–48
+   stay on Tape_02 as written, without a local per-file inventory. Nothing
+   more will be fetched, and no further Session 37 metadata is kept. The local
+   catalog already holds zero Session 37 rows. *Verified 2026-09-23.*
 4. **The code is finished for the current scope and green in CI.** *Verified
    2026-09-04 (PR #2).*
 
@@ -50,15 +51,18 @@ Every line carries one of three evidence labels:
 | ID | Item | Blocked by | Label |
 | --- | --- | --- | --- |
 | O1 | Replacement LTO-8 drive, then a synthetic pilot on a scratch cartridge | RMA (external) | Documented |
-| O2 | Confirm the remote source still holds Session 37 chunks 49–216, then re-fetch and re-localize them | Remote host access | **Unknown**, most urgent |
-| O3 | Copy the production host's `LTO_METADATA` and a fresh catalog dump here. This is the only per-file inventory for Session 37 chunks 0–48 on Tape_02 | Production host access | Unknown |
-| O4 | Tape_03 / Tape_04: verify and adopt, or rewrite. Both hold partial, uncataloged copies | O1 | Documented |
+| O4 | Tape_03 / Tape_04: reformat as scratch. Their partial Session 37 copies are no longer wanted | O1 | Documented |
 | O5 | **Second copy of `LTO_METADATA/` and `db_backups/`**. Both exist only in this repo folder on one drive, and a `git clean -x` would delete them | Operator decision on the target | Verified 2026-09-23 |
-| O6 | Fresh `pg_dump`. The newest dump is dated 2026-08-21, and Docker Desktop (and `lto_pg`) was not running on 2026-09-23 | Starting Docker | Verified 2026-09-23 |
+| O6 | Fresh `pg_dump`. The newest dump is dated 2026-08-21, and the catalog is 139 MB live | — | Verified 2026-09-23 |
 | O7 | SCCM maintenance window or deployment exemption for the archive host | IT | Documented, incident 005 |
-| O8 | Revert the incident-008 `config.ini` overrides when Session 37 completes | O2 | Documented |
+| O8 | Revert the incident-008 `config.ini` overrides; Session 37 is abandoned, so nothing needs them | — | Documented |
 | O9 | Off-host monitoring. A restart watchdog exists (`scripts/archive_watchdog.ps1`), but the only monitor still runs on the host doing the work | — | Documented, incident 007 |
 | O10 | Two `[STORAGE_MAP:*]` host sections in the local `config.ini` still hold TODO placeholders | Real host details | Verified 2026-09-23 |
+
+## Decisions
+
+- 2026-09-23: Session 37 abandoned. Closes the former items "re-fetch
+  chunks 49–216" and "copy the production host's metadata".
 
 Deliberately **not** planned: physical PostgreSQL compaction (plan 4 task 6.2)
 stays separately approved future work.
