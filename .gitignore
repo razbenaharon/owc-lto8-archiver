@@ -17,6 +17,9 @@ source/
 staging/
 restored/
 LOCAL_MANIFEST_ARCHIVE/
+# Relocated 2026-09-18 from the operator's Desktop. The per-file manifest
+# root now lives in-repo but stays untracked - it is real inventory data.
+LTO_METADATA/
 backup_logs/
 storage_map_logs/
 # Everything here stays untracked. This repo is PUBLIC, and storage_map/logs/
@@ -32,6 +35,7 @@ lto_archive*.db
 
 # Local config — contains host/user/paths. Use config.example.ini as template.
 config.ini
+config.ini.bak*
 
 # Vendor drivers/installers — proprietary, not redistributed (see README).
 Framework & Drivers/

@@ -130,6 +130,7 @@ The offline suite needs no tape, no drive and no database. PostgreSQL suites ski
 ---
 ## Documentation
 
+- [Project status](docs/PROJECT_STATUS.md) — milestones achieved, open items, what is not in git
 - [Documentation map](docs/README.md) — task routing and source-of-truth rules
   for engineers and LLMs.
 - [Repository and safety guidance](AGENTS.md) — read before changing code or
