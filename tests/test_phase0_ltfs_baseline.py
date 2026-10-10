@@ -439,9 +439,16 @@ class RobocopyCommandBaselineTests(unittest.TestCase):
         cmd = self._capture_robocopy_cmd()
         self.assertIsNotNone(cmd, "robocopy command was never constructed")
         self.assertEqual(cmd[0], "robocopy")
-        for flag in ("/E", "/J", "/R:3", "/W:10", "/NP", "/NDL", "/NFL",
+        for flag in ("/E", "/J", "/R:0", "/W:0", "/NP", "/NDL", "/NFL",
                      "/BYTES"):
             self.assertIn(flag, cmd)
+
+    def test_tape_write_never_retries(self):
+        """Incident 010: the first hard write error must stop the chunk, not be
+        retried into a failing drive — exactly one /R option, and it is 0."""
+        cmd = self._capture_robocopy_cmd()
+        self.assertEqual(self._opts(cmd, "/R:"), ["/R:0"])
+        self.assertEqual(self._opts(cmd, "/W:"), ["/W:0"])
 
     def test_source_and_destination_are_unchanged(self):
         cmd = self._capture_robocopy_cmd()

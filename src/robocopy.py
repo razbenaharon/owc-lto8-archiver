@@ -15,6 +15,27 @@ from .runtime import CANCEL, _apply_proc_tuning, _is_admin, _progress_done, _pro
 # the whole run.
 _ROBOCOPY_ERROR_RE = re.compile(r'ERROR \d+ \(0x[0-9A-Fa-f]{8}\)')
 
+# When robocopy retries, the ERROR line is followed by its message line and then
+# "Waiting N seconds... Retrying...". With /R:0 there is no such line and, unlike
+# an exhausted /R:n, no "RETRY LIMIT EXCEEDED" either (verified on Windows
+# robocopy 2026-10-11) — so the absence of a retry is the only unrecovered-error
+# signal. A directory-attribute ERROR 19 (incident 010) even leaves the Dirs
+# FAILED counter at 0.
+_RETRY_LOOKAHEAD_LINES = 3
+
+
+def _unrecovered_error_lines(output):
+    """ERROR lines robocopy did not follow with a retry (stripped)."""
+    lines = (output or '').splitlines()
+    unrecovered = []
+    for i, line in enumerate(lines):
+        if not _ROBOCOPY_ERROR_RE.search(line):
+            continue
+        window = lines[i + 1:i + 1 + _RETRY_LOOKAHEAD_LINES]
+        if not any('Retrying' in nxt for nxt in window):
+            unrecovered.append(line.strip())
+    return unrecovered
+
 
 # Verdict returned by classify_robocopy_result. ``is_success`` is the single
 # authoritative gate the tape writer commits on; ``category`` names the failure
@@ -29,11 +50,19 @@ def _robocopy_file(src, dst, display_name=None):
     """
     Copy a single file using robocopy with unbuffered I/O.
     Shows a simple active heartbeat while copying.
-    Returns True on success (robocopy exit code < 8).
+
+    The file lands at ``dirname(dst)/basename(src)`` — robocopy cannot rename
+    during a copy, so the basename of ``dst`` is ignored. Callers that need a
+    different name use ``LTORetriever._copy_file_to``.
+
+    Returns True only when classify_robocopy_result accepts robocopy's own
+    output (exit code alone is never trusted — incident 009) AND the landed
+    file is exactly the source size.
     """
     src_dir  = os.path.dirname(os.path.abspath(src))
     dst_dir  = os.path.dirname(os.path.abspath(dst))
     filename = os.path.basename(src)
+    landed   = os.path.join(dst_dir, filename)
     os.makedirs(dst_dir, exist_ok=True)
 
     try:
@@ -51,9 +80,11 @@ def _robocopy_file(src, dst, display_name=None):
          '/IT',   # include tweaked files (always copy)
          '/R:3',  # retry 3 times on failure
          '/W:10', # wait 10 s between retries
-         '/NP', '/NDL', '/NJH', '/NJS', '/NFL',
+         '/NP', '/NDL', '/NJH', '/NFL',
+         '/BYTES', # keep the job summary, with integer byte counts
         ],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding='utf-8', errors='replace',
     )
     register_proc(proc)  # so Ctrl+C can terminate a long restore copy
 
@@ -63,7 +94,7 @@ def _robocopy_file(src, dst, display_name=None):
         start = time.time()
         while not stop_evt.wait(5):
             try:
-                cur_size = os.path.getsize(dst) if os.path.exists(dst) else 0
+                cur_size = os.path.getsize(landed) if os.path.exists(landed) else 0
             except OSError:
                 cur_size = 0
             pct     = (cur_size / fsize * 100) if fsize else 100
@@ -76,7 +107,7 @@ def _robocopy_file(src, dst, display_name=None):
     t = threading.Thread(target=_monitor, daemon=True)
     t.start()
     try:
-        proc.wait()
+        out, err = proc.communicate()
     finally:
         unregister_proc(proc)
     stop_evt.set()
@@ -90,8 +121,34 @@ def _robocopy_file(src, dst, display_name=None):
     # cancellation was requested is never a success.
     if CANCEL.is_set():
         return False
-    # robocopy exit codes < 8 indicate success (0=nothing done, 1=ok, 2-7=ok+extras)
-    return proc.returncode < 8
+
+    # robocopy can exit 0 after "ERROR: RETRY LIMIT EXCEEDED" having copied
+    # nothing (incident 009), so the verdict comes from its own output, exactly
+    # as for a tape write. /IS /IT force a copy, so 1 file / fsize bytes is the
+    # expected work.
+    output = (out or '') + '\n' + (err or '')
+    verdict = classify_robocopy_result(
+        proc.returncode, _parse_robocopy_summary(out), output,
+        expected_files=1, expected_bytes=fsize, expected_source_files=1)
+    if not verdict.is_success:
+        print(f"\n[ERROR] robocopy {verdict.category} (rc={proc.returncode}): "
+              f"{verdict.detail} — {src}")
+        for line in verdict.error_lines[:3]:
+            print(f"        {line}")
+        return False
+
+    # Local check of the landed copy (never reads the source again): a
+    # truncated file must not pass even if robocopy's summary looked clean.
+    try:
+        landed_size = os.path.getsize(landed)
+    except OSError as e:
+        print(f"\n[ERROR] robocopy reported success but {landed} is missing ({e})")
+        return False
+    if landed_size != fsize:
+        print(f"\n[ERROR] robocopy size mismatch for {landed}: "
+              f"{landed_size} bytes, expected {fsize}")
+        return False
+    return True
 
 
 def _parse_robocopy_bytes(tokens, idx):
@@ -282,21 +339,25 @@ def _run_robocopy_tuned(cmd, priority=None, affinity=None, on_start=None,
 
 
 def classify_robocopy_result(returncode, rc_sum, rc_output,
-                             expected_files=None, expected_bytes=None):
+                             expected_files=None, expected_bytes=None,
+                             expected_source_files=None):
     """Decide whether a robocopy tape write is trustworthy using ONLY the
     robocopy process's own evidence (its return code, complete output, parsed
     summary) plus locally-known source-side expectations. No tape is read.
 
     Returns a :class:`RobocopyVerdict`. Conservative by construction: a missing
-    or malformed summary, or an unexpected zero-copy result, is NEVER success —
-    even when the process happened to return 0. The deliberate existing rule is
-    preserved: an ERROR line accompanied by a *complete* summary with zero failed
-    files is a transient robocopy retried successfully (/R /W) and stays success;
-    the summary counters are the authoritative verdict.
+    or malformed summary, an ERROR robocopy did not retry, or less work
+    accounted for than the source holds is NEVER success — even when the
+    process happened to return 0. An ERROR line that robocopy *retried*
+    ("Retrying...") and that is followed by a complete summary with zero failed
+    files is a recovered transient and stays success.
 
     ``expected_files``/``expected_bytes`` are the source-side work submitted to
-    this write (counted locally before the copy). They gate the zero-copy sanity
-    check only — they are never compared against anything read back from tape.
+    this write (counted locally before the copy); they gate the zero-copy
+    sanity check. ``expected_source_files`` is every file robocopy should
+    enumerate in the source (excluding /XD subtrees; /XF files are counted by
+    robocopy as skipped): copied + skipped must reach it. None of these is ever
+    compared against anything read back from tape.
     """
     output = rc_output or ''
     error_lines = [ln.strip() for ln in output.splitlines()
@@ -344,7 +405,16 @@ def classify_robocopy_result(returncode, rc_sum, rc_output,
             False, 'files_failed',
             f'{files_failed} file(s) failed to copy', error_lines)
 
-    # 5. Zero-work sanity vs. the source-side work we submitted. If we staged
+    # 5. An ERROR robocopy never retried was not recovered, whatever the
+    #    counters say (the tape write runs /R:0, so this is every ERROR there).
+    unrecovered = _unrecovered_error_lines(output)
+    if unrecovered:
+        return RobocopyVerdict(
+            False, 'unrecovered_error',
+            f'{len(unrecovered)} ERROR line(s) robocopy did not retry',
+            error_lines)
+
+    # 6. Zero-work sanity vs. the source-side work we submitted. If we staged
     #    files but robocopy neither copied nor skipped (already-on-tape) any,
     #    the write did nothing though work was expected. Requiring BOTH
     #    copied==0 and skipped==0 keeps a legitimate all-already-present resume
@@ -361,6 +431,17 @@ def classify_robocopy_result(returncode, rc_sum, rc_output,
             False, 'zero_copy_unexpected',
             f'no bytes copied though ~{expected_bytes} were expected from '
             'source', error_lines)
+
+    # 7. Partial work: every source file must be either copied or skipped
+    #    (already present / excluded by name). A file that vanished before
+    #    enumeration, or one counted as a mismatch, leaves a gap here even
+    #    though FAILED is 0.
+    accounted = files_copied + files_skipped
+    if expected_source_files and accounted < expected_source_files:
+        return RobocopyVerdict(
+            False, 'incomplete_copy',
+            f'robocopy accounted for {accounted} file(s) (copied+skipped) '
+            f'but the source holds {expected_source_files}', error_lines)
 
     # Success: complete summary, no failures, work is accounted for. Any ERROR
     # lines here were transient and recovered — the summary is authoritative.

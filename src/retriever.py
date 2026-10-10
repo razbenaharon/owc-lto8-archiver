@@ -778,7 +778,9 @@ class LTORetriever:
                 return 0
             _acquire_tape_io_lock(f"restore {os.path.basename(tape_path)}")
             try:
-                ok = _robocopy_file(tape_path, local_tar)
+                # local_tar is renamed (restore_<uuid>_...), and robocopy keeps
+                # the source basename, so it must go through _copy_file_to.
+                ok = self._copy_file_to(tape_path, local_tar)
             finally:
                 _release_tape_io_lock()
             if not ok:
