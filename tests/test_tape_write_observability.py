@@ -36,6 +36,12 @@ _SUMMARY_ALL_SKIPPED = (
     "Times : 0:00:01 0:00:01\n"
 )
 _ERROR_LINE = "2026/07/24 07:00:41 ERROR 32 (0x00000020) Copying File x.zip\n"
+# What robocopy prints when it retries an ERROR (/R:n with n > 0).
+_RETRIED_ERROR = (
+    _ERROR_LINE
+    + "The process cannot access the file because it is being used by another process.\n"
+    + "Waiting 10 seconds... Retrying...\n"
+)
 
 # Realistic robocopy output ALWAYS contains an options header that echoes the
 # file filter as "Files : *.*" — this must not be mistaken for the summary.
@@ -69,6 +75,21 @@ _REAL_WRITE_PROTECTED = (
     "   Dirs :         1         0         1         0         0         0\n"
     "   Files :         0         0         0         0         0         0\n"
     "   Bytes :         0         0         0         0         0         0\n"
+)
+
+# The same write-protected failure under the tape write's /R:0: robocopy prints
+# the ERROR and its message but NO "Retrying" and NO "RETRY LIMIT EXCEEDED"
+# (shape verified against real robocopy /R:0 output, 2026-10-11).
+_REAL_WRITE_PROTECTED_NO_RETRY = (
+    "  Started : Fri Jul 24 10:16:36 2026\n"
+    "    Files : *.*\n"
+    "  Options : *.* /BYTES /S /E /J /R:0 /W:0\n"
+    "2026/07/24 10:16:36 ERROR 19 (0x00000013) Changing File Attributes "
+    "Z:\\_pack_s0037_049\\\n"
+    "The media is write protected.\n"
+    "   Dirs :         1         0         1         0         0         0\n"
+    "   Files :         6         6         0         0         0         0\n"
+    "   Bytes : 1731382179 1731382179 0 0 0 0\n"
 )
 
 
@@ -168,10 +189,11 @@ class SummaryParserTests(unittest.TestCase):
 # =============================================================================
 class ClassifierTests(unittest.TestCase):
     def _classify(self, output, returncode, expected_files=3,
-                  expected_bytes=1600000000):
+                  expected_bytes=1600000000, expected_source_files=None):
         return classify_robocopy_result(
             returncode, _parse_robocopy_summary(output), output,
-            expected_files=expected_files, expected_bytes=expected_bytes)
+            expected_files=expected_files, expected_bytes=expected_bytes,
+            expected_source_files=expected_source_files)
 
     def test_clean_success(self):
         v = self._classify(_SUMMARY_OK, 1)
@@ -201,13 +223,52 @@ class ClassifierTests(unittest.TestCase):
         v = self._classify(_SUMMARY_ALL_SKIPPED, 1)
         self.assertTrue(v.is_success)
 
-    def test_error_with_valid_summary_is_recovered_transient(self):
-        # scenario 2 (deliberate rule preserved): an ERROR line accompanied by a
-        # complete summary with 0 failures is a recovered transient -> success,
-        # and the error evidence is still captured.
-        v = self._classify(_ERROR_LINE + _SUMMARY_OK, 1)
-        self.assertTrue(v.is_success)
+    def test_retried_error_with_valid_summary_is_recovered_transient(self):
+        # scenario 2: an ERROR robocopy RETRIED, followed by a complete summary
+        # with 0 failures, is a recovered transient -> success, and the error
+        # evidence is still captured.
+        v = self._classify(_RETRIED_ERROR + _SUMMARY_OK, 1)
+        self.assertTrue(v.is_success, v.detail)
         self.assertEqual(len(v.error_lines), 1)
+
+    def test_error_never_retried_is_unrecovered_even_with_clean_summary(self):
+        v = self._classify(
+            _ERROR_LINE + "The process cannot access the file.\n" + _SUMMARY_OK, 1)
+        self.assertFalse(v.is_success)
+        self.assertEqual(v.category, "unrecovered_error")
+
+    def test_write_protected_without_retries_is_failure(self):
+        # Incident 010 under /R:0: exit 0, no retry-limit line, Dirs FAILED 0,
+        # and every file counted as copied. Only the un-retried ERROR shows it.
+        v = self._classify(_REAL_WRITE_PROTECTED_NO_RETRY, 0, expected_files=6,
+                           expected_bytes=1731382179, expected_source_files=6)
+        self.assertFalse(v.is_success)
+        self.assertEqual(v.category, "unrecovered_error")
+
+    def test_partial_copy_is_failure(self):
+        # 10 files in the source, 9 copied, nothing FAILED: one is unaccounted.
+        out = ("Files : 10 9 0 0 0 0\nBytes : 900 900 0 0 0 0\n"
+               "Times : 0:00:01 0:00:01\n")
+        v = self._classify(out, 1, expected_files=10, expected_bytes=1000,
+                           expected_source_files=10)
+        self.assertFalse(v.is_success)
+        self.assertEqual(v.category, "incomplete_copy")
+
+    def test_mismatch_leaves_a_gap_and_fails(self):
+        out = ("Files : 10 9 0 1 0 0\nBytes : 900 900 0 0 0 0\n"
+               "Times : 0:00:01 0:00:01\n")
+        v = self._classify(out, 5, expected_files=10, expected_bytes=1000,
+                           expected_source_files=10)
+        self.assertFalse(v.is_success)
+        self.assertEqual(v.category, "incomplete_copy")
+
+    def test_resume_with_excluded_files_counted_as_skipped_is_success(self):
+        # /XF resume excludes are reported by robocopy as skipped.
+        out = ("Files : 10 7 3 0 0 0\nBytes : 1000 700 300 0 0 0\n"
+               "Times : 0:00:01 0:00:01\n")
+        v = self._classify(out, 1, expected_files=10, expected_bytes=1000,
+                           expected_source_files=10)
+        self.assertTrue(v.is_success, v.detail)
 
     def test_error_without_summary_fails(self):
         # scenario 2: ERROR present AND summary missing -> untrusted.
@@ -339,7 +400,7 @@ class StreamingRawLogTests(unittest.TestCase):
 # Integration through LTOBackup.run (scenarios 7, 8, 9, 10, 12, 13)
 # =============================================================================
 class BackupRunClassificationTests(unittest.TestCase):
-    def _run_backup(self, stdout, returncode, cancel=False):
+    def _run_backup(self, stdout, returncode, cancel=False, source_files=1):
         """Drive a direct (non-packed) backup with a faked robocopy result.
 
         Returns (db, raised_exc_or_None, source_dir_kept_open=False).
@@ -350,8 +411,10 @@ class BackupRunClassificationTests(unittest.TestCase):
         tape = os.path.join(tmp, "tape")
         os.makedirs(source)
         os.makedirs(tape)
-        with open(os.path.join(source, "bundle.bin"), "wb") as f:
-            f.write(b"x" * 1024)
+        for i in range(source_files):
+            name = "bundle.bin" if i == 0 else f"bundle_{i}.bin"
+            with open(os.path.join(source, name), "wb") as f:
+                f.write(b"x" * 1024)
         db = _CommitTrackingDB()
         backup = LTOBackup(db, "", governor=None, log_dir=tmp)
         backup.eject_tape = lambda _drive: None
@@ -378,6 +441,13 @@ class BackupRunClassificationTests(unittest.TestCase):
         db, raised = self._run_backup(_SUMMARY_OK, 1)
         self.assertIsNone(raised)
         self.assertGreaterEqual(db.file_commits, 1)
+
+    def test_partial_copy_never_commits(self):
+        # The source holds 4 files; robocopy accounts for only 3 (copied 3,
+        # skipped 0, FAILED 0). The unaccounted file must block the commit.
+        db, raised = self._run_backup(_SUMMARY_OK, 1, source_files=4)
+        self.assertIsNotNone(raised)
+        self.assertEqual(db.file_commits, 0)
 
     def test_exit_zero_without_summary_never_commits(self):
         # scenarios 8 + 10: exit 0 but no summary -> raise, zero file commits.

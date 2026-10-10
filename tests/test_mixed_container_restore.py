@@ -118,6 +118,34 @@ class MixedContainerRestoreTests(unittest.TestCase):
             self.assertEqual(handle.read(), b"tar-data")
         self.retriever._verify_tape.assert_not_called()
 
+    def test_tar_restore_from_tape_finds_its_renamed_staged_copy(self):
+        # No local container, so the TAR is staged from tape under a renamed
+        # path (restore_<uuid>_<name>). robocopy keeps the source basename, so
+        # copying straight to that path left the file where the restore never
+        # looked and every tape-backed Stored TAR restore failed.
+        members = [("project/t.txt", b"from-tape")]
+        tape_dir = os.path.join(self.tmp, "tape", "containers")
+        os.makedirs(tape_dir)
+        tape_tar = os.path.join(tape_dir, "opaque.data")
+        sidecar = os.path.join(self.tmp, "tape.jsonl.zst")
+        _write_tar(tape_tar, members)
+        _write_sidecar(sidecar, 7, "/srv", members)
+        record = self._tar_record(None, sidecar, members)
+        record.update({
+            "tape_container_locator": tape_tar,
+            "member_name": "project/t.txt", "stored_path": "project/t.txt",
+            "original_path": "/srv/project/t.txt", "file_name": "t.txt",
+            "file_size_bytes": 9,
+        })
+
+        self.assertEqual(self.retriever._restore_container([record]), 1)
+
+        with open(os.path.join(self.restore, "t.txt"), "rb") as handle:
+            self.assertEqual(handle.read(), b"from-tape")
+        self.retriever._verify_tape.assert_called_once_with("T2")
+        # The staged copy is removed; no stray file named after the source.
+        self.assertEqual(os.listdir(self.staging), [])
+
     def test_zip_tar_and_loose_restore_in_one_request(self):
         zip_path = os.path.join(self.tmp, "zip.container")
         with zipfile.ZipFile(zip_path, "w") as zf:

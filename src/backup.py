@@ -64,6 +64,31 @@ def _tape_destination_root(source, tape_drive, tape_parent_dir=None):
     return os.path.join(tape_drive, parent, os.path.basename(source))
 
 
+def _count_robocopy_source_files(source, exclude_dir_paths=None):
+    """Count the files robocopy /E will enumerate under the local ``source``.
+
+    Files under an /XD directory are not enumerated by robocopy at all, so they
+    are pruned here; /XF files ARE enumerated (reported as skipped), so they
+    stay. An /XD entry with a path matches that directory, a bare name matches
+    any directory of that name. Walks the local staging source only — never
+    the tape."""
+    full, names = set(), set()
+    for entry in exclude_dir_paths or ():
+        if os.path.dirname(entry):
+            full.add(os.path.normcase(os.path.abspath(entry)))
+        else:
+            names.add(os.path.normcase(entry))
+    count = 0
+    for root, dirs, files in os.walk(source):
+        dirs[:] = [
+            d for d in dirs
+            if os.path.normcase(d) not in names
+            and os.path.normcase(os.path.abspath(os.path.join(root, d)))
+            not in full]
+        count += len(files)
+    return count
+
+
 class LTOBackup:
     def __init__(self, db: "PgDatabaseManager", ibm_eject_cmd: str,
                  tape_priority=None, tape_affinity=None, log_dir=None,
@@ -328,6 +353,11 @@ class LTOBackup:
             # Direct path: the loose files newly submitted to this write.
             expected_files = len(loose_map)
 
+        # Every file robocopy will enumerate (copy, or skip as present/excluded
+        # by /XF); the classifier requires copied + skipped to reach it.
+        expected_source_files = _count_robocopy_source_files(
+            source, exclude_dir_paths)
+
         _progress_done()
         print(f"[BACKUP] {len(loose_map)} loose file(s) staged "
               f"({total_bytes / 1024**3:.2f} GB to copy) | {skipped} already on tape.")
@@ -401,7 +431,12 @@ class LTOBackup:
              # done here — it is a manifest/schema change, out of Phase 2/2.5.
              '/COPY:D',
              '/DCOPY:D',
-             '/R:3', '/W:10',
+             # No retries. One unrecoverable write latched Tape_02 read-only
+             # (incident 010), so the first hard write error must stop the
+             # chunk for diagnosis rather than be retried into a failing drive.
+             # Without retries robocopy prints no "RETRY LIMIT EXCEEDED"; the
+             # classifier treats any un-retried ERROR line as a failure.
+             '/R:0', '/W:0',
              '/NP',    # no per-file progress %
              '/NDL',   # no directory listing lines
              '/NFL',   # no per-file listing lines (keep job header+summary)
@@ -491,7 +526,8 @@ class LTOBackup:
             # zero-copy result is never success even when the return code is 0.
             verdict = classify_robocopy_result(
                 rc.returncode, rc_sum, rc_output,
-                expected_files=expected_files, expected_bytes=total_bytes)
+                expected_files=expected_files, expected_bytes=total_bytes,
+                expected_source_files=expected_source_files)
             raw_log.write_footer(rc.returncode, rc_sum, verdict)
 
             if not verdict.is_success:
