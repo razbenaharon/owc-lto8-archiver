@@ -1,6 +1,8 @@
 import urllib.parse
 import unittest
+from unittest import mock
 
+from src import telegram_notify
 from src.telegram_notify import (
     TelegramNotifier,
     format_backup_summary,
@@ -33,6 +35,18 @@ class TelegramNotifierTests(unittest.TestCase):
 
         self.assertFalse(notifier.send("hello"))
         self.assertEqual(calls, [])
+
+    def test_retired_bot_overrides_an_enabled_config(self):
+        class _Cfg:
+            telegram_enabled = True
+            telegram_bot_token = "123:secret"
+            telegram_chat_id = "42"
+            telegram_timeout_seconds = 10
+
+        self.assertTrue(telegram_notify.TELEGRAM_BOT_RETIRED)
+        self.assertFalse(TelegramNotifier.from_config(_Cfg()).enabled)
+        with mock.patch.object(telegram_notify, "TELEGRAM_BOT_RETIRED", False):
+            self.assertTrue(TelegramNotifier.from_config(_Cfg()).enabled)
 
     def test_missing_credentials_warns_without_sending(self):
         warnings = []

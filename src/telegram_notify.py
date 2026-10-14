@@ -8,6 +8,13 @@ import urllib.request
 TELEGRAM_API_BASE = "https://api.telegram.org"
 MAX_TELEGRAM_TEXT = 3900
 
+# The project's Telegram bot was deleted (2026-10-14). Every production path
+# builds its notifier through from_config(), so this switch silences them all
+# regardless of `[TELEGRAM] enabled` in config.ini. The code is kept intact:
+# to bring notifications back, create a new bot, put its token/chat id in
+# .env, and set this to False.
+TELEGRAM_BOT_RETIRED = True
+
 
 def _clean_secret(value):
     value = (value or "").strip()
@@ -68,7 +75,8 @@ class TelegramNotifier:
     @classmethod
     def from_config(cls, cfg, warn=print):
         return cls(
-            enabled=getattr(cfg, "telegram_enabled", False),
+            enabled=(not TELEGRAM_BOT_RETIRED
+                     and getattr(cfg, "telegram_enabled", False)),
             bot_token=getattr(cfg, "telegram_bot_token", ""),
             chat_id=getattr(cfg, "telegram_chat_id", ""),
             timeout_seconds=getattr(cfg, "telegram_timeout_seconds", 10),
