@@ -1,6 +1,6 @@
 # Project status
 
-**The one-page answer to "where is this project?"** Updated 2026-09-23 on the
+**The one-page answer to "where is this project?"** Updated 2026-10-14 on the
 operator workstation. Counts and tape state are not restated here; they live
 in [`tape-and-archive-state.md`](tape-and-archive-state.md). This file records
 what is **done**, what is **open**, and what is **blocked**, so nobody has to
@@ -45,7 +45,8 @@ Every line carries one of three evidence labels:
 | M12 | 2026-08-21 | Campaign-store verifier and failing-drive evacuation tooling | `feat: verify campaign containers…` |
 | M13 | 2026-09-04 | Clean-clone green: 1,752 tests offline, CI on Python 3.11 and 3.13 | PR #1, PR #2 |
 | M14 | 2026-09-18 | Manifests moved off the Desktop into `LTO_METADATA/`; reconciliation `--heavy` PASS: disk = ledger = aggregates, 4,240,566 rows | [state](tape-and-archive-state.md) |
-| M15 | 2026-09-23 | Catalog reduced to the two production tapes: Tape_03/Tape_04 rows removed, reconciliation `--heavy` still PASS, fresh verified dump taken; incident-008 overrides confirmed absent from `config.ini` | this commit |
+| M15 | 2026-09-23 | Catalog reduced to the two production tapes: Tape_03/Tape_04 rows removed, reconciliation `--heavy` still PASS, fresh verified dump taken; incident-008 overrides confirmed absent from `config.ini` | `bc9f609` |
+| M16 | 2026-10-14 | Telegram notifications retired: the bot was deleted, so `TELEGRAM_BOT_RETIRED` in `src/telegram_notify.py` forces every notifier off. The code, config keys, and tests are kept so it can be re-enabled with a new bot | this commit |
 
 ## Open — ordered by what unblocks what
 
@@ -64,6 +65,11 @@ Every line carries one of three evidence labels:
   cartridges are blank stock to reformat once a healthy drive exists.
 - 2026-09-23: Session 37 abandoned. Closes the former items "re-fetch
   chunks 49–216" and "copy the production host's metadata".
+- 2026-10-14: Telegram bot deleted; notifications disabled in code, not
+  removed. Backup summaries, pipeline alerts, heartbeats, and Storage Map
+  messages are no longer pushed anywhere off the host. To restore: create
+  a new bot, set `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` in `.env` and
+  `[TELEGRAM] enabled = true`, then set `TELEGRAM_BOT_RETIRED = False`.
 
 Deliberately **not** planned: physical PostgreSQL compaction (plan 4 task 6.2)
 stays separately approved future work.
