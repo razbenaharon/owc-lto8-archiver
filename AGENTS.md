@@ -140,7 +140,7 @@ Current production state — verify, don't assume:
 
 ```powershell
 python -m pip install -r requirements.txt          # set up / update the environment
-$files = @(Get-ChildItem src -Filter *.py | ForEach-Object { $_.FullName }) + @(Get-ChildItem storage_map -Filter *.py | ForEach-Object { $_.FullName }) + @((Resolve-Path run.py).Path, (Resolve-Path inspect_db.py).Path); python -m py_compile @files  # syntax check before handoff
+$files = @(Get-ChildItem src -Filter *.py | ForEach-Object { $_.FullName }) + @((Resolve-Path run.py).Path, (Resolve-Path inspect_db.py).Path); python -m py_compile @files  # syntax check before handoff
 python run.py                                        # run the main application
 python inspect_db.py                                # run the database inspector
 ```
@@ -249,66 +249,6 @@ perf work. In brief:
    (`RemoteOrchestrator._fetch_batches_parallel`); 3 measured ~30 MB/s. Once the
    tape overhead is amortised by a sufficiently large bounded chunk, fetch can
    become the binding constraint.
-
-## Storage Map & Analytics (`storage_map/`)
-
-A self-contained remote disk-usage mapper for the lab servers,
-**decoupled from the tape pipeline** (it does not touch `src/cli.py`,
-`lto_archive.db`, or the LTFS drive). `storage_map/run_app.py` is its single
-top-level Python entrypoint; internal code lives in `storage_map/lib/` and
-`storage_map/webapp/`.
-
-- **Stage 1 — `scan` (fire-and-forget).** Connects to each configured server
-  over SSH (reusing `remote_transport._ssh_run`), launches a low-priority
-  `ionice -c3 nice -n19 du -x -B1 --max-depth=2` per mount under
-  `nohup`/`setsid`, then exits immediately. The scan keeps running on the server
-  after the SSH session closes — no live connection is held for the ~hours-long
-  `du`.
-- **Stage 1.5 — `status` / `fetch`.** `status` checks each server's remote
-  completion sentinel; `fetch` SCPs the finished raw log to
-  `storage_map/logs/<server>_<ts>.rawlog` (+ a `<server>_latest.rawlog` pointer)
-  via `remote_transport._scp_fetch_file`.
-- **Stage 2 — `view` / `treemap`.** Parse a *local* raw log only (never the
-  disks again): `parse_size` normalizes du size tokens (byte-exact `-B1`
-  integers, plus legacy `-h` units) to bytes and `parse_raw_log`
-  builds a Mount → user/project → sub-folder tree, rendered as a Rich terminal
-  dashboard (`view`), full HTML dashboard (`dashboard`), or interactive Plotly
-  HTML treemap (`treemap`). `rich`
-  and `plotly` are **optional** — each visualizer prints a `pip install` hint if
-  its library is missing.
-- **Interactive web dashboard (`python storage_map/run_app.py [--open-chrome]`).**
-  A FastAPI + uvicorn app (`storage_map/webapp/`) that serves the same
-  overview live from the fetched raw logs, adds in-browser action
-  buttons (start scan / check status / refresh servers), static HTML/PDF state
-  exports, and a **tape-coverage
-  table** matching each mount's directories (mount + `match_depth` levels,
-  default 2 — never individual files) against the PostgreSQL catalog: one
-  read-only aggregation of `files_index.original_path` prefixes
-  (`webapp/coverage.py`), cached in `storage_map/logs/coverage_cache.json`
-  and refreshed only via the "Refresh DB coverage" button. It also serves a
-  **deletion ledger** (`storage_map/lib/deletions.py`, `GET /api/deletions`,
-  the "Reclaimed from servers" panel): the permanent record of server
-  directories deleted *after* their archive was verified on tape, each entry
-  carrying the verification numbers and a gzipped inventory of every removed
-  file. The module only records deletions — it never performs one. Rules,
-  permissions, and the deletion log live in
-  [docs/server_deletions.md](docs/server_deletions.md). Binds to
-  `127.0.0.1:8765` (`web_port`/`match_depth`/`host_map`
-  keys in `[STORAGE_MAP]`, all optional). The app is intentionally local-only
-  and binds to `127.0.0.1`. `fastapi`/`uvicorn` are optional
-  dependencies used only by the web app.
-  Tests: `tests/test_storage_map_webapp.py`.
-
-Mount points and servers are **config-driven, never hardcoded** — see the
-`[STORAGE_MAP]` / `[STORAGE_MAP:<name>]` sections in `config.ini`
-(`config.example.ini` documents them). SSH user/password default to the
-`[REMOTE]` account (secret still in `.env`). Output lands in
-`storage_map/logs/` and generated `storage_map/index.html` (gitignored like
-`backup_logs/`).
-
-Run `python storage_map/run_app.py --open-chrome`, then use the in-app Start
-scan, Check status, and Refresh servers controls. Unit tests:
-`tests/test_storage_map.py` (pure parser + launcher coverage, no hardware/network).
 
 ## Commit & Pull Request Guidelines
 
@@ -543,3 +483,9 @@ hardware pilot, and a full production resume into one step.
 Current production state: see **`docs/tape-and-archive-state.md`** (dated
 snapshot; verify live evidence before acting) and the newest OPEN incidents in
 `docs/incidents/README.md`.
+
+## Server mapping and cleanup
+
+The Storage Map (remote disk-usage mapper, coverage dashboard, server-deletion
+procedure) moved on 2026-11-06 to the separate private repo
+`lab-storage-triage`. This repo is now only the LTO-8 tape archiver.

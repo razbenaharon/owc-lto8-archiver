@@ -67,7 +67,6 @@ drive to establish status.
 | Drive cleaning / ITDT diagnostics | [`drive_cleaning_and_itdt_runbook.md`](drive_cleaning_and_itdt_runbook.md) |
 | Performance work | [`performance_insights_and_recommendations.md`](performance_insights_and_recommendations.md) |
 | Transfer/chunk sizing | [`tape_transfer_size_analysis.md`](tape_transfer_size_analysis.md) |
-| Reclaiming server space after archival | [`server_deletions.md`](server_deletions.md) |
 
 Retired historical documents (completed plan handoffs, one-off migration
 runbooks, superseded design notes, benchmarks) live **outside the public

@@ -1,4 +1,4 @@
-"""Reconcile the catalog, the per-file manifests, and the Storage Map source.
+"""Reconcile the catalog and the per-file manifests.
 
 One command proves the post-Plan-4 source-of-truth boundaries hold:
 
@@ -10,10 +10,7 @@ One command proves the post-Plan-4 source-of-truth boundaries hold:
 3. **Tape accounting is preserved** — per-tape used space computed the way
    the archiver computes it (live rows + pruned-manifest aggregates) matches
    the `tapes.used_space` counters.
-4. **The Storage Map is derivable** — the coverage SQL the web app runs
-   returns the same grand totals as the DB-side sources it aggregates, so a
-   Storage Map number can always be traced back to catalog + manifests.
-5. **Closed tapes are protected** — every tape marked ``full`` reports zero
+4. **Closed tapes are protected** — every tape marked ``full`` reports zero
    available bytes from ``tape_budget_bytes``.
 
 Exit code 0 only when every check passes. Run it after any export/prune and
@@ -170,46 +167,6 @@ def run_checks(conninfo, archive_root, *, heavy=False,
             if recorded != computed:
                 accounting_ok = False
         check("tape_accounting_preserved", accounting_ok, accounting_detail)
-
-        # 4. Storage Map derivability: the coverage SQL grand totals equal
-        # the DB-side sources it merges (files_index POSIX rows + catalog
-        # small-file totals + pruned-manifest uncovered aggregates).
-        from storage_map.webapp.coverage import COVERAGE_SQL
-        coverage = conn.execute(
-            COVERAGE_SQL % {"threshold_bytes": threshold_bytes,
-                            "max_segs": 64}).fetchall()
-        coverage_bytes = sum(int(r["tape_bytes"] or 0) for r in coverage)
-        coverage_files = sum(int(r["tape_files"] or 0) for r in coverage)
-        source = conn.execute(
-            """WITH fi AS (
-                   SELECT COALESCE(SUM(sub.bytes),0) AS bytes,
-                          COUNT(*) AS files
-                   FROM (SELECT MAX(file_size_bytes) AS bytes
-                         FROM files_index WHERE original_path LIKE '/%%'
-                         GROUP BY source_host, original_path) sub
-               ), dti AS (
-                   SELECT COALESCE(SUM(direct_small_file_bytes),0) AS bytes,
-                          COALESCE(SUM(direct_small_file_count),0) AS files
-                   FROM directory_tree_index
-                   WHERE original_dir_path LIKE '/%%'
-               ), pruned AS (
-                   SELECT COALESCE(SUM(a.direct_uncovered_bytes),0) AS bytes,
-                          COALESCE(SUM(a.direct_uncovered_file_count),0) AS files
-                   FROM local_manifest_folder_aggregates a
-                   JOIN local_manifest_exports e ON e.export_id=a.export_id
-                   WHERE e.status='pruned' AND a.original_dir_path LIKE '/%%'
-               )
-               SELECT (SELECT bytes FROM fi)+(SELECT bytes FROM dti)
-                        +(SELECT bytes FROM pruned) AS bytes,
-                      (SELECT files FROM fi)+(SELECT files FROM dti)
-                        +(SELECT files FROM pruned) AS files""").fetchone()
-        check("storage_map_derivable",
-              coverage_bytes == int(source["bytes"] or 0)
-              and coverage_files == int(source["files"] or 0),
-              {"coverage_bytes": coverage_bytes,
-               "coverage_files": coverage_files,
-               "source_bytes": int(source["bytes"] or 0),
-               "source_files": int(source["files"] or 0)})
 
         # 5. Closed tapes refuse writes.
         protection_detail = {}

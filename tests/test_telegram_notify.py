@@ -6,7 +6,6 @@ from src import telegram_notify
 from src.telegram_notify import (
     TelegramNotifier,
     format_backup_summary,
-    format_storage_fetch_summary,
 )
 
 
@@ -132,18 +131,6 @@ class TelegramMessageFormatTests(unittest.TestCase):
         self.assertNotIn("file_a.dat", text)
         self.assertNotIn("skipped.csv", text)
         self.assertNotIn(r"C:\secret", text)
-
-    def test_storage_fetch_summary_is_aggregate_only(self):
-        text = format_storage_fetch_summary(
-            ["srv01"],
-            ["srv02(PENDING)"],
-            ["so03"],
-            {"dashboard": 0},
-        )
-
-        self.assertIn("Fetched: srv01", text)
-        self.assertIn("Skipped: srv02(PENDING)", text)
-        self.assertIn("Render: dashboard=ok", text)
 
 
 if __name__ == "__main__":

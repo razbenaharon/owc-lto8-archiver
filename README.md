@@ -58,7 +58,7 @@ flowchart LR
 
 **Concurrency against a single physical drive.** Two processes must never address the tape at once, and the LTFS mount letter is not stable — it has moved E: → Z:. Ownership is therefore a named Windows mutex keyed on the *physical drive identity* from config, never the drive letter ([incident 006](docs/incidents/006-20260716-drive-letter-and-conf-drift.md)). It fails closed: no configured identity means no tape access.
 
-**Keeping per-file detail off the catalog.** One PostgreSQL row per archived small file does not scale. Packed small files are inventoried in immutable `jsonl.zst` manifest segments; PostgreSQL keeps segment checksums and folder aggregates. `scripts/validate_archive_reconciliation.py` proves catalog, manifests and Storage Map agree.
+**Keeping per-file detail off the catalog.** One PostgreSQL row per archived small file does not scale. Packed small files are inventoried in immutable `jsonl.zst` manifest segments; PostgreSQL keeps segment checksums and folder aggregates. `scripts/validate_archive_reconciliation.py` proves catalog and manifests agree.
 
 ## Technical decisions worth defending
 
@@ -83,7 +83,7 @@ Each store answers exactly one kind of question; none duplicates another. This i
 
 ## Tech stack
 
-Python 3 · PostgreSQL 17 (psycopg 3, COPY bulk-load, `pg_trgm`/`btree_gin`) · IBM LTFS + `robocopy` · SSH/`tar` streaming · PySide6 (catalog inspector) · FastAPI + uvicorn (Storage Map) · Docker Compose · pytest · GitHub Actions
+Python 3 · PostgreSQL 17 (psycopg 3, COPY bulk-load, `pg_trgm`/`btree_gin`) · IBM LTFS + `robocopy` · SSH/`tar` streaming · PySide6 (catalog inspector) · Docker Compose · pytest · GitHub Actions
 
 ## Repository structure
 
@@ -94,7 +94,6 @@ src/                 77 modules, strictly downward dependencies
   scan_frontier.py   the sole production scanner
   remote_staging.py  SSH fetch, retry classification, packing
   pg_*.py            PostgreSQL layer (mixins → PgDatabaseManager facade)
-storage_map/         remote disk-usage mapper, decoupled from the tape pipeline
 scripts/sql/         19 ordered migrations (+ rollback variants), applied at startup
 scripts/             operational tooling + the public-repo privacy gate
 docs/incidents/      16 post-mortems
@@ -152,7 +151,6 @@ The offline suite needs no tape, no drive and no database. PostgreSQL suites ski
 - **Multi-tape support** — tracks multiple tapes; prompts you to swap tapes during restore when needed
 - **Remote archive** — fetch files from a remote SSH host into local staging, pack them, and stream them to LTO
 - **Database Inspector GUI** — standalone PySide6 app for lazy browsing, searching, and managing the tape/file index without touching the CLI
-- **Storage Map** - run `python storage_map/run_app.py --open-chrome` for the single local web app with scan, status, refresh, tape coverage, and HTML/PDF export
 
 ## Manifest formats
 
@@ -233,8 +231,6 @@ python run.py --backup-db
 # Database Inspector GUI (requires PySide6)
 python inspect_db.py
 
-# Storage Map web app (opens Chrome when configured)
-python storage_map/run_app.py --open-chrome
 ```
 
 ### Main Menu
@@ -378,8 +374,8 @@ pruned, these manifests are the per-file source of truth for packed small
 files: PostgreSQL retains segment checksums and direct/recursive folder count
 and byte aggregates, but no per-file snapshot rows. See
 `docs/local_small_file_manifest_runbook.md`, and run
-`python scripts/validate_archive_reconciliation.py` to prove the catalog,
-manifests, and Storage Map agree.
+`python scripts/validate_archive_reconciliation.py` to prove the catalog
+and manifests agree.
 
 The CLI also creates session tables for resumable work:
 

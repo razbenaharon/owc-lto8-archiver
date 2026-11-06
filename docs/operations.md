@@ -12,8 +12,6 @@ Companion runbooks this document links instead of restating:
   drive cleaning and ITDT diagnostics (read-only ITDT use only).
 - [local_small_file_manifest_runbook.md](local_small_file_manifest_runbook.md)
   — small-file manifest export/prune.
-- [server_deletions.md](server_deletions.md) — reclaiming server space after
-  verified archival.
 
 ## Standing rules (non-negotiable)
 

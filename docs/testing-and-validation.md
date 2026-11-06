@@ -19,7 +19,7 @@ No hardware, network, or database is required.
 ## Syntax sweep before handoff
 
 ```powershell
-$files = @(Get-ChildItem src -Filter *.py | ForEach-Object { $_.FullName }) + @(Get-ChildItem storage_map -Filter *.py | ForEach-Object { $_.FullName }) + @((Resolve-Path run.py).Path, (Resolve-Path inspect_db.py).Path); python -m py_compile @files
+$files = @(Get-ChildItem src -Filter *.py | ForEach-Object { $_.FullName }) + @((Resolve-Path run.py).Path, (Resolve-Path inspect_db.py).Path); python -m py_compile @files
 ```
 
 ## PostgreSQL tests — disposable server only

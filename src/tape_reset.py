@@ -430,7 +430,7 @@ def _forbidden_processes(current_pid=None):
         "$p=Get-CimInstance Win32_Process | Where-Object {"
         "$_.Name -ieq 'Robocopy.exe' -or $_.Name -like 'LtfsCmd*.exe' -or "
         "($_.Name -ieq 'python.exe' -and $_.CommandLine -match "
-        "'(?i)(run\\.py|inspect_db\\.py|storage_map\\\\run_app\\.py)')};"
+        "'(?i)(run\\.py|inspect_db\\.py)')};"
         "$p | Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress")
     proc = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
