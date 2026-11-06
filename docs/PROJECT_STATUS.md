@@ -56,7 +56,7 @@ Every line carries one of three evidence labels:
 | O5 | **Second copy of `LTO_METADATA/` and `db_backups/`**. Both exist only in this repo folder on one drive, and a `git clean -x` would delete them | Operator decision on the target | Verified 2026-09-23 |
 | O7 | SCCM maintenance window or deployment exemption for the archive host | IT | Documented, incident 005 |
 | O9 | Off-host monitoring. A restart watchdog exists (`scripts/archive_watchdog.ps1`), but the only monitor still runs on the host doing the work | — | Documented, incident 007 |
-| O10 | Two `[STORAGE_MAP:*]` host sections in the local `config.ini` still hold TODO placeholders | Real host details | Verified 2026-09-23 |
+| O10 | ~~Storage Map host placeholders~~ — moot: server mapping and cleanup moved to the separate private `lab-storage-triage` repo on 2026-11-06 | — | Closed 2026-11-06 |
 
 ## Decisions
 

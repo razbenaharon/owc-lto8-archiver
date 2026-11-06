@@ -124,31 +124,6 @@ schema CHECK). No content hashes exist in these artifacts — hashing would mean
 reading every source byte over SSH, so the residual same-size-replacement risk
 is documented rather than papered over.
 
-## Storage Map & analytics (`storage_map/`)
-
-A self-contained remote disk-usage mapper for the lab servers, **decoupled
-from the tape pipeline** (it does not touch `src/cli.py`, the archive catalog,
-or the LTFS drive). `storage_map/run_app.py` is its single entrypoint;
-internals live in `storage_map/lib/` and `storage_map/webapp/`.
-
-- **Stage 1 — `scan` (fire-and-forget):** connects to each configured server
-  over SSH, launches a low-priority `du` per mount under `nohup`/`setsid`,
-  then exits; no live connection is held during the hours-long scan.
-- **Stage 1.5 — `status` / `fetch`:** checks the remote completion sentinel;
-  SCPs the finished raw log to `storage_map/logs/`.
-- **Stage 2 — `view` / `dashboard` / `treemap`:** parses a *local* raw log
-  only (never the disks again) into a Rich terminal dashboard, HTML dashboard,
-  or Plotly treemap.
-- **Interactive web dashboard:** a FastAPI + uvicorn app bound to
-  `127.0.0.1:8765`, adding a tape-coverage table (directory prefixes matched
-  read-only against the PostgreSQL catalog, cached) and a **deletion ledger**
-  — the permanent record of server directories deleted after their archive was
-  verified on tape. The module only records deletions, never performs one;
-  rules live in [server_deletions.md](server_deletions.md).
-
-Mount points and servers are config-driven (`[STORAGE_MAP]` sections), never
-hardcoded.
-
 ## Database migrations (scripts/sql/, 001–019)
 
 | # | Adds |
