@@ -42,10 +42,15 @@ class FeatureGateTests(unittest.TestCase):
             self._config(include_section=False).stored_tar_write_enabled)
 
     def test_malformed_gate_fails_closed(self):
+        # Audit M9: a malformed yes/no is no longer read as "no" - that rule
+        # silently disabled guards whose safe value is "yes". It now refuses
+        # to yield a value at all (and stops startup), which is still closed:
+        # the gate can never come back True.
+        from src.config import ConfigError
         for value in ("maybe", "truthy", "2", "enabled", ""):
             with self.subTest(value=value):
-                self.assertFalse(
-                    self._config(value).stored_tar_write_enabled)
+                with self.assertRaises(ConfigError):
+                    self._config(value).stored_tar_write_enabled
 
     def test_only_explicit_true_values_enable(self):
         for value in ("true", "1", "yes", "on"):
