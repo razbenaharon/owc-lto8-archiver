@@ -27,9 +27,10 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from src import db_backend  # noqa: E402
+from src.cli_errors import OperationalError  # noqa: E402
 from src.config import ConfigManager  # noqa: E402
 from src.constants import tape_budget_bytes  # noqa: E402
-from src.pg_bulk import build_conninfo  # noqa: E402
 from src.local_manifest_archive import (  # noqa: E402
     SMALL_FILE_THRESHOLD_BYTES, _connect, _used_space_by_tape)
 
@@ -40,13 +41,16 @@ except ImportError:  # pragma: no cover
 
 
 def _conninfo(cfg):
-    section = cfg.config["DATABASE"] if cfg.config.has_section("DATABASE") else {}
-    return build_conninfo(
-        host=section.get("host", "localhost"),
-        port=section.get("port", "5432"),
-        dbname=section.get("dbname", "lto_archive"),
-        user=section.get("user", "lto"),
-        sslmode=section.get("sslmode", "prefer"))
+    """The catalog target the application itself uses.
+
+    ``cfg.db_dsn`` carries the password the app resolves (``PGPASSWORD`` in
+    the environment, then ``.env``, then config.ini); building the target
+    from config.ini alone left it out, so the documented command could not
+    connect. The checks reconcile the small-file manifest export ledger,
+    which exists only on PostgreSQL, so SQLite is refused before connecting.
+    """
+    db_backend.require_postgresql(cfg, "small_file_manifest_maintenance")
+    return cfg.db_dsn
 
 
 def _segment_totals(path, *, heavy=False, expected_sha=None):
@@ -195,7 +199,12 @@ def main(argv=None):
                         help="Print the full JSON report.")
     args = parser.parse_args(argv)
     cfg = ConfigManager()
-    report = run_checks(_conninfo(cfg), cfg.local_manifest_archive_root,
+    try:
+        conninfo = _conninfo(cfg)
+    except OperationalError as exc:      # a deliberate refusal: one line
+        print(f"{exc}", file=sys.stderr)
+        return 1
+    report = run_checks(conninfo, cfg.local_manifest_archive_root,
                         heavy=args.heavy)
     if args.json:
         print(json.dumps(report, indent=2, default=str))
