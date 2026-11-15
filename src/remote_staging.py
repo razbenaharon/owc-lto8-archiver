@@ -50,12 +50,15 @@ from .paths import (_LEGACY_PATH_LIMIT, _dir_tree_size,
                      _disambiguate_local_rel, _exceeds_legacy_path_limit,
                      _local_collision_key, _long, _remote_fetch_base_and_rel,
                      remote_store_base_and_rel,
-                    _reserved_name_component, _winsafe_extracted_rel)
+                    _reserved_name_component, _resolve_extracted_path,
+                    _winsafe_extracted_rel)
 from .pipeline_types import (
     ArtifactKind, ArtifactReadiness, ChunkStatus, ContainerFormat,
-    ContainerValidationState, StagedArtifact, StagedChunk, StagedContainer)
+    ContainerValidationState, SourceDisposition, StagedArtifact, StagedChunk,
+    StagedContainer)
 from .ram_telemetry import RamStageSampler
-from .remote_transport import _remote_tar_fetch, _remote_tar_store
+from .remote_transport import (_remote_source_status_probe,
+                               _remote_tar_fetch, _remote_tar_store)
 from .tar_container import validate_stored_tar_part
 from .runtime import (CANCEL, _fmt_eta, _phase, _progress_done, _progress_line,
                       _status)
@@ -374,6 +377,16 @@ def _is_transient_fetch_error(err):
 
 def _enum_value(value):
     return getattr(value, "value", value)
+
+
+# The only remote observations that may excuse a planned file from a chunk.
+# Each is a positive statement by the source host about that exact name; a
+# file that merely failed to appear locally is never one of them.
+_CONFIRMED_ABSENT_DISPOSITIONS = frozenset({
+    SourceDisposition.SOURCE_MISSING,
+    SourceDisposition.SOURCE_PERMISSION_DENIED,
+    SourceDisposition.SOURCE_UNREADABLE,
+})
 
 
 def _serialize_staged_container(item):
@@ -1561,13 +1574,48 @@ class RemoteChunkStager:
         collisions = []     # renamed files: fetched individually, then moved
         claimed = {}        # collision key of local_rel -> owning remote rel
         fetching_ids = []
+        chunk_files = list(chunk_files)
 
-        for row in chunk_files:
+        # A row already marked source_missing is only an earlier run's opinion.
+        # Ask the source again before letting the chunk go on without the
+        # file: an older build recorded files as missing that were merely
+        # extracted under a different Unicode form (audit H9).
+        recorded_missing = [
+            (index, row) for index, row in enumerate(chunk_files)
+            if row['status'] == 'source_missing']
+        still_missing = set()
+        if recorded_missing:
+            by_base = defaultdict(list)
+            for index, row in recorded_missing:
+                try:
+                    remote_base, rel = _remote_fetch_base_and_rel(
+                        self.host.remote_path, row['remote_path'])
+                except ValueError:
+                    # Unaddressable by the fetch path: nothing to re-ask.
+                    still_missing.add(index)
+                    continue
+                by_base[remote_base].append((index, rel))
+            for remote_base, items in by_base.items():
+                verdicts, error = self._confirm_source_absence(
+                    remote_base, [rel for _, rel in items])
+                if error:
+                    print(f"\n[REMOTE] Could not re-confirm recorded missing "
+                          f"source files: {error}")
+                    self.host._note_fetch_failure(error)
+                    return False, source_missing_files, fetched_file_count
+                for position, (index, rel) in enumerate(items):
+                    if verdicts.get(position) in _CONFIRMED_ABSENT_DISPOSITIONS:
+                        still_missing.add(index)
+                    else:
+                        print(f"[REMOTE] Recorded as missing but present at "
+                              f"the source - fetching it now: {rel}")
+
+        for row_index, row in enumerate(chunk_files):
             remote_fpath = row['remote_path']
             fsize        = row['file_size_bytes']
             manifest_id  = row['manifest_id']
 
-            if row['status'] == 'source_missing':
+            if row['status'] == 'source_missing' and row_index in still_missing:
                 source_missing_files.append({
                     'manifest_id': manifest_id,
                     'remote_path': remote_fpath,
@@ -1705,11 +1753,31 @@ class RemoteChunkStager:
             item['manifest_id'] for item in source_missing_files
         }
         fetched_updates = []
-        for row, _, rel, local_rel, local_path in records:
+        listing_cache = {}
+        absent = []         # locally absent; needs the source's confirmation
+        for row, remote_base, rel, local_rel, local_path in records:
             fsize       = row['file_size_bytes']
             manifest_id = row['manifest_id']
-            if manifest_id in source_missing_ids:
+            if manifest_id is not None and manifest_id in source_missing_ids:
                 continue
+            if not os.path.exists(_long(local_path)):
+                # The extractor may have written the name in another Unicode
+                # normalisation form (libarchive composes to NFC on Windows;
+                # macOS-origin names are decomposed). Look for that before
+                # believing the file is gone.
+                found, found_rel, ambiguous = _resolve_extracted_path(
+                    fetch_dir, local_rel, listing_cache)
+                if ambiguous:
+                    msg = (f"refusing to guess which staged file is "
+                           f"'{row['remote_path']}': several local names "
+                           "differ from it only by Unicode normalisation.")
+                    print(f"\n[REMOTE] {msg}")
+                    self.host.db.update_manifest_row(
+                        manifest_id, session_id=session_id,
+                        status='fetch_failed', error_msg=msg[:500])
+                    return False, source_missing_files, fetched_file_count
+                if found is not None:
+                    local_path, local_rel = found, found_rel
             if not os.path.exists(_long(local_path)):
                 # An absent file is normally a genuine remote omission (the
                 # remote tar emitted a tolerated "Cannot stat"). But if the
@@ -1732,24 +1800,7 @@ class RemoteChunkStager:
                         manifest_id, session_id=session_id,
                         status='fetch_failed', error_msg=msg[:500])
                     return False, source_missing_files, fetched_file_count
-                detail = {
-                    'manifest_id': manifest_id,
-                    'remote_path': row['remote_path'],
-                    'file_size_bytes': fsize,
-                }
-                source_missing_files.append(detail)
-                source_missing_ids.add(manifest_id)
-                self.host.skipped_tracker.add(
-                    'remote', row['remote_path'], "missing after tar fetch",
-                    'fetch', session_id=session_id, chunk_index=chunk_index)
-                print(f"[REMOTE] Source missing; skipped: {row['remote_path']}")
-                self.host.db.update_manifest_row(
-                    manifest_id,
-                    session_id=session_id,
-                    status='source_missing',
-                    local_rel_path=None,
-                    error_msg="missing after tar fetch",
-                )
+                absent.append((row, remote_base, rel))
                 continue
 
             try:
@@ -1779,6 +1830,15 @@ class RemoteChunkStager:
                 return False, source_missing_files, fetched_file_count
 
             fetched_updates.append((local_rel, manifest_id))
+
+        # "Not on disk" is not evidence about the source. A file is recorded
+        # source_missing only when the remote host itself says so; otherwise
+        # the chunk fails loudly and stays resumable, because completing it
+        # would archive the chunk without a file that still exists.
+        if absent and not self._record_confirmed_absent(
+                session_id, chunk_index, absent, source_missing_files):
+            return False, source_missing_files, fetched_file_count
+
         for start in range(0, len(fetched_updates), self.host.metadata_batch_size):
             if governor := getattr(self.host, 'governor', None):
                 governor.wait_or_pause("fetch", "continue")
@@ -1787,6 +1847,99 @@ class RemoteChunkStager:
                 session_id=session_id)
         fetched_file_count = len(fetched_updates)
         return True, source_missing_files, fetched_file_count
+
+    def _confirm_source_absence(self, remote_base, rel_paths, abort_evt=None):
+        """Ask the source host what became of ``rel_paths``.
+
+        Returns ``(verdicts, error)``. ``verdicts`` maps the position of a
+        path in ``rel_paths`` to its :class:`SourceDisposition` for every path
+        the remote reports as anything other than a present, readable regular
+        file; a position that is absent from the mapping is *present*.
+        ``error`` is a message when the question could not be answered, in
+        which case nothing may be concluded."""
+        rel_paths = list(rel_paths)
+        if not rel_paths:
+            return {}, None
+        try:
+            diagnostics, unresolved = _remote_source_status_probe(
+                self.host.remote_user, self.host.remote_host, remote_base,
+                list(enumerate(rel_paths)),
+                password=self.host.remote_password,
+                cipher=self.host.ssh_cipher,
+                fetch_cores=self.host.fetch_cores, abort_evt=abort_evt)
+        except Exception as exc:  # noqa: BLE001 - reported, never guessed
+            return {}, f"source status probe failed: {exc}"
+        if unresolved:
+            return {}, "; ".join(str(item) for item in unresolved)
+        verdicts = {}
+        for item in diagnostics:
+            position = int(item.plan_ordinal)
+            if not 0 <= position < len(rel_paths) \
+                    or item.path != rel_paths[position]:
+                return {}, ("source status probe answered for a path that "
+                            "was not asked about")
+            verdicts[position] = item.disposition
+        return verdicts, None
+
+    def _record_confirmed_absent(self, session_id, chunk_index, absent,
+                                 source_missing_files):
+        """Record locally-absent files as source_missing only on proof.
+
+        ``absent`` is ``[(row, remote_base, rel), ...]``. Returns False (after
+        marking the offending rows ``fetch_failed``) when the source could not
+        be asked or reports any of them as still present."""
+        by_base = defaultdict(list)
+        for row, remote_base, rel in absent:
+            by_base[remote_base].append((row, rel))
+        confirmed = []
+        for remote_base, items in by_base.items():
+            verdicts, error = self._confirm_source_absence(
+                remote_base, [rel for _, rel in items])
+            if error:
+                msg = (f"{len(items)} file(s) did not arrive and the source "
+                       f"could not confirm they are gone: {error}")
+                print(f"\n[REMOTE] {msg}")
+                self.host._note_fetch_failure(error)
+                self.host.db.update_manifest_rows_fetch_failed(
+                    (row['manifest_id'] for row, _ in items), msg[:500],
+                    session_id=session_id)
+                return False
+            for position, (row, rel) in enumerate(items):
+                disposition = verdicts.get(position)
+                if disposition not in _CONFIRMED_ABSENT_DISPOSITIONS:
+                    state = (disposition.value if disposition is not None
+                             else "present")
+                    msg = (f"refusing to skip '{row['remote_path']}': it was "
+                           f"not staged locally but the source reports it "
+                           f"as {state}.")
+                    print(f"\n[REMOTE] {msg}")
+                    self.host.db.update_manifest_row(
+                        row['manifest_id'], session_id=session_id,
+                        status='fetch_failed', error_msg=msg[:500])
+                    return False
+                confirmed.append((row, disposition))
+        for row, disposition in confirmed:
+            reason = ("missing after tar fetch"
+                      if disposition is SourceDisposition.SOURCE_MISSING
+                      else f"{disposition.value} after tar fetch")
+            source_missing_files.append({
+                'manifest_id': row['manifest_id'],
+                'remote_path': row['remote_path'],
+                'file_size_bytes': row['file_size_bytes'],
+            })
+            self.host.skipped_tracker.add(
+                'remote', row['remote_path'], reason,
+                'fetch', session_id=session_id, chunk_index=chunk_index)
+            print(f"[REMOTE] Source missing (confirmed by the source host); "
+                  f"skipped: {row['remote_path']}")
+            self.host.db.update_manifest_row(
+                row['manifest_id'],
+                session_id=session_id,
+                status='source_missing',
+                local_rel_path=None,
+                error_msg=reason,
+            )
+        return True
 
     def _fetch_one_batch(self, remote_base, base_batch, fetch_dir, fetch_abort):
         """Fetch one metadata-sized batch as a single tar stream.
@@ -1968,6 +2121,13 @@ class RemoteChunkStager:
                 natural = os.path.join(
                     tmp, _winsafe_extracted_rel(rel).replace('/', os.sep))
                 if not os.path.exists(_long(natural)):
+                    # Alone in tmp, a name that differs only by Unicode form
+                    # can only be this file.
+                    found, _found_rel, ambiguous = _resolve_extracted_path(
+                        tmp, _winsafe_extracted_rel(rel))
+                    if found is not None and not ambiguous:
+                        natural = found
+                if not os.path.exists(_long(natural)):
                     # As in _fetch_chunk: a reserved-name or over-MAX_PATH
                     # target is a local write failure, not a remote omission —
                     # surface it loudly (resumable) instead of source_missing.
@@ -1987,21 +2147,10 @@ class RemoteChunkStager:
                             status='fetch_failed',
                             error_msg=msg[:500])
                         return False
-                    detail = {
-                        'manifest_id': row['manifest_id'],
-                        'remote_path': row['remote_path'],
-                        'file_size_bytes': row['file_size_bytes'],
-                    }
-                    source_missing_files.append(detail)
-                    self.host.skipped_tracker.add(
-                        'remote', row['remote_path'], "missing after tar fetch",
-                        'fetch', session_id=session_id, chunk_index=None)
-                    print(f"[REMOTE] Source missing; skipped: {row['remote_path']}")
-                    self.host.db.update_manifest_row(
-                        row['manifest_id'], session_id=session_id,
-                        status='source_missing',
-                        local_rel_path=None,
-                        error_msg="missing after tar fetch")
+                    if not self._record_confirmed_absent(
+                            session_id, None, [(row, remote_base, rel)],
+                            source_missing_files):
+                        return False
                     continue
 
                 os.makedirs(_long(os.path.dirname(local_path)), exist_ok=True)

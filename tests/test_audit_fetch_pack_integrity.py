@@ -281,5 +281,125 @@ class TrailingSpaceNameTests(_Harness):
         self.assertEqual(self.staged_bytes("d/name"), b"PLAIN!")
 
 
+NFD_NAME = unicodedata.normalize("NFD", "d/café.txt")
+NFC_NAME = unicodedata.normalize("NFC", "d/café.txt")
+
+
+class UnicodeNormalisationTests(_Harness):
+    """H9: a name is not 'missing at source' because its form changed."""
+
+    def test_decomposed_name_is_staged_not_recorded_missing(self):
+        self.assertNotEqual(NFD_NAME, NFC_NAME)
+        self.build({NFD_NAME: b"NFD-DATA"})
+        ok, missing, count = self.fetch()
+        self.assertTrue(ok)
+        self.assertEqual(missing, [])
+        self.assertEqual(count, 1)
+        self.assertEqual(self.requested(), [NFD_NAME])
+        self.assertEqual(self.row(NFD_NAME)["status"], "fetched")
+        self.assertEqual(self.staged_bytes(NFD_NAME), b"NFD-DATA")
+        self.assertEqual(self.remote.probes, [])
+
+    def test_composed_and_decomposed_twins_are_not_merged(self):
+        for order in ((NFD_NAME, NFC_NAME), (NFC_NAME, NFD_NAME)):
+            with self.subTest(first=ascii(order[0])):
+                shutil.rmtree(_long(self.staging), ignore_errors=True)
+                os.makedirs(self.staging)
+                content = {NFD_NAME: b"DECOMPOSED", NFC_NAME: b"COMPOSED!!"}
+                self.build({name: content[name] for name in order})
+                ok, missing, count = self.fetch()
+                self.assertTrue(ok)
+                self.assertEqual((missing, count), ([], 2))
+                self.assertEqual(self.staged_bytes(NFD_NAME), b"DECOMPOSED")
+                self.assertEqual(self.staged_bytes(NFC_NAME), b"COMPOSED!!")
+
+    def test_ambiguous_normalisation_match_is_reported_not_guessed(self):
+        from src.paths import _resolve_extracted_path
+        root = os.path.join(self.staging, "amb")
+        os.makedirs(root)
+        composed = "ḗ.txt"                    # e + macron + acute
+        variants = (unicodedata.normalize("NFD", composed),
+                    "ḗ.txt")
+        for name in variants:
+            with open(os.path.join(root, name), "wb") as handle:
+                handle.write(b"x")
+        self.assertEqual(len(os.listdir(root)), 2)
+        path, rel, ambiguous = _resolve_extracted_path(root, composed)
+        self.assertIsNone(path)
+        self.assertTrue(ambiguous)
+        os.remove(os.path.join(root, variants[1]))
+        path, rel, ambiguous = _resolve_extracted_path(root, composed)
+        self.assertFalse(ambiguous)
+        self.assertEqual(rel, variants[0])
+        self.assertTrue(os.path.isfile(path))
+
+
+class SourceMissingNeedsProofTests(_Harness):
+    """H9: only the source host can excuse a planned file from a chunk."""
+
+    def test_remote_confirmed_absence_is_recorded_as_source_missing(self):
+        self.build({"d/a.txt": b"AAAAA"}, missing=("d/gone.txt",))
+        ok, missing, count = self.fetch()
+        self.assertTrue(ok)
+        self.assertEqual(count, 1)
+        self.assertEqual([item["remote_path"] for item in missing],
+                         [f"{REMOTE_ROOT}/d/gone.txt"])
+        self.assertEqual(self.row("d/gone.txt")["status"], "source_missing")
+        self.assertEqual(self.remote.probes, [[(0, "d/gone.txt")]])
+
+    def test_locally_absent_but_remotely_present_file_fails_the_chunk(self):
+        self.build({"d/a.txt": b"AAAAA", "d/b.txt": b"BBBBB"})
+        real_fetch = self.remote.fetch
+
+        def lossy(user, host, base, rel_paths, dest, **kwargs):
+            # The extractor silently fails to materialise b.txt.
+            kept = [rel for rel in rel_paths if rel != "d/b.txt"]
+            return real_fetch(user, host, base, kept, dest, **kwargs)
+
+        with mock.patch("src.remote_staging._remote_tar_fetch",
+                        side_effect=lossy):
+            ok, missing, _count = self.fetch()
+        self.assertFalse(ok)
+        self.assertEqual(missing, [])
+        self.assertEqual(self.row("d/b.txt")["status"], "fetch_failed")
+        self.assertIn("reports it as present", self.row("d/b.txt")["error_msg"])
+
+    def test_unanswerable_probe_fails_the_chunk(self):
+        self.build({"d/a.txt": b"AAAAA"}, missing=("d/gone.txt",))
+        self.remote.probe_error = "source status probe failed (exit 255)"
+        ok, missing, _count = self.fetch()
+        self.assertFalse(ok)
+        self.assertEqual(missing, [])
+        self.assertEqual(self.row("d/gone.txt")["status"], "fetch_failed")
+
+    def test_non_regular_source_is_not_an_excuse(self):
+        self.build({"d/a.txt": b"AAAAA"}, missing=("d/now_a_dir",))
+        self.remote.probe_overrides["d/now_a_dir"] = (
+            SourceDisposition.SOURCE_CHANGED)
+        ok, _missing, _count = self.fetch()
+        self.assertFalse(ok)
+        self.assertEqual(self.row("d/now_a_dir")["status"], "fetch_failed")
+
+    def test_stale_source_missing_row_is_refetched_when_source_has_it(self):
+        self.build({"d/a.txt": b"AAAAA", NFD_NAME: b"NFD-DATA"})
+        stale = self.row(NFD_NAME)
+        stale.update(status="source_missing",
+                     error_msg="missing after tar fetch")
+        ok, missing, count = self.fetch()
+        self.assertTrue(ok)
+        self.assertEqual((missing, count), ([], 2))
+        self.assertEqual(self.row(NFD_NAME)["status"], "fetched")
+        self.assertEqual(self.staged_bytes(NFD_NAME), b"NFD-DATA")
+
+    def test_recorded_missing_row_stays_missing_when_source_agrees(self):
+        self.build({"d/a.txt": b"AAAAA"}, missing=("d/gone.txt",))
+        self.row("d/gone.txt").update(status="source_missing")
+        ok, missing, count = self.fetch()
+        self.assertTrue(ok)
+        self.assertEqual(count, 1)
+        self.assertEqual(len(missing), 1)
+        self.assertEqual(self.requested(), ["d/a.txt"])
+
+
 if __name__ == "__main__":
     unittest.main()
