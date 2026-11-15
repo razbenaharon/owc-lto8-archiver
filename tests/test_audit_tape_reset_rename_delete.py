@@ -1,0 +1,431 @@
+"""Audit M3 - tape reset, rename and delete against the real schema.
+
+Three defects, each reproduced on disposable PostgreSQL with migrations
+013-018 installed:
+
+* the reset cleanup ignored the tables migrations 015/018 added, so it could
+  not even delete the catalog (a restrictive foreign key from
+  ``directory_archive_parts``), and containers copied to the erased generation
+  kept counting as used space;
+* a reset interrupted after its cleanup stage could never be resumed, which
+  also blocked any new reset of that tape;
+* renaming a tape reset its generation number to 1, and deleting a tape always
+  failed.
+
+No tape, drive or LTFS path is touched: every hardware call is patched.
+"""
+import contextlib
+import os
+import stat
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
+from unittest import mock
+
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:                          # pragma: no cover - guard handles it
+    psycopg = None
+    dict_row = None
+
+from pg_test_guard import (SKIP_REASON, create_test_database,
+                           drop_test_database, pg_available)
+from test_directory_catalog_pg import _DirectoryCatalogFixture
+
+from src import tape_reset
+
+
+def _pg_available():
+    return psycopg is not None and pg_available()
+
+
+def _sha():
+    return "0" * 64
+
+
+class _ResetFixture(_DirectoryCatalogFixture):
+    """Session on T_A with three 'done' chunks, a loose part and a container."""
+
+    def setUp(self):
+        super().setUp()
+        self._part(self.dir_id, 0)                        # loose, files_index
+        self._container_part(self.dir_id, 1, writer_state="copied")
+        self._exec("UPDATE archive_containers SET actual_artifact_bytes=500")
+        self.transitions = [
+            {"session_id": self.session_id, "chunk_index": index,
+             "before": "done", "after": "pending",
+             "reason": "latest durable output erased"}
+            for index in range(3)]
+
+    def _operation(self, operation_id="op-m3"):
+        self.db.create_tape_reset_intent(
+            operation_id=operation_id, tape_label="T_A", expected_drive="X:",
+            expected_drive_serial="SER", expected_ltfs_gen=1, expected_vcr=1,
+            backup_path="b.dump", backup_sha256=_sha(),
+            restore_list_path="r.txt", restore_list_sha256=_sha(),
+            shadow_database="shadow", impact_report_path="i.json",
+            impact_report_sha256=_sha(), impact={})
+        self.db.mark_tape_reset_hardware_started(operation_id)
+        self.db.mark_tape_reset_hardware_succeeded(operation_id, {"ok": True})
+        return operation_id
+
+    def _count(self, table, where="tape_label='T_A'"):
+        return self._query(
+            f"SELECT count(*) AS n FROM {table} WHERE {where}")[0]["n"]
+
+
+@unittest.skipUnless(_pg_available(), SKIP_REASON)
+class ResetCleanupContainerTablesTests(_ResetFixture, unittest.TestCase):
+    def test_used_space_counts_a_copied_container_before_the_reset(self):
+        self.assertEqual(self.db.recalculate_tape_used_space("T_A"), 600)
+
+    def test_cleanup_clears_the_restore_routes_and_the_catalog(self):
+        """Used to die on directory_archive_parts -> files_index RESTRICT."""
+        evidence = self.db.apply_tape_reset_cleanup(
+            self._operation(), self.transitions)
+
+        self.assertEqual(self._count("directory_archive_parts"), 0)
+        self.assertEqual(self._count("files_index"), 0)
+        self.assertEqual(self._count("archive_runs"), 0)
+        self.assertEqual(evidence["deleted"]["directory_archive_parts"], 2)
+        self.assertEqual(
+            evidence["before_counts"]["directory_archive_parts"], 2)
+        self.assertEqual(
+            evidence["after_counts"]["directory_archive_parts"], 0)
+        statuses = [row["status"] for row in self._query(
+            "SELECT status FROM remote_chunks WHERE session_id=%s "
+            "ORDER BY chunk_index", (self.session_id,))]
+        self.assertEqual(statuses, ["pending"] * 3)
+        self.assertEqual(self.db.get_active_tape_generation("T_A"), 2)
+
+    def test_the_erased_generation_does_not_return_to_the_accounting(self):
+        self.db.apply_tape_reset_cleanup(self._operation(), self.transitions)
+        # The container row is kept as history of the retired generation...
+        row = self._query(
+            """SELECT c.writer_state, g.state, g.generation
+               FROM archive_containers c
+               JOIN tape_generations g
+                 ON g.generation_id=c.tape_generation_id""")[0]
+        self.assertEqual((row["writer_state"], row["state"],
+                          row["generation"]), ("copied", "retired", 1))
+        # ...but a later mount's recalculation must not count it again.
+        self.assertEqual(self.db.recalculate_tape_used_space("T_A"), 0)
+        self.assertEqual(self.db.get_tape("T_A")["used_space"], 0)
+
+    def test_cleanup_is_idempotent_once_it_has_succeeded(self):
+        operation_id = self._operation()
+        first = self.db.apply_tape_reset_cleanup(operation_id,
+                                                 self.transitions)
+        again = self.db.apply_tape_reset_cleanup(operation_id,
+                                                 self.transitions)
+        self.assertEqual(first["deleted"], again["deleted"])
+        self.assertEqual(self.db.get_active_tape_generation("T_A"), 2)
+        self.assertEqual(self._count(
+            "tape_generations", "volume_label='T_A'"), 2)
+
+    def test_another_tape_is_untouched(self):
+        # The fixture's only archive run belongs to T_A; give T_B its own so
+        # the T_B catalog row does not hang off a run the reset will delete.
+        self.run_id = self._query(
+            """INSERT INTO archive_runs (run_label,tape_label,session_kind,
+                   started_at,completed_at,remote_session_id)
+               VALUES ('fixture:T_B','T_B','remote',now(),now(),%s)
+               RETURNING run_id""", (self.session_id,))[0]["run_id"]
+        self._part(self.child_id, 2, tape_label="T_B")
+        self.db.apply_tape_reset_cleanup(self._operation(), self.transitions)
+        self.assertEqual(
+            self._count("directory_archive_parts", "tape_label='T_B'"), 1)
+        self.assertEqual(self._count("files_index", "tape_label='T_B'"), 1)
+
+
+@unittest.skipUnless(_pg_available(), SKIP_REASON)
+class ResetResumeTests(_ResetFixture, unittest.TestCase):
+    """execute_reset end to end, with every hardware call patched."""
+
+    PRE = {"label": "T_A", "drive": "X:\\", "drive_serial": "SER",
+           "device": "tape0", "ltfs_generation": 7, "vcr": 70}
+    POST = {"label": "T_A", "drive": "X:\\", "drive_serial": "SER",
+            "device": "tape0", "ltfs_generation": 1, "vcr": 2}
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = Path(tempfile.mkdtemp(prefix="lto_m3_"))
+        self.addCleanup(self._rmtree)
+        backup = self.tmp / "backup.dump"
+        backup.write_bytes(b"backup")
+        restore = self.tmp / "restore.list"
+        restore.write_text("1; entry\n", encoding="utf-8")
+        self.identity = dict(self.PRE)
+        self.write_test_error = None
+        self.formats = 0
+        self.cfg = SimpleNamespace(lto_drive="X:\\")
+        self.operation_id = "op-resume"
+
+        latest = {(self.session_id, index): {
+            "tape_label": "T_A", "status": "completed",
+            "finished_at": "2026-01-01T00:00:00"} for index in range(3)}
+
+        def fake_format(drive, label, operation_id):
+            self.formats += 1
+            self.identity = dict(self.POST)
+            return {"mounted_identity": dict(self.POST), "ejected": False}
+
+        def fake_write_test(drive, operation_id):
+            if self.write_test_error:
+                raise RuntimeError(self.write_test_error)
+            return {"bytes_written": 1}
+
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        for name, value in (
+                ("AUDIT_ROOT", self.tmp / "audits"),
+                ("mounted_identity", lambda drive: dict(self.identity)),
+                ("latest_chunk_write_evidence", lambda *a, **k: (latest, {})),
+                ("_forbidden_processes", lambda pid=None: []),
+                ("_format_and_positive_evidence", fake_format),
+                ("smallest_write_test", fake_write_test),
+                ("_acquire_tape_io_lock", lambda *a, **k: None),
+                ("_release_tape_io_lock", lambda *a, **k: None)):
+            stack.enter_context(mock.patch.object(tape_reset, name, value))
+
+        backup_info = tape_reset.verify_backup_inputs(backup, restore)
+        backup_info["shadow_verified"] = True
+        report = tape_reset.build_impact_report(
+            self.db, operation_id=self.operation_id, tape_label="T_A",
+            identity=dict(self.PRE), backup=backup_info,
+            shadow_database="shadow")
+        self.impact_path, _ = tape_reset.write_immutable_json(
+            tape_reset.audit_dir(self.operation_id) / "impact.json", report)
+
+    def _rmtree(self):
+        for root, _dirs, files in os.walk(self.tmp):
+            for name in files:
+                os.chmod(os.path.join(root, name), stat.S_IWRITE)
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, resume=False):
+        return tape_reset.execute_reset(
+            self.db, self.cfg, tape_label="T_A", impact_path=self.impact_path,
+            delete_catalog=True, confirmed=True,
+            resume_operation=self.operation_id if resume else None)
+
+    def _state(self):
+        return self.db.get_tape_reset_operation(self.operation_id)["state"]
+
+    def _interrupt_after_cleanup(self):
+        self.write_test_error = "interrupted after cleanup"
+        with self.assertRaisesRegex(RuntimeError, "interrupted after cleanup"):
+            self._run()
+        self.assertEqual(self._state(), "cleanup_succeeded")
+        self.write_test_error = None
+
+    def test_an_uninterrupted_reset_reaches_verified(self):
+        final = self._run()
+        self.assertEqual(final["state"], "verified")
+        self.assertEqual(self.formats, 1)
+
+    def test_a_reset_interrupted_after_cleanup_can_be_resumed(self):
+        self._interrupt_after_cleanup()
+        final = self._run(resume=True)
+        self.assertEqual(final["state"], "verified")
+        self.assertEqual(self.formats, 1, "a resume must never format again")
+        self.assertEqual(self.db.get_active_tape_generation("T_A"), 2)
+        # Running it yet again is a no-op that reports the same outcome.
+        self.assertEqual(self._run(resume=True)["state"], "verified")
+        self.assertEqual(self.formats, 1)
+
+    def test_a_finished_reset_no_longer_blocks_a_new_one(self):
+        self._interrupt_after_cleanup()
+        self._run(resume=True)
+        row = self.db.create_tape_reset_intent(
+            operation_id="op-next", tape_label="T_A", expected_drive="X:",
+            expected_drive_serial="SER", expected_ltfs_gen=1, expected_vcr=2,
+            backup_path="b", backup_sha256=_sha(), restore_list_path="r",
+            restore_list_sha256=_sha(), shadow_database="s",
+            impact_report_path="i", impact_report_sha256=_sha(), impact={})
+        self.assertEqual((row["old_generation"], row["new_generation"]),
+                         (2, 3))
+
+    def test_resume_survives_losing_the_audit_files(self):
+        """The database copy of each stage's evidence is enough to converge."""
+        self._interrupt_after_cleanup()
+        directory = tape_reset.audit_dir(self.operation_id)
+        for name in ("hardware_result.json", "cleanup_result.json"):
+            os.chmod(directory / name, stat.S_IWRITE)
+            os.remove(directory / name)
+        final = self._run(resume=True)
+        self.assertEqual(final["state"], "verified")
+        self.assertEqual(self.formats, 1)
+        for name in ("hardware_result.json", "cleanup_result.json",
+                     "verification.json", "final_report.json"):
+            self.assertTrue((directory / name).exists(), name)
+
+    def test_resume_still_refuses_a_different_impact_report(self):
+        self._interrupt_after_cleanup()
+        self._exec("UPDATE tape_reset_operations SET impact_report_sha256=%s",
+                   ("f" * 64,))
+        with self.assertRaisesRegex(RuntimeError, "Impact report differs"):
+            self._run(resume=True)
+        self.assertEqual(self._state(), "cleanup_succeeded")
+
+    def test_resume_still_refuses_a_different_cartridge(self):
+        self._interrupt_after_cleanup()
+        self.identity["drive_serial"] = "OTHER"
+        with self.assertRaisesRegex(RuntimeError, "identity changed"):
+            self._run(resume=True)
+        self.assertEqual(self._state(), "cleanup_succeeded")
+
+    def test_scope_drift_before_cleanup_is_still_refused(self):
+        self._exec("UPDATE remote_chunks SET status='done' WHERE false")
+        self._part(self.child_id, 2)        # the catalog changed after approval
+        with self.assertRaisesRegex(RuntimeError, "scope differs"):
+            self._run()
+        self.assertEqual(self.formats, 0)
+
+
+@unittest.skipUnless(_pg_available(), SKIP_REASON)
+class RenameWithContainersTests(_ResetFixture, unittest.TestCase):
+    def test_a_rename_carries_containers_and_restore_routes(self):
+        """Used to fail: the new tables still referenced the old label."""
+        # Loose restore routes are out of scope here: they reference
+        # files_index.record_key, which a rename rewrites (see the test below).
+        self._exec("DELETE FROM directory_archive_parts "
+                   "WHERE loose_record_key IS NOT NULL")
+        self.db.rename_tape("T_A", "T_NEW")
+        self.assertEqual(self._count("tapes", "volume_label='T_A'"), 0)
+        self.assertEqual(
+            self._count("archive_containers", "tape_label='T_NEW'"), 1)
+        self.assertEqual(
+            self._count("directory_archive_parts", "tape_label='T_NEW'"), 1)
+        self.assertEqual(self.db.get_active_tape_generation("T_NEW"), 1)
+
+    def test_a_rename_blocked_by_loose_routes_changes_nothing(self):
+        """Known limit, pinned so it stays fail-closed.
+
+        A rename rewrites files_index.record_key, and migration 018's loose
+        restore routes hold a foreign key on that key. The rename is refused
+        by the database and must roll back completely - never half-renamed.
+        """
+        with self.assertRaises(psycopg.errors.ForeignKeyViolation):
+            self.db.rename_tape("T_A", "T_NEW")
+        self.assertEqual(self._count("tapes", "volume_label='T_NEW'"), 0)
+        self.assertEqual(self._count("files_index"), 1)
+        self.assertEqual(self._count("archive_containers"), 1)
+        self.assertEqual(self.db.get_active_tape_generation("T_A"), 1)
+
+
+@unittest.skipUnless(_pg_available(), SKIP_REASON)
+class RenameAndDeleteTests(unittest.TestCase):
+    def setUp(self):
+        from src.pg_db import PgDatabaseManager
+
+        self.dbname, self.conninfo = create_test_database("lto_m3c")
+        self.db = PgDatabaseManager(self.conninfo)
+        self.addCleanup(self._drop)
+
+    def _drop(self):
+        try:
+            self.db.close()
+        except Exception:
+            pass
+        drop_test_database(self.dbname)
+
+    def _q(self, sql, params=()):
+        with cast(Any, psycopg).connect(
+                self.conninfo, autocommit=True,
+                row_factory=cast(Any, dict_row)) as conn:
+            cur = conn.execute(sql, params)
+            return cur.fetchall() if cur.description else []
+
+    def _reset_twice(self, label):
+        """Leave ``label`` at generation 3 with two retired generations."""
+        self._q("UPDATE tape_generations SET state='retired' "
+                "WHERE volume_label=%s", (label,))
+        self._q(
+            """INSERT INTO tape_generations (tape_id,volume_label,generation,
+                   state,formatted_at)
+               SELECT tape_id,volume_label,g,
+                      CASE WHEN g=3 THEN 'active' ELSE 'retired' END, now()
+               FROM tapes, (VALUES (2),(3)) AS v(g) WHERE volume_label=%s""",
+            (label,))
+        self._q("UPDATE tapes SET current_generation=3 WHERE volume_label=%s",
+                (label,))
+
+    def test_a_rename_keeps_the_generation_number(self):
+        self.db.register_tape("GEN_OLD", 12000)
+        self._reset_twice("GEN_OLD")
+        self.assertEqual(self.db.get_active_tape_generation("GEN_OLD"), 3)
+
+        self.db.rename_tape("GEN_OLD", "GEN_NEW")
+
+        self.assertEqual(self.db.get_tape("GEN_NEW")["current_generation"], 3)
+        self.assertEqual(self.db.get_active_tape_generation("GEN_NEW"), 3)
+        # The exact-generation lookup the writer uses must still resolve.
+        row = self._q(
+            """SELECT g.generation FROM tape_generations g
+               JOIN tapes t ON t.tape_id=g.tape_id
+               WHERE g.volume_label='GEN_NEW' AND g.state='active'
+                 AND g.generation=t.current_generation""")
+        self.assertEqual([r["generation"] for r in row], [3])
+
+    def test_an_unreferenced_tape_can_be_deleted(self):
+        """Used to fail for every tape: its own generation row blocked it."""
+        self.db.register_tape("DEL1", 12000)
+        self.db.delete_tape("DEL1")
+        self.assertFalse(self.db.tape_exists("DEL1"))
+        self.assertEqual(self._q(
+            "SELECT 1 FROM tape_generations WHERE volume_label='DEL1'"), [])
+
+    def test_deleting_a_missing_tape_is_reported(self):
+        with self.assertRaisesRegex(RuntimeError, "Tape not found"):
+            self.db.delete_tape("NOPE")
+
+    def test_a_tape_with_session_history_is_refused_and_left_intact(self):
+        self.db.register_tape("DEL2", 12000)
+        snap = self._q(
+            """INSERT INTO remote_snapshots (remote_host,remote_path,
+                   fingerprint,total_files,total_bytes,created_at)
+               VALUES ('h','/r','fp-del',1,1,now()) RETURNING snapshot_id"""
+        )[0]["snapshot_id"]
+        plan = self._q(
+            """INSERT INTO remote_plans (snapshot_id,fingerprint,chunk_count,
+                   created_at) VALUES (%s,'pf-del',1,now())
+               RETURNING plan_id""", (snap,))[0]["plan_id"]
+        self._q(
+            """INSERT INTO remote_sessions (session_label,remote_host,
+                   remote_user,remote_path,tape_label,staging_dir,total_files,
+                   total_bytes,chunk_count,plan_id,created_at,status,
+                   tape_generation)
+               VALUES ('DELS','h','u','/r','DEL2','C:\\stg',1,1,1,%s,now(),
+                       'active',1)""", (plan,))
+        self._q(
+            """INSERT INTO archive_runs (run_label,tape_label,session_kind,
+                   started_at) VALUES ('del-run','DEL2','local',now())""")
+        with self.assertRaisesRegex(RuntimeError,
+                                    "Refusing to delete.*remote_sessions"):
+            self.db.delete_tape("DEL2")
+        self.assertTrue(self.db.tape_exists("DEL2"))
+        # The refusal rolled back the catalog deletes as well.
+        self.assertEqual(len(self._q(
+            "SELECT 1 FROM archive_runs WHERE tape_label='DEL2'")), 1)
+        self.assertEqual(self.db.get_active_tape_generation("DEL2"), 1)
+
+    def test_a_tape_with_reset_history_is_refused(self):
+        self.db.register_tape("DEL3", 12000)
+        self.db.create_tape_reset_intent(
+            operation_id="op-del", tape_label="DEL3", expected_drive="X:",
+            expected_drive_serial="S", expected_ltfs_gen=1, expected_vcr=1,
+            backup_path="b", backup_sha256=_sha(), restore_list_path="r",
+            restore_list_sha256=_sha(), shadow_database="s",
+            impact_report_path="i", impact_report_sha256=_sha(), impact={})
+        with self.assertRaisesRegex(RuntimeError, "tape_reset_operations"):
+            self.db.delete_tape("DEL3")
+        self.assertTrue(self.db.tape_exists("DEL3"))
+
+
+if __name__ == "__main__":
+    unittest.main()

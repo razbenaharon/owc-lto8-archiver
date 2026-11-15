@@ -522,9 +522,21 @@ def execute_reset(db, cfg, *, tape_label, impact_path, delete_catalog,
         post_format = bool(hardware_path.exists() or (
             op and op["state"] in
             ("hardware_succeeded", "cleanup_succeeded", "verified")))
-        expected = (read_json(hardware_path)["mounted_identity"]
-                    if post_format and hardware_path.exists()
-                    else impact["mounted_identity"])
+        if post_format and hardware_path.exists():
+            expected = read_json(hardware_path)["mounted_identity"]
+        elif post_format:
+            # The audit file is gone but the database recorded the same
+            # evidence when the format succeeded. Falling back to the
+            # PRE-format identity here would compare the new filesystem
+            # against the erased one and refuse every resume.
+            expected = ((op.get("hardware_evidence") or {})
+                        .get("mounted_identity"))
+            if not expected:
+                raise RuntimeError(
+                    "[TAPE RESET] Post-format identity evidence is missing "
+                    "from both the audit directory and the database")
+        else:
+            expected = impact["mounted_identity"]
         identity_keys = ["label", "drive", "drive_serial", "device",
                          "ltfs_generation"]
         if not post_format:
@@ -535,14 +547,29 @@ def execute_reset(db, cfg, *, tape_label, impact_path, delete_catalog,
                     f"[TAPE RESET] Mounted identity changed at {key}: "
                     f"{identity.get(key)!r} != {expected.get(key)!r}")
 
-        current = build_impact_report(
-            db, operation_id=operation_id, tape_label=tape_label,
-            identity=identity, backup=impact["backup"],
-            shadow_database=impact["shadow_database"])
-        if canonical_json_bytes(_impact_core(current)) != canonical_json_bytes(
-                _impact_core(impact)):
-            raise RuntimeError(
-                "[TAPE RESET] Observed deletion scope differs from impact report")
+        cleanup_done = bool(op and op["state"] in
+                            ("cleanup_succeeded", "verified"))
+        if cleanup_done:
+            # The cleanup transaction already committed: the catalog now
+            # (correctly) no longer matches the PRE-cleanup scope in the impact
+            # report, so re-deriving and comparing that scope would refuse
+            # every resume and leave the operation open forever - which also
+            # blocks any new reset of this tape. What must still hold is that
+            # this is the SAME approved report the cleanup ran under.
+            if op["impact_report_sha256"] != sha256_file(impact_path):
+                raise RuntimeError(
+                    "[TAPE RESET] Impact report differs from the one this "
+                    "operation's cleanup was executed under")
+        else:
+            current = build_impact_report(
+                db, operation_id=operation_id, tape_label=tape_label,
+                identity=identity, backup=impact["backup"],
+                shadow_database=impact["shadow_database"])
+            if canonical_json_bytes(_impact_core(current)) != \
+                    canonical_json_bytes(_impact_core(impact)):
+                raise RuntimeError(
+                    "[TAPE RESET] Observed deletion scope differs from impact "
+                    "report")
 
         if op is None:
             op = db.create_tape_reset_intent(
@@ -563,6 +590,15 @@ def execute_reset(db, cfg, *, tape_label, impact_path, delete_catalog,
         hardware_path = directory / "hardware_result.json"
         cleanup_path = directory / "cleanup_result.json"
         verification_path = directory / "verification.json"
+
+        if (op["state"] in ("hardware_succeeded", "cleanup_succeeded",
+                            "verified")
+                and not hardware_path.exists()
+                and op.get("hardware_evidence")):
+            # Every later stage (and the final report) reads this file; the
+            # database holds the same evidence, so a lost file never strands
+            # an operation that already formatted the cartridge.
+            write_immutable_json(hardware_path, op["hardware_evidence"])
 
         if op["state"] in ("intent_recorded", "hardware_started"):
             if hardware_path.exists():
@@ -586,7 +622,20 @@ def execute_reset(db, cfg, *, tape_label, impact_path, delete_catalog,
         else:
             cleanup = read_json(cleanup_path) if cleanup_path.exists() else (
                 op.get("cleanup_evidence") or {})
+        if (op["state"] in ("cleanup_succeeded", "verified")
+                and not cleanup_path.exists()):
+            # Interrupted between the cleanup commit and its audit file: the
+            # database copy is the durable evidence, so re-create the file
+            # from it (without the later verification annotation).
+            write_immutable_json(cleanup_path, {
+                key: value for key, value in dict(cleanup).items()
+                if key != "verification"})
 
+        if op["state"] == "verified" and not verification_path.exists():
+            verification = (op.get("cleanup_evidence") or {}).get(
+                "verification")
+            if verification:
+                write_immutable_json(verification_path, verification)
         if op["state"] == "cleanup_succeeded":
             if verification_path.exists():
                 verification = read_json(verification_path)
