@@ -396,6 +396,25 @@ class DirectoryCatalogPgTests(_DirectoryCatalogFixture, unittest.TestCase):
         self.assertTrue(rows)
         paths = {row["canonical_path"] for row in rows}
         self.assertIn("/r/data", paths)
+        # Same value TYPES on every backend: the view's computed columns are
+        # decoded JSON and real booleans, not engine-specific text / 0-1.
+        row = next(r for r in rows if r["canonical_path"] == "/r/data")
+        self.assertEqual(row["coverage_state"], "final")
+        self.assertIs(row["coverage_is_final"], True)
+        self.assertIsInstance(row["child_directories"], list)
+        self.assertIsInstance(row["coverage_generations"], list)
+        self.assertEqual(len(row["coverage_generations"]), 1)
+        self.assertEqual(
+            row["coverage_generations"][0]["coverage_state"], "final")
+        self.assertIsInstance(row["restore_route"], dict)
+        self.assertEqual(row["restore_route"]["tape_label"],
+                         row["tape_label"])
+        self.assertIsInstance(row["scan_is_final"], bool)
+        parent = self.db.get_directory_catalog_status(
+            directory_id=row["parent_directory_id"])[0]
+        self.assertIn(
+            row["directory_id"],
+            [child["directory_id"] for child in parent["child_directories"]])
 
     def test_completeness_never_reads_tape(self):
         import src.pg_directory_catalog as module

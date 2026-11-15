@@ -8,6 +8,7 @@ operation on ``PgConnectionCore``.
 """
 from collections import defaultdict
 
+from .db_backend import as_json
 from .pg_core import _now_utc, _rows
 
 
@@ -1360,10 +1361,21 @@ class PgDirectoryCatalogMixin:
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
 
         def operation(conn):
-            return _rows(conn.execute(
+            rows = _rows(conn.execute(
                 "SELECT * FROM directory_catalog_status_v" + where
                 + " ORDER BY source_host, canonical_path, session_id",
                 tuple(params),
             ).fetchall())
+            # The view computes these columns, so an engine without typed
+            # expression results hands back JSON text / 0-1; normalise them
+            # (a no-op for the values PostgreSQL returns).
+            for row in rows:
+                for column in ("child_directories", "coverage_generations",
+                               "restore_route"):
+                    if row.get(column) is not None:
+                        row[column] = as_json(row[column])
+                if row.get("coverage_is_final") is not None:
+                    row["coverage_is_final"] = bool(row["coverage_is_final"])
+            return rows
 
         return self._run_read(operation, "read directory catalog status")
