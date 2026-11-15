@@ -1068,10 +1068,12 @@ class PgSessionMixin:
             report["artifact"] = self._export_fetch_state(
                 archive_root, session_id, wanted, rows)
             report["deleted"] = conn.execute(
-                """DELETE FROM remote_file_state s
-                   USING remote_plan_files pf
-                   WHERE s.plan_file_id=pf.plan_file_id
-                     AND s.session_id=%s AND pf.chunk_index = ANY(%s)""",
+                """DELETE FROM remote_file_state
+                   WHERE session_id=%s
+                     AND EXISTS (
+                         SELECT 1 FROM remote_plan_files pf
+                         WHERE pf.plan_file_id=remote_file_state.plan_file_id
+                           AND pf.chunk_index = ANY(%s))""",
                 (session_id, wanted)).rowcount
             return report
 
@@ -2421,31 +2423,39 @@ class PgSessionMixin:
 
         def operation(conn):
             plan_files = conn.execute("""
-                DELETE FROM remote_plan_files pf
-                USING remote_plans p
-                WHERE p.plan_id=pf.plan_id
-                  AND NOT EXISTS (
-                    SELECT 1 FROM remote_sessions s WHERE s.plan_id=p.plan_id
+                DELETE FROM remote_plan_files
+                WHERE EXISTS (
+                    SELECT 1 FROM remote_plans p
+                    WHERE p.plan_id=remote_plan_files.plan_id
+                      AND NOT EXISTS (
+                        SELECT 1 FROM remote_sessions s
+                        WHERE s.plan_id=p.plan_id
+                      )
                   )
             """)
             plans = conn.execute("""
-                DELETE FROM remote_plans p
+                DELETE FROM remote_plans
                 WHERE NOT EXISTS (
-                    SELECT 1 FROM remote_sessions s WHERE s.plan_id=p.plan_id
+                    SELECT 1 FROM remote_sessions s
+                    WHERE s.plan_id=remote_plans.plan_id
                 )
             """)
             snapshot_files = conn.execute("""
-                DELETE FROM remote_snapshot_files sf
-                USING remote_snapshots sn
-                WHERE sn.snapshot_id=sf.snapshot_id
-                  AND NOT EXISTS (
-                    SELECT 1 FROM remote_plans p WHERE p.snapshot_id=sn.snapshot_id
+                DELETE FROM remote_snapshot_files
+                WHERE EXISTS (
+                    SELECT 1 FROM remote_snapshots sn
+                    WHERE sn.snapshot_id=remote_snapshot_files.snapshot_id
+                      AND NOT EXISTS (
+                        SELECT 1 FROM remote_plans p
+                        WHERE p.snapshot_id=sn.snapshot_id
+                      )
                   )
             """)
             snapshots = conn.execute("""
-                DELETE FROM remote_snapshots sn
+                DELETE FROM remote_snapshots
                 WHERE NOT EXISTS (
-                    SELECT 1 FROM remote_plans p WHERE p.snapshot_id=sn.snapshot_id
+                    SELECT 1 FROM remote_plans p
+                    WHERE p.snapshot_id=remote_snapshots.snapshot_id
                 )
             """)
             return {
