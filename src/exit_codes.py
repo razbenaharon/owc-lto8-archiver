@@ -127,9 +127,9 @@ class StopResult:
     source: Optional[str] = None
     session_id: Optional[int] = None
     chunk_index: Optional[int] = None
-    #: Whether the caller should keep the staged pack for a direct resume. A gate
-    #: block (the write never started) keeps it; a mid-attempt write failure
-    #: (re-fetchable) does not. Not serialized to the status files.
+    #: Whether the caller should keep the staged pack for a direct resume.
+    #: Every writer stop keeps it: the pack is intact local data whatever
+    #: happened at the tape. Not serialized to the status files.
     preserve_pack: bool = True
 
     @property

@@ -212,10 +212,13 @@ class RemoteChunkWriter:
             # before ownership. Launch the external writer without a per-chunk
             # tape-budget recheck here.
             #     ONLY when the writer actually starts (via on_write_start), so
-            #     'backing' means exactly "the tape write has physically begun".
-            #     A failure BEFORE that (drive not ready, bad metadata) never set
-            #     'backing', so it is safely re-fetchable; a failure AT OR AFTER
-            #     it is physically ambiguous and must stay 'backing'.
+            #     'backing' means exactly "the tape write has physically begun"
+            #     — and that includes the very first write-touch, creating the
+            #     destination directory on tape. A failure BEFORE that (drive
+            #     not ready, bad metadata) never set 'backing', so it is safely
+            #     re-drivable; a failure AT OR AFTER it (write-protected media
+            #     on mkdir included) is a hard tape failure and must stay
+            #     'backing'.
             backup_cls = LTOBackup if eject_after else _NoEjectBackup
             governor = getattr(self.host, 'governor', None)
             tape_pending = (
@@ -286,8 +289,12 @@ class RemoteChunkWriter:
                         chunk_index=chunk_index, preserve_pack=True,
                         detailed_reason=f"tape write failed after starting: {e}"),
                         escalate=True)
-                # Failure BEFORE the write started: nothing reached the tape, so
-                # the chunk is safely re-fetchable. 'backing' was never set.
+                # Failure BEFORE the write started: no write-touch of the tape
+                # happened (LTOBackup marks 'backing' before it even creates
+                # the destination directory), so 'backing' was never set and
+                # the chunk is safely re-drivable. The pack is intact local
+                # data and is KEPT on every error — the resume reuses it by
+                # exact inventory instead of re-fetching.
                 if CANCEL.is_set():
                     return self.host._record_stop(StopResult(
                         exit_code=ExitCode.USER_STOP,
@@ -303,7 +310,7 @@ class RemoteChunkWriter:
                     exit_code=ExitCode.TRANSIENT_RESUMABLE,
                     reason=REASON_TAPE_WRITE_FAILED, resumable=True,
                     source="write", session_id=session_id,
-                    chunk_index=chunk_index, preserve_pack=False,
+                    chunk_index=chunk_index, preserve_pack=True,
                     detailed_reason=str(e)))
         except BaseException:
             raise

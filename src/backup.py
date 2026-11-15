@@ -233,7 +233,9 @@ class LTOBackup:
         exclude_dir_paths  = exclude_dir_paths or []
         tape_root = _tape_destination_root(
             source, tape_drive, tape_parent_dir=tape_parent_dir)
-        os.makedirs(tape_root, exist_ok=True)
+        # NOTE: the destination directory is deliberately NOT created here.
+        # Creating it is the first WRITE to the tape, so it happens only after
+        # the chunk is marked 'backing' (see the write boundary below).
 
         # Build lookup: staging-relative-path -> metadata dict (loose large files only)
         meta_by_rel = {}
@@ -491,6 +493,25 @@ class LTOBackup:
                             # write has STARTED — a failure past this point is
                             # physically ambiguous (data may be partly on tape).
                             _mark_writer_started_durably()
+                            # First write-touch of the tape, strictly AFTER the
+                            # chunk is 'backing'. On write-protected or failing
+                            # media this is where the error surfaces; it used to
+                            # run before the marker and was then misread as
+                            # "nothing reached the tape" (transient, pack
+                            # discarded). It is a hard tape error: record it,
+                            # never start robocopy, never retry.
+                            try:
+                                os.makedirs(tape_root, exist_ok=True)
+                            except OSError as e:
+                                note_tape_io_error(
+                                    f"mkdir {tape_root} failed: {e} "
+                                    f"tape={tape_label}")
+                                raise RuntimeError(
+                                    "Hard tape error creating the destination "
+                                    f"directory on tape ({tape_root}): {e}. "
+                                    "The copy was not started and will not be "
+                                    "retried; the staged data is kept."
+                                ) from e
                             rc = _run_robocopy_tuned(
                                 robocopy_cmd,
                                 priority=self.tape_priority,
