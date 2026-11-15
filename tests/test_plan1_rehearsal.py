@@ -382,7 +382,7 @@ class ProductionGateTests(unittest.TestCase):
         assignment = code_text(
             PgSessionMixin.append_remote_streaming_chunk)
         self.assertIn("if stored_tar_write_enabled", assignment)
-        staging = code_text("remote_staging", strings=False)
+        staging = code_text("remote_staging")
         self.assertIn("get_chunk_packaging_format", staging)
         self.assertIn("_stage_stored_tar_chunk", staging)
 
