@@ -129,14 +129,6 @@ class PgDirectoryCatalogMixin:
     )
 
     @staticmethod
-    def _view_exists_conn(conn, view_name):
-        return conn.execute(
-            """SELECT 1 FROM information_schema.views
-               WHERE table_schema='public' AND table_name=%s""",
-            (view_name,),
-        ).fetchone() is not None
-
-    @staticmethod
     def _named_objects_conn(conn, catalog, name_column):
         return {
             row[name_column]
@@ -717,13 +709,9 @@ class PgDirectoryCatalogMixin:
         self._require_manifest_directory_catalog_schema()
 
         def operation(conn):
-            row = conn.execute(
-                """SELECT lto_transition_chunk_plan_source(
-                           %s, %s, %s, %s, %s, %s) AS transition_id""",
-                (session_id, chunk_index, plan_manifest_artifact_id,
-                 *identities),
-            ).fetchone()
-            return int(row["transition_id"])
+            return int(self._sql_transition_chunk_plan_source_conn(
+                conn, session_id, chunk_index, plan_manifest_artifact_id,
+                *identities))
 
         return self._transaction(
             operation,

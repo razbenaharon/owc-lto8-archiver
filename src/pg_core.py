@@ -157,6 +157,14 @@ class PgConnectionCore:
             (index_name,)).fetchone() is not None
 
     @staticmethod
+    def _view_exists_conn(conn, view_name):
+        return conn.execute(
+            """SELECT 1 FROM information_schema.views
+               WHERE table_schema='public' AND table_name=%s""",
+            (view_name,),
+        ).fetchone() is not None
+
+    @staticmethod
     def _create_stage_table_conn(conn, stage_table, source_table, col_sql):
         """Empty transaction-scoped copy of ``source_table``'s columns."""
         conn.execute(
@@ -206,6 +214,52 @@ class PgConnectionCore:
              created_at),
         ).fetchone()
         return row["session_id"], bool(row["inserted"])
+
+    @staticmethod
+    def _single_column_references_conn(conn, parent_table):
+        """``(child_table, child_column, parent_column)`` for every
+        single-column foreign key that points at ``parent_table``; the child
+        identifiers are quoted and safe to interpolate."""
+        return [
+            (row["child_table"], row["child_column"], row["parent_column"])
+            for row in conn.execute(
+                """SELECT c.conrelid::regclass::text AS child_table,
+                          quote_ident(a.attname) AS child_column,
+                          fa.attname AS parent_column
+                   FROM pg_constraint c
+                   JOIN pg_attribute a
+                     ON a.attrelid=c.conrelid AND a.attnum=c.conkey[1]
+                   JOIN pg_attribute fa
+                     ON fa.attrelid=c.confrelid AND fa.attnum=c.confkey[1]
+                   WHERE c.contype='f' AND c.confrelid=%s::regclass
+                     AND array_length(c.conkey, 1)=1
+                   ORDER BY 1, 2""", (parent_table,)).fetchall()]
+
+    @staticmethod
+    def _sql_assign_new_chunk_format_conn(
+            conn, session_id, chunk_index, stored_tar_write_enabled,
+            schema_version, reader_contract_version):
+        """The only legal packaging format for a new chunk (schema function
+        ``lto_assign_new_chunk_format``)."""
+        return conn.execute(
+            """SELECT lto_assign_new_chunk_format(%s,%s,%s,%s,%s)
+                      AS packaging_format""",
+            (session_id, chunk_index, stored_tar_write_enabled,
+             schema_version, reader_contract_version),
+        ).fetchone()["packaging_format"]
+
+    @staticmethod
+    def _sql_transition_chunk_plan_source_conn(
+            conn, session_id, chunk_index, plan_manifest_artifact_id,
+            plan4_gate_id, plan4_evidence_id, approval_identity):
+        """Audited ``legacy_db`` -> ``manifest`` move (schema function
+        ``lto_transition_chunk_plan_source``); returns the audit row id."""
+        return conn.execute(
+            """SELECT lto_transition_chunk_plan_source(
+                       %s, %s, %s, %s, %s, %s) AS transition_id""",
+            (session_id, chunk_index, plan_manifest_artifact_id,
+             plan4_gate_id, plan4_evidence_id, approval_identity),
+        ).fetchone()["transition_id"]
 
     @staticmethod
     def _vacuum_analyze_conn(conn):

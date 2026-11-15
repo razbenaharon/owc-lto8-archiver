@@ -1354,14 +1354,10 @@ class PgContainerMixin:
             raise RuntimeError(
                 "[DB] Migration 015 is not installed; refusing to create an "
                 "unformatted remote chunk")
-        row = conn.execute(
-            """SELECT lto_assign_new_chunk_format(%s,%s,%s,%s,%s)
-                      AS packaging_format""",
-            (int(session_id), int(chunk_index),
-             stored_tar_write_enabled is True,
-             CONTAINER_FORMAT_SCHEMA_VERSION, reader_contract_version),
-        ).fetchone()
-        return ContainerFormat(row["packaging_format"])
+        return ContainerFormat(self._sql_assign_new_chunk_format_conn(
+            conn, int(session_id), int(chunk_index),
+            stored_tar_write_enabled is True,
+            CONTAINER_FORMAT_SCHEMA_VERSION, reader_contract_version))
 
     def assign_new_chunk_format(
             self, session_id, chunk_index, *, stored_tar_write_enabled=False,
