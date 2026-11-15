@@ -2224,7 +2224,25 @@ class PgSessionMixin:
         if kind not in ("local", "remote"):
             raise RuntimeError(f"[DB] Unknown session kind: {kind}")
 
+        table = "local_sessions" if kind == "local" else "remote_sessions"
+        active_message = (
+            f"[DB] Refusing to delete {kind} session {session_id}: it is "
+            "marked active. A row marked active is treated as live until "
+            "proven otherwise - finish it, or prove it stale with "
+            "`inspect_db.py --reconcile-stale-sessions`, before deleting.")
+
         def operation(conn):
+            # Audit M8: one click in the inspector used to delete the session
+            # an archiver was writing. The refusal lives here, in the only
+            # write path, and the final DELETE repeats the condition so a
+            # session that turns active mid-transaction rolls everything back.
+            current = conn.execute(
+                f"SELECT status FROM {table} WHERE session_id=%s",
+                (session_id,)).fetchone()
+            if current is not None and str(
+                    current["status"] or "").strip().lower() == "active":
+                raise RuntimeError(active_message)
+
             if kind == "local":
                 refs = conn.execute(
                     "SELECT COUNT(*) AS n FROM files_index WHERE local_session_id=%s",
@@ -2242,10 +2260,12 @@ class PgSessionMixin:
                     (session_id,),
                 )
                 cur = conn.execute(
-                    "DELETE FROM local_sessions WHERE session_id=%s",
+                    """DELETE FROM local_sessions WHERE session_id=%s
+                       AND COALESCE(status,'') <> 'active'""",
                     (session_id,))
                 self._require_updated(
-                    cur, f"[DB] Local session not found: {session_id}")
+                    cur, active_message if current is not None
+                    else f"[DB] Local session not found: {session_id}")
                 return cur.rowcount
 
             conn.execute(
@@ -2257,9 +2277,11 @@ class PgSessionMixin:
                 (session_id,),
             )
             cur = conn.execute(
-                "DELETE FROM remote_sessions WHERE session_id=%s", (session_id,))
+                """DELETE FROM remote_sessions WHERE session_id=%s
+                   AND COALESCE(status,'') <> 'active'""", (session_id,))
             self._require_updated(
-                cur, f"[DB] Remote session not found: {session_id}")
+                cur, active_message if current is not None
+                else f"[DB] Remote session not found: {session_id}")
             return cur.rowcount
 
         removed = self._transaction(
