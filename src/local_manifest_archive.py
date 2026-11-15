@@ -637,6 +637,8 @@ def _build_catalog_aggregates(conn, export_id):
 def execute_export(conninfo, archive_root, hot_backup_path, *,
                    threshold_bytes=SMALL_FILE_THRESHOLD_BYTES):
     """Snapshot eligible rows and write immutable local manifest segments."""
+    # Refuse a SQLite catalog before validating (or creating) anything.
+    db_backend.require_postgresql(conninfo, "small_file_manifest_maintenance")
     if not hot_backup_path or not os.path.isfile(hot_backup_path):
         raise OperationalError("[MANIFEST] A verified hot backup path is required.")
     root = os.path.abspath(archive_root)
