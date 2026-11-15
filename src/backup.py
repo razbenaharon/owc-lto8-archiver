@@ -362,7 +362,7 @@ class LTOBackup:
 
         _progress_done()
         print(f"[BACKUP] {len(loose_map)} loose file(s) staged "
-              f"({total_bytes / 1024**3:.2f} GB to copy) | {skipped} already on tape.")
+              f"({total_bytes / 1024**3:.2f} GiB to copy) | {skipped} already on tape.")
 
         # ---------------------------------------------------------------
         # Phase 2 - Single robocopy call: source directory to tape
@@ -388,7 +388,7 @@ class LTOBackup:
                 elapsed = time.time() - start_time
                 _progress_line(
                     f"[COPYING] robocopy active | elapsed {_fmt_eta(elapsed)} | "
-                    f"chunk {total_bytes / 1024**3:.1f} GB"
+                    f"chunk {total_bytes / 1024**3:.1f} GiB"
                 )
 
         mon = threading.Thread(target=_monitor, daemon=True)
@@ -827,7 +827,7 @@ class LTOBackup:
                 copied_bytes = rc_sum['bytes_copied']
                 _db_checkpoint()
                 new_used = int(self.db.recalculate_tape_used_space(tape_label) or 0)
-                print(f"[DB] Tape used space reconciled to {new_used / 1024**3:.3f} GB.")
+                print(f"[DB] Tape used space reconciled to {new_used / 1024**3:.3f} GiB.")
 
         # ---------------------------------------------------------------
         # Phase 4 - Print Robocopy job summary
@@ -886,8 +886,8 @@ class LTOBackup:
         print("=" * 60)
         print(f"Tape            : {tape_label}")
         print(f"Total Time      : {total_time / 60:.1f} minutes")
-        print(f"Data Copied     : {copied_bytes / 1024**3:.2f} GB")
-        print(f"Avg Speed       : {rc_sum['speed_mbs']:.1f} MB/s")
+        print(f"Data Copied     : {copied_bytes / 1024**3:.2f} GiB")
+        print(f"Avg Speed       : {rc_sum['speed_mbs']:.1f} MiB/s")
         print(f"Files Copied    : {rc_sum['files_copied']}")
         print(f"Files Skipped   : {rc_sum['files_skipped'] + skipped}")
         print(f"Source Missing  : "
