@@ -192,6 +192,16 @@ class ArchiverLockVerificationTests(unittest.TestCase):
         with self.assertRaises(ArchiverLockLost):
             self.db.verify_archiver_lock()
 
+    @sqlite_only("PostgreSQL's repeated acquire is a documented no-op")
+    def test_a_repeated_acquire_does_not_hide_a_lost_lock(self):
+        from src.pg_core import ArchiverLockLost
+
+        self.db.acquire_archiver_lock()
+        self.db.acquire_archiver_lock()             # still ours: fine
+        self._kill_lock_backend()
+        with self.assertRaises(ArchiverLockLost):
+            self.db.acquire_archiver_lock()
+
     def test_a_second_manager_is_refused_while_the_lock_is_held(self):
         self.db.acquire_archiver_lock()
         other = self.tdb.manager(init_schema=False)

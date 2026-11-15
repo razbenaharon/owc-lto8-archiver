@@ -19,10 +19,12 @@ import hashlib
 import os
 import sqlite3
 import urllib.parse
+import uuid
 from datetime import datetime
 from pathlib import Path
 
 from . import db_backend
+from .archive_artifacts import ArtifactConflict, publish_no_clobber
 from .constants import DB_BACKUP_DIR
 
 SQLITE_BACKUP_SUFFIX = ".sqlite3"
@@ -201,8 +203,10 @@ def create_sqlite_backup(cfg, output_dir=None, prefix=None, verify=True):
     if os.path.normcase(str(output_path)) == os.path.normcase(str(source)):
         raise RuntimeError(
             "[DB BACKUP] The backup target is the live catalog itself")
-    temporary = output_path.with_name(output_path.name + ".part")
-    temporary.unlink(missing_ok=True)
+    # A name no other backup can share: two backups started in the same
+    # second must never write to (or delete) each other's working file.
+    temporary = output_path.with_name(
+        f"{output_path.name}.{uuid.uuid4().hex}.part")
     try:
         try:
             live = sqlite3.connect(_read_only_uri(source), uri=True,
@@ -229,10 +233,22 @@ def create_sqlite_backup(cfg, output_dir=None, prefix=None, verify=True):
                 raise RuntimeError(
                     "[DB BACKUP] The new backup failed verification and was "
                     "discarded.\n" + result.summary())
-        os.replace(temporary, output_path)
+        # No-clobber publish: never replaces an existing backup, even one
+        # that appeared after the check above.
+        try:
+            publish_no_clobber(temporary, output_path)
+        except ArtifactConflict as exc:
+            raise RuntimeError(
+                "[DB BACKUP] Refusing to overwrite an existing backup"
+            ) from exc
         if verify:
-            # Inventory beside the final name (the copy was just verified).
-            verify_sqlite_backup(cfg, output_path)
+            # Inventory beside the final name, and a second proof that what
+            # was published is the copy that was verified.
+            final = verify_sqlite_backup(cfg, output_path)
+            if not final.ok:
+                raise RuntimeError(
+                    "[DB BACKUP] The published backup failed verification; "
+                    "do not rely on it.\n" + final.summary())
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise

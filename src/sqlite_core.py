@@ -116,8 +116,9 @@ def schema_fingerprint(raw):
         if row[2] not in owned:
             continue
         for value in row:
-            text = "" if value is None else " ".join(str(value).split())
-            encoded = text.encode("utf-8")
+            # The exact stored text: collapsing whitespace would also collapse
+            # it inside string literals and hide a changed guard condition.
+            encoded = ("" if value is None else str(value)).encode("utf-8")
             digest.update(len(encoded).to_bytes(8, "big"))
             digest.update(encoded)
     return digest.hexdigest()
@@ -212,6 +213,17 @@ class SqliteConnectionCore(PgConnectionCore):
                     "[DB] This SQLite catalog was written by a NEWER version "
                     f"of the application (schema versions {unknown} are "
                     "unknown here). Refusing to open it.")
+            if applied:
+                # Before any upgrade: the schema must still be exactly what
+                # the last applied migration left. Otherwise a new migration
+                # would record a fingerprint that silently blesses the drift.
+                recorded = applied[max(applied)][2]
+                if recorded != schema_fingerprint(raw):
+                    raise RuntimeError(
+                        "[DB] The SQLite catalog schema does not match the "
+                        "schema this application installed (definition "
+                        "fingerprint drift). Refusing to open it; restore a "
+                        "verified backup.")
             for version, name, path in files:
                 checksum = _file_checksum(path)
                 if version in applied:
@@ -646,6 +658,9 @@ class SqliteConnectionCore(PgConnectionCore):
         when the lock cannot be taken for any reason (fail closed).
         """
         if self._lock_conn is not None:
+            # Already taken by this manager: prove it is still ours rather
+            # than report success for a lock that was lost meanwhile.
+            self.verify_archiver_lock()
             return
         lock = sqlite_lock.ArchiverLock(self._sqlite_path)
         try:
@@ -799,7 +814,51 @@ class SqliteSchemaReports:
             issues.append("schema_migrations has no applied migration")
         elif recorded["schema_fingerprint"] != actual:
             issues.append("SQLite catalog-definition fingerprint drift")
+        issues.extend(self._sqlite_authority_row_issues_conn(conn))
         return issues, actual
+
+    def _sqlite_authority_row_issues_conn(self, conn):
+        """The three schema-authority rows must hold exactly what the first
+        migration recorded when this catalog was created."""
+        first = conn.execute(
+            "SELECT checksum, schema_fingerprint FROM schema_migrations "
+            "WHERE version=1").fetchone()
+        if first is None:
+            return ["schema_migrations has no record of migration 1"]
+        expected = {"migration_checksum": first["checksum"],
+                    "schema_fingerprint": first["schema_fingerprint"][:32]}
+        issues = []
+        if first["checksum"] != self.sqlite_schema_checksum():
+            issues.append("recorded checksum of migration 1 differs from "
+                          "the installed schema file")
+        for table in ("container_format_schema_metadata",
+                      "manifest_directory_catalog_schema_metadata"):
+            if not self._table_exists_conn(conn, table):
+                continue
+            for row in conn.execute(
+                    f"SELECT migration_checksum, schema_fingerprint "
+                    f"FROM {table}").fetchall():
+                for key, value in expected.items():
+                    if row[key] != value:
+                        issues.append(
+                            f"{table}.{key} does not match the recorded "
+                            "schema")
+        if self._table_exists_conn(conn, "container_format_schema_authority"):
+            for row in conn.execute(
+                    "SELECT schema_fingerprint, migration_checksums "
+                    "FROM container_format_schema_authority "
+                    "WHERE authority_version=2").fetchall():
+                if row["schema_fingerprint"] != expected[
+                        "schema_fingerprint"]:
+                    issues.append(
+                        "container_format_schema_authority.schema_fingerprint "
+                        "does not match the recorded schema")
+                if db_backend.as_json(row["migration_checksums"]) != {
+                        "sqlite_001": first["checksum"]}:
+                    issues.append(
+                        "container_format_schema_authority.migration_checksums "
+                        "does not match the recorded schema")
+        return issues
 
     def _container_format_schema_report_conn(self, conn):
         from .pg_containers import (

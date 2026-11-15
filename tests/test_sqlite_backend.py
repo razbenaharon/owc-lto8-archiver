@@ -206,6 +206,101 @@ class AutomaticSchemaTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "fingerprint drift"):
             SqliteDatabaseManager(self.dsn)
 
+    def test_drift_is_refused_before_a_pending_migration_is_applied(self):
+        """An upgrade must not record a fingerprint that blesses a schema
+        somebody changed underneath it."""
+        from src import sqlite_core
+        from src.sqlite_db import SqliteDatabaseManager
+        SqliteDatabaseManager(self.dsn).close()
+        raw = sqlite3.connect(self.path)
+        raw.execute("DROP TRIGGER trg_remote_chunks_packaging_write_once")
+        raw.commit()
+        raw.close()
+        extra = os.path.join(self.tmp, "002_extra.sql")
+        with open(extra, "w", encoding="utf-8") as handle:
+            handle.write("CREATE TABLE upgrade_marker (x INTEGER);\n")
+        files = sqlite_core.migration_files() + [(2, "002_extra.sql", extra)]
+        with mock.patch.object(sqlite_core, "migration_files",
+                               return_value=files):
+            with self.assertRaisesRegex(RuntimeError, "fingerprint drift"):
+                SqliteDatabaseManager(self.dsn)
+        raw = sqlite3.connect(self.path)
+        try:
+            self.assertEqual(raw.execute(
+                "SELECT count(*) FROM schema_migrations").fetchone()[0], 1)
+            self.assertIsNone(raw.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='upgrade_marker'"
+            ).fetchone())
+        finally:
+            raw.close()
+
+    def test_a_pending_migration_upgrades_a_clean_catalog(self):
+        from src import sqlite_core
+        from src.sqlite_db import SqliteDatabaseManager
+        db = SqliteDatabaseManager(self.dsn)
+        db.register_tape("BEFORE_UPGRADE", 1)
+        db.close()
+        extra = os.path.join(self.tmp, "002_extra.sql")
+        with open(extra, "w", encoding="utf-8") as handle:
+            handle.write("CREATE INDEX idx_upgrade_probe "
+                         "ON tapes (status);\n")
+        files = sqlite_core.migration_files() + [(2, "002_extra.sql", extra)]
+        with mock.patch.object(sqlite_core, "migration_files",
+                               return_value=files):
+            db = SqliteDatabaseManager(self.dsn)
+            try:
+                status = db.sqlite_schema_status()
+                self.assertEqual(status["schema_version"], 2)
+                self.assertFalse(status["drift"])
+                self.assertTrue(db.tape_exists("BEFORE_UPGRADE"))
+                self.assertTrue(db.validate_container_format_authority())
+            finally:
+                db.close()
+            SqliteDatabaseManager(self.dsn).close()      # reopens cleanly
+
+    def test_whitespace_inside_a_guard_literal_is_drift(self):
+        from src.sqlite_core import schema_fingerprint
+        SqliteDatabaseManagerPath = self.path
+        from src.sqlite_db import SqliteDatabaseManager
+        SqliteDatabaseManager(self.dsn).close()
+        raw = sqlite3.connect(SqliteDatabaseManagerPath)
+        try:
+            before = schema_fingerprint(raw)
+            raw.execute("CREATE TRIGGER trg_tapes_probe BEFORE DELETE ON "
+                        "tapes BEGIN SELECT RAISE(ABORT, 'a b'); END")
+            one = schema_fingerprint(raw)
+            raw.execute("DROP TRIGGER trg_tapes_probe")
+            raw.execute("CREATE TRIGGER trg_tapes_probe BEFORE DELETE ON "
+                        "tapes BEGIN SELECT RAISE(ABORT, 'a  b'); END")
+            two = schema_fingerprint(raw)
+        finally:
+            raw.close()
+        self.assertEqual(len({before, one, two}), 3)
+
+    def test_a_tampered_authority_row_fails_the_write_gate(self):
+        from src.sqlite_db import SqliteDatabaseManager
+        db = SqliteDatabaseManager(self.dsn)
+        try:
+            self.assertTrue(db.validate_container_format_authority())
+            raw = sqlite3.connect(self.path)
+            try:
+                raw.execute("PRAGMA writable_schema=ON")
+                raw.execute("DROP TRIGGER "
+                            "trg_container_format_schema_authority_v2_immutable")
+                raw.execute("UPDATE container_format_schema_authority "
+                            "SET schema_fingerprint=?", ("f" * 32,))
+                raw.commit()
+            finally:
+                raw.close()
+            report = db.container_format_schema_authority_v2_report()
+            self.assertFalse(report["ready"])
+            self.assertTrue(any("does not match the recorded schema" in issue
+                                for issue in report["issues"]))
+            with self.assertRaises(RuntimeError):
+                db.validate_container_format_authority()
+        finally:
+            db.close()
+
     def test_an_unrelated_table_in_the_file_is_not_drift(self):
         from src.sqlite_db import SqliteDatabaseManager
         SqliteDatabaseManager(self.dsn).close()
@@ -613,6 +708,66 @@ class SqliteBackupTests(unittest.TestCase):
         self.assertIn("FAILED", result.summary())
         with self.assertRaises(RuntimeError):
             result.raise_if_failed()
+
+    def test_two_backups_in_the_same_second_never_share_a_file(self):
+        from src import db_backup
+        fixed = mock.Mock()
+        fixed.now.return_value.strftime.return_value = "20260101_000000"
+        with mock.patch.object(db_backup, "datetime", fixed):
+            first = db_backup.create_database_backup(
+                self.cfg, output_dir=self.out)
+            with self.assertRaisesRegex(RuntimeError,
+                                        "Refusing to overwrite"):
+                db_backup.create_database_backup(
+                    self.cfg, output_dir=self.out)
+        self.assertTrue(db_backup.verify_backup(self.cfg, first).ok)
+        self.assertEqual(
+            [name for name in os.listdir(self.out) if name.endswith(".part")],
+            [])
+
+    def test_a_backup_that_appears_during_the_copy_is_not_overwritten(self):
+        from src import db_backup
+        real_verify = db_backup.verify_sqlite_backup
+        planted = {}
+
+        def verify_and_plant(cfg, path, **kwargs):
+            result = real_verify(cfg, path, **kwargs)
+            if not planted:
+                final = str(path).rsplit(".", 2)[0]
+                with open(final, "wb") as handle:
+                    handle.write(b"someone else's backup")
+                planted["path"] = final
+            return result
+
+        with mock.patch.object(db_backup, "verify_sqlite_backup",
+                               verify_and_plant):
+            with self.assertRaisesRegex(RuntimeError,
+                                        "Refusing to overwrite"):
+                db_backup.create_database_backup(
+                    self.cfg, output_dir=self.out)
+        with open(planted["path"], "rb") as handle:
+            self.assertEqual(handle.read(), b"someone else's backup")
+        self.assertEqual(
+            [name for name in os.listdir(self.out) if name.endswith(".part")],
+            [])
+
+    def test_a_failed_final_verification_is_not_reported_as_success(self):
+        from src import db_backup
+        real_verify = db_backup.verify_sqlite_backup
+        calls = []
+
+        def verify(cfg, path, **kwargs):
+            calls.append(str(path))
+            if len(calls) == 2:
+                with open(path, "r+b") as handle:
+                    handle.seek(os.path.getsize(path) // 2)
+                    handle.write(b"\xff" * 4096)
+            return real_verify(cfg, path, **kwargs)
+
+        with mock.patch.object(db_backup, "verify_sqlite_backup", verify):
+            with self.assertRaisesRegex(RuntimeError, "failed verification"):
+                db_backup.create_database_backup(
+                    self.cfg, output_dir=self.out)
 
     def test_an_empty_file_is_not_a_backup(self):
         from src import db_backup
