@@ -63,6 +63,9 @@ REASON_UNEXPECTED_TAPE_OR_DB_STATE = "unexpected_tape_or_db_state"
 #: written, so no chunk is ambiguous and the staged pack stays reusable.
 REASON_LTFS_OWNERSHIP_UNAVAILABLE = "ltfs_ownership_unavailable"
 REASON_AMBIGUOUS_ACTIVE_SESSIONS = "ambiguous_active_sessions"
+#: The cross-process single-writer lock is no longer provably held (its
+#: PostgreSQL session died). Never retried: another writer may hold it.
+REASON_ARCHIVER_LOCK_LOST = "archiver_lock_lost"
 #: The sealed-batch feature flag was explicitly enabled, but the feature is not
 #: ready (schema not applied, checksum mismatch, or exact schema drift). Startup
 #: refuses BEFORE any worker thread rather than fall back to legacy behaviour

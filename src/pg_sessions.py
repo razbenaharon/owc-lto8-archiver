@@ -1826,6 +1826,14 @@ class PgSessionMixin:
                 )
             return True
 
+        # Audit H6: 'backing' is the instant a physical tape write begins. A
+        # run that took the single-writer lock must still own it at that
+        # instant - PostgreSQL may have restarted since the group started, and
+        # the pool reconnects silently. Raises ArchiverLockLost; never retried.
+        if target == ChunkStatus.BACKING.value and getattr(
+                self, "_archiver_lock_expected", False):
+            self.verify_archiver_lock()
+
         return self._transaction(
             operation, f"chunk {chunk_index + 1} -> {target}")
 

@@ -76,6 +76,16 @@ def _coerce_timestamp_kwargs(kwargs):
     }
 
 
+class ArchiverLockLost(RuntimeError):
+    """The single-writer advisory lock is not provably held any more.
+
+    Raised by :meth:`PgConnectionCore.verify_archiver_lock`. It is a hard
+    safety stop, never a retry: the lock lives on one PostgreSQL session, so
+    once that session is gone another archiver or a tape reset may already
+    hold the lock, and re-acquiring it here would only hide that.
+    """
+
+
 class PgConnectionCore:
     """Pool, retrying transaction runner, schema init and archiver lock."""
 
@@ -88,6 +98,11 @@ class PgConnectionCore:
         require_psycopg()
         self.db_path = conninfo
         self._lock_conn: Optional[Any] = None
+        #: Backend pid of the session that took the archiver lock, and whether
+        #: this process is inside an acquire/release window at all. Both exist
+        #: so a lost lock can be told apart from "never asked for one".
+        self._lock_backend_pid: Optional[int] = None
+        self._archiver_lock_expected = False
         self._pool: Any = pool or make_pool(
             conninfo, min_size=1, max_size=8, row_factory=dict_row)
         try:
@@ -902,10 +917,12 @@ class PgConnectionCore:
         conn = self._pool.getconn()
         try:
             conn.autocommit = True
-            locked = conn.execute(
-                "SELECT pg_try_advisory_lock(%s) AS locked",
+            row = conn.execute(
+                """SELECT pg_try_advisory_lock(%s) AS locked,
+                          pg_backend_pid() AS pid""",
                 (self.ARCHIVER_LOCK_KEY,),
-            ).fetchone()["locked"]
+            ).fetchone()
+            locked = row["locked"]
         except Exception:
             self._pool.putconn(conn)
             raise
@@ -917,10 +934,65 @@ class PgConnectionCore:
                 "a time; finish or close the other instance and retry."
             )
         self._lock_conn = conn
+        self._lock_backend_pid = int(row["pid"])
+        self._archiver_lock_expected = True
+
+    def verify_archiver_lock(self):
+        """Prove THIS process still owns the archiver lock, or raise.
+
+        The lock is a session-level advisory lock on one pinned connection. If
+        PostgreSQL restarts (or that backend is terminated) the lock is gone,
+        while the pool quietly reconnects and every other query keeps working -
+        so nothing else in the application notices. This asks the pinned
+        session itself two questions in one round trip: "are you still the
+        backend that took the lock?" and "does pg_locks show you holding it?".
+
+        Fails CLOSED on every doubt - no pinned connection, a dead connection,
+        a different backend pid, a missing lock row, or any error while asking
+        - by raising :class:`ArchiverLockLost`. It never re-acquires: after a
+        loss another archiver or a tape reset may hold the lock, and only a
+        fresh, explicitly started run may ask for it again.
+
+        PostgreSQL-only by nature (``pg_locks`` / ``pg_backend_pid``); a
+        different backend must supply its own proof behind the same name.
+        """
+        conn = self._lock_conn
+        expected_pid = getattr(self, "_lock_backend_pid", None)
+        if conn is None or expected_pid is None:
+            raise ArchiverLockLost(
+                "[LOCK] The archiver lock is not held by this process. "
+                "Refusing to start a tape write without it.")
+        try:
+            row = conn.execute(
+                """SELECT pg_backend_pid() AS pid, EXISTS (
+                       SELECT 1 FROM pg_locks
+                       WHERE locktype='advisory' AND granted
+                         AND pid=pg_backend_pid()
+                         AND classid=%s AND objid=%s AND objsubid=1
+                   ) AS owned""",
+                (self.ARCHIVER_LOCK_KEY >> 32,
+                 self.ARCHIVER_LOCK_KEY & 0xFFFFFFFF),
+            ).fetchone()
+        except Exception as exc:
+            raise ArchiverLockLost(
+                "[LOCK] The database session holding the archiver lock is "
+                f"gone ({type(exc).__name__}: {exc}). The lock died with it "
+                "and another archiver or a tape reset may now hold it. "
+                "Stopping: this run must not write to tape again.") from exc
+        if row is None or int(row["pid"]) != int(expected_pid)                 or not row["owned"]:
+            raise ArchiverLockLost(
+                "[LOCK] The pinned database session no longer owns the "
+                "archiver lock (expected backend "
+                f"{expected_pid}, got {row['pid'] if row else None}, "
+                f"owned={bool(row['owned']) if row else False}). "
+                "Stopping: this run must not write to tape again.")
+        return True
 
     def release_archiver_lock(self):
         conn = self._lock_conn
         self._lock_conn = None
+        self._lock_backend_pid = None
+        self._archiver_lock_expected = False
         if conn is None:
             return
         try:
