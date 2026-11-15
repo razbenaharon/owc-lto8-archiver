@@ -46,7 +46,7 @@ from PySide6.QtWidgets import (
 )
 
 from .constants import (TAPE_STATUS_ACTIVE, TAPE_STATUS_FULL, tape_is_full,
-                        tape_status_reason_suffix)
+                        tape_status_reason_suffix, tape_usage)
 from .db import _fmt_ts
 from .inspector_repository import InspectorRepository
 
@@ -973,7 +973,7 @@ class ManageWidget(QWidget):
         self.tapes_table = QTableWidget(0, 8)
         self.tapes_table.setHorizontalHeaderLabels([
             "ID", "Volume Label", "Initialized", "Capacity GB",
-            "Used", "Files", "Used %", "Status"])
+            "Used", "Files", "Used % of plan budget", "Status"])
         self.tapes_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.tapes_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         layout.addWidget(self.tapes_table, 1)
@@ -1065,12 +1065,13 @@ class ManageWidget(QWidget):
             used = tape["used_space"] or 0
             cap = tape["total_capacity"] or 0
             full = tape_is_full(tape.get("status"))
-            pct = (used / (cap * 1024 ** 3) * 100) if cap else 0
+            # Percent of the planning budget — shared with the text menu.
+            usage = tape_usage(cap, used)
             values = [
                 tape["tape_id"], label, _fmt_ts(tape["date_formatted"]),
                 cap or "", _fmt_bytes(used),
                 self.db.count_tape_file_records(label),
-                "FULL" if full else f"{pct:.1f}%",
+                "FULL" if full else usage.percent_text,
                 ("FULL" + tape_status_reason_suffix(tape)) if full
                 else TAPE_STATUS_ACTIVE]
             for col, value in enumerate(values):

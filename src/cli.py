@@ -213,6 +213,7 @@ def _print_tapes_table(db):
     if not tapes:
         print("[DB] No tapes registered.")
         return tapes
+    from .constants import tape_usage
     BAR_W = 20
     print(f"\n{'ID':>4}  {'Volume Label':<25}  {'Initialized':<19}  Space")
     print("-" * 80)
@@ -229,13 +230,15 @@ def _print_tapes_table(db):
             # that cannot land.
             space_s = (f"FULL - {used_gb:.1f} GB written"
                        f"{tape_status_reason_suffix(t)}")
-        elif cap_gb:
-            pct     = min(used_gb / cap_gb, 1.0)
-            filled  = round(pct * BAR_W)
-            bar     = '█' * filled + '░' * (BAR_W - filled)
-            space_s = f"[{bar}] {pct*100:.1f}%  {used_gb:.1f}/{cap_gb:.0f} GB"
         else:
-            space_s = f"{used_gb:.1f} GB used  (no capacity set)"
+            # Percent of the planning budget (constants.tape_usage) — the one
+            # figure shared with the GUI and with the planner itself.
+            usage   = tape_usage(cap_gb, used_b)
+            filled  = round(usage.bar_fraction * BAR_W)
+            bar     = '█' * filled + '░' * (BAR_W - filled)
+            space_s = (f"[{bar}] {usage.percent_text}  {used_gb:.1f}/"
+                       f"{usage.budget_bytes / 1000**3:.0f} GB"
+                       f"{'' if cap_gb else '  (no capacity set)'}")
         print(f"{t['tape_id']:>4}  {t['volume_label']:<25}  {date_s:<19}  {space_s}")
     return tapes
 
