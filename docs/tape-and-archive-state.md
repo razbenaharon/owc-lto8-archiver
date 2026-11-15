@@ -86,7 +86,10 @@ verification has **not** completed — see below.
   sweep found it was the **only** copy on the workstation; the tree is
   git-ignored (`LTO_METADATA/`). 145 segments, 241 MiB compressed,
   inventorying 1.34 TiB of source files.
-  Layout: `<Tape_label>/<session>/bundle_<id>.jsonl.zst`, each segment
+  Layout: `<Tape_label>/<session>/bundle_<id>.jsonl.zst` (segments written
+  from 2026-11 on are named `bundle_<id>.export_<export_id>.jsonl.zst`, so a
+  later export can never take an earlier export's file name; an existing
+  segment is never overwritten), each segment
   SHA-256-recorded in `local_manifest_segments`. Verified after the move by
   `scripts/validate_archive_reconciliation.py --heavy`: disk == ledger ==
   aggregates at 4,240,566 rows / 88,770 directories, all six checks PASS.
