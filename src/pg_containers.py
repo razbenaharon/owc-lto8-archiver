@@ -12,7 +12,8 @@ from dataclasses import asdict, is_dataclass
 
 from .pipeline_types import (ArtifactReadiness, ContainerFormat,
                              ContainerValidationState, SourceDisposition)
-from .pg_core import _row, _rows
+from .db_backend import lease_deadline
+from .pg_core import _now_utc, _row, _rows
 from .session_reconcile import classify_session37_format_boundary_category
 from .stored_tar_planning import (build_stored_tar_chunk_plan,
                                   StoredTarChunkPlan,
@@ -2115,13 +2116,14 @@ class PgContainerMixin:
                 """UPDATE archive_containers
                    SET validation_state='building', owner_token=%s,
                        validated_part_locator=%s,
-                       lease_expires_at=now()+(%s * interval '1 second'),
+                       lease_expires_at=%s,
                        validation_started_at=COALESCE(validation_started_at, now()),
                        updated_at=now()
                    WHERE container_id=%s AND validation_state='planned'
                      AND owner_token IS NULL
                    RETURNING *""",
-                (token, part, lease_seconds, int(container_id)),
+                (token, part, lease_deadline(_now_utc(), lease_seconds),
+                 int(container_id)),
             ).fetchone()
             if row is None:
                 raise RuntimeError("Stored TAR build claim lost its owner race")
@@ -2257,14 +2259,15 @@ class PgContainerMixin:
             row = conn.execute(
                 """UPDATE archive_containers
                    SET owner_token=%s,
-                       lease_expires_at=now()+(3600 * interval '1 second'),
+                       lease_expires_at=%s,
                        updated_at=now()
                    WHERE container_id=%s AND owner_token=%s
                      AND validation_state=%s
                      AND writer_state='not_started'
                      AND catalog_state='not_started'
                    RETURNING *""",
-                (new, int(container_id), old, state),
+                (new, lease_deadline(_now_utc(), 3600), int(container_id),
+                 old, state),
             ).fetchone()
             if row is None:
                 raise RuntimeError(

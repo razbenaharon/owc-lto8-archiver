@@ -98,6 +98,12 @@ def day_bounds(value):
     return day, day + timedelta(days=1)
 
 
+def lease_deadline(now, lease_seconds):
+    """``now`` plus a lease length, computed in Python (the portable form of
+    ``%s + make_interval(secs => %s)``)."""
+    return now + timedelta(seconds=float(lease_seconds))
+
+
 def as_timestamp(value):
     """An aware UTC ``datetime`` (or None) from a typed column value OR from
     the text SQLite returns for an expression such as ``MAX(ts)``."""

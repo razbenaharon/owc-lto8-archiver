@@ -5,6 +5,7 @@ import os
 from .cli_errors import OperationalError
 from .logsetup import get_logger
 from .pipeline_types import ChunkStatus
+from .db_backend import lease_deadline
 from .pg_core import (_coerce_timestamp_kwargs, _now_utc, _row, _rows,
                       _valid_columns)
 
@@ -1861,13 +1862,13 @@ class PgSessionMixin:
             cur = conn.execute(
                 """UPDATE remote_chunks
                    SET status='fetching', owner_token=%s, attempt_id=%s,
-                       lease_expires_at=%s + make_interval(secs => %s),
+                       lease_expires_at=%s,
                        updated_at=%s
                    WHERE session_id=%s AND chunk_index=%s
                      AND status IN ('pending','fetch_failed','backup_failed')
                      AND (owner_token IS NULL OR lease_expires_at < %s)""",
-                (owner_token, attempt_id, now, float(lease_seconds), now,
-                 session_id, int(chunk_index), now),
+                (owner_token, attempt_id, lease_deadline(now, lease_seconds),
+                 now, session_id, int(chunk_index), now),
             )
             return cur.rowcount == 1
 
@@ -1882,12 +1883,12 @@ class PgSessionMixin:
         def operation(conn):
             cur = conn.execute(
                 """UPDATE remote_chunks
-                   SET lease_expires_at=%s + make_interval(secs => %s),
+                   SET lease_expires_at=%s,
                        updated_at=%s
                    WHERE session_id=%s AND chunk_index=%s AND owner_token=%s
                      AND status <> 'backing'""",
-                (now, float(lease_seconds), now, session_id, int(chunk_index),
-                 owner_token),
+                (lease_deadline(now, lease_seconds), now, session_id,
+                 int(chunk_index), owner_token),
             )
             return cur.rowcount == 1
 
