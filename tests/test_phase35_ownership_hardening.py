@@ -205,22 +205,45 @@ class OwnershipIdentityTests(unittest.TestCase):
                         side_effect=AssertionError("subprocess used")):
             self.assertTrue(own.default_mutex_name())
 
-    def test_production_config_declares_the_id(self):
-        """Operator-machine check: a real config.ini must declare the id.
+    def test_the_id_is_read_from_the_hardware_section_of_config(self):
+        """Hermetic: a temp project root stands in for the repo root.
 
-        config.ini is untracked by design, so this asserts nothing on a
-        clean clone or in CI. The identity *logic* is covered hermetically
-        by the tests above; this one only catches a locally misconfigured
-        drive.
+        This used to read the operator's untracked config.ini and skip when it
+        was absent, so it proved nothing on a clean clone and could fail on a
+        host for reasons unrelated to the code.
         """
-        import configparser
-        config_path = os.path.join(PROJECT_ROOT, "config.ini")
-        if not os.path.exists(config_path):
-            self.skipTest("no local config.ini (expected on a clean clone/CI)")
-        parser = configparser.ConfigParser()
-        parser.read(config_path, encoding="utf-8")
-        value = parser.get("HARDWARE", "ltfs_ownership_id", fallback="")
-        self.assertEqual(own.validate_ownership_id(value), value.strip())
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "config.ini")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("[HARDWARE]\n"
+                         "ltfs_ownership_id =  drive_TESTONLY_01  \n"
+                         "ltfs_writer_lock_timeout_seconds = 7\n")
+            with mock.patch.object(own, "PROJECT_ROOT", root):
+                value = own.configured_ownership_id()
+                self.assertEqual(value, "drive_TESTONLY_01")
+                self.assertEqual(own.validate_ownership_id(value), value)
+                self.assertEqual(own.default_mutex_name(),
+                                 "OWC_LTO8_LTFS_OWNERSHIP_drive_TESTONLY_01")
+                self.assertEqual(own.writer_timeout_seconds(), 7)
+
+    def test_a_config_without_the_id_fails_closed(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            for body in (None, "[HARDWARE]\nlto_drive = X:\\\n",
+                         "[HARDWARE]\nltfs_ownership_id =\n",
+                         "not an ini file at all\n"):
+                path = os.path.join(root, "config.ini")
+                if body is None:
+                    self.assertFalse(os.path.exists(path))
+                else:
+                    with open(path, "w", encoding="utf-8") as fh:
+                        fh.write(body)
+                with mock.patch.object(own, "PROJECT_ROOT", root):
+                    self.assertEqual(own.configured_ownership_id(), "")
+                    with self.assertRaises(LtfsOwnershipError) as ctx:
+                        own.default_mutex_name()
+                self.assertEqual(ctx.exception.kind, own.FAILURE_BAD_IDENTITY)
 
     def test_example_config_documents_the_id(self):
         with open(os.path.join(PROJECT_ROOT, "config.example.ini"),

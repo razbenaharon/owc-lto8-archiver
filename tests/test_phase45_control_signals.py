@@ -205,14 +205,13 @@ class DeadPressureConfigRemovedTests(unittest.TestCase):
     def test_example_config_documents_no_ratio_keys(self):
         import os
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        for name in ("config.example.ini", "config.ini"):
-            path = os.path.join(root, name)
-            if not os.path.exists(path):
-                continue
-            with open(path, encoding="utf-8") as fh:
-                body = fh.read()
-            self.assertNotIn("staging_pressure_high_ratio", body)
-            self.assertNotIn("staging_pressure_low_ratio", body)
+        # The tracked example only: the operator's untracked config.ini is
+        # not part of the repository and must not decide a test result.
+        path = os.path.join(root, "config.example.ini")
+        with open(path, encoding="utf-8") as fh:
+            body = fh.read()
+        self.assertNotIn("staging_pressure_high_ratio", body)
+        self.assertNotIn("staging_pressure_low_ratio", body)
 
     def test_need_based_decision_is_the_only_model(self):
         # The decision depends only on resident/need/staging_max — no ratios.
