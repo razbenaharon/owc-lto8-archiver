@@ -5,15 +5,6 @@ import posixpath
 import unicodedata
 
 
-def _safe_log_token(value, default='item'):
-    text = str(value or '').strip()
-    if text:
-        text = os.path.basename(os.path.normpath(text))
-    text = re.sub(r'[^A-Za-z0-9._-]+', '_', text or default)
-    text = text.strip('._-')
-    return (text or default)[:80]
-
-
 def _clean_config_path(value):
     """Return a filesystem path from config text, tolerating optional quotes."""
     value = (value or '').strip()

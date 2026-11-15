@@ -838,6 +838,12 @@ def validate_backup_local_path(
             "[DB BACKUP] Backup artifact path is not an absolute local path")
 
     lto_text = str(getattr(cfg, "lto_drive", "") or "").strip()
+    if getattr(cfg, "lto_drive_configured", None) is False:
+        # No tape drive is configured at all. ``cfg.lto_drive`` would still
+        # hand back "." (a blank value, normalised) or a default letter, and
+        # comparing against that refused every backup on the program's own
+        # drive. Whenever a drive IS configured the refusal below stands.
+        lto_text = ""
     if lto_text:
         lto_absolute = os.path.abspath(lto_text)
         if (lto_absolute.startswith(("\\\\", "//"))

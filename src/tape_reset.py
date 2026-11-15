@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import db_backend
-from .constants import DEFAULT_TAPE_CAPACITY_GB, LTFS_DIR, PROJECT_ROOT
+from .constants import LTFS_DIR, PROJECT_ROOT
 from .ltfs import get_volume_label
 from .runtime import _acquire_tape_io_lock, _release_tape_io_lock
 from .windows_update_guard import ltfs_current_mount_status

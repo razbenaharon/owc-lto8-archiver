@@ -1,4 +1,4 @@
-"""PySide6 lazy PostgreSQL archive inspector."""
+"""PySide6 lazy archive-catalog inspector (SQLite or PostgreSQL)."""
 import os
 import sys
 

@@ -100,7 +100,12 @@ class PgConnectionCore:
     #: which :class:`src.sqlite_core.SqliteConnectionCore` overrides.
     BACKEND = db_backend.BACKEND_POSTGRESQL
 
-    def __init__(self, conninfo, *, init_schema=True, pool=None):
+    def __init__(self, conninfo, *, init_schema=True, pool=None,
+                 complete_fresh_schema=False):
+        """``complete_fresh_schema=True`` (the application's own start-up,
+        :func:`src.db.create_database_manager`) also installs the explicit
+        migrations when - and only when - the database held no catalog at all
+        before this start-up. See :meth:`_complete_fresh_schema`."""
         self._require_driver()
         self.db_path = conninfo
         self._lock_conn: Optional[Any] = None
@@ -109,14 +114,155 @@ class PgConnectionCore:
         #: so a lost lock can be told apart from "never asked for one".
         self._lock_backend_pid: Optional[int] = None
         self._archiver_lock_expected = False
+        #: Migration files this start-up installed because the database was
+        #: empty; ``()`` for every existing catalog.
+        self.fresh_schema_installed: tuple = ()
         self._pool: Any = pool or self._open_pool(conninfo)
         try:
-            if init_schema:
+            if init_schema and complete_fresh_schema:
+                self._init_schema_completing_a_fresh_database()
+            elif init_schema:
                 self._init_schema()
                 self._ensure_runtime_constraints()
         except Exception:
             self.close()
             raise
+
+    #: Session advisory lock serialising the fresh-database installation, so
+    #: two programs started together on one empty database cannot both decide
+    #: "empty" and migrate at once. Unrelated to the archiver lock.
+    FRESH_INSTALL_LOCK_KEY = 0x4C544F46         # "LTOF"
+    #: Exists only while a fresh-database installation is in progress. Left
+    #: behind by a crash, it lets the next start-up finish the job.
+    FRESH_INSTALL_MARKER = "lto_fresh_schema_install"
+
+    def _init_schema_completing_a_fresh_database(self):
+        """Start-up schema, plus the explicit migrations on an EMPTY database.
+
+        The explicit route (``inspect_db.py --apply-*-schema``) protects data:
+        every command demands a verified ``pg_dump`` backup first. A database
+        that holds no catalog has nothing to protect, and without those
+        migrations it cannot take a packed archive at all.
+
+        "Empty" is decided before anything is created and is deliberately
+        strict - see :meth:`_fresh_install_state`. Every other database is
+        opened exactly as before: explicit migrations stay explicit.
+        """
+        with self._pool.connection() as guard:
+            guard.execute("SELECT pg_advisory_lock(%s)",
+                          (self.FRESH_INSTALL_LOCK_KEY,))
+            guard.rollback()
+            try:
+                state = self._fresh_install_state()
+                if state == "empty":
+                    with self._pool.connection() as conn:
+                        conn.execute(
+                            f"CREATE TABLE {self.FRESH_INSTALL_MARKER} ("
+                            "started_at TIMESTAMPTZ NOT NULL DEFAULT now())")
+                        conn.commit()
+                self._init_schema()
+                self._ensure_runtime_constraints()
+                if state != "existing":
+                    self._complete_fresh_schema(resumed=state == "interrupted")
+            finally:
+                try:
+                    guard.execute("SELECT pg_advisory_unlock(%s)",
+                                  (self.FRESH_INSTALL_LOCK_KEY,))
+                    guard.rollback()
+                except Exception:
+                    pass        # closing the connection releases it anyway
+
+    def _fresh_install_state(self):
+        """``'empty'``, ``'interrupted'`` or ``'existing'``.
+
+        * ``empty`` - the current schema has no table or view at all. One
+          pre-existing relation, a catalog table from any version or anything
+          else, makes the database ``existing``.
+        * ``interrupted`` - an earlier fresh installation left its marker and
+          the catalog still records nothing (no tape, file or session).
+        * ``existing`` - everything else, including a marked database that
+          has since been used: it is never migrated implicitly.
+        """
+        with self._pool.connection() as conn:
+            try:
+                relations = {row["relname"] for row in conn.execute(
+                    """SELECT c.relname
+                       FROM pg_class c
+                       JOIN pg_namespace n ON n.oid = c.relnamespace
+                       WHERE n.nspname = current_schema()
+                         AND c.relkind IN ('r', 'p', 'v', 'm')""").fetchall()}
+                if not relations:
+                    return "empty"
+                if self.FRESH_INSTALL_MARKER not in relations:
+                    return "existing"
+                for table in ("tapes", "files_index", "remote_sessions"):
+                    if table in relations and conn.execute(
+                            f"SELECT 1 FROM {table} LIMIT 1").fetchone():
+                        return "existing"
+                return "interrupted"
+            finally:
+                conn.rollback()
+
+    def _complete_fresh_schema(self, resumed=False):
+        """Install whichever explicit migrations are still missing, in the
+        order of the explicit commands: 007, 014 + finalize, 015, 016 + 017,
+        018, 019. Each step is skipped when its own report says it is
+        installed, so an interrupted installation simply continues."""
+        steps = (
+            ("007", self.directory_catalog_schema_installed,
+             self.apply_directory_catalog_schema),
+            ("014 + finalize", self.incremental_scan_schema_finalized,
+             lambda: self.apply_incremental_scan_schema(finalize=True)),
+            # Not the migration-015 report: its fingerprint stops matching
+            # once 016/017 extend the same tables, so it reads "not ready" on
+            # a complete schema. 015 is atomic; its table is the evidence.
+            ("015",
+             lambda: self._run_read(
+                 lambda conn: self._table_exists_conn(
+                     conn, "archive_containers"),
+                 "container format schema presence"),
+             self.apply_container_format_schema),
+            ("016 + 017",
+             lambda: self.stored_tar_plan_schema_report()[
+                 "installation_state"] == "installed",
+             self.apply_stored_tar_plan_schema),
+            ("018",
+             lambda: self.manifest_directory_catalog_schema_report()[
+                 "installation_state"] == "installed",
+             self.apply_manifest_directory_catalog_schema),
+            ("019",
+             lambda: self.container_format_schema_authority_v2_report()[
+                 "installed"],
+             self.apply_container_format_schema_authority_v2),
+        )
+        installed = []
+        for name, is_installed, apply in steps:
+            try:
+                if is_installed():
+                    continue
+                apply()
+            except Exception as exc:
+                raise RuntimeError(
+                    "[DB] This PostgreSQL database was empty, and installing "
+                    f"the complete catalog schema stopped at migration {name} "
+                    f"(installed in this run: {', '.join(installed) or 'none'}"
+                    f"): {exc}\n[DB] Nothing was archived. Fix the cause and "
+                    "start the program again: the installation continues "
+                    "where it stopped.") from exc
+            installed.append(name)
+        with self._pool.connection() as conn:
+            conn.execute(f"DROP TABLE IF EXISTS {self.FRESH_INSTALL_MARKER}")
+            conn.commit()
+        self.fresh_schema_installed = tuple(installed)
+        message = (
+            "[DB] New, empty PostgreSQL database: "
+            + ("finished installing" if resumed else "installed")
+            + " the complete catalog schema (migrations "
+            + (", ".join(installed) or "none were missing") + ").")
+        from .logsetup import get_logger
+        get_logger().info("fresh_postgresql_schema_installed: resumed=%s "
+                          "migrations=%s", resumed, ", ".join(installed))
+        print(message)
 
     # ------------------------------------------------------------------
     # Backend hooks (PostgreSQL implementations)

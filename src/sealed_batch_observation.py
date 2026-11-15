@@ -24,7 +24,7 @@ import os
 import queue
 import threading
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from typing import Optional, Tuple

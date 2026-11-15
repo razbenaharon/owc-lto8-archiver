@@ -1416,37 +1416,105 @@ class PgSessionMixin:
         and validated locally. The terminal manifest stays on local disk and in
         the database-backup procedure; it is never written to tape after the
         data write.
+
+        A ready terminal artifact and the aggregates that point at it are
+        immutable (migration 018). Recording the SAME artifact and aggregates
+        again - a retry after an ambiguous commit - is therefore a no-op that
+        returns the existing artifact id; anything different is refused here,
+        before a statement the schema guards would reject.
         """
         if not terminal_locator or str(terminal_locator).endswith(".part"):
             raise RuntimeError(
                 "[DB] a terminal manifest locator must name a ready artifact")
         now = _now_utc()
         counts = dict(disposition_counts or {})
+        final_columns = (
+            "final_archived_count", "final_source_missing_count",
+            "final_source_permission_denied_count",
+            "final_source_unreadable_count", "final_source_changed_count",
+            "final_unresolved_count", "final_archived_bytes")
+        finals = (
+            int(counts.get("archived", 0)),
+            int(counts.get("source_missing", 0)),
+            int(counts.get("source_permission_denied", 0)),
+            int(counts.get("source_unreadable", 0)),
+            int(counts.get("source_changed", 0)),
+            int(counts.get("unresolved", 0)),
+            int(archived_bytes or 0))
+
+        def refuse(detail):
+            return RuntimeError(
+                f"[DB] chunk {int(chunk_index)} of session {session_id} "
+                f"already has a ready terminal manifest with {detail}; "
+                "refusing to overwrite terminal state")
 
         def operation(conn):
             if not self._column_exists_conn(conn, "remote_chunks",
                                             "final_archived_count"):
                 raise RuntimeError(
                     "[DB] terminal state requires migration 018")
-            artifact_id = conn.execute(
-                """INSERT INTO archive_artifacts
-                       (session_id, chunk_index, artifact_kind,
-                        artifact_version, local_locator, artifact_size_bytes,
-                        readiness_state, published_at, created_at, updated_at)
-                   VALUES (%s,%s,'terminal_manifest','terminal-state-v1',%s,%s,
-                           'ready',%s,%s,%s)
-                   ON CONFLICT (session_id, chunk_index, artifact_kind,
-                                artifact_version)
-                   DO UPDATE SET local_locator=EXCLUDED.local_locator,
-                                 artifact_size_bytes=
-                                     EXCLUDED.artifact_size_bytes,
-                                 readiness_state='ready',
-                                 published_at=EXCLUDED.published_at,
-                                 updated_at=EXCLUDED.updated_at
-                   RETURNING artifact_id""",
-                (session_id, int(chunk_index), str(terminal_locator),
-                 artifact_size_bytes, now, now, now),
-            ).fetchone()["artifact_id"]
+            chunk = conn.execute(
+                """SELECT terminal_manifest_artifact_id, final_archived_count,
+                          final_source_missing_count,
+                          final_source_permission_denied_count,
+                          final_source_unreadable_count,
+                          final_source_changed_count, final_unresolved_count,
+                          final_archived_bytes
+                   FROM remote_chunks
+                   WHERE session_id=%s AND chunk_index=%s FOR UPDATE""",
+                (session_id, int(chunk_index)),
+            ).fetchone()
+            if chunk is None:
+                raise RuntimeError(
+                    f"[DB] Remote chunk not found: session {session_id}, "
+                    f"chunk {int(chunk_index)}")
+            existing = conn.execute(
+                """SELECT artifact_id, local_locator, artifact_size_bytes,
+                          readiness_state
+                   FROM archive_artifacts
+                   WHERE session_id=%s AND chunk_index=%s
+                     AND artifact_kind='terminal_manifest'
+                     AND artifact_version='terminal-state-v1'
+                     AND container_id IS NULL""",
+                (session_id, int(chunk_index)),
+            ).fetchone()
+
+            if existing is not None and existing["readiness_state"] == "ready":
+                if (existing["local_locator"] != str(terminal_locator)
+                        or existing["artifact_size_bytes"]
+                        != artifact_size_bytes):
+                    raise refuse("a different artifact")
+                artifact_id = existing["artifact_id"]
+                if chunk["terminal_manifest_artifact_id"] is not None:
+                    recorded = tuple(chunk[name] for name in final_columns)
+                    if (chunk["terminal_manifest_artifact_id"] != artifact_id
+                            or recorded != finals):
+                        raise refuse("different final dispositions")
+                    return artifact_id
+            else:
+                # The unique index is partial (WHERE container_id IS NULL), so
+                # the conflict target must repeat its predicate.
+                artifact_id = conn.execute(
+                    """INSERT INTO archive_artifacts
+                           (session_id, chunk_index, artifact_kind,
+                            artifact_version, local_locator,
+                            artifact_size_bytes, readiness_state, published_at,
+                            created_at, updated_at)
+                       VALUES (%s,%s,'terminal_manifest','terminal-state-v1',
+                               %s,%s,'ready',%s,%s,%s)
+                       ON CONFLICT (session_id, chunk_index, artifact_kind,
+                                    artifact_version)
+                           WHERE container_id IS NULL
+                       DO UPDATE SET local_locator=EXCLUDED.local_locator,
+                                     artifact_size_bytes=
+                                         EXCLUDED.artifact_size_bytes,
+                                     readiness_state='ready',
+                                     published_at=EXCLUDED.published_at,
+                                     updated_at=EXCLUDED.updated_at
+                       RETURNING artifact_id""",
+                    (session_id, int(chunk_index), str(terminal_locator),
+                     artifact_size_bytes, now, now, now),
+                ).fetchone()["artifact_id"]
 
             conn.execute(
                 """UPDATE remote_chunks
@@ -1460,15 +1528,7 @@ class PgSessionMixin:
                        final_archived_bytes=%s,
                        updated_at=%s
                    WHERE session_id=%s AND chunk_index=%s""",
-                (artifact_id,
-                 int(counts.get("archived", 0)),
-                 int(counts.get("source_missing", 0)),
-                 int(counts.get("source_permission_denied", 0)),
-                 int(counts.get("source_unreadable", 0)),
-                 int(counts.get("source_changed", 0)),
-                 int(counts.get("unresolved", 0)),
-                 int(archived_bytes or 0), now,
-                 session_id, int(chunk_index)),
+                (artifact_id, *finals, now, session_id, int(chunk_index)),
             )
             return artifact_id
 
@@ -1729,8 +1789,7 @@ class PgSessionMixin:
         :class:`~src.pipeline_types.ForbiddenTransition` for a transition the
         matrix does not allow — the old state is preserved either way.
         """
-        from .pipeline_types import (ChunkStatus, ForbiddenTransition,
-                                     assert_chunk_transition)
+        from .pipeline_types import ChunkStatus, assert_chunk_transition
 
         target = ChunkStatus(to_status).value
         if expected_from is None:

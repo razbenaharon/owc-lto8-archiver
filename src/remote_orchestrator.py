@@ -101,66 +101,45 @@ Data boundaries (unchanged by Plan 1)
 (Robocopy + catalog sync), ``src.pg_catalog.PgCatalogMixin`` (file/directory
 rows), ``src.retriever.LTORetriever`` (ZIP/loose restore).
 """
-import gc
-import json
 import os
-import random
 import time
-import queue
 import shutil
 import threading
 import posixpath
-import uuid
 from datetime import datetime, timezone
-from collections import defaultdict
 from typing import Optional
 
 from .backup import LTOBackup, _NoEjectBackup
 from .constants import (DEFAULT_TAPE_CAPACITY_GB, LOCAL_STAGING_RESERVE_BYTES,
                         LTFS_WRITE_WARNING, tape_budget_bytes, tape_is_full,
                         tape_status_reason_suffix)
-from .db import _apply_canonical_remote_paths
 from .exit_codes import (
     ExitCode, StopResult,
     REASON_NETWORK_RETRY_EXHAUSTED, REASON_SCCM_REBOOT_PENDING,
     REASON_WINDOWS_REBOOT_PENDING, REASON_STOPPED_AT_CHUNK_BOUNDARY,
-    REASON_TAPE_WRITE_FAILED,
     REASON_AMBIGUOUS_BACKING_CHUNK, REASON_LTFS_SYNC_MODE_NOT_TIME5,
     REASON_LTFS_MEDIA_DEGRADED,
     REASON_LTFS_MOUNT_UNVERIFIABLE, REASON_UNEXPECTED_TAPE_OR_DB_STATE,
     REASON_LTFS_OWNERSHIP_UNAVAILABLE,
     REASON_SEALED_BATCH_FEATURE_UNAVAILABLE, REASON_SCAN_FRONTIER_UNAVAILABLE,
-    REASON_AMBIGUOUS_ACTIVE_SESSIONS, REASON_SSH_AUTHENTICATION_FAILED,
-    REASON_SSH_PERMISSION_DENIED, REASON_SSH_HOST_KEY_MISMATCH,
-    REASON_MISSING_NONINTERACTIVE_CREDENTIAL, REASON_BAD_CONFIG,
+    REASON_AMBIGUOUS_ACTIVE_SESSIONS, REASON_BAD_CONFIG,
     REASON_NO_ACTIVE_SESSION, REASON_NONINTERACTIVE_REQUIRES_RESUME,
-    REASON_USER_REQUESTED_STOP, REASON_COMPLETED,
-    CLASS_DNS_RESOLUTION_FAILURE, CLASS_CONNECTION_TIMEOUT,
-    CLASS_CONNECTION_RESET, CLASS_CONNECTION_REFUSED,
-    CLASS_NETWORK_UNREACHABLE, CLASS_TEMPORARY_TRANSPORT_FAILURE)
+    REASON_USER_REQUESTED_STOP, REASON_COMPLETED)
 from .logsetup import get_logger
 from .status_file import write_status, write_last_failure
 from .windows_update_guard import (RebootSentinel, assess_reboot_state,
                                    ltfs_current_mount_status,
                                    ltfs_media_health,
                                    ltfs_sync_mode_status,
-                                   pending_reboot_reasons,
-                                   reboot_block_reasons)
+                                   pending_reboot_reasons)
 from .ltfs import (_ensure_lto_drive_ready, get_volume_label,
                    note_device_state_change)
-from .ltfs_ownership import (LtfsOwnershipError, OWNERSHIP,
-                             writer_timeout_seconds)
-from .packer import LTOPacker
-from .paths import (_LEGACY_PATH_LIMIT, _dir_tree_size,
-                    _disambiguate_local_rel, _exceeds_legacy_path_limit,
-                    _long, _remote_fetch_base_and_rel,
-                    _reserved_name_component, _volume_cluster_size,
-                    _winsafe_extracted_rel)
+from .ltfs_ownership import LtfsOwnershipError, OWNERSHIP
+from .paths import _volume_cluster_size
 from .pipeline_types import ScanMetrics, StagedChunk, StreamState
 from .pg_containers import stored_tar_reader_contract_version
 from .ready_queue import ReadyQueue
 from .remote_pipeline import RemotePipelineCoordinator
-from .ram_telemetry import RamStageSampler
 from .remote_transport import _remote_tar_fetch
 from .resource_governor import ResourceGovernor
 from .reporting import _write_source_missing_only_log
@@ -170,10 +149,10 @@ from .planning import StreamingChunkBuilder
 from .scan_frontier import (FrontierScanCoordinator,
                             build_frontier_scanner_factory,
                             incremental_scan_schema_ready)
-from .runtime import (CANCEL, _acquire_tape_io_lock, _fmt_eta, _phase,
-                      _priority_class, _progress_done, _progress_line,
-                      _release_tape_io_lock, _status, compute_affinity_sets,
-                      pin_current_process, unpin_current_process)
+from .runtime import (CANCEL, _acquire_tape_io_lock, _phase,
+                      _priority_class, _release_tape_io_lock, _status,
+                      compute_affinity_sets, pin_current_process,
+                      unpin_current_process)
 from .skipped import SkippedFileTracker
 from .telegram_notify import TelegramNotifier, send_best_effort
 from .ui import ConsoleUI

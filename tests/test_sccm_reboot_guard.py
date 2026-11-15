@@ -338,7 +338,7 @@ class PendingRebootSignalRegistryTests(unittest.TestCase):
     def test_computer_rename_mismatch_is_critical(self):
         k, v = self._with_registry(values={
             (wug._COMPUTERNAME_ACTIVE, "ComputerName"): "EXAMPLE-HOST",
-            (wug._COMPUTERNAME_PENDING, "ComputerName"): "LAB-HPLB-10",
+            (wug._COMPUTERNAME_PENDING, "ComputerName"): "EXAMPLE-HOST-RENAMED",
         })
         with k, v:
             signals = wug.pending_reboot_signals()

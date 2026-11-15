@@ -3,7 +3,7 @@
 The classification rules are pure and tested without a database. The guard
 behaviour that actually protects a live archiver is tested end to end against a
 throwaway PostgreSQL database, skipped automatically when no server is
-reachable (same convention as ``test_pg_integration``).
+reachable (same convention as ``test_db_integration``).
 """
 from datetime import datetime, timedelta, timezone
 import io

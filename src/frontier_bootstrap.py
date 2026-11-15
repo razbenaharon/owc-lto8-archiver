@@ -34,8 +34,6 @@ chunk, never changes the chunk format, and never touches LTFS.
 A failed bootstrap leaves coverage non-final and must be retried or reconciled;
 it never makes a legacy scanner available to production.
 """
-import os
-
 from .logsetup import get_logger
 from .pipeline_types import ChunkStatus
 from .scan_frontier import (DirectoryFrontierCoordinator, canonicalize_scopes,

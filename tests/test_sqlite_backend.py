@@ -709,6 +709,60 @@ class SqliteBackupTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             result.raise_if_failed()
 
+    def _real_config(self, hardware_lines):
+        """A real ConfigManager on this catalog, loaded from a temp file."""
+        from src.config import ConfigManager
+        path = os.path.join(self.out, "config.ini")
+        lines = ["[DATABASE]", "backend = sqlite",
+                 "sqlite_path = " + self.tdb.path, "[HARDWARE]"]
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines + list(hardware_lines)) + "\n")
+        with mock.patch("src.config._load_env_file", return_value={}):
+            return ConfigManager(config_path=path)
+
+    def _backup_from_inside(self, cfg):
+        """Back up while the working directory is on the backup's own drive:
+        a blank ``lto_drive`` normalises to "." and used to be compared as
+        "the tape is on the current drive"."""
+        from src import db_backup
+        previous = os.getcwd()
+        os.chdir(self.out)
+        try:
+            return db_backup.create_database_backup(
+                cfg, output_dir=os.path.join(self.out, "backups"))
+        finally:
+            os.chdir(previous)
+
+    def test_a_blank_tape_drive_does_not_block_a_backup(self):
+        from src import db_backup
+        cfg = self._real_config(["lto_drive ="])
+        self.assertFalse(cfg.lto_drive_configured)
+        path = self._backup_from_inside(cfg)
+        self.assertTrue(os.path.isfile(path))
+        self.assertTrue(db_backup.verify_backup(cfg, path).ok)
+
+    def test_an_absent_tape_drive_setting_does_not_block_a_backup(self):
+        cfg = self._real_config([])
+        self.assertFalse(cfg.lto_drive_configured)
+        # The accessor still falls back to a default letter; point the
+        # question at this very drive to prove the guard no longer asks it.
+        drive = os.path.splitdrive(os.path.abspath(self.out))[0] + os.sep
+        with mock.patch.object(type(cfg), "lto_drive",
+                               new_callable=mock.PropertyMock,
+                               return_value=drive):
+            path = self._backup_from_inside(cfg)
+        self.assertTrue(os.path.isfile(path))
+
+    def test_a_configured_tape_drive_still_refuses_a_backup_on_it(self):
+        drive = os.path.splitdrive(os.path.abspath(self.out))[0] + os.sep
+        for value in (drive, '"' + drive + '"'):
+            with self.subTest(lto_drive=value):
+                cfg = self._real_config(["lto_drive = " + value])
+                self.assertTrue(cfg.lto_drive_configured)
+                with self.assertRaisesRegex(RuntimeError, "LTFS drive"):
+                    self._backup_from_inside(cfg)
+        self.assertFalse(os.path.exists(os.path.join(self.out, "backups")))
+
     def test_two_backups_in_the_same_second_never_share_a_file(self):
         from src import db_backup
         fixed = mock.Mock()

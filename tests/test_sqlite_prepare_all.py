@@ -56,6 +56,11 @@ POSTGRESQL_ONLY_FUNCTIONS = {
         "_init_schema", "_ensure_runtime_constraints",
         "apply_directory_catalog_schema", "apply_incremental_scan_schema",
         "apply_on",
+        # completing an EMPTY PostgreSQL database at start-up; reached only
+        # through PgDatabaseManager(complete_fresh_schema=True), which the
+        # SQLite core never passes (SQLite installs everything at creation)
+        "_init_schema_completing_a_fresh_database", "_fresh_install_state",
+        "_complete_fresh_schema",
         # hooks overridden by SqliteConnectionCore
         "_set_local_setting_conn", "_index_exists_conn", "_view_exists_conn",
         "_constraint_exists_conn", "_create_stage_table_conn",
@@ -86,22 +91,12 @@ POSTGRESQL_ONLY_FUNCTIONS = {
 }
 
 
-#: Statements that are wrong on BOTH backends today (each verified to fail
-#: on PostgreSQL 17 with the error quoted). They are pre-existing defects in
-#: code paths that are not live, are NOT caused by the SQLite backend, and
-#: are deliberately left unfixed here so PostgreSQL behaviour does not change
-#: under this work. The test fails when one of them starts preparing, so an
-#: entry cannot outlive its defect.
-KNOWN_DEFECTS_ON_BOTH_BACKENDS = {
-    ("pg_catalog.py", "_derive_bundle_base_path"):
-        "PostgreSQL: UndefinedColumn 'root_path' - remote_scan_scopes has "
-        "source_root, not root_path (src/schema_audit.py names the same "
-        "column mismatch)",
-    ("pg_sessions.py", "record_terminal_manifest"):
-        "PostgreSQL: 'no unique or exclusion constraint matching the ON "
-        "CONFLICT specification' - the unique index is partial (WHERE "
-        "container_id IS NULL) and the statement gives no index predicate",
-}
+#: Statements that are wrong on BOTH backends: ``(module, function) -> the
+#: PostgreSQL error``. Empty since the two original entries were fixed
+#: (tests/test_catalog_defect_regressions.py). An entry must quote the error
+#: a real PostgreSQL gives; the test fails when a listed statement starts
+#: preparing, so an entry cannot outlive its defect.
+KNOWN_DEFECTS_ON_BOTH_BACKENDS = {}
 
 #: Tables named only inside a table-exists guard for a pre-PostgreSQL layout.
 #: They exist in neither schema, so the guarded statement never runs.

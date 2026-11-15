@@ -47,6 +47,31 @@ class TelegramNotifierTests(unittest.TestCase):
         with mock.patch.object(telegram_notify, "TELEGRAM_BOT_RETIRED", False):
             self.assertTrue(TelegramNotifier.from_config(_Cfg()).enabled)
 
+    def test_retired_bot_explains_itself_once_and_stays_silent_otherwise(self):
+        class _Cfg:
+            telegram_enabled = True
+            telegram_bot_token = ""
+            telegram_chat_id = ""
+            telegram_timeout_seconds = 10
+
+        class _Off(_Cfg):
+            telegram_enabled = False
+
+        notes, calls = [], []
+        with mock.patch.object(telegram_notify, "_retired_note_shown", False):
+            TelegramNotifier.from_config(_Off(), warn=notes.append)
+            self.assertEqual(notes, [])
+            first = TelegramNotifier.from_config(_Cfg(), warn=notes.append)
+            TelegramNotifier.from_config(_Cfg(), warn=notes.append)
+            first.urlopen = lambda *a, **k: calls.append((a, k))
+            # Retired + enabled + no credentials: no "token is missing"
+            # warning and no network call, only the one explanation.
+            self.assertFalse(first.send("hello"))
+        self.assertEqual(len(notes), 1)
+        self.assertIn("retired", notes[0])
+        self.assertIn("[TELEGRAM] enabled = true has no effect", notes[0])
+        self.assertEqual(calls, [])
+
     def test_missing_credentials_warns_without_sending(self):
         warnings = []
         calls = []

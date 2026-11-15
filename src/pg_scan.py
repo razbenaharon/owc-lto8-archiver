@@ -25,7 +25,6 @@ is a way to lose data or to claim coverage that was never established:
 
 Every method refuses on a database without migration 014 rather than degrading.
 """
-import json
 import uuid
 
 from .logsetup import get_logger

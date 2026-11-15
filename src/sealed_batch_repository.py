@@ -258,7 +258,6 @@ class SealedBatchRepository:
         """Apply 012 idempotently, then record/verify its checksum and run exact
         schema-drift validation. Never reports success just because the tables
         exist; a recorded-but-different checksum fails closed."""
-        import psycopg
         ddl = _MIGRATION_FILE.read_text(encoding="utf-8")
         checksum = migration_checksum()
         conn = self._connect()

@@ -327,5 +327,27 @@ def test_schema_matches_what_the_code_reads():
     read = _keys_read_by_config_module() | _keys_read_by_ltfs_ownership()
     assert read <= _schema_keys(), (
         f"read but missing from CONFIG_SCHEMA: {sorted(read - _schema_keys())}")
-    unread = _schema_keys("live", "inert") - read
+    unread = _schema_keys("live") - read
     assert unread == set(), f"in CONFIG_SCHEMA but never read: {sorted(unread)}"
+    # An inert or retired key has no accessor at all: the schema entry exists
+    # only so an old config.ini still loads, with a notice.
+    dormant = _schema_keys("inert", "retired") - {("REMOTE", "incremental_scan")}
+    assert dormant & read == set(), (
+        f"marked inert/retired but still read: {sorted(dormant & read)}")
+
+
+def test_every_inert_key_still_loads_with_a_no_effect_notice(tmp_path):
+    values = {"bool": "true", "int": "5", "float": "5", "str": "x"}
+    inert = sorted(_schema_keys("inert"))
+    assert len(inert) == 7
+    body = {}
+    for section, key in inert:
+        body.setdefault(section, []).append(
+            f"{key} = {values[CONFIG_SCHEMA[section][key].kind]}")
+    text = "".join(f"[{section}]\n" + "\n".join(lines) + "\n"
+                   for section, lines in body.items())
+    cfg = _load(tmp_path, text)
+    for section, key in inert:
+        assert any(f"[{section}] {key} has no effect" in note
+                   for note in cfg.warnings), (section, key)
+    assert len(cfg.warnings) == len(inert)

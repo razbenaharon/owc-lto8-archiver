@@ -8,7 +8,8 @@ from types import SimpleNamespace
 import zstandard as zstd
 
 from src.catalog_v3 import catalog_directory_chain, catalog_file_name
-from src.db import DatabaseManager, _apply_canonical_remote_paths, _file_record_key
+from src.db import (_apply_canonical_remote_paths, _file_record_key,
+                    _postgres_connection_error_message)
 from src.container_catalog import TarCatalogAdapter
 from src.inspector_repository import InspectorRepository
 from src.pg_db import _canonical_remote_path, _coerce_timestamptz, _now_utc
@@ -95,13 +96,29 @@ class PostgresOnlyHelperTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "canonical POSIX"):
                 list(TarCatalogAdapter(db, chunk).records())
 
-    def test_legacy_database_manager_constructor_is_removed(self):
-        with self.assertRaisesRegex(RuntimeError, "legacy DatabaseManager class has been removed"):
-            DatabaseManager("archive.db")
+    def test_connection_error_offers_docker_hints_only_for_a_local_server(self):
+        local = _postgres_connection_error_message(SimpleNamespace(
+            pg_host="127.0.0.1", pg_port="5432", pg_dbname="cat",
+            pg_user="lto", pg_password="set"))
+        self.assertIn("PostgreSQL at 127.0.0.1:5432", local)
+        self.assertIn("docker compose up -d db", local)
+        self.assertNotIn("No PostgreSQL password", local)
+
+        remote = _postgres_connection_error_message(SimpleNamespace(
+            pg_host="db.example.org", pg_port="6432", pg_dbname="cat",
+            pg_user="lto", pg_password=""))
+        self.assertIn("PostgreSQL at db.example.org:6432", remote)
+        self.assertNotIn("docker", remote)
+        self.assertIn("reachable from this machine", remote)
+        self.assertIn("No PostgreSQL password", remote)
+        for message in (local, remote):
+            self.assertIn("[DATABASE] backend", message)
+            self.assertTrue(all(line.startswith("[DB] ")
+                                for line in message.splitlines()))
 
     def test_record_key_includes_source_host(self):
         left = _file_record_key("/data/a.bin", "TAPE001", source_host="srv02")
-        right = _file_record_key("/data/a.bin", "TAPE001", source_host="so03")
+        right = _file_record_key("/data/a.bin", "TAPE001", source_host="srv03")
         self.assertNotEqual(left, right)
         self.assertEqual(len(left), 32)
 

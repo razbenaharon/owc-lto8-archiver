@@ -27,7 +27,7 @@ import re
 import socket
 import sqlite3
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 from . import db_backend, sqlite_adapter, sqlite_lock
 from .constants import PROJECT_ROOT

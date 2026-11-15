@@ -15,7 +15,7 @@ coverage honesty that makes it safe to believe:
 The remote host is a fake that serves a synthetic tree; the frontier database
 is an in-memory double implementing the same contract as
 :class:`~src.pg_scan.PgScanMixin` (whose real SQL is covered by the isolated
-PostgreSQL tests in ``tests/test_pg_integration.py``). No SSH, no PostgreSQL,
+PostgreSQL tests in ``tests/test_db_integration.py``). No SSH, no PostgreSQL,
 no LTFS.
 """
 import copy

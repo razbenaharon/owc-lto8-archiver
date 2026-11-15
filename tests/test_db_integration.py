@@ -1,15 +1,15 @@
-"""Live-PostgreSQL integration tests for the archive catalog.
+"""Live-database integration tests for the archive catalog, on both backends.
 
 These exercise the real query paths that pure unit tests cannot: ILIKE escaping
 against a real planner (§1.1), backslash-safe remote manifests (§1.2), batched
 directory-chain resolution (§2.1), and RETURNING-based upsert stats (§2.4).
 
-They run against a throwaway database created on the configured server and are
-skipped automatically when no server is reachable (e.g. CI without Docker), so
-they never touch the operator's live ``lto_archive`` catalog. Point them at a
-server with the standard PG* environment variables (PGHOST/PGPORT/PGUSER/
-PGPASSWORD); the local ``docker compose up -d db`` default works out of the box
-with ``PGPASSWORD=change_me_local``.
+Classes decorated with ``@each_backend`` (``tests/db_backends.py``) run on
+SQLite always - a throwaway file in a temporary directory - and on PostgreSQL
+when ``LTO_TEST_PG_DSN`` names a disposable server; the remaining classes are
+PostgreSQL-specific and skip without one. ``tests/pg_test_guard.py`` refuses
+implicit defaults, port 5432 and any server hosting ``lto_archive``, so these
+tests can never touch a live catalog.
 """
 import os
 import tempfile
