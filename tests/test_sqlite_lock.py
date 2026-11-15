@@ -292,6 +292,20 @@ class FailClosedTests(LockTestCase):
             lock.acquire()
         self.assertFalse(lock.held)
 
+    @unittest.skipIf(os.name == "nt", "flock semantics are POSIX-only")
+    def test_verify_never_reacquires_a_dropped_os_lock(self):
+        """Review finding: verify() used to re-flock its own descriptor, which
+        silently took a dropped lock again instead of reporting the loss."""
+        import fcntl
+        lock = sl.ArchiverLock(self.db)
+        lock.acquire()
+        self.addCleanup(lock.release)
+        self.assertTrue(lock.verify())
+        fcntl.flock(lock._fd, fcntl.LOCK_UN)        # the OS lock is gone
+        with self.assertRaises(sl.ArchiverLockLost):
+            lock.verify()
+        self.assertFalse(sl.probe_held(self.db))    # and was not re-taken
+
     def test_unwritable_location_reported_by_the_os(self):
         lock = sl.ArchiverLock(self.db)
         with mock.patch.object(

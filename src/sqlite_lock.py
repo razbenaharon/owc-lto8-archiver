@@ -359,10 +359,24 @@ class ArchiverLock:
         if _read_owner_fd(fd).get("token") != self.token:
             raise lost("the owner token in the lock file does not match")
         if msvcrt is None and fcntl is not None:
-            try:                        # re-asserting a held flock is a no-op
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Never re-flock our own descriptor: if the lock had been dropped
+            # that would silently take it again and hide the loss. Probe with
+            # a SECOND open file description instead - flock locks belong to
+            # the description, so the probe must be refused while ours holds.
+            try:
+                probe_fd = os.open(self.lock_path, os.O_RDWR)
             except OSError as exc:
-                raise lost(f"the OS lock is gone ({exc})") from exc
+                raise lost(f"the lock file cannot be opened ({exc})") from exc
+            try:
+                try:
+                    fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    pass                # refused: the lock is still held
+                else:
+                    fcntl.flock(probe_fd, fcntl.LOCK_UN)
+                    raise lost("the OS lock was no longer held")
+            finally:
+                os.close(probe_fd)
         return True
 
     def __enter__(self):

@@ -401,10 +401,12 @@ def classify_robocopy_result(returncode, rc_sum, rc_output,
             'Robocopy did not complete (no return code)', error_lines)
 
     # 2. Robocopy's own hard-failure signals.
-    if returncode >= 8:
+    #    A negative code means the process was killed, never a clean finish.
+    if returncode >= 8 or returncode < 0:
         return RobocopyVerdict(
             False, 'nonzero_return_code',
-            f'Robocopy returned failure code {returncode} (>=8)', error_lines)
+            f'Robocopy returned failure code {returncode} (>=8 or killed)',
+            error_lines)
     if 'RETRY LIMIT EXCEEDED' in output:
         return RobocopyVerdict(
             False, 'retry_limit_exceeded',
@@ -485,8 +487,12 @@ def classify_robocopy_result(returncode, rc_sum, rc_output,
             f'robocopy summary has no Bytes line though {expected_bytes} '
             'byte(s) were expected', error_lines)
     bytes_accounted = bytes_copied + int(rc_sum.get('bytes_skipped', 0) or 0)
-    if (expected_bytes and rc_sum.get('bytes_exact')
-            and bytes_accounted < expected_bytes):
+    #    A rounded summary ("4.52 g", no /BYTES) carries three significant
+    #    digits, so it is held to 98% of the expected total rather than waved
+    #    through: a gross shortfall is still a failed copy.
+    bytes_floor = (expected_bytes if rc_sum.get('bytes_exact')
+                   else int(expected_bytes * 0.98)) if expected_bytes else 0
+    if expected_bytes and bytes_accounted < bytes_floor:
         return RobocopyVerdict(
             False, 'incomplete_bytes',
             f'robocopy accounted for {bytes_accounted} byte(s) '
