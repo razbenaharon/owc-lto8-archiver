@@ -151,7 +151,6 @@ class LocalGateBlocksAreObeyed(_LocalGateCase):
         self.assertEqual(self.world.count("register_tape"), 0)
         self.assertEqual(self.world.db.local_status_writes, [])
 
-    @unittest.expectedFailure
     def test_an_assigned_chunk_is_refused_on_a_tape_marked_full(self):
         """PRODUCT BUG (reported, not fixed here - src/ is out of scope).
 

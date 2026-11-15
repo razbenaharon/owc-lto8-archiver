@@ -463,8 +463,12 @@ class LocalOrchestrator:
             elif not root_empty or record_count > 0:
                 print(f"[TAPE] Appending to registered tape '{tape_label}' "
                       f"({record_count} indexed file record(s) already present).")
-            if not self._ensure_chunk_fits_tape(tape_label, entries):
-                return None
+
+        # Runs for an already-assigned (resumed) chunk too: a cartridge marked
+        # FULL after a latched write error, or one that no longer has budget,
+        # must be refused whether or not this chunk was assigned to it earlier.
+        if not self._ensure_chunk_fits_tape(tape_label, entries):
+            return None
 
         return tape_label
 
