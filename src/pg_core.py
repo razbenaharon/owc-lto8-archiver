@@ -127,6 +127,9 @@ class PgConnectionCore:
             "010_postgres_local_manifest_archive.sql",
             "011_postgres_tape_status.sql",
             "013_postgres_tape_reset_safety.sql",
+            # Additive and idempotent: one audit table plus a row trigger that
+            # stops a raw UPDATE moving a 'backing'/'done' chunk backwards.
+            "020_postgres_chunk_transition_guard.sql",
         )
         with self._pool.connection() as conn:
             with conn.cursor() as cur:

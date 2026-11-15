@@ -2027,8 +2027,7 @@ class RealConcurrencyTests(unittest.TestCase):
         self.assertEqual(len(winners), 1, f"winners: {winners}")
 
     def test_a_claim_cannot_be_taken_from_a_backing_chunk(self):
-        self.db.transition_chunk(self.session_id, 0, "fetching",
-                                 validate=False)
+        self.db.transition_chunk(self.session_id, 0, "fetching")
         self.db.transition_chunk(self.session_id, 0, "packing")
         self.db.transition_chunk(self.session_id, 0, "backing")
         self.assertFalse(
@@ -2107,8 +2106,7 @@ class RealConcurrencyTests(unittest.TestCase):
     # -- transitions ------------------------------------------------------
     def test_a_forbidden_transition_is_refused_against_real_state(self):
         from src.pipeline_types import ForbiddenTransition
-        self.db.transition_chunk(self.session_id, 0, "fetching",
-                                 validate=False)
+        self.db.transition_chunk(self.session_id, 0, "fetching")
         self.db.transition_chunk(self.session_id, 0, "packing")
         self.db.transition_chunk(self.session_id, 0, "backing")
         for target in ("pending", "fetching", "packing", "backup_failed"):
@@ -2120,8 +2118,7 @@ class RealConcurrencyTests(unittest.TestCase):
                         (self.session_id,))[0]["status"], "backing")
 
     def test_backing_may_still_move_forward_to_done(self):
-        self.db.transition_chunk(self.session_id, 0, "fetching",
-                                 validate=False)
+        self.db.transition_chunk(self.session_id, 0, "fetching")
         self.db.transition_chunk(self.session_id, 0, "packing")
         self.db.transition_chunk(self.session_id, 0, "backing")
         self.assertTrue(self.db.transition_chunk(self.session_id, 0, "done"))
@@ -2129,8 +2126,7 @@ class RealConcurrencyTests(unittest.TestCase):
     def test_a_lost_compare_and_swap_returns_false(self):
         """The chunk is 'fetching'; a caller that believed it was 'pending'
         must LOSE the swap rather than overwrite someone else's progress."""
-        self.db.transition_chunk(self.session_id, 0, "fetching",
-                                 validate=False)
+        self.db.transition_chunk(self.session_id, 0, "fetching")
         # pending -> fetching is a legal transition, so the matrix permits the
         # attempt; it is the compare-and-swap that must fail.
         self.assertFalse(self.db.transition_chunk(
@@ -2148,11 +2144,9 @@ class RealConcurrencyTests(unittest.TestCase):
     def test_a_stale_owner_token_loses_the_swap(self):
         self.db.claim_chunk_for_staging(self.session_id, 0, "owner-A", "att-A")
         self.assertFalse(self.db.transition_chunk(
-            self.session_id, 0, "packing", owner_token="owner-STALE",
-            validate=False))
+            self.session_id, 0, "packing", owner_token="owner-STALE"))
         self.assertTrue(self.db.transition_chunk(
-            self.session_id, 0, "packing", owner_token="owner-A",
-            validate=False))
+            self.session_id, 0, "packing", owner_token="owner-A"))
 
     # -- segment consumption ----------------------------------------------
     def _ready_segment(self, first=0, last=9):

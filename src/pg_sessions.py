@@ -1710,7 +1710,7 @@ class PgSessionMixin:
 
     def transition_chunk(self, session_id, chunk_index, to_status, *,
                          expected_from=None, owner_token=None, attempt_id=None,
-                         error_msg=None, clear_error=False, validate=True):
+                         error_msg=None, clear_error=False):
         """The ONE method that moves a chunk between persisted states.
 
         Plan 1, Task 1.5. Before this, chunk status was written from half a
@@ -1722,8 +1722,9 @@ class PgSessionMixin:
         Arguments:
           ``expected_from``  compare-and-swap predicate: a status or iterable of
                              statuses the row must currently be in. ``None``
-                             means unconditional (the legacy behaviour, kept for
-                             the compatibility wrapper).
+                             means "whatever it is now": the row is locked,
+                             its real status read, and the matrix checked
+                             against that inside the same transaction.
           ``owner_token`` /
           ``attempt_id``     validated against the row when those columns exist
                              (migration 014). On a database without them a
@@ -1733,7 +1734,12 @@ class PgSessionMixin:
           ``error_msg`` /
           ``clear_error``    written deliberately, never as a side effect. Pass
                              ``clear_error=True`` to blank a stale message.
-          ``validate``       check :data:`~src.pipeline_types.CHUNK_TRANSITIONS`.
+
+        Every call is checked against
+        :data:`~src.pipeline_types.CHUNK_TRANSITIONS`; there is no unvalidated
+        mode (audit H5). The only way across the matrix is the named, audited
+        :meth:`override_chunk_transition`, and migration 020 enforces the same
+        rule for ``backing``/``done`` in the database itself.
 
         Returns True when the row moved, False when the compare-and-swap did not
         match (someone else changed it first). Raises
@@ -1743,20 +1749,20 @@ class PgSessionMixin:
         from .pipeline_types import (ChunkStatus, ForbiddenTransition,
                                      assert_chunk_transition)
 
-        target = ChunkStatus(to_status).value if validate else str(to_status)
+        target = ChunkStatus(to_status).value
         if expected_from is None:
             expected = None
         elif isinstance(expected_from, (str, ChunkStatus)):
             expected = [ChunkStatus(expected_from).value]
         else:
             expected = [ChunkStatus(s).value for s in expected_from]
-        if validate and expected:
+        if expected:
             for source in expected:
                 assert_chunk_transition(source, target)
         now = _now_utc()
 
         def operation(conn):
-            if validate and not expected:
+            if not expected:
                 # No caller-supplied predicate: read the row's actual state and
                 # check the matrix against THAT, so a forbidden move (notably an
                 # automatic retry out of 'backing') is refused wherever it comes
@@ -1914,6 +1920,8 @@ class PgSessionMixin:
         ``pending``). Omit it to drop the lease while leaving the status alone
         — used when the caller has already transitioned the chunk itself.
         """
+        from .pipeline_types import assert_chunk_transition
+
         now = _now_utc()
 
         def operation(conn):
@@ -1924,6 +1932,18 @@ class PgSessionMixin:
                 sets.insert(0, "status=%s")
                 params.insert(0, str(to_status))
             params.extend([session_id, int(chunk_index), owner_token])
+            if to_status is not None:
+                # The pool-return is a status change like any other: check it
+                # against the matrix on the row's real, locked state.
+                row = conn.execute(
+                    """SELECT status FROM remote_chunks
+                       WHERE session_id=%s AND chunk_index=%s
+                         AND owner_token=%s AND status <> 'backing'
+                       FOR UPDATE""",
+                    (session_id, int(chunk_index), owner_token),
+                ).fetchone()
+                if row is not None and row["status"] != str(to_status):
+                    assert_chunk_transition(row["status"], to_status)
             cur = conn.execute(
                 f"""UPDATE remote_chunks SET {', '.join(sets)}
                     WHERE session_id=%s AND chunk_index=%s AND owner_token=%s
@@ -1999,13 +2019,92 @@ class PgSessionMixin:
             operation, f"reclaim chunk {int(chunk_index) + 1}")
 
     def update_chunk_status(self, session_id, chunk_index, status):
-        """Compatibility wrapper over :meth:`transition_chunk` (Task 1.5).
+        """Move a chunk to ``status``, validated against its real state.
 
-        Unconditional and unvalidated, exactly as before, so no existing caller
-        changes behaviour while they migrate. New code should call
-        ``transition_chunk`` with an ``expected_from`` predicate.
+        A thin name over :meth:`transition_chunk` kept for the pipeline's call
+        sites. It used to be unconditional and unvalidated, which let any
+        caller move a ``backing`` or ``done`` chunk back into the pool (audit
+        H5). It now locks the row, reads its actual status and refuses any
+        move :data:`~src.pipeline_types.CHUNK_TRANSITIONS` does not allow by
+        raising :class:`~src.pipeline_types.ForbiddenTransition`.
         """
-        self.transition_chunk(session_id, chunk_index, status, validate=False)
+        self.transition_chunk(session_id, chunk_index, status)
+
+    def _override_chunk_transition_conn(
+            self, conn, session_id, chunk_index, *, expected_from, to_status,
+            override, reason, authorized_by, error_msg=None):
+        """Record a named override and apply it, inside the caller's tx.
+
+        Returns True when the chunk moved. A lost compare-and-swap returns
+        False and leaves NO open override behind: the audit row is written
+        only for a move that really happened.
+        """
+        from .pipeline_types import (ChunkStatus,
+                                     assert_chunk_override_transition)
+
+        name = assert_chunk_override_transition(
+            override, expected_from, to_status)
+        source = ChunkStatus(expected_from).value
+        target = ChunkStatus(to_status).value
+        reason = str(reason or "").strip()
+        authorized_by = str(authorized_by or "").strip()
+        if not reason or not authorized_by:
+            raise ValueError(
+                "a chunk transition override needs a reason and the identity "
+                "that authorised it")
+        row = conn.execute(
+            """SELECT status FROM remote_chunks
+               WHERE session_id=%s AND chunk_index=%s FOR UPDATE""",
+            (int(session_id), int(chunk_index)),
+        ).fetchone()
+        if row is None or row["status"] != source:
+            return False
+        conn.execute(
+            """INSERT INTO remote_chunk_transition_overrides
+                   (session_id, chunk_index, from_status, to_status,
+                    override_name, reason, authorized_by)
+               VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+            (int(session_id), int(chunk_index), source, target, name.value,
+             reason, authorized_by),
+        )
+        cur = conn.execute(
+            """UPDATE remote_chunks
+               SET status=%s, error_msg=%s, updated_at=%s
+               WHERE session_id=%s AND chunk_index=%s AND status=%s""",
+            (target, error_msg, _now_utc(), int(session_id),
+             int(chunk_index), source),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError(
+                "[DB] chunk transition override compare-and-set failed")
+        get_logger().warning(
+            "chunk_transition_override: session=%s chunk=%s %s -> %s "
+            "override=%s authorized_by=%s reason=%s",
+            session_id, int(chunk_index) + 1, source, target, name.value,
+            authorized_by, reason)
+        return True
+
+    def override_chunk_transition(self, session_id, chunk_index, to_status, *,
+                                  expected_from, override, reason,
+                                  authorized_by):
+        """Cross the transition matrix through a NAMED, AUDITED override.
+
+        This is the only supported way to move a ``backing`` or ``done`` chunk
+        backwards, and it is for a human-driven recovery, never for the
+        pipeline. ``override`` must be a
+        :class:`~src.pipeline_types.ChunkTransitionOverride` that permits
+        exactly this ``expected_from -> to_status`` move; ``reason`` and
+        ``authorized_by`` are mandatory and are stored permanently in
+        ``remote_chunk_transition_overrides``. The move is a compare-and-swap
+        on ``expected_from``: returns False (and records nothing) if the chunk
+        is no longer in that state.
+        """
+        return self._transaction(
+            lambda conn: self._override_chunk_transition_conn(
+                conn, session_id, chunk_index, expected_from=expected_from,
+                to_status=to_status, override=override, reason=reason,
+                authorized_by=authorized_by),
+            f"override chunk {int(chunk_index) + 1} -> {to_status}")
 
     def get_pending_chunks(self, session_id):
         rows = self._run_read(
