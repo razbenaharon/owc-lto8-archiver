@@ -152,3 +152,261 @@ def test_h15_only_one_write_is_in_flight(qapp, fake_repo, monkeypatch):
     assert widget.rename_btn.isEnabled()
     assert widget._run_db_task(lambda: 7, on_done=done.append)
     assert pump(qapp, lambda: done == [True, 7])
+
+
+# --------------------------------------------------------------------------
+# M8 - destructive actions, pagination, dead button, database-down refresh
+# --------------------------------------------------------------------------
+
+class Dialogs:
+    """Records and scripts every modal the inspector can raise."""
+
+    def __init__(self, monkeypatch):
+        self.errors = []
+        self.warnings = []
+        self.typed_prompts = []
+        self.typed_answer = ("", False)
+        self.question_answer = inspector.QMessageBox.StandardButton.Yes
+        box = inspector.QMessageBox
+        monkeypatch.setattr(box, "critical", staticmethod(
+            lambda _p, _t, message, *_a, **_k: self.errors.append(message)))
+        monkeypatch.setattr(box, "warning", staticmethod(
+            lambda _p, _t, message, *_a, **_k: self.warnings.append(message)))
+        monkeypatch.setattr(box, "information", staticmethod(
+            lambda *_a, **_k: None))
+        monkeypatch.setattr(box, "question", staticmethod(
+            lambda *_a, **_k: self.question_answer))
+        monkeypatch.setattr(inspector.QInputDialog, "getText", staticmethod(
+            self._get_text))
+
+    def _get_text(self, _parent, _title, label, *_a, **_k):
+        self.typed_prompts.append(label)
+        return self.typed_answer
+
+
+@pytest.fixture
+def dialogs(monkeypatch):
+    return Dialogs(monkeypatch)
+
+
+def _session_row(session_id, status, kind="remote"):
+    return {"kind": kind, "session_id": session_id,
+            "session_label": f"S{session_id}", "status": status, "mode": "",
+            "created_at": None, "completed_at": None, "chunks": 1,
+            "manifest_rows": 0, "manifest_bytes": 0, "file_records": 0}
+
+
+def _manage_with_sessions(qapp, fake_repo, rows):
+    fake_repo.sessions = rows
+    fake_repo.deletable_checks = []
+
+    def require_session_deletable(self, kind, session_id):
+        fake_repo.deletable_checks.append((kind, session_id))
+        if fake_repo.blockers:
+            raise RuntimeError("; ".join(fake_repo.blockers))
+
+    fake_repo.require_session_deletable = require_session_deletable
+    db = FakeDb()
+    widget = inspector.ManageWidget(db, "fake-dsn")
+    widget.refresh_sessions()
+    assert pump(qapp, lambda: widget.sessions_table.rowCount() == len(rows))
+    return db, widget
+
+
+def _settle(qapp, widget):
+    assert pump(qapp, lambda: widget.tasks.pending() == 0)
+    qapp.processEvents()
+
+
+def test_m8_gui_refuses_to_delete_an_active_session(qapp, fake_repo, dialogs):
+    db, widget = _manage_with_sessions(qapp, fake_repo, [
+        _session_row(36, "abandoned"), _session_row(37, "active")])
+    widget.sessions_table.selectRow(1)
+    assert widget.selected_session() == ("remote", 37)
+    dialogs.typed_answer = ("37", True)
+    widget.delete_session()
+    _settle(qapp, widget)
+    assert db.calls == [], "an active session was deleted from the GUI"
+    assert dialogs.typed_prompts == [], "refusal must come before any prompt"
+    assert any("active" in message for message in dialogs.errors)
+
+
+def test_m8_session_delete_needs_typed_confirmation(qapp, fake_repo, dialogs):
+    db, widget = _manage_with_sessions(qapp, fake_repo, [
+        _session_row(36, "abandoned"), _session_row(37, "active")])
+    widget.sessions_table.selectRow(0)
+
+    for wrong in (("", True), ("yes", True), ("37", True), ("36", False)):
+        dialogs.typed_answer = wrong
+        widget.delete_session()
+        _settle(qapp, widget)
+    assert db.calls == [], "deleted without the typed confirmation"
+    assert all("36" in prompt for prompt in dialogs.typed_prompts)
+
+    dialogs.typed_answer = ("36", True)
+    widget.delete_session()
+    assert pump(qapp, lambda: db.calls == [("delete_session", "remote", 36)])
+    # The repository pre-flight ran on the way.
+    assert fake_repo.deletable_checks == [("remote", 36)]
+
+
+def test_m8_session_delete_stops_when_repository_refuses(qapp, fake_repo,
+                                                         dialogs):
+    db, widget = _manage_with_sessions(qapp, fake_repo, [
+        _session_row(36, "abandoned")])
+    fake_repo.blockers = ["the archiver lock is held (1 holder(s))"]
+    widget.sessions_table.selectRow(0)
+    dialogs.typed_answer = ("36", True)
+    widget.delete_session()
+    assert pump(qapp, lambda: bool(dialogs.errors))
+    _settle(qapp, widget)
+    assert db.calls == []
+    assert "archiver lock is held" in dialogs.errors[-1]
+    assert widget.delete_session_btn.isEnabled()
+
+
+@pytest.mark.parametrize("action,expected,call", [
+    ("delete_tape", "Tape_T", ("delete_tape", "Tape_T")),
+    ("wipe_tape_files", "Tape_T", ("delete_files_for_tape", "Tape_T")),
+])
+def test_m8_tape_destruction_needs_the_label_typed(qapp, fake_repo, dialogs,
+                                                   action, expected, call):
+    db = FakeDb()
+    db.delete_tape = lambda label: db.calls.append(("delete_tape", label))
+    db.delete_files_for_tape = lambda label: db.calls.append(
+        ("delete_files_for_tape", label))
+    widget = inspector.ManageWidget(db, "fake-dsn")
+    widget.refresh_tapes()
+    widget.tapes_table.selectRow(0)
+    dialogs.typed_answer = ("tape_t", True)        # close, but not the label
+    getattr(widget, action)()
+    _settle(qapp, widget)
+    assert db.calls == []
+    dialogs.typed_answer = (expected, True)
+    getattr(widget, action)()
+    assert pump(qapp, lambda: db.calls == [call])
+    _settle(qapp, widget)
+
+
+class PagedRepository(FakeRepository):
+    """Three pages of search/browse results; can be told to fail."""
+    fail_queries = False
+
+    @staticmethod
+    def _page(cursor):
+        page = (cursor or {}).get("page", 0)
+        if PagedRepository.fail_queries:
+            raise RuntimeError("server closed the connection unexpectedly")
+        return {"rows": [{"file_id": page * 10 + i, "file_name": f"f{page}_{i}"}
+                         for i in range(3)],
+                "has_more": page < 2,
+                "next_cursor": {"page": page + 1} if page < 2 else None}
+
+    def list_tapes(self):
+        return []
+
+    def search_catalog_fts(self, _query, scope=None, cursor=None, limit=None):
+        return self._page(cursor)
+
+    def list_directory_files(self, _directory_id, sort="name", cursor=None,
+                             limit=None):
+        return self._page(cursor)
+
+
+class ListingDb(FakeDb):
+    def list_source_hosts(self):
+        return ["source-host.example"]
+
+
+def _paging_widget(qapp, monkeypatch, kind):
+    PagedRepository.fail = None
+    PagedRepository.fail_queries = False
+    monkeypatch.setattr(inspector, "InspectorRepository", PagedRepository)
+    if kind == "search":
+        widget = inspector.SearchWidget(ListingDb(), "fake-dsn")
+        widget.query.setText("needle")
+        widget.new_search()
+    else:
+        widget = inspector.BrowseWidget(ListingDb(), "fake-dsn")
+        widget.current_directory_id = 5
+        widget.load_page(None)
+    assert pump(qapp, lambda: len(widget.table_model.rows) == 3)
+    return widget
+
+
+def _first_id(widget):
+    return widget.table_model.rows[0]["file_id"]
+
+
+@pytest.mark.parametrize("kind", ["search", "browse"])
+def test_m8_failed_page_change_keeps_pagination_state(qapp, monkeypatch,
+                                                      dialogs, kind):
+    widget = _paging_widget(qapp, monkeypatch, kind)
+    widget.next_page()
+    assert pump(qapp, lambda: _first_id(widget) == 10)
+    assert widget.page_index == 1
+
+    PagedRepository.fail_queries = True
+    widget.next_page()
+    assert pump(qapp, lambda: bool(dialogs.errors))
+    # Still on page 2 of 3, showing page 2's rows, with a working stack.
+    assert widget.page_index == 1
+    assert _first_id(widget) == 10
+    assert widget.next_btn.isEnabled() and widget.prev_btn.isEnabled()
+    assert "page 2" in widget.status.text()
+
+    PagedRepository.fail_queries = False
+    widget.next_page()
+    assert pump(qapp, lambda: _first_id(widget) == 20)
+    assert widget.page_index == 2 and not widget.next_btn.isEnabled()
+    widget.previous_page()
+    assert pump(qapp, lambda: _first_id(widget) == 10)
+    widget.previous_page()
+    assert pump(qapp, lambda: _first_id(widget) == 0)
+    assert widget.page_index == 0 and not widget.prev_btn.isEnabled()
+
+
+def test_m8_no_button_launches_a_removed_command(qapp, fake_repo, dialogs,
+                                                 monkeypatch):
+    launched = []
+    monkeypatch.setattr(subprocess, "Popen",
+                        lambda cmd, *_a, **_k: launched.append(cmd))
+    dialogs.question_answer = inspector.QMessageBox.StandardButton.No
+    db, widget = _manage_with_sessions(qapp, fake_repo, [
+        _session_row(36, "abandoned")])
+    widget.refresh_tapes()
+    buttons = widget.findChildren(inspector.QPushButton)
+    assert buttons
+    for button in buttons:
+        button.click()
+        _settle(qapp, widget)
+    assert launched == [], f"a button still shells out: {launched}"
+    assert db.calls == []
+
+
+def test_m8_refresh_with_database_down_shows_an_error(qapp, fake_repo,
+                                                      dialogs):
+    db = ListingDb()
+    fake_repo.require_catalog_v3 = lambda self: None
+    fake_repo.list_tapes = lambda self: []
+    window = inspector.DBInspectorQtApp(db, "fake-dsn")
+    window.tabs.setCurrentWidget(window.manage)
+    _settle(qapp, window.manage)
+    assert dialogs.errors == []
+
+    db.fail_list_tapes = "connection to server at 127.0.0.1 failed"
+    fake_repo.fail = "connection to server at 127.0.0.1 failed"
+    window.refresh_all()                      # must not raise
+    _settle(qapp, window.manage)
+    assert dialogs.errors, "refresh with the database down said nothing"
+    assert all("127.0.0.1 failed" in message for message in dialogs.errors)
+    assert "database" in dialogs.errors[0].lower()
+
+    # A later refresh, database back, recovers without a restart.
+    db.fail_list_tapes = None
+    fake_repo.fail = None
+    dialogs.errors.clear()
+    window.refresh_all()
+    _settle(qapp, window.manage)
+    assert dialogs.errors == []
+    assert window.manage.tapes_table.rowCount() == 1

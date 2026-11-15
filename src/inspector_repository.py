@@ -22,6 +22,7 @@ except ImportError:  # pragma: no cover - requirements includes zstandard
 
 from .catalog_query import prefix_pattern, substring_pattern
 from .db import _derived_file_name
+from .directory_catalog_validation import archiver_lock_status
 
 
 DEFAULT_PAGE_SIZE = 250
@@ -210,6 +211,45 @@ class InspectorRepository:
                            0 AS file_records
                     FROM remote_sessions s ORDER BY s.session_id"""))
         return sorted(rows, key=lambda r: (r["kind"], int(r["session_id"])))
+
+    def session_delete_blockers(self, kind, session_id):
+        """Reasons a session must not be deleted right now; ``[]`` = allowed.
+
+        Read-only pre-flight for the inspector's *Delete Selected Session*
+        (audit M8). ``PgDatabaseManager.delete_session`` repeats the status
+        refusal inside its own transaction; this adds the archiver-lock check
+        and gives the operator every reason at once, before anything is
+        attempted.
+        """
+        kind = (kind or "").strip().lower()
+        if kind not in ("local", "remote"):
+            return [f"unknown session kind: {kind!r}"]
+        table = "local_sessions" if kind == "local" else "remote_sessions"
+        reasons = []
+        row = None
+        if self._table_exists(table):
+            row = self._execute(
+                f"SELECT status FROM {table} WHERE session_id=%s",
+                (int(session_id),)).fetchone()
+        if row is None:
+            reasons.append(f"{kind} session {session_id} does not exist")
+        elif str(row["status"] or "").strip().lower() == "active":
+            reasons.append(
+                f"{kind} session {session_id} is marked active (a row marked "
+                "active is treated as live until proven otherwise)")
+        holders = archiver_lock_status(self.db_path)
+        if holders:
+            reasons.append(
+                f"the archiver lock is held ({holders} holder(s)): an "
+                "archiver is running")
+        return reasons
+
+    def require_session_deletable(self, kind, session_id):
+        reasons = self.session_delete_blockers(kind, session_id)
+        if reasons:
+            raise RuntimeError(
+                f"[DB] Refusing to delete {kind} session {session_id}: "
+                + "; ".join(reasons) + ".")
 
     def list_directory_bundles(self, tape_label=None, cursor=None, limit=None):
         page_size = self._limit(limit)
