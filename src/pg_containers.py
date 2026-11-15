@@ -2041,7 +2041,7 @@ class PgContainerMixin:
                     conn, "_stage_acm", member_columns, member_rows)
                 conn.execute(
                     f"INSERT INTO archive_container_members ({col_sql}) "
-                    f"SELECT {col_sql} FROM _stage_acm "
+                    f"SELECT {col_sql} FROM _stage_acm WHERE true "
                     "ON CONFLICT DO NOTHING")
             return self._read_stored_tar_chunk_plan_conn(
                 conn, session_id, chunk_index)

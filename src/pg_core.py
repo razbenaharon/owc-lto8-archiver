@@ -188,7 +188,7 @@ class PgConnectionCore:
         """
         affected = conn.execute(
             f"""INSERT INTO {table} ({col_sql})
-                SELECT {col_sql} FROM {stage_table}
+                SELECT {col_sql} FROM {stage_table} WHERE true
                 ON CONFLICT ({conflict_column}) {conflict_action}
                 RETURNING (xmax = 0) AS inserted"""
         ).fetchall()

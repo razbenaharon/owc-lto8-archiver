@@ -761,6 +761,9 @@ class PgCatalogMixin:
                 "INSERT INTO directory_archive_bundles ("
                 + ", ".join(bundle_columns) + ") "
                 "SELECT " + ", ".join(bundle_columns) + " FROM _dir_bundles "
+                # WHERE true: SQLite cannot tell "FROM t ON CONFLICT" from a
+                # join constraint; the no-op filter is valid on both engines.
+                "WHERE true "
                 f"ON CONFLICT (record_key) {conflict}"
             )
             db_bundle_ids = {
@@ -860,6 +863,7 @@ class PgCatalogMixin:
                 "INSERT INTO directory_archive_stats ("
                 + ", ".join(stats_columns) + ") "
                 "SELECT " + ", ".join(stats_columns) + " FROM _dir_stats "
+                "WHERE true "
                 "ON CONFLICT (record_key) DO UPDATE SET " + stats_update
             )
 
@@ -887,6 +891,7 @@ class PgCatalogMixin:
                 "INSERT INTO directory_tree_index ("
                 + ", ".join(tree_columns) + ") "
                 "SELECT " + ", ".join(tree_columns) + " FROM _dir_tree "
+                "WHERE true "
                 "ON CONFLICT (record_key) DO UPDATE SET " + tree_update
             )
             return {
