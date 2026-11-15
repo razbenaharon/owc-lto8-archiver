@@ -868,7 +868,7 @@ CREATE TABLE remote_chunks (
     writer_completed_at TIMESTAMPTZ TEXT,
     catalog_committed_at TIMESTAMPTZ TEXT,
     stored_tar_max_size_bytes INTEGER,
-    plan_source TEXT NOT NULL,
+    plan_source TEXT NOT NULL DEFAULT 'legacy_db',
     plan_manifest_artifact_id INTEGER,
     terminal_manifest_artifact_id INTEGER,
     plan_ordinal_scope TEXT NOT NULL DEFAULT 'chunk',

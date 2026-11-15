@@ -1,34 +1,27 @@
 """Audit H6 - the single-writer lock must be PROVEN, not assumed.
 
-The archiver lock is a session-level advisory lock on one pinned connection.
-When that PostgreSQL session dies the lock is released, the pool reconnects,
-and nothing else in the application notices. These tests kill the lock backend
-on disposable PostgreSQL (``pg_terminate_backend``) and assert that every write
-entry then refuses - and that nothing silently re-acquires the lock.
+PostgreSQL: the archiver lock is a session-level advisory lock on one pinned
+connection. When that session dies the lock is released, the pool reconnects,
+and nothing else in the application notices. The tests kill the lock backend
+(``pg_terminate_backend``).
+
+SQLite: the lock is an OS file lock on ``<db>.archiver.lock`` plus an owner
+token row. The tests drop the OS lock handle behind the manager's back, and
+separately overwrite the token row / lock-file token.
+
+On both backends every write entry must then refuse, and nothing may silently
+re-acquire the lock.
 """
 import threading
 import unittest
 from types import SimpleNamespace
-from typing import Any, cast
 from unittest import mock
 
-try:
-    import psycopg
-    from psycopg.rows import dict_row
-except ImportError:                          # pragma: no cover - guard handles it
-    psycopg = None
-    dict_row = None
-
-from pg_test_guard import (SKIP_REASON, create_test_database,
-                           drop_test_database, pg_available)
+from db_backends import create_test_db, each_backend, sqlite_only
 
 from src.archiver_lock_guard import (archiver_lock_stop,
                                      assert_archiver_lock_held)
 from src.exit_codes import ExitCode, REASON_ARCHIVER_LOCK_LOST
-
-
-def _pg_available():
-    return psycopg is not None and pg_available()
 
 
 class LockGuardUnitTests(unittest.TestCase):
@@ -55,30 +48,24 @@ class LockGuardUnitTests(unittest.TestCase):
             SimpleNamespace(verify_archiver_lock=lambda: True)))
 
 
-@unittest.skipUnless(_pg_available(), SKIP_REASON)
+@each_backend
 class ArchiverLockVerificationTests(unittest.TestCase):
     def setUp(self):
-        from src.pg_db import PgDatabaseManager
-
-        self.dbname, self.conninfo = create_test_database("lto_lockv")
-        self.db = PgDatabaseManager(self.conninfo)
-        self.addCleanup(self._drop)
-
-    def _drop(self):
-        try:
-            self.db.close()
-        except Exception:
-            pass
-        drop_test_database(self.dbname)
+        self.tdb = create_test_db(self.BACKEND, "lto_lockv")
+        self.addCleanup(self.tdb.drop)
+        self.db = self.tdb.manager(migrations="startup")
 
     def _admin(self, sql, params=()):
-        with cast(Any, psycopg).connect(
-                self.conninfo, autocommit=True,
-                row_factory=cast(Any, dict_row)) as conn:
-            cur = conn.execute(sql, params)
-            return cur.fetchall() if cur.description else []
+        return self.tdb.run(sql, params)
 
     def _kill_lock_backend(self):
+        """Make the lock disappear underneath a manager that believes it
+        still holds it."""
+        if self.tdb.is_sqlite:
+            # The OS lock handle is gone (closed), exactly as if the process
+            # had lost it; the manager's own bookkeeping is left untouched.
+            self.db._file_lock.release()
+            return
         pid = self.db._lock_backend_pid
         self.assertIsNotNone(pid)
         killed = self._admin("SELECT pg_terminate_backend(%s) AS ok", (pid,))
@@ -93,6 +80,9 @@ class ArchiverLockVerificationTests(unittest.TestCase):
         self.fail("the lock backend did not terminate")
 
     def _lock_holders(self):
+        if self.tdb.is_sqlite:
+            from src.sqlite_lock import probe_held
+            return [1] if probe_held(self.tdb.path) else []
         key = self.db.ARCHIVER_LOCK_KEY
         return self._admin(
             """SELECT l.pid FROM pg_locks l
@@ -126,7 +116,6 @@ class ArchiverLockVerificationTests(unittest.TestCase):
 
     def test_a_terminated_lock_backend_is_detected_and_never_reacquired(self):
         from src.pg_core import ArchiverLockLost
-        from src.pg_db import PgDatabaseManager
 
         self.db.acquire_archiver_lock()
         self.assertEqual(len(self._lock_holders()), 1)
@@ -143,7 +132,7 @@ class ArchiverLockVerificationTests(unittest.TestCase):
         with self.assertRaises(ArchiverLockLost):
             self.db.verify_archiver_lock()
         # ...so a second archiver CAN take it, and this one still refuses.
-        other = PgDatabaseManager(self.conninfo, init_schema=False)
+        other = self.tdb.manager(init_schema=False)
         try:
             other.acquire_archiver_lock()
             self.assertTrue(other.verify_archiver_lock())
@@ -157,9 +146,61 @@ class ArchiverLockVerificationTests(unittest.TestCase):
         from src.pg_core import ArchiverLockLost
 
         self.db.acquire_archiver_lock()
-        self.db._lock_backend_pid += 1          # the pinned pid is not "ours"
+        if self.tdb.is_sqlite:
+            self.db._lock_token = "0" * 32      # the token is not "ours"
+        else:
+            self.db._lock_backend_pid += 1      # the pinned pid is not "ours"
         with self.assertRaises(ArchiverLockLost):
             self.db.verify_archiver_lock()
+
+    @sqlite_only("the owner-token row is the SQLite loss-detection layer")
+    def test_an_overwritten_owner_token_row_is_a_loss(self):
+        from src.pg_core import ArchiverLockLost
+
+        self.db.acquire_archiver_lock()
+        self.assertTrue(self.db.verify_archiver_lock())
+        self._admin("UPDATE archiver_lock SET owner_token='someone-else'")
+        with self.assertRaises(ArchiverLockLost):
+            self.db.verify_archiver_lock()
+        # The OS lock is still ours: nobody else can take it meanwhile.
+        other = self.tdb.manager(init_schema=False)
+        with self.assertRaisesRegex(RuntimeError, "Another archiver"):
+            other.acquire_archiver_lock()
+
+    @sqlite_only("the owner-token row is the SQLite loss-detection layer")
+    def test_a_deleted_owner_token_row_is_a_loss(self):
+        from src.pg_core import ArchiverLockLost
+
+        self.db.acquire_archiver_lock()
+        self._admin("DELETE FROM archiver_lock")
+        with self.assertRaises(ArchiverLockLost):
+            self.db.verify_archiver_lock()
+
+    @sqlite_only("the lock file is the SQLite authority")
+    def test_a_rewritten_lock_file_token_is_a_loss(self):
+        import json
+        import os
+        from src.pg_core import ArchiverLockLost
+        from src.sqlite_lock import OWNER_RECORD_BYTES, lock_path_for
+
+        self.db.acquire_archiver_lock()
+        record = json.dumps({"token": "f" * 32, "pid": 1}).encode()
+        fd = self.db._file_lock._fd
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, record.ljust(OWNER_RECORD_BYTES, b" "))
+        self.assertTrue(os.path.exists(lock_path_for(self.tdb.path)))
+        with self.assertRaises(ArchiverLockLost):
+            self.db.verify_archiver_lock()
+
+    def test_a_second_manager_is_refused_while_the_lock_is_held(self):
+        self.db.acquire_archiver_lock()
+        other = self.tdb.manager(init_schema=False)
+        with self.assertRaisesRegex(RuntimeError, "Another archiver"):
+            other.acquire_archiver_lock()
+        self.assertEqual(len(self._lock_holders()), 1)
+        self.db.release_archiver_lock()
+        other.acquire_archiver_lock()
+        self.assertTrue(other.verify_archiver_lock())
 
     # -- the write entries ------------------------------------------------
     def _seed_chunk(self, status="packing"):
@@ -181,9 +222,7 @@ class ArchiverLockVerificationTests(unittest.TestCase):
                VALUES ('LOCKS','h','u','/r','LKT','C:\\stg',1,1,1,%s,now(),
                        'active',1) RETURNING session_id""",
             (plan,))[0]["session_id"]
-        self._admin(
-            """INSERT INTO remote_chunks (session_id,chunk_index,status,
-                   updated_at) VALUES (%s,0,%s,now())""", (session_id, status))
+        self.tdb.insert_remote_chunk(session_id, 0, status)
         return session_id
 
     def _status(self, session_id):
