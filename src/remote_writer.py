@@ -140,14 +140,31 @@ class RemoteChunkWriter:
             recorded = self.host._get_recorded_stop()
             if recorded is not None:
                 return recorded
+            self.host._gate_mount_started_at = None
             gate_block = self.host._pre_write_safety_gate(
                 session_id, first, tape_label, stop_pipeline)
             if gate_block is not None:
                 return gate_block
             self.host._readiness_checks += 1
             self.host._cartridge_verifications += 1
+            # The mount start the gate scoped its drive-health evidence to.
+            mount_started_at = getattr(
+                self.host, '_gate_mount_started_at', None)
 
-            for desc in tape_descs:
+            for position, desc in enumerate(tape_descs):
+                # Drive/medium health before EACH later chunk, not only once
+                # per group: a fault logged while chunk N was being written
+                # must stop chunk N+1 (Tape_02 froze after errors nobody
+                # read). This repeats only the PASSIVE half of the gate — it
+                # reads IBM's LogFile.csv and nothing else: no readiness
+                # probe, no label read, no event-log query, no tape access.
+                if position > 0 and mount_started_at:
+                    media_block = self.host._verify_ltfs_media_health(
+                        mount_started_at=mount_started_at)
+                    if media_block is not None:
+                        media_block.session_id = session_id
+                        media_block.chunk_index = desc.chunk_index
+                        return self.host._record_stop(media_block)
                 # Cheap, non-LTFS stop checks between chunks. A staged reboot,
                 # a recorded stop or a cancel must still end the group at a
                 # chunk boundary — but none of these touches the drive.

@@ -1948,6 +1948,9 @@ class RemoteOrchestrator:
                 reason=REASON_LTFS_MEDIA_DEGRADED, resumable=False,
                 source="gate", detailed_reason=msg)
 
+        # Remembered so the writer can repeat the PASSIVE half of this check
+        # (IBM LogFile.csv only) before each later chunk of the same group.
+        self._gate_mount_started_at = mount_started_at
         health = ltfs_media_health(since_iso=mount_started_at)
 
         if not health.get("determinate"):
