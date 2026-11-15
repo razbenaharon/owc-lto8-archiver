@@ -241,7 +241,7 @@ class AddressOverrideBypassTests(unittest.TestCase):
     def test_harmless_parameters_are_still_accepted(self):
         self.assertEqual(
             guard.assert_safe_dsn(
-                "postgresql://lto:ltotest_local_only@127.0.0.1:15432/postgres"),
+                "postgresql://lto:pw@127.0.0.1:15432/postgres"),
             ("127.0.0.1", 15432, "postgres"))
         self.assertEqual(
             guard.assert_safe_dsn(

@@ -118,7 +118,7 @@ class PostgresOnlyHelperTests(unittest.TestCase):
 
     def test_record_key_includes_source_host(self):
         left = _file_record_key("/data/a.bin", "TAPE001", source_host="srv02")
-        right = _file_record_key("/data/a.bin", "TAPE001", source_host="so03")
+        right = _file_record_key("/data/a.bin", "TAPE001", source_host="srv03")
         self.assertNotEqual(left, right)
         self.assertEqual(len(left), 32)
 

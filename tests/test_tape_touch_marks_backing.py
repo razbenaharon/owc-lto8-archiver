@@ -124,7 +124,7 @@ class WriterClassifiesAnEarlyTapeErrorAsHard(_Workspace):
             staged_bytes=2048, skip_tape=False, session_id=37,
             packaging_format=ContainerFormat.ZIP,
             metadata=[{"is_packed": True, "container_name": "Bundle_0001.zip",
-                       "file_name": "a.txt", "original_path": "/strg/a.txt",
+                       "file_name": "a.txt", "original_path": "/vault/a.txt",
                        "file_size_bytes": 10, "stored_path": "a.txt"}],
             source_missing_files=[], containers=[], artifacts=[])
 
