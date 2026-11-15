@@ -8,6 +8,7 @@ import zipfile
 import posixpath
 import ntpath
 from collections import defaultdict
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from .archive_artifacts import (TAR_SIDECAR_VERSION, ArtifactError,
@@ -50,6 +51,84 @@ class RestoreContainmentError(RuntimeError):
     """A restore destination would fall outside the chosen restore directory."""
 
 
+class RestoreCancelled(RuntimeError):
+    """The operator cancelled; files already published were kept."""
+
+
+#: Process exit code a caller should use for a restore that did not restore
+#: everything it was asked to. Deliberately outside ``exit_codes.ExitCode``,
+#: whose values describe archive-pipeline stops.
+RESTORE_INCOMPLETE_EXIT_CODE = 1
+RESTORE_CANCELLED_EXIT_CODE = 40          # == ExitCode.USER_STOP
+
+REASON_RESTORE_COMPLETED = "restore_completed"
+REASON_RESTORE_INCOMPLETE = "restore_incomplete"
+REASON_RESTORE_CANCELLED = "restore_cancelled"
+REASON_RESTORE_NOTHING_REQUESTED = "restore_nothing_requested"
+
+_SUMMARY_FAILURE_LINES = 50
+
+
+@dataclass
+class RestoreResult:
+    """Truthful outcome of a restore request.
+
+    ``restored`` holds only files that were published under their final name
+    after their content was verified; everything else that was asked for is in
+    ``failures`` (tried, not restored) or ``skipped`` (never attempted).
+    ``ok`` is the single question a caller needs answered; ``exit_code`` and
+    ``reason`` mirror the ``StopResult`` attributes the CLI already reads.
+    """
+
+    restored: list = field(default_factory=list)   # final paths
+    failures: list = field(default_factory=list)   # (name, reason)
+    skipped: int = 0
+    skip_notes: list = field(default_factory=list)
+    cancelled: bool = False
+
+    @property
+    def restored_count(self):
+        return len(self.restored)
+
+    @property
+    def failed_count(self):
+        return len(self.failures)
+
+    @property
+    def requested(self):
+        return self.restored_count + self.failed_count + self.skipped
+
+    @property
+    def ok(self):
+        return (not self.cancelled and not self.failures
+                and self.skipped == 0)
+
+    @property
+    def exit_code(self):
+        if self.cancelled:
+            return RESTORE_CANCELLED_EXIT_CODE
+        return 0 if self.ok else RESTORE_INCOMPLETE_EXIT_CODE
+
+    @property
+    def reason(self):
+        if self.cancelled:
+            return REASON_RESTORE_CANCELLED
+        if not self.ok:
+            return REASON_RESTORE_INCOMPLETE
+        return (REASON_RESTORE_COMPLETED if self.restored
+                else REASON_RESTORE_NOTHING_REQUESTED)
+
+    def _mark(self):
+        return len(self.restored), len(self.failures), len(self.skip_notes)
+
+    def _since(self, mark):
+        notes = self.skip_notes[mark[2]:]
+        return RestoreResult(
+            restored=self.restored[mark[0]:], failures=self.failures[mark[1]:],
+            skipped=sum(count for count, _reason in notes),
+            skip_notes=notes, cancelled=self.cancelled)
+
+
 class LTORetriever:
     def __init__(self, db: "PgDatabaseManager", tape_drive: str,
                  staging_dir: str, restore_dir: str,
@@ -59,6 +138,49 @@ class LTORetriever:
         self.staging_dir = staging_dir
         self.restore_dir = restore_dir
         self.manifest_archive_root = manifest_archive_root
+        #: Outcome of the most recent ``run()`` (also set when it raises).
+        self.last_result = RestoreResult()
+        self._result = self.last_result
+
+    # -- truthful accounting ------------------------------------------------
+    @staticmethod
+    def _record_name(record):
+        return str(record.get('original_path') or record.get('file_name')
+                   or record.get('member_name') or record.get('stored_path')
+                   or '<unnamed>')
+
+    def _note_restored(self, path):
+        self._result.restored.append(path)
+
+    def _note_failed(self, name, reason):
+        self._result.failures.append((str(name), str(reason)))
+
+    def _note_skipped(self, count, reason):
+        if count > 0:
+            self._result.skipped += int(count)
+            self._result.skip_notes.append((int(count), str(reason)))
+
+    def _print_summary(self, result):
+        """Say what was restored and, by name, what was not."""
+        where = self.restore_dir
+        if result.ok:
+            print(f"\n[RESTORE] Complete. {result.restored_count:,} file(s) "
+                  f"restored to: {where}")
+            return
+        state = "CANCELLED" if result.cancelled else "INCOMPLETE"
+        print(f"\n[RESTORE] {state}. {result.restored_count:,} of "
+              f"{result.requested:,} file(s) restored to: {where}  "
+              f"(failed: {result.failed_count:,}, "
+              f"skipped: {result.skipped:,})")
+        for count, reason in result.skip_notes:
+            print(f"[RESTORE] Skipped {count:,}: {reason}")
+        if result.failures:
+            print("[RESTORE] NOT restored:")
+            for name, reason in result.failures[:_SUMMARY_FAILURE_LINES]:
+                print(f"  - {name}: {reason}")
+            hidden = result.failed_count - _SUMMARY_FAILURE_LINES
+            if hidden > 0:
+                print(f"  ... and {hidden:,} more")
 
     @staticmethod
     def _source_path_module(path):
@@ -299,10 +421,46 @@ class LTORetriever:
     @staticmethod
     def _check_cancelled():
         if CANCEL.is_set():
-            raise RuntimeError("[RESTORE] Cancelled by user; "
-                               "partially restored files were kept.")
+            raise RestoreCancelled("[RESTORE] Cancelled by user; "
+                                   "partially restored files were kept.")
 
     def run(self):
+        """Run the interactive restore menu and return a ``RestoreResult``.
+
+        The result is also kept on ``self.last_result``, including when this
+        raises (a cancel sets ``cancelled``), so a caller that catches the
+        error can still read ``ok`` / ``exit_code`` / ``failures``.
+        """
+        self.last_result = self._result = RestoreResult()
+        try:
+            self._run_menu()
+        except RestoreCancelled:
+            self._result.cancelled = True
+            self._print_summary(self._result)
+            raise
+        return self._result
+
+    def _restore_one_selected(self, record, restore_base=None):
+        if self._record_needs_tape(record):
+            self._verify_tape(record['tape_label'])
+        mark = self._result._mark()
+        self._restore_record(record, restore_base=restore_base)
+        self._settle([record], mark, "no outcome was recorded")
+        self._print_summary(self._result._since(mark))
+
+    def _settle(self, records, mark, reason):
+        """Guarantee every record in a group ended as restored or failed.
+
+        A restore helper that returned without recording an outcome for a
+        record must never read as success, so the shortfall is charged as
+        failures.
+        """
+        delta = self._result._since(mark)
+        shortfall = len(records) - delta.restored_count - delta.failed_count
+        for _ in range(max(0, shortfall)):
+            self._note_failed("<unidentified>", reason)
+
+    def _run_menu(self):
         print("\n--- RETRIEVER: Search & Restore ---")
         print("1. Search by filename / wildcard  (e.g. *.mov, IMG_*)")
         print("2. Search by date range")
@@ -438,9 +596,7 @@ class LTORetriever:
             if not record:
                 print("[RETRIEVER] File ID not found.")
                 continue
-            if self._record_needs_tape(record):
-                self._verify_tape(record['tape_label'])
-            self._restore_record(record, restore_base=restore_base)
+            self._restore_one_selected(record, restore_base=restore_base)
             return
 
     @staticmethod
@@ -495,16 +651,15 @@ class LTORetriever:
         if not record:
             print("[RETRIEVER] Manifest file ID not found.")
             return
-        if self._record_needs_tape(record):
-            self._verify_tape(record["tape_label"])
-        self._restore_record(record)
+        self._restore_one_selected(record)
 
     def _restore_all_pages(self, fetch_after, total_results, restore_base=None):
         # One tape at a time: a multi-tape restore used to interleave tapes
         # page by page, prompting a cartridge swap every RESTORE_PAGE_SIZE
         # files. Within each tape, keyset pagination on file_id (OFFSET paging
         # re-scans every skipped row — O(n^2) over a large result).
-        restored = 0
+        processed = 0
+        mark = self._result._mark()
         for tape in [t['volume_label'] for t in self.db.list_tapes()]:
             after_id = 0
             while True:
@@ -512,19 +667,26 @@ class LTORetriever:
                 page = fetch_after(after_id, tape)
                 if not page:
                     break
-                self._restore_many(page, restore_base=restore_base)
-                restored += len(page)
+                self._restore_many(page, restore_base=restore_base,
+                                   summarize=False)
+                processed += len(page)
                 after_id = page[-1]['file_id']
-        if restored < total_results:
-            print(f"\n[RESTORE] Note: {total_results - restored:,} matching "
-                  "record(s) reference tapes that are no longer registered "
-                  "and were not restored.")
+        if processed < total_results:
+            self._note_skipped(
+                total_results - processed,
+                "matching record(s) reference tapes that are no longer "
+                "registered and were not restored")
         print(f"\n[RESTORE] Requested {total_results:,}; processed "
-              f"{restored:,} file(s).")
+              f"{processed:,} record(s).")
+        outcome = self._result._since(mark)
+        self._print_summary(outcome)
+        return outcome
 
-    def _restore_many(self, records, restore_base=None):
+    def _restore_many(self, records, restore_base=None, summarize=True):
+        """Restore ``records``; return the ``RestoreResult`` for this call."""
         total = len(records)
         done  = 0
+        mark = self._result._mark()
 
         # Group by tape so we only ask for each tape once
         by_tape = defaultdict(list)
@@ -572,7 +734,11 @@ class LTORetriever:
                 done += len(container_records)
                 print(f"[RESTORE] Progress: {done}/{total}")
 
-        print(f"\n[RESTORE] Complete. {total} file(s) restored to: {self.restore_dir}")
+        self._settle(records, mark, "no outcome was recorded")
+        outcome = self._result._since(mark)
+        if summarize:
+            self._print_summary(outcome)
+        return outcome
 
     def _verify_tape(self, required_label):
         while True:
@@ -612,8 +778,15 @@ class LTORetriever:
         return True
 
     def _restore_loose(self, record, restore_base=None):
+        name = self._record_name(record)
         src = self._resolve_tape_path(record['stored_path'])
-        dst = self._destination_for_record(record, restore_base=restore_base)
+        try:
+            dst = self._destination_for_record(
+                record, restore_base=restore_base)
+        except RestoreContainmentError as exc:
+            print(f"[ERROR] {exc}")
+            self._note_failed(name, exc)
+            return False
         print(f"\n[RESTORE] Copying loose file: {record['file_name']}")
         os.makedirs(os.path.dirname(os.path.abspath(dst)), exist_ok=True)
         _acquire_tape_io_lock(f"restore {record['file_name']}")
@@ -624,8 +797,11 @@ class LTORetriever:
         self._check_cancelled()
         if ok:
             print(f"[RESTORE] Saved to: {dst}")
+            self._note_restored(dst)
         else:
             print("[ERROR] Restore failed: robocopy error")
+            self._note_failed(name, "could not copy the file from tape")
+        return bool(ok)
 
     @staticmethod
     def _resolve_zip_entry(zip_names, stored_in_zip, file_name):
@@ -728,8 +904,12 @@ class LTORetriever:
         return written
 
     def _restore_tar_members(self, local_tar, records, restore_base=None,
-                             sidecar=None):
-        """Validate the full TAR, then extract selected members atomically."""
+                             sidecar=None, restored_out=None):
+        """Validate the full TAR, then extract selected members atomically.
+
+        Every record published is appended to ``restored_out`` so a caller can
+        tell exactly which records a mid-container failure left unrestored.
+        """
         if not records:
             return 0
         first = records[0]
@@ -792,6 +972,9 @@ class LTORetriever:
                         self._check_cancelled()
                         published = self._publish_temp_no_clobber(temp_path, dst)
                         print(f"[OK] {record['file_name']} -> {published}")
+                        self._note_restored(published)
+                        if restored_out is not None:
+                            restored_out.append(record)
                         restored += 1
                         seen.add(normalized)
                     finally:
@@ -821,11 +1004,17 @@ class LTORetriever:
             raise RuntimeError("[RESTORE] A loose file is not a container")
 
         record = records[0]
+
+        def fail_all(reason):
+            for item in records:
+                self._note_failed(self._record_name(item), reason)
+            return 0
+
         try:
             sidecar = sidecar or self._load_tar_sidecar(record)
         except ArtifactError as exc:
             print(f"[ERROR] Stored TAR restore refused: {exc}")
-            return 0
+            return fail_all(f"Stored TAR restore refused: {exc}")
         local_tar = self._local_container_path(record)
         owns_staged_copy = False
         if not (local_tar and os.path.isfile(local_tar)):
@@ -842,7 +1031,7 @@ class LTORetriever:
                 self.staging_dir,
                 f"restore_{uuid.uuid4().hex}_{os.path.basename(tape_path)}")
             if not self._bundle_staging_space_ok(tape_path):
-                return 0
+                return fail_all("not enough staging space for the container")
             _acquire_tape_io_lock(f"restore {os.path.basename(tape_path)}")
             try:
                 # local_tar is renamed (restore_<uuid>_...), and robocopy keeps
@@ -852,18 +1041,25 @@ class LTORetriever:
                 _release_tape_io_lock()
             if not ok:
                 print("[ERROR] Could not copy Stored TAR from tape: robocopy error")
-                return 0
+                return fail_all("could not copy the Stored TAR from tape")
             owns_staged_copy = True
+        published = []
         try:
             return self._restore_tar_members(
                 local_tar, records, restore_base=restore_base,
-                sidecar=sidecar)
+                sidecar=sidecar, restored_out=published)
         except (ArtifactError, StoredTarError, tarfile.TarError,
                 OSError, RuntimeError) as exc:
             if CANCEL.is_set():
                 raise
             print(f"[ERROR] Stored TAR restore refused: {exc}")
-            return 0
+            done_ids = {id(item) for item in published}
+            for item in records:
+                if id(item) not in done_ids:
+                    self._note_failed(
+                        self._record_name(item),
+                        f"Stored TAR restore refused: {exc}")
+            return len(published)
         finally:
             if owns_staged_copy:
                 try:
@@ -873,6 +1069,7 @@ class LTORetriever:
 
     def _restore_packed(self, record, restore_base=None):
         # Full path of the ZIP on tape, remapped to the current drive letter.
+        name = self._record_name(record)
         tape_zip_path = self._resolve_tape_path(record['container_name'])
         stored_in_zip = record['stored_path']       # relative path inside the ZIP
         local_zip     = os.path.join(self.staging_dir, os.path.basename(tape_zip_path))
@@ -882,7 +1079,8 @@ class LTORetriever:
 
         os.makedirs(self.staging_dir, exist_ok=True)
         if not self._bundle_staging_space_ok(tape_zip_path):
-            return
+            self._note_failed(name, "not enough staging space for the ZIP")
+            return False
         _acquire_tape_io_lock(f"restore {os.path.basename(tape_zip_path)}")
         try:
             ok = _robocopy_file(tape_zip_path, local_zip)
@@ -890,28 +1088,35 @@ class LTORetriever:
             _release_tape_io_lock()
         if not ok:
             print("[ERROR] Could not copy ZIP from tape: robocopy error")
-            return
+            self._note_failed(name, "could not copy the ZIP from tape")
+            return False
 
         print(f"[RESTORE] Step 2/3: Extracting '{record['file_name']}' from ZIP...")
-        dst = self._destination_for_record(record, restore_base=restore_base)
         try:
+            dst = self._destination_for_record(
+                record, restore_base=restore_base)
             with zipfile.ZipFile(local_zip, 'r') as zf:
                 entry, warn, err = self._resolve_zip_entry(
                     zf.namelist(), stored_in_zip, record['file_name'])
-                if err:
+                if err or entry is None:
+                    err = err or "ZIP entry could not be resolved."
                     print(f"[ERROR] {err}")
-                    return
-                if entry is None:
-                    print("[ERROR] ZIP entry could not be resolved.")
-                    return
+                    self._note_failed(name, err)
+                    return False
                 if warn:
                     print(f"[WARN] {warn}")
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 with zf.open(entry) as zf_src, open(dst, 'wb') as out:
                     shutil.copyfileobj(zf_src, out)
             print(f"[RESTORE] Saved to: {dst}")
+            self._note_restored(dst)
+            return True
+        except RestoreCancelled:
+            raise
         except Exception as e:
             print(f"[ERROR] Extraction failed: {e}")
+            self._note_failed(name, f"extraction failed: {e}")
+            return False
         finally:
             print("[RESTORE] Step 3/3: Removing staging ZIP...")
             try:
@@ -925,8 +1130,16 @@ class LTORetriever:
         local_zip = os.path.join(self.staging_dir, os.path.basename(tape_zip_path))
         print(f"\n[RESTORE] Copying {os.path.basename(tape_zip_path)} from tape to staging...")
         os.makedirs(self.staging_dir, exist_ok=True)
+        pending = list(records)       # records with no recorded outcome yet
+        restored = 0
+
+        def fail_pending(reason):
+            while pending:
+                self._note_failed(self._record_name(pending.pop(0)), reason)
+
         if not self._bundle_staging_space_ok(tape_zip_path):
-            return
+            fail_pending("not enough staging space for the ZIP")
+            return 0
         _acquire_tape_io_lock(f"restore {os.path.basename(tape_zip_path)}")
         try:
             ok = _robocopy_file(tape_zip_path, local_zip)
@@ -934,39 +1147,53 @@ class LTORetriever:
             _release_tape_io_lock()
         if not ok:
             print("[ERROR] Could not copy ZIP from tape: robocopy error")
-            return
+            fail_pending("could not copy the ZIP from tape")
+            return 0
         print(f"[RESTORE] Extracting {len(records)} file(s)...")
         try:
             with zipfile.ZipFile(local_zip, 'r') as zf:
                 zip_names = zf.namelist()
-                for record in records:
+                while pending:
+                    record = pending[0]
+                    name = self._record_name(record)
                     stored_in_zip = record['stored_path']
-                    dst = self._destination_for_record(record,
-                                                       restore_base=restore_base)
                     entry, warn, err = self._resolve_zip_entry(
                         zip_names, stored_in_zip, record['file_name'])
-                    if err:
+                    if err or entry is None:
+                        err = err or (f"{record['file_name']}: ZIP entry "
+                                      "could not be resolved.")
                         print(f"[ERROR] {err}")
-                        continue
-                    if entry is None:
-                        print(f"[ERROR] {record['file_name']}: ZIP entry could not be resolved.")
+                        self._note_failed(name, err)
+                        pending.pop(0)
                         continue
                     if warn:
                         print(f"[WARN] {warn}")
                     try:
+                        dst = self._destination_for_record(
+                            record, restore_base=restore_base)
                         os.makedirs(os.path.dirname(dst), exist_ok=True)
                         with zf.open(entry) as zf_src, open(dst, 'wb') as out:
                             shutil.copyfileobj(zf_src, out)
                         print(f"[OK] {record['file_name']}")
+                        self._note_restored(dst)
+                        restored += 1
+                    except RestoreCancelled:
+                        raise
                     except Exception as e:
                         print(f"[ERROR] {record['file_name']}: {e}")
+                        self._note_failed(name, f"extraction failed: {e}")
+                    pending.pop(0)
+        except RestoreCancelled:
+            raise
         except Exception as e:
             print(f"[ERROR] ZIP extraction failed: {e}")
+            fail_pending(f"ZIP extraction failed: {e}")
         finally:
             try:
                 os.remove(local_zip)
             except OSError:
                 pass
+        return restored
 
     # ------------------------------------------------------------------
     # Bundle-complete directory restore (includes small files with no
@@ -1016,6 +1243,10 @@ class LTORetriever:
                 if bundle.get("container_id") is not None:
                     print("[ERROR] Linked directory container has no persisted "
                           "format; refusing to guess.")
+                    self._note_failed(
+                        needle, "a linked directory container has no "
+                        "persisted format; nothing was restored")
+                    self._print_summary(self._result)
                     return
                 bundle = dict(bundle)
                 bundle.update({
@@ -1029,16 +1260,23 @@ class LTORetriever:
             by_tape[bundle["tape_label"]].append(bundle)
         print(f"\n[RESTORE] {len(bundles)} bundle(s) across "
               f"{len(by_tape)} tape(s) cover '{needle}'.")
-        total = 0
+        mark = self._result._mark()
         for tape_label, tape_bundles in by_tape.items():
             self._check_cancelled()
             if any(self._record_needs_tape(b) for b in tape_bundles):
                 self._verify_tape(tape_label)
             for bundle in tape_bundles:
-                total += self._extract_container_subtree(
-                    bundle, needle, restore_base)
-        print(f"\n[RESTORE] Directory restore complete: {total} file(s) "
-              f"extracted to {self.restore_dir}")
+                self._extract_container_subtree(bundle, needle, restore_base)
+        outcome = self._result._since(mark)
+        self._print_summary(outcome)
+        return outcome
+
+    @staticmethod
+    def _container_label(bundle):
+        locator = (bundle.get("tape_container_locator")
+                   or bundle.get("stored_bundle_path")
+                   or bundle.get("container_name") or "container")
+        return f"<every file in {os.path.basename(str(locator))}>"
 
     def _extract_container_subtree(self, bundle, dir_path, restore_base):
         route = self._route_container_format(bundle)
@@ -1055,6 +1293,9 @@ class LTORetriever:
                 bundle, directory=dir_path, limit=1_000_000)
         except ArtifactError as exc:
             print(f"[ERROR] Stored TAR directory restore refused: {exc}")
+            self._note_failed(
+                self._container_label(bundle),
+                f"Stored TAR directory restore refused: {exc}")
             return 0
         if not sidecar.matches:
             return 0
@@ -1080,7 +1321,10 @@ class LTORetriever:
         print(f"\n[RESTORE] Copying {os.path.basename(tape_zip_path)} "
               "from tape to staging...")
         os.makedirs(self.staging_dir, exist_ok=True)
+        whole_bundle = f"<every file in {os.path.basename(tape_zip_path)}>"
         if not self._bundle_staging_space_ok(tape_zip_path):
+            self._note_failed(
+                whole_bundle, "not enough staging space for the ZIP")
             return 0
         _acquire_tape_io_lock(f"restore {os.path.basename(tape_zip_path)}")
         try:
@@ -1089,6 +1333,7 @@ class LTORetriever:
             _release_tape_io_lock()
         if not ok:
             print("[ERROR] Could not copy ZIP from tape: robocopy error")
+            self._note_failed(whole_bundle, "could not copy the ZIP from tape")
             return 0
         extracted = 0
         try:
@@ -1108,12 +1353,18 @@ class LTORetriever:
                                 exist_ok=True)
                     with zf.open(entry) as zsrc, open(dst, "wb") as out:
                         shutil.copyfileobj(zsrc, out)
+                    self._note_restored(dst)
                     extracted += 1
                     if extracted % 500 == 0:
                         print(f"[RESTORE] {extracted} file(s) extracted...")
+        except RestoreCancelled:
+            raise
         except Exception as e:
             print(f"[ERROR] Extraction failed for "
                   f"{os.path.basename(tape_zip_path)}: {e}")
+            self._note_failed(
+                f"<remaining files in {os.path.basename(tape_zip_path)}>",
+                f"extraction failed: {e}")
         finally:
             try:
                 os.remove(local_zip)

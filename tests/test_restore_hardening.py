@@ -204,5 +204,173 @@ class RestoreContainmentTests(_RestoreCase):
         self.assertIn("D/ok.txt", self._files_under(self.restore))
 
 
+class RestoreAccountingTests(_RestoreCase):
+    """H13: the final message and the result count what really happened."""
+
+    def _zip_records(self, zip_name, names):
+        return [{"tape_label": "T1", "is_packed": True, "bundle_id": 1,
+                 "container_name": os.path.join(self.tape, zip_name),
+                 "stored_path": name, "file_name": os.path.basename(name),
+                 "original_path": "/src/" + name} for name in names]
+
+    def _loose_record(self, name, content=None):
+        path = os.path.join(self.tape, name)
+        if content is not None:
+            with open(path, "wb") as handle:
+                handle.write(content)
+        return {"tape_label": "T1", "is_packed": False, "stored_path": path,
+                "file_name": name, "original_path": "/src/" + name}
+
+    def _run_many(self, records):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            result = self.retriever._restore_many(records)
+        return result, out.getvalue()
+
+    def test_zero_files_restored_is_not_reported_as_restored(self):
+        # The bundle is absent from the "tape": nothing can be restored.
+        records = self._zip_records("Missing.zip", ["a.txt", "b.txt", "c.txt"])
+        result, text = self._run_many(records)
+        self.assertEqual(self._files_under(self.restore), [])
+        self.assertNotIn("Complete.", text)
+        self.assertIn("INCOMPLETE. 0 of 3 file(s) restored", text)
+        for name in ("a.txt", "b.txt", "c.txt"):
+            self.assertIn("/src/" + name, text)
+        self.assertFalse(result.ok)
+        self.assertEqual(
+            (result.restored_count, result.failed_count, result.skipped),
+            (0, 3, 0))
+        self.assertNotEqual(result.exit_code, 0)
+
+    def test_partial_success_counts_each_outcome(self):
+        with zipfile.ZipFile(os.path.join(self.tape, "B.zip"), "w") as zf:
+            zf.writestr("in_zip.txt", "ZIP")
+        records = (
+            [self._loose_record("ok.bin", b"OK"),
+             self._loose_record("gone.bin")]            # source file absent
+            + self._zip_records("B.zip", ["in_zip.txt", "not_in_zip.txt"]))
+        result, text = self._run_many(records)
+        self.assertEqual(
+            (result.restored_count, result.failed_count, result.skipped),
+            (2, 2, 0))
+        self.assertFalse(result.ok)
+        self.assertEqual(self._files_under(self.restore),
+                         ["in_zip.txt", "ok.bin"])
+        self.assertIn("2 of 4 file(s) restored", text)
+        failed_names = {name for name, _reason in result.failures}
+        self.assertEqual(failed_names,
+                         {"/src/gone.bin", "/src/not_in_zip.txt"})
+        self.assertEqual(sorted(os.path.basename(p) for p in result.restored),
+                         ["in_zip.txt", "ok.bin"])
+
+    def test_full_success_is_reported_complete(self):
+        records = [self._loose_record("one.bin", b"1"),
+                   self._loose_record("two.bin", b"22")]
+        result, text = self._run_many(records)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(result.restored_count, 2)
+        self.assertIn("Complete. 2 file(s) restored", text)
+
+    def test_unsafe_name_is_a_recorded_failure_not_a_crash(self):
+        records = [self._loose_record("ok.bin", b"OK"),
+                   dict(self._loose_record("x.bin", b"X"), file_name="..",
+                        original_path=None)]
+        result, _text = self._run_many(records)
+        self.assertEqual((result.restored_count, result.failed_count), (1, 1))
+
+    def test_records_on_unregistered_tapes_are_skipped_not_restored(self):
+        page = [dict(self._loose_record("one.bin", b"1"), file_id=1)]
+
+        class _DB:
+            @staticmethod
+            def list_tapes():
+                return [{"volume_label": "T1"}]
+        self.retriever.db = cast(Any, _DB())
+        calls = []
+
+        def fetch_after(after_id, tape):
+            calls.append((after_id, tape))
+            return page if after_id == 0 else []
+        out = io.StringIO()
+        with redirect_stdout(out):
+            result = self.retriever._restore_all_pages(fetch_after, 3)
+        self.assertEqual(
+            (result.restored_count, result.failed_count, result.skipped),
+            (1, 0, 2))
+        self.assertFalse(result.ok)
+        self.assertIn("INCOMPLETE", out.getvalue())
+        self.assertIn("1 of 3 file(s) restored", out.getvalue())
+
+    def test_directory_restore_reports_a_bundle_it_could_not_read(self):
+        class _DB:
+            @staticmethod
+            def find_directory_restore_bundles(dir_path, **_kw):
+                return [{"tape_label": "T1", "base_path": "/vault",
+                         "stored_bundle_path":
+                             os.path.join(self.tape, "Missing.zip")}]
+        self.retriever.db = cast(Any, _DB())
+        out = io.StringIO()
+        with redirect_stdout(out):
+            result = self.retriever._restore_directory_complete("/vault/D")
+        self.assertFalse(result.ok)
+        self.assertNotIn("complete", out.getvalue().lower().replace(
+            "incomplete", ""))
+        self.assertIn("Missing.zip", out.getvalue())
+
+    def test_run_returns_the_result_and_keeps_it_on_last_result(self):
+        record = dict(self._zip_records("Missing.zip", ["a.txt"])[0], file_id=7)
+
+        class _DB:
+            @staticmethod
+            def count_search_files(*_a):
+                return 1
+
+            @staticmethod
+            def search_files(*_a, **_kw):
+                return [dict(record, file_size_bytes=1, backup_date=None,
+                             source_host="h")]
+
+            @staticmethod
+            def get_file_by_id(_id):
+                return record
+        self.retriever.db = cast(Any, _DB())
+        out = io.StringIO()
+        with redirect_stdout(out), mock.patch(
+                "builtins.input", side_effect=["1", "a.txt", "7"]):
+            result = self.retriever.run()
+        self.assertIs(result, self.retriever.last_result)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.exit_code,
+                         retriever_mod.RESTORE_INCOMPLETE_EXIT_CODE)
+        self.assertEqual(result.reason, "restore_incomplete")
+        self.assertIn("INCOMPLETE", out.getvalue())
+
+    def test_cancel_raises_and_marks_last_result_cancelled(self):
+        class _DB:
+            @staticmethod
+            def count_search_files(*_a):
+                return 1
+
+            @staticmethod
+            def search_files(*_a, **_kw):
+                return [{"file_id": 1, "file_name": "a", "file_size_bytes": 1,
+                         "backup_date": None, "tape_label": "T1"}]
+
+            @staticmethod
+            def list_tapes():
+                CANCEL.set()
+                return [{"volume_label": "T1"}]
+        self.retriever.db = cast(Any, _DB())
+        self.addCleanup(CANCEL.clear)
+        with redirect_stdout(io.StringIO()), mock.patch(
+                "builtins.input", side_effect=["1", "a", "ALL"]):
+            with self.assertRaisesRegex(RuntimeError, "Cancelled"):
+                self.retriever.run()
+        self.assertTrue(self.retriever.last_result.cancelled)
+        self.assertFalse(self.retriever.last_result.ok)
+        self.assertNotEqual(self.retriever.last_result.exit_code, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
