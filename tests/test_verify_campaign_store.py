@@ -302,5 +302,22 @@ class ResumeTrustTests(_Store):
         self.assertIn("SHA-256 mismatch", text)
 
 
+class RegularFileTests(_Store):
+    """review F3: a receipted container must be a regular file."""
+
+    def test_directory_in_place_of_a_container_fails(self):
+        os.makedirs(os.path.join(self.chunk_dir, "container_0000.tar"))
+        receipt = self._good_receipt()
+        receipt["containers"][0]["tar_size"] = os.path.getsize(
+            os.path.join(self.chunk_dir, "container_0000.tar"))
+        self._write(receipt, tar=False)
+        for full in (False, True):
+            with self.subTest(full=full):
+                result = self._chunk(full=full)
+                self.assertEqual(result["status"], "fail")
+                self.assertIn("not a regular file", result["detail"])
+                self.assertEqual(result["bytes_verified"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

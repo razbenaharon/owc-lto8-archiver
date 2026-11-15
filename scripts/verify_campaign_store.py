@@ -38,6 +38,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 from datetime import datetime, timezone
 
@@ -319,6 +320,13 @@ def verify_chunk(root, index, chunk_dir, *, full, already_ok,
                          detail=f"missing or unreadable: {exc}")
             result["containers"].append(entry)
             problems.append(f"{name}: {entry['detail']}")
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            # A directory (or anything else) carrying the container's name has
+            # a "size" too; only a regular file can be a container.
+            entry.update(status="fail", detail="not a regular file")
+            result["containers"].append(entry)
+            problems.append(f"{name}: not a regular file")
             continue
         actual_size = info.st_size
         expected_size = container["tar_size"]
