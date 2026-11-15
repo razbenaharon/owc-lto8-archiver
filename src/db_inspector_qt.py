@@ -13,7 +13,6 @@ from PySide6.QtCore import (
     QAbstractTableModel,
     QModelIndex,
     QObject,
-    QRunnable,
     QThreadPool,
     Qt,
     Signal,
@@ -66,56 +65,82 @@ def _fmt_bytes(value):
     return f"{n:.1f} PiB"
 
 
-class WorkerSignals(QObject):
-    finished = Signal(object, object)
-    failed = Signal(object, str)
+def _in_repository(db_path, function):
+    """Bind ``function(repo)`` to a fresh read-only repository connection.
+
+    ``InspectorRepository`` is looked up when the job runs, so the connection
+    is opened on the worker thread, never on the GUI thread.
+    """
+    def job():
+        with InspectorRepository(db_path) as repo:
+            return function(repo)
+    return job
 
 
-class RepositoryWorker(QRunnable):
-    def __init__(self, db_path, token, function):
-        super().__init__()
-        self.db_path = db_path
-        self.token = token
-        self.function = function
-        self.signals = WorkerSignals()
+class TaskRunner(QObject):
+    """Run blocking database calls on the thread pool; reply on the GUI thread.
 
-    @Slot()
-    def run(self):
-        try:
-            with InspectorRepository(self.db_path) as repo:
-                result = self.function(repo)
-        except Exception as exc:
-            self.signals.failed.emit(self.token, str(exc))
-            return
-        self.signals.finished.emit(self.token, result)
+    Lifetime model (audit H15). Each worker used to own a private signal
+    ``QObject`` hanging off an auto-deleted ``QRunnable``. Once ``run()``
+    returned nothing kept that object alive, so it was routinely destroyed
+    while its queued reply was still in the event queue: the reply was dropped
+    (write buttons stayed disabled, tables never refreshed) and, often enough,
+    the interpreter crashed tearing a ``QObject`` down from a pool thread.
 
-
-class _DbTaskSignals(QObject):
-    finished = Signal(object)
-    failed = Signal(str)
-
-
-class DbWriteTask(QRunnable):
-    """Run a blocking PgDatabaseManager write off the UI thread.
-
-    Heavy maintenance ops (rename_tape rebuilds every record_key of a tape;
-    cleanup runs VACUUM) used to freeze the event loop for minutes at catalog
-    scale. The manager is connection-pool backed, so it is thread-safe here.
+    Here there is exactly one signal, it belongs to this object, and this
+    object lives on the GUI thread for as long as its owner widget does. A job
+    is a plain callable; the runner holds a strong reference to it and to its
+    callbacks from ``submit`` until the reply has been delivered. The reply is
+    always a queued connection, so callbacks only ever run on the GUI thread.
     """
 
-    def __init__(self, fn):
-        super().__init__()
-        self.fn = fn
-        self.signals = _DbTaskSignals()
+    _reply = Signal(int, bool, object)
 
-    @Slot()
-    def run(self):
-        try:
-            result = self.fn()
-        except Exception as exc:
-            self.signals.failed.emit(str(exc))
+    def __init__(self, parent=None, pool=None):
+        super().__init__(parent)
+        self._pool = pool or QThreadPool.globalInstance()
+        self._jobs = {}
+        self._next_id = 0
+        self._reply.connect(self._deliver, Qt.ConnectionType.QueuedConnection)
+
+    def pending(self):
+        """Number of submitted jobs whose reply has not been delivered yet."""
+        return len(self._jobs)
+
+    def submit(self, fn, on_ok=None, on_fail=None):
+        """Run ``fn()`` off the GUI thread.
+
+        Exactly one of ``on_ok(result)`` / ``on_fail(message)`` is then called
+        on the GUI thread.
+        """
+        self._next_id += 1
+        job_id = self._next_id
+
+        def job():
+            try:
+                ok, payload = True, fn()
+            except Exception as exc:
+                ok, payload = False, str(exc) or exc.__class__.__name__
+            try:
+                self._reply.emit(job_id, ok, payload)
+            except RuntimeError:
+                # The owning window was closed and destroyed while the job
+                # ran; there is nobody left to tell.
+                pass
+
+        self._jobs[job_id] = (job, on_ok, on_fail)
+        self._pool.start(job)
+        return job_id
+
+    @Slot(int, bool, object)
+    def _deliver(self, job_id, ok, payload):
+        entry = self._jobs.pop(job_id, None)
+        if entry is None:
             return
-        self.signals.finished.emit(result)
+        _job, on_ok, on_fail = entry
+        callback = on_ok if ok else on_fail
+        if callback is not None:
+            callback(payload)
 
 
 class TreeNode:
@@ -148,7 +173,7 @@ class ArchiveTreeModel(QAbstractItemModel):
         super().__init__(parent)
         self.db_path = db_path
         self.root = TreeNode("root", "root")
-        self.pool = QThreadPool.globalInstance()
+        self.tasks = TaskRunner(self)
         self._token = 0
         self._load_tapes()
 
@@ -252,10 +277,10 @@ class ArchiveTreeModel(QAbstractItemModel):
                 row["recursive_file_count"] = totals.get("recursive_file_count", 0)
             return page
 
-        worker = RepositoryWorker(self.db_path, token, load)
-        worker.signals.finished.connect(self._on_loaded)
-        worker.signals.failed.connect(self._on_failed)
-        self.pool.start(worker)
+        self.tasks.submit(
+            _in_repository(self.db_path, load),
+            on_ok=lambda result: self._on_loaded(token, result),
+            on_fail=lambda message: self._on_failed(token, message))
 
     def node_from_index(self, index):
         return index.internalPointer() if index.isValid() else self.root
@@ -265,7 +290,6 @@ class ArchiveTreeModel(QAbstractItemModel):
             return QModelIndex()
         return self.createIndex(node.row(), 0, node)
 
-    @Slot(object, object)
     def _on_loaded(self, token, result):
         _token_id, node = token
         node.loading = False
@@ -286,7 +310,6 @@ class ArchiveTreeModel(QAbstractItemModel):
         node.cursor = result["next_cursor"]
         node.has_more = bool(result["has_more"])
 
-    @Slot(object, str)
     def _on_failed(self, token, message):
         _token_id, node = token
         node.loading = False
@@ -414,7 +437,7 @@ class BrowseWidget(QWidget):
         super().__init__(parent)
         self.db = db
         self.db_path = db_path
-        self.pool = QThreadPool.globalInstance()
+        self.tasks = TaskRunner(self)
         self.generation = 0
         self.current_directory_id = None
         self.current_sort = "name"
@@ -512,15 +535,12 @@ class BrowseWidget(QWidget):
         sort = self.current_sort
         self.status.setText("Loading...")
 
-        worker = RepositoryWorker(
-            self.db_path, generation,
-            lambda repo: repo.list_directory_files(
-                directory_id, sort=sort, cursor=cursor, limit=PAGE_SIZE))
-        worker.signals.finished.connect(self._on_files_loaded)
-        worker.signals.failed.connect(lambda _token, msg: self._show_error(msg))
-        self.pool.start(worker)
+        self.tasks.submit(
+            _in_repository(self.db_path, lambda repo: repo.list_directory_files(
+                directory_id, sort=sort, cursor=cursor, limit=PAGE_SIZE)),
+            on_ok=lambda result: self._on_files_loaded(generation, result),
+            on_fail=self._show_error)
 
-    @Slot(object, object)
     def _on_files_loaded(self, generation, result):
         if generation != self.generation:
             return
@@ -601,7 +621,7 @@ class SearchWidget(QWidget):
         super().__init__(parent)
         self.db = db
         self.db_path = db_path
-        self.pool = QThreadPool.globalInstance()
+        self.tasks = TaskRunner(self)
         self.generation = 0
         self.cursor_stack = [None]
         self.page_index = 0
@@ -689,15 +709,12 @@ class SearchWidget(QWidget):
         if source_host and source_host != "All":
             scope["source_host"] = source_host
         self.status.setText("Searching...")
-        worker = RepositoryWorker(
-            self.db_path, generation,
-            lambda repo: repo.search_catalog_fts(
-                query, scope=scope, cursor=cursor, limit=PAGE_SIZE))
-        worker.signals.finished.connect(self._on_loaded)
-        worker.signals.failed.connect(lambda _token, msg: self._show_error(msg))
-        self.pool.start(worker)
+        self.tasks.submit(
+            _in_repository(self.db_path, lambda repo: repo.search_catalog_fts(
+                query, scope=scope, cursor=cursor, limit=PAGE_SIZE)),
+            on_ok=lambda result: self._on_loaded(generation, result),
+            on_fail=self._show_error)
 
-    @Slot(object, object)
     def _on_loaded(self, generation, result):
         if generation != self.generation:
             return
@@ -761,7 +778,7 @@ class DirectoryCatalogWidget(QWidget):
         super().__init__(parent)
         self.db = db
         self.db_path = db_path
-        self.pool = QThreadPool.globalInstance()
+        self.tasks = TaskRunner(self)
         self.generation = 0
 
         layout = QVBoxLayout(self)
@@ -814,13 +831,11 @@ class DirectoryCatalogWidget(QWidget):
         self.generation += 1
         generation = self.generation
         self.status.setText(f"{label}...")
-        worker = RepositoryWorker(self.db_path, generation, fn)
-        worker.signals.finished.connect(
-            lambda token, result: self._loaded(token, result, columns))
-        worker.signals.failed.connect(lambda _token, msg: self._show_error(msg))
-        self.pool.start(worker)
+        self.tasks.submit(
+            _in_repository(self.db_path, fn),
+            on_ok=lambda result: self._loaded(generation, result, columns),
+            on_fail=self._show_error)
 
-    @Slot(object, object)
     def _loaded(self, generation, result, columns):
         if generation != self.generation:
             return
@@ -926,8 +941,9 @@ class ManageWidget(QWidget):
         super().__init__(parent)
         self.db = db
         self.db_path = db_path
-        self.pool = QThreadPool.globalInstance()
+        self.tasks = TaskRunner(self)
         self._sessions_token = 0
+        self._write_in_flight = False
         self._cleanup_summary = {}
         layout = QVBoxLayout(self)
         tabs = QTabWidget(self)
@@ -1004,11 +1020,20 @@ class ManageWidget(QWidget):
                 self.refresh_btn, self.delete_session_btn, self.cleanup_btn)
 
     def _run_db_task(self, fn, on_done=None):
-        """Run a DB write in the thread pool with the write buttons disabled."""
+        """Run a DB write in the thread pool with the write buttons disabled.
+
+        One write at a time: a second request while one is in flight is
+        refused (returns False) rather than queued behind it, so a stray
+        double activation cannot run the same destructive action twice.
+        """
+        if self._write_in_flight:
+            return False
+        self._write_in_flight = True
         for button in self._write_buttons():
             button.setEnabled(False)
 
         def _restore_buttons():
+            self._write_in_flight = False
             for button in self._write_buttons():
                 button.setEnabled(True)
 
@@ -1021,10 +1046,8 @@ class ManageWidget(QWidget):
             _restore_buttons()
             self._show_error(message)
 
-        task = DbWriteTask(fn)
-        task.signals.finished.connect(_ok)
-        task.signals.failed.connect(_fail)
-        self.pool.start(task)
+        self.tasks.submit(fn, on_ok=_ok, on_fail=_fail)
+        return True
 
     def selected_tape(self):
         row = self.tapes_table.currentRow()
@@ -1136,19 +1159,14 @@ class ManageWidget(QWidget):
         token = self._sessions_token
         self.sessions_table.setRowCount(0)
         self.cleanup_btn.setEnabled(False)
-        worker = RepositoryWorker(
-            self.db_path,
-            token,
-            lambda repo: {
+        self.tasks.submit(
+            _in_repository(self.db_path, lambda repo: {
                 "rows": repo.list_sessions(),
                 "summary": repo.unreferenced_remote_data_summary(),
-            },
-        )
-        worker.signals.finished.connect(self._on_sessions_loaded)
-        worker.signals.failed.connect(lambda _token, msg: self._show_error(msg))
-        self.pool.start(worker)
+            }),
+            on_ok=lambda result: self._on_sessions_loaded(token, result),
+            on_fail=self._show_error)
 
-    @Slot(object, object)
     def _on_sessions_loaded(self, token, result):
         if token != self._sessions_token:
             return
@@ -1266,7 +1284,11 @@ def run_qt_inspector(db, db_path, display_ref=None):
     app.setApplicationName("LTO Archive Inspector")
     window = DBInspectorQtApp(db, db_path, display_ref=display_ref)
     window.show()
-    return app.exec()
+    code = app.exec()
+    # Let in-flight database calls finish before the window (and the runners
+    # their replies are addressed to) is torn down.
+    QThreadPool.globalInstance().waitForDone(10000)
+    return code
 
 
 if __name__ == "__main__":
