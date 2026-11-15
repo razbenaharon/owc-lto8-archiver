@@ -11,6 +11,7 @@ deliberately exhaustive over the declared statuses: a new status that nobody
 wires into ``CHUNK_TRANSITIONS`` shows up here as an unreachable state rather
 than as a silent runtime refusal.
 """
+from source_facts import code_text
 import inspect
 import unittest
 from itertools import product
@@ -187,7 +188,7 @@ def _repo(**kwargs):
 class TransitionChunkTests(unittest.TestCase):
     def test_it_is_the_only_place_chunk_status_is_written(self):
         from src.pg_sessions import PgSessionMixin
-        wrapper = inspect.getsource(PgSessionMixin.update_chunk_status)
+        wrapper = code_text(PgSessionMixin.update_chunk_status)
         self.assertIn("transition_chunk", wrapper)
         # The wrapper contains no SQL of its own any more.
         self.assertNotIn("UPDATE remote_chunks", wrapper)
@@ -316,7 +317,7 @@ class TypedCallSiteTests(unittest.TestCase):
     def test_the_writer_and_stager_use_the_enum_not_bare_strings(self):
         from src import remote_staging, remote_writer
         for module in (remote_staging, remote_writer):
-            source = inspect.getsource(module)
+            source = code_text(module)
             for literal in ("'backing'", "'done'", "'fetching'", "'packing'",
                             "'fetch_failed'", "'backup_failed'"):
                 self.assertNotIn(

@@ -13,6 +13,7 @@ could quietly have lost:
 
 No SSH, no PostgreSQL, no staging, no tape: every collaborator is injected.
 """
+from source_facts import code_only
 import threading
 import unittest
 from types import SimpleNamespace
@@ -403,7 +404,7 @@ class OrchestratorIsWiringTests(unittest.TestCase):
         """
         import inspect
         from src.remote_orchestrator import RemoteOrchestrator
-        source = inspect.getsource(RemoteOrchestrator._run_streaming_session)
+        source = code_only(RemoteOrchestrator._run_streaming_session)
         self.assertIn("FrontierScanCoordinator", source)
         self.assertNotIn("RemoteScanCoordinator", source)
         for gone in ("_scanner_planner", "_append_chunk", "_chunk_rows",

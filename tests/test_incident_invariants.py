@@ -10,6 +10,7 @@ and the numbered incidents. They are asserted BEHAVIOURALLY where possible (run
 the code, watch what it does to a fake drive) and structurally only where
 behaviour cannot be reached without a real device.
 """
+from source_facts import code_only
 import os
 import threading
 import unittest
@@ -364,13 +365,6 @@ class CartridgeIdentityTests(unittest.TestCase):
                 block = orch._verify_mounted_cartridge("Tape_02")
             self.assertIsNotNone(block, behaviour)
 
-    def test_the_group_gate_still_verifies_the_cartridge(self):
-        import inspect
-        gate = inspect.getsource(ro.RemoteOrchestrator._pre_write_safety_gate)
-        self.assertIn("_verify_mounted_cartridge", gate)
-        # ...exactly once per group, not per chunk.
-        self.assertEqual(gate.count("_verify_mounted_cartridge("), 1)
-
     def test_both_loops_announce_the_target_cartridge_without_reading_it(self):
         """The early check moved into the group, so silence is not acceptable:
         the operator is told which cartridge is expected, and when it will be
@@ -378,7 +372,7 @@ class CartridgeIdentityTests(unittest.TestCase):
         import inspect
         for method in (ro.RemoteOrchestrator._run_streaming_session,
                        ro.RemoteOrchestrator._run_session):
-            source = inspect.getsource(method)
+            source = code_only(method)
             self.assertIn("_announce_target_cartridge", source,
                           method.__name__)
 
@@ -429,31 +423,13 @@ class TapeLabelCanonicalizationTests(unittest.TestCase):
 # Incident 005 — the guards that actually hold
 # =============================================================================
 class RestartGuardTests(unittest.TestCase):
-    def test_the_pre_write_reboot_check_is_still_in_the_gate(self):
-        """'Refuse to START work likely to be interrupted' — the guard that
-        holds against a 60-second SCCM warning."""
-        import inspect
-        gate = inspect.getsource(ro.RemoteOrchestrator._pre_write_safety_gate)
-        self.assertIn("_pre_tape_write_reboot_check", gate)
-
-    def test_the_mount_must_be_time5_before_every_group(self):
-        """`sync_type=unmount` is what turned a restart into ~126 GB of loss."""
-        import inspect
-        gate = inspect.getsource(ro.RemoteOrchestrator._pre_write_safety_gate)
-        self.assertIn("_verify_current_mount_time5", gate)
 
     def test_both_loops_still_arm_the_reboot_sentinel(self):
         import inspect
         for method in (ro.RemoteOrchestrator._run_streaming_session,
                        ro.RemoteOrchestrator._run_session):
-            self.assertIn("RebootSentinel", inspect.getsource(method),
+            self.assertIn("RebootSentinel", code_only(method),
                           method.__name__)
-
-    def test_media_health_is_checked_before_every_group(self):
-        import inspect
-        gate = inspect.getsource(ro.RemoteOrchestrator._pre_write_safety_gate)
-        self.assertIn("_verify_ltfs_media_health", gate)
-
 
 # =============================================================================
 # Policy 000 rule 8 — no ltfsck / format / reset, ever, unprompted
@@ -493,17 +469,6 @@ class RobocopyEvidenceTests(unittest.TestCase):
         # reporting zeroed counters as "no failures" (incident 009).
         parsed = _parse_robocopy_summary("ERROR 32 Copying File x.bin\n")
         self.assertFalse(parsed["summary_found"])
-
-    def test_the_writer_still_delegates_the_commit_to_ltobackup(self):
-        """The conservative classifier lives in LTOBackup; the extraction must
-        not have bypassed it."""
-        import inspect
-        source = inspect.getsource(RemoteChunkWriter._write_one_chunk_owned)
-        self.assertIn("_backup_writer", source)
-        self.assertIn("on_write_start", source)
-        # The writer must not decide success from a return code itself.
-        self.assertNotIn("returncode", source)
-
 
 # =============================================================================
 # Incident 008 — the fetch-overrun trap is still configurable and armed

@@ -16,6 +16,7 @@ to do to data that already exists. These tests assert the properties that make
 
 Isolated-PostgreSQL behaviour lives in ``tests/test_pg_integration.py``.
 """
+from source_facts import code_text
 import os
 import re
 import unittest
@@ -334,7 +335,7 @@ class PreflightTests(unittest.TestCase):
     def test_it_is_read_only(self):
         import inspect
         from src.pg_core import PgConnectionCore
-        source = inspect.getsource(
+        source = code_text(
             PgConnectionCore.incremental_scan_schema_preflight)
         for mutation in ("INSERT", "UPDATE", "DELETE", "CREATE", "ALTER",
                          "DROP", "commit()"):

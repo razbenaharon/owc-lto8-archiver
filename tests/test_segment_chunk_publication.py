@@ -15,6 +15,7 @@ Three properties matter here, and each protects a different failure:
 3. **A sealed chunk is immutable.** Appending to one would change what a
    written chunk is recorded as containing.
 """
+from source_facts import code_text
 import os
 import tempfile
 import unittest
@@ -342,7 +343,7 @@ class SealImmutabilityTests(_Publisher):
         """Structural: the real SQL path carries the same refusal."""
         import inspect
         from src.pg_sessions import PgSessionMixin
-        source = inspect.getsource(
+        source = code_text(
             PgSessionMixin.append_remote_streaming_chunk)
         self.assertIn("membership_state", source)
         self.assertIn("SEALED", source)
@@ -350,7 +351,7 @@ class SealImmutabilityTests(_Publisher):
     def test_sealing_requires_migration_014(self):
         import inspect
         from src.pg_sessions import PgSessionMixin
-        source = inspect.getsource(PgSessionMixin.seal_remote_chunk)
+        source = code_text(PgSessionMixin.seal_remote_chunk)
         self.assertIn("migration 014", source)
         # Expectation and segment reference are set in ONE transaction.
         self.assertEqual(source.count("self._transaction("), 1)

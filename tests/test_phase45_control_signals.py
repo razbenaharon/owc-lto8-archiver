@@ -14,6 +14,7 @@ Every test is offline and bounded: LTFS is a fake adapter or a counting command,
 the writer is a recording double, and nothing touches Z:\\, an IBM helper or a
 live database.
 """
+from source_facts import code_only
 import threading
 import time
 import unittest
@@ -198,7 +199,7 @@ class DeadPressureConfigRemovedTests(unittest.TestCase):
 
     def test_orchestrator_has_no_pressure_ratio_fields(self):
         import inspect
-        src = inspect.getsource(ro)
+        src = code_only(ro)
         self.assertNotIn("staging_pressure_high_ratio", src)
         self.assertNotIn("staging_pressure_low_ratio", src)
 

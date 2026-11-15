@@ -6,6 +6,7 @@ that recomputation is idempotent, that the schema's partial unique indexes
 actually reject duplicate contributions, and that a directory spanning several
 chunks, containers and tapes is queryable as one thing.
 """
+from source_facts import code_text
 import unittest
 from typing import Any, cast
 
@@ -547,7 +548,7 @@ class RestoreRoutingTests(_DirectoryCatalogFixture, unittest.TestCase):
 
         import src.pg_directory_catalog as module
 
-        source = inspect.getsource(module.PgDirectoryCatalogMixin
+        source = code_text(module.PgDirectoryCatalogMixin
                                    .find_directory_restore_parts)
         for token in ("open(", "robocopy", "LtfsCmd", "lto_drive"):
             self.assertNotIn(token, source, token)

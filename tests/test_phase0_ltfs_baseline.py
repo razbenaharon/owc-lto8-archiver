@@ -8,6 +8,7 @@ unintended change to a neighbouring behaviour shows up as an unexpected failure.
 Every test is mock-only and uses a temporary directory as its fake drive. The
 autouse guard in conftest.py fails closed if any of them reaches the real mount.
 """
+from source_facts import code_only
 import configparser
 import os
 import queue
@@ -133,7 +134,7 @@ class ReadinessProbeTests(unittest.TestCase):
                 return ".".join(reversed(parts))
             return None
 
-        tree = ast.parse(inspect.getsource(ltfs))
+        tree = ast.parse(code_only(ltfs))
         targets = {"_verify_readiness_uncached",
                    "_ensure_lto_drive_ready_unlocked",
                    "_ensure_lto_drive_ready"}
@@ -508,7 +509,7 @@ class RobocopyCommandBaselineTests(unittest.TestCase):
             return None
 
         found = set()
-        for node in ast.walk(ast.parse(inspect.getsource(backup_mod))):
+        for node in ast.walk(ast.parse(code_only(backup_mod))):
             if isinstance(node, ast.Call):
                 name = dotted(node.func)
                 if name in banned:
@@ -613,9 +614,9 @@ class ReadinessInvalidationWiringTests(unittest.TestCase):
         from src import backup as backup_mod
         from src import remote_orchestrator as ro_mod
         self.assertIn("note_tape_io_error(",
-                      inspect.getsource(backup_mod))
+                      code_only(backup_mod))
         self.assertIn("note_device_state_change(",
-                      inspect.getsource(ro_mod))
+                      code_only(ro_mod))
 
     def test_successful_write_keeps_cached_readiness(self):
         """Invalidation must be failure-scoped, not fired on every write."""

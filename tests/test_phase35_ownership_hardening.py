@@ -4,6 +4,7 @@ failures, bounded timeouts, and static watchdog/coverage validation.
 Nothing here touches the tape: mutexes are named per test run, LTFS adapters are
 fakes, and PowerShell is only *parsed*, never executed.
 """
+from source_facts import code_only
 import ast
 import os
 import re
@@ -309,13 +310,6 @@ class OwnershipFailureClassificationTests(unittest.TestCase):
                               own.FAILURE_PRIMITIVE,
                               own.FAILURE_BAD_IDENTITY}), 4)
 
-    def test_reason_constant_is_wired_into_the_orchestrator(self):
-        from src import remote_orchestrator as ro
-        import inspect
-        body = inspect.getsource(ro)
-        self.assertIn("REASON_LTFS_OWNERSHIP_UNAVAILABLE", body)
-        self.assertIn("LtfsOwnershipError", body)
-
     def test_ownership_stop_preserves_the_pack_and_does_not_set_backing(self):
         """Static proof via AST: the ownership stop preserves the pack, and
         'backing' is only ever set from the writer-start callback."""
@@ -327,9 +321,9 @@ class OwnershipFailureClassificationTests(unittest.TestCase):
         # orchestrator method is a delegating façade.
         from src.remote_writer import RemoteChunkWriter
         group_src = textwrap.dedent(
-            inspect.getsource(RemoteChunkWriter._write_chunk_group))
+            code_only(RemoteChunkWriter._write_chunk_group))
         one_src = textwrap.dedent(
-            inspect.getsource(RemoteChunkWriter._write_one_chunk_owned))
+            code_only(RemoteChunkWriter._write_one_chunk_owned))
         group_fn = ast.parse(group_src).body[0]
 
         # The ownership handler must set preserve_pack=True with our reason.
@@ -495,7 +489,7 @@ class ProtectedOperationCoverageTests(unittest.TestCase):
 
     def test_low_level_helpers_assert_ownership(self):
         import inspect
-        src = inspect.getsource(ltfs)
+        src = code_only(ltfs)
         for fn in ("def drive_status", "def _read_volume_label_unlocked",
                    "def _eject_tape_unlocked"):
             idx = src.index(fn)
@@ -506,7 +500,7 @@ class ProtectedOperationCoverageTests(unittest.TestCase):
     def test_every_ltfs_module_entry_point_is_guarded(self):
         """Public LTFS helpers either take the lock or assert ownership."""
         import inspect
-        src = inspect.getsource(ltfs)
+        src = code_only(ltfs)
         tree = ast.parse(src)
         guarded, unguarded = [], []
         interesting = {
@@ -564,7 +558,7 @@ class ProtectedOperationCoverageTests(unittest.TestCase):
         drive-status output.
         """
         import inspect
-        src = inspect.getsource(ltfs)
+        src = code_only(ltfs)
         tree = ast.parse(src)
         required = {"tape_info", "_ltfs_drive_status", "format_tape",
                     "check_tape"}

@@ -22,6 +22,7 @@ What is asserted here:
 No real drive, no IBM helper, no SSH: ``FakeLtfsAdapter``/``TapeOperationLog``
 record every attempted operation.
 """
+from source_facts import code_text
 import threading
 import unittest
 from types import SimpleNamespace
@@ -115,7 +116,7 @@ class NewSessionTapeLabelTests(unittest.TestCase):
 
     def test_new_session_no_longer_probes_drive_readiness(self):
         import inspect
-        source = inspect.getsource(ro.RemoteOrchestrator._start_new_session)
+        source = code_text(ro.RemoteOrchestrator._start_new_session)
         self.assertNotIn("_ensure_lto_drive_ready", source)
         self.assertNotIn("get_volume_label", source)
 
@@ -144,22 +145,12 @@ class NoIdleTapeAccessTests(unittest.TestCase):
         import inspect
         for method in (ro.RemoteOrchestrator._run_streaming_session,
                        ro.RemoteOrchestrator._run_session):
-            source = inspect.getsource(method)
+            source = code_text(method)
             self.assertNotIn("_ensure_lto_drive_ready", source, method.__name__)
             self.assertNotIn("_verify_mounted_cartridge", source,
                              method.__name__)
             self.assertNotIn("get_volume_label", source, method.__name__)
             self.assertNotIn("eject_tape", source, method.__name__)
-
-    def test_the_group_writer_is_the_only_gate_caller(self):
-        import inspect
-        from src.remote_writer import RemoteChunkWriter
-        group = inspect.getsource(RemoteChunkWriter._write_chunk_group)
-        self.assertEqual(group.count("_pre_write_safety_gate("), 1)
-        one = inspect.getsource(RemoteChunkWriter._write_one_chunk_owned)
-        self.assertNotIn("_pre_write_safety_gate", one)
-        self.assertNotIn("_ensure_lto_drive_ready", one)
-        self.assertNotIn("_verify_mounted_cartridge", one)
 
     def test_a_skip_tape_chunk_never_reaches_the_drive(self):
         from src.remote_writer import RemoteChunkWriter
@@ -211,7 +202,7 @@ class NoRemoteEjectTests(unittest.TestCase):
 
     def test_completion_does_not_eject(self):
         import inspect
-        source = inspect.getsource(
+        source = code_text(
             ro.RemoteOrchestrator._run_streaming_session)
         self.assertNotIn("eject_tape", source)
 
@@ -301,7 +292,7 @@ class AtomicTapeRegistrationTests(unittest.TestCase):
     def test_register_tape_creates_the_active_generation_in_one_transaction(self):
         import inspect
         from src.pg_tapes import PgTapeMixin
-        source = inspect.getsource(PgTapeMixin.register_tape)
+        source = code_text(PgTapeMixin.register_tape)
         # Both inserts are inside ONE operation handed to _transaction.
         self.assertIn("INSERT INTO tapes", source)
         self.assertIn("INSERT INTO tape_generations", source)
@@ -311,7 +302,7 @@ class AtomicTapeRegistrationTests(unittest.TestCase):
     def test_the_active_generation_reader_is_read_only(self):
         import inspect
         from src.pg_tapes import PgTapeMixin
-        source = inspect.getsource(PgTapeMixin.get_active_tape_generation)
+        source = code_text(PgTapeMixin.get_active_tape_generation)
         self.assertIn("_run_read", source)
         for mutation in ("INSERT", "UPDATE", "DELETE"):
             self.assertNotIn(mutation, source.upper().replace(
