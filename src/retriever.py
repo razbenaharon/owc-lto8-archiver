@@ -912,7 +912,23 @@ class LTORetriever:
         Any failure removes the temp file and propagates; nothing is ever left
         under the final name. Returns the published path.
         """
-        info = zf.getinfo(entry)
+        if isinstance(entry, zipfile.ZipInfo):
+            info = entry
+        else:
+            # A name is only an identity if it is unique. ``getinfo`` returns
+            # the LAST member of that name; with two, picking either would be
+            # a guess reported as a success.
+            counts = getattr(zf, "_restore_name_counts", None)
+            if counts is None:      # one pass per open ZIP, not per record
+                counts = defaultdict(int)
+                for item in zf.infolist():
+                    counts[item.filename] += 1
+                zf._restore_name_counts = counts
+            if counts.get(entry, 0) != 1:
+                raise zipfile.BadZipFile(
+                    f"{counts.get(entry, 0)} ZIP members share the name "
+                    f"{entry!r}; refusing to pick one")
+            info = zf.getinfo(entry)
         dst_dir = os.path.dirname(os.path.abspath(dst))
         os.makedirs(dst_dir, exist_ok=True)
         temp_path = os.path.join(
@@ -1394,20 +1410,37 @@ class LTORetriever:
         extracted = 0
         try:
             with zipfile.ZipFile(local_zip, 'r') as zf:
-                for entry in zf.namelist():
-                    if entry.endswith("/"):
-                        continue
+                # Iterate the members themselves, not their names: extracting
+                # by name would fetch the last same-named member every time.
+                members = [info for info in zf.infolist()
+                           if not info.filename.endswith("/")]
+                name_counts = defaultdict(int)
+                for info in members:
+                    name_counts[info.filename] += 1
+                reported_duplicates = set()
+                for info in members:
+                    entry = info.filename
                     canonical = self._canonical_from_zip_entry(base_path, entry)
                     if not self._entry_under_directory(canonical, dir_path):
                         continue
                     self._check_cancelled()
+                    if name_counts[entry] > 1:
+                        # Never silently pick one; report the name once.
+                        if entry not in reported_duplicates:
+                            reported_duplicates.add(entry)
+                            reason = (f"{name_counts[entry]} members of this "
+                                      "bundle share this name; refusing to "
+                                      "pick one")
+                            print(f"[ERROR] {canonical}: {reason}")
+                            self._note_failed(canonical, reason)
+                        continue
                     rel = (canonical[len(restore_base):]
                            if restore_base and canonical.startswith(restore_base)
                            else canonical)
                     # One bad entry must not stop the rest of the directory.
                     try:
                         dst = self._extract_zip_entry(
-                            zf, entry, self._safe_destination(rel))
+                            zf, info, self._safe_destination(rel))
                     except RestoreCancelled:
                         raise
                     except Exception as e:

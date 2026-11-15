@@ -544,5 +544,52 @@ class ReviewFollowUpTests(_RestoreCase):
         self.assertIn("directory catalog is not installed", out.getvalue())
         self.assertIn("INCOMPLETE", out.getvalue())
 
+    def _duplicate_bundle(self):
+        import warnings
+        zip_path = os.path.join(self.tape, "Dup.zip")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("D/ok.txt", "OK")
+                zf.writestr("D/twice.txt", "FIRST")
+                zf.writestr("D/twice.txt", "SECOND")
+                zf.writestr("D/also_ok.txt", "FINE")
+        return zip_path
+
+    def test_duplicate_member_name_in_directory_restore_is_a_failure(self):
+        # review F4
+        zip_path = self._duplicate_bundle()
+
+        class _DB:
+            @staticmethod
+            def find_directory_restore_bundles(dir_path, **_kw):
+                return [{"tape_label": "T1", "stored_bundle_path": zip_path,
+                         "base_path": "/vault"}]
+        self.retriever.db = cast(Any, _DB())
+        out = io.StringIO()
+        with redirect_stdout(out):
+            result = self.retriever._restore_directory_complete("/vault/D")
+        self.assertEqual(self._files_under(self.restore),
+                         ["D/also_ok.txt", "D/ok.txt"])
+        self.assertFalse(result.ok)
+        self.assertEqual((result.restored_count, result.failed_count), (2, 1))
+        self.assertEqual(result.failures[0][0], "/vault/D/twice.txt")
+        self.assertIn("share", result.failures[0][1])
+
+    def test_duplicate_member_name_is_refused_for_a_catalog_record(self):
+        # review F4: the record paths resolve by name too.
+        zip_path = self._duplicate_bundle()
+        records = [{"tape_label": "T1", "is_packed": True, "bundle_id": 1,
+                    "container_name": zip_path, "stored_path": name,
+                    "file_name": os.path.basename(name),
+                    "original_path": "/vault/" + name}
+                   for name in ("D/twice.txt", "D/ok.txt")]
+        with redirect_stdout(io.StringIO()):
+            result = self.retriever._restore_many(records)
+        self.assertEqual(self._files_under(self.restore), ["ok.txt"])
+        self.assertEqual((result.restored_count, result.failed_count), (1, 1))
+        self.assertEqual(result.failures[0][0], "/vault/D/twice.txt")
+
+
 if __name__ == "__main__":
     unittest.main()
