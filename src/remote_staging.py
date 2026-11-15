@@ -30,6 +30,7 @@ import shutil
 import threading
 import time
 import uuid
+import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
@@ -377,6 +378,133 @@ def _is_transient_fetch_error(err):
 
 def _enum_value(value):
     return getattr(value, "value", value)
+
+
+class ChunkReconciliationError(RuntimeError):
+    """A packed chunk does not hold exactly the files that were fetched."""
+
+
+def _slash(path):
+    return str(path or "").replace("\\", "/")
+
+
+def reconcile_packed_chunk(planned_rows, source_missing_files,
+                           fetched_file_count, manifest_rows, metadata,
+                           pack_dir=None):
+    """Compare plan, fetch and pack; return a list of discrepancies.
+
+    The packer records a per-file failure in the skip list and carries on, so
+    its return value alone cannot show that a file was dropped (audit H7).
+    This is the gate between packing and the tape writer: an empty list means
+    every planned file is either positively source-missing or present in the
+    pack exactly once at its fetched size, and nothing else is in the pack.
+
+    ``manifest_rows`` are the chunk's rows re-read after the fetch (they carry
+    ``local_rel_path``); ``metadata`` is the packer's output. With
+    ``pack_dir`` the staged artifacts themselves are inspected too: each ZIP's
+    central directory and each loose file's size must agree with the metadata.
+    """
+    problems = []
+    planned = list(planned_rows)
+    missing_paths = {item['remote_path'] for item in source_missing_files}
+    expected_count = len(planned) - len(missing_paths)
+    if len({row['remote_path'] for row in planned}) != len(planned):
+        problems.append("the plan lists a source path more than once")
+    if len(missing_paths) != len(source_missing_files):
+        problems.append("a source-missing file is listed more than once")
+    if not missing_paths <= {row['remote_path'] for row in planned}:
+        problems.append("a source-missing file is not part of the plan")
+    if int(fetched_file_count) != expected_count:
+        problems.append(
+            f"planned {len(planned):,} file(s), {len(missing_paths):,} "
+            f"confirmed missing at source, but {int(fetched_file_count):,} "
+            "fetched")
+    if len(metadata) != int(fetched_file_count):
+        problems.append(
+            f"{int(fetched_file_count):,} file(s) fetched but "
+            f"{len(metadata):,} packed")
+
+    packed = {}
+    for item in metadata:
+        stored = _slash(item.get('stored_path'))
+        if stored in packed:
+            problems.append(f"packed twice: {stored}")
+        packed[stored] = item
+
+    local_by_remote = {
+        row['remote_path']: row.get('local_rel_path') for row in manifest_rows}
+    expected_local = set()
+    for row in planned:
+        remote_path = row['remote_path']
+        if remote_path in missing_paths:
+            continue
+        local_rel = local_by_remote.get(remote_path)
+        if not local_rel:
+            problems.append(f"no staged path recorded for: {remote_path}")
+            continue
+        local_rel = _slash(local_rel)
+        expected_local.add(local_rel)
+        item = packed.get(local_rel)
+        if item is None:
+            problems.append(f"fetched but not packed: {remote_path}")
+            continue
+        if int(item.get('file_size_bytes', -1)) != int(row['file_size_bytes']):
+            problems.append(
+                f"packed size {item.get('file_size_bytes')} differs from "
+                f"planned {row['file_size_bytes']}: {remote_path}")
+    for stored in packed:
+        if stored not in expected_local:
+            problems.append(f"packed but not planned: {stored}")
+
+    if pack_dir is not None and not problems:
+        problems.extend(_pack_artifact_discrepancies(pack_dir, metadata))
+    return problems
+
+
+def _pack_artifact_discrepancies(pack_dir, metadata):
+    """Check the staged ZIPs and loose files against the packer metadata."""
+    problems = []
+    by_container = defaultdict(dict)
+    for item in metadata:
+        stored = _slash(item.get('stored_path'))
+        size = int(item.get('file_size_bytes', -1))
+        if item.get('is_packed'):
+            by_container[item.get('container_name')][stored] = size
+            continue
+        path = os.path.join(pack_dir, stored.replace('/', os.sep))
+        try:
+            actual = os.path.getsize(_long(path))
+        except OSError as exc:
+            problems.append(f"loose file is not in the pack: {stored} ({exc})")
+            continue
+        if actual != size:
+            problems.append(
+                f"loose file is {actual} B in the pack, expected {size} B: "
+                f"{stored}")
+    for container, members in by_container.items():
+        path = os.path.join(pack_dir, str(container))
+        try:
+            with zipfile.ZipFile(_long(path)) as archive:
+                actual = {}
+                for info in archive.infolist():
+                    if info.filename in actual:
+                        problems.append(
+                            f"{container} holds {info.filename} twice")
+                    actual[info.filename] = info.file_size
+        except (OSError, zipfile.BadZipFile) as exc:
+            problems.append(f"bundle {container} is unreadable: {exc}")
+            continue
+        if actual != members:
+            absent = sorted(set(members) - set(actual))
+            extra = sorted(set(actual) - set(members))
+            wrong = sorted(name for name in set(members) & set(actual)
+                           if members[name] != actual[name])
+            problems.append(
+                f"bundle {container} disagrees with its metadata: "
+                f"{len(absent)} absent, {len(extra)} undeclared, "
+                f"{len(wrong)} wrong-sized "
+                f"(e.g. {(absent + extra + wrong)[:3]})")
+    return problems
 
 
 # The only remote observations that may excuse a planned file from a chunk.
@@ -1301,8 +1429,15 @@ class RemoteChunkStager:
         # LTOPacker necessarily sees temporary Windows staging paths. Replace
         # them before logging/indexing with the durable canonical remote paths
         # persisted in the remote manifest.
+        manifest_rows = self.host.db.get_chunk_files(session_id, chunk_index)
+        # The gate between packing and the tape writer (audit H7): the pack
+        # must hold exactly the fetched files. Checked before the staging
+        # paths are rewritten, while stored_path still names the fetched file.
+        self._require_reconciled_pack(
+            session_id, chunk_index, chunk_files, source_missing_files,
+            fetched_file_count, manifest_rows, metadata, fetch_dir, pack_dir)
         canonical_count = _apply_canonical_remote_paths(
-            metadata, self.host.db.get_chunk_files(session_id, chunk_index))
+            metadata, manifest_rows)
         if canonical_count != len(metadata):
             self.host.db.update_chunk_status(session_id, chunk_index,
                 ChunkStatus.FETCH_FAILED.value)
@@ -1348,6 +1483,55 @@ class RemoteChunkStager:
             session_id=session_id,
             packaging_format=chunk_format,
         )
+
+    def _require_reconciled_pack(
+            self, session_id, chunk_index, planned_rows, source_missing_files,
+            fetched_file_count, manifest_rows, metadata, fetch_dir, pack_dir):
+        """Fail the chunk unless plan, fetch and pack agree file for file.
+
+        On a mismatch the chunk is marked ``fetch_failed`` (resumable), the
+        raw fetch is dropped, and the pack is set aside under a
+        ``.reconcile_failed`` name for diagnosis: it is never handed to the
+        writer and can never be picked up as a resumable pack."""
+        problems = reconcile_packed_chunk(
+            planned_rows, source_missing_files, fetched_file_count,
+            manifest_rows, metadata, pack_dir=pack_dir)
+        if not problems:
+            return
+        kept = self._quarantine_failed_pack(pack_dir)
+        if not CANCEL.is_set():
+            self.host.db.update_chunk_status(
+                session_id, chunk_index, ChunkStatus.FETCH_FAILED.value)
+        self.host._cleanup_dir(fetch_dir)
+        shown = "; ".join(problems[:5])
+        more = (f" (+{len(problems) - 5} more)" if len(problems) > 5 else "")
+        message = (
+            f"[PACK] Chunk {chunk_index + 1} failed reconciliation and was "
+            f"NOT queued for tape: {shown}{more}. "
+            + (f"The pack is kept for diagnosis at {kept}."
+               if kept else "The pack could not be set aside and was left "
+                            f"at {pack_dir}."))
+        get_logger().error("chunk_reconciliation_failed: %s", message)
+        print(f"\n{message}")
+        raise ChunkReconciliationError(message)
+
+    def _quarantine_failed_pack(self, pack_dir):
+        """Rename a rejected pack out of the writer's and resume's reach."""
+        if not os.path.isdir(_long(pack_dir)):
+            return None
+        kept = pack_dir + ".reconcile_failed"
+        try:
+            if os.path.exists(_long(kept)):
+                # Keep at most one rejected pack per chunk so repeated
+                # failures cannot fill the staging volume.
+                shutil.rmtree(_long(kept))
+            os.rename(_long(pack_dir), _long(kept))
+        except OSError:
+            get_logger().warning(
+                "could not set aside the rejected pack %s", pack_dir,
+                exc_info=True)
+            return None
+        return kept
 
     def _discard_desc(self, desc):
         """Drop a staged-but-unused chunk: clean its dirs and free its budget."""

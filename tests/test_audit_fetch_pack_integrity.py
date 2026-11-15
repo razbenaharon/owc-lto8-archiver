@@ -401,5 +401,156 @@ class SourceMissingNeedsProofTests(_Harness):
         self.assertEqual(self.requested(), ["d/a.txt"])
 
 
+def _bundle_contents(pack_dir):
+    """{zip entry name: bytes} over every bundle in a pack dir."""
+    found = {}
+    for name in sorted(os.listdir(pack_dir)):
+        if name.lower().endswith(".zip"):
+            with zipfile.ZipFile(os.path.join(pack_dir, name)) as archive:
+                for entry in archive.namelist():
+                    found[entry] = archive.read(entry)
+    return found
+
+
+class PackReconciliationTests(_Harness):
+    """H7: a chunk reaches the writer with every fetched file, or not at all."""
+
+    FILES = {"d/one.txt": b"ONE-ONE", "d/two.txt": b"TWO-TWO-TWO",
+             "d/three.txt": b"THREE"}
+
+    def _stage_with_locked_file(self, locked_rel, workers=1):
+        """Run the real packer while one fetched file is unreadable."""
+        import msvcrt
+        from src.packer import LTOPacker
+        self.host.pack_parallel_workers = workers
+        real_run = LTOPacker.run
+
+        def run_with_lock(packer, *args, **kwargs):
+            victim = os.path.join(
+                self.fetch_dir, locked_rel.replace("/", os.sep))
+            handle = open(victim, "r+b")
+            size = os.path.getsize(victim)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, size)
+            try:
+                return real_run(packer, *args, **kwargs)
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, size)
+                handle.close()
+
+        with mock.patch.object(LTOPacker, "run", run_with_lock):
+            return self.stage()
+
+    def test_clean_chunk_is_staged_with_every_file(self):
+        self.build(self.FILES)
+        desc = self.stage()
+        self.assertIsNotNone(desc)
+        self.assertEqual(len(desc.metadata), 3)
+        self.assertEqual(
+            _bundle_contents(self.pack_dir),
+            {"d/one.txt": b"ONE-ONE", "d/two.txt": b"TWO-TWO-TWO",
+             "d/three.txt": b"THREE"})
+
+    def test_file_that_fails_while_packing_fails_the_chunk(self):
+        from src.remote_staging import ChunkReconciliationError
+        for workers in (1, 2):
+            with self.subTest(workers=workers):
+                shutil.rmtree(_long(self.staging), ignore_errors=True)
+                os.makedirs(self.staging)
+                self.build(self.FILES)
+                with self.assertRaises(ChunkReconciliationError) as caught:
+                    self._stage_with_locked_file("d/two.txt", workers)
+                self.assertIn("3 file(s) fetched but 2 packed",
+                              str(caught.exception))
+                self.assertIn(f"{REMOTE_ROOT}/d/two.txt", str(caught.exception))
+                self.assertEqual(self.db.chunk_statuses[-1], "fetch_failed")
+                # Never left where the writer or a resume could pick it up...
+                self.assertFalse(os.path.exists(self.pack_dir))
+                self.assertIsNone(
+                    self.host._try_resume_pack(1, 0, self.pack_dir))
+                # ...but kept for diagnosis.
+                kept = self.pack_dir + ".reconcile_failed"
+                self.assertTrue(os.path.isdir(kept))
+                self.assertNotIn("d/two.txt", _bundle_contents(kept))
+                self.assertEqual(self.host._staged_bytes, 0)
+
+    def test_confirmed_source_missing_file_is_reconciled_not_fatal(self):
+        self.build(self.FILES, missing=("d/gone.txt",))
+        desc = self.stage()
+        self.assertEqual(len(desc.metadata), 3)
+        self.assertEqual(len(desc.source_missing_files), 1)
+
+    def test_odd_names_reach_the_bundle_with_their_own_bytes(self):
+        files = {"d/file ": b"SPACE", "d/file": b"PLAIN",
+                 NFD_NAME: b"DECOMPOSED", NFC_NAME: b"COMPOSED!!"}
+        self.build(files)
+        desc = self.stage()
+        self.assertEqual(len(desc.metadata), 4)
+        bundle = _bundle_contents(self.pack_dir)
+        by_source = {item["canonical_source_path"]: bundle[item["stored_path"]]
+                     for item in desc.metadata}
+        self.assertEqual(
+            by_source,
+            {f"{REMOTE_ROOT}/{rel}": data for rel, data in files.items()})
+
+
+class ReconcileFunctionTests(unittest.TestCase):
+    """The pure comparison: count AND identity AND size."""
+
+    def _case(self):
+        planned = [
+            {"remote_path": "/data/a", "file_size_bytes": 3},
+            {"remote_path": "/data/b", "file_size_bytes": 4},
+            {"remote_path": "/data/gone", "file_size_bytes": 9},
+        ]
+        missing = [{"remote_path": "/data/gone"}]
+        rows = [
+            {"remote_path": "/data/a", "local_rel_path": "a"},
+            {"remote_path": "/data/b", "local_rel_path": "b"},
+            {"remote_path": "/data/gone", "local_rel_path": None},
+        ]
+        metadata = [
+            {"stored_path": "a", "file_size_bytes": 3, "is_packed": True},
+            {"stored_path": "b", "file_size_bytes": 4, "is_packed": True},
+        ]
+        return planned, missing, rows, metadata
+
+    def _problems(self, planned, missing, rows, metadata, fetched=2):
+        from src.remote_staging import reconcile_packed_chunk
+        return reconcile_packed_chunk(planned, missing, fetched, rows, metadata)
+
+    def test_consistent_chunk_has_no_discrepancy(self):
+        self.assertEqual(self._problems(*self._case()), [])
+
+    def test_dropped_file_is_named(self):
+        planned, missing, rows, metadata = self._case()
+        problems = self._problems(planned, missing, rows, metadata[:1])
+        self.assertTrue(any("fetched but not packed: /data/b" in item
+                            for item in problems), problems)
+
+    def test_same_count_but_wrong_identity_is_caught(self):
+        planned, missing, rows, metadata = self._case()
+        metadata[1] = {"stored_path": "stray", "file_size_bytes": 4,
+                       "is_packed": True}
+        problems = self._problems(planned, missing, rows, metadata)
+        self.assertTrue(any("packed but not planned: stray" in item
+                            for item in problems), problems)
+        self.assertTrue(any("fetched but not packed: /data/b" in item
+                            for item in problems), problems)
+
+    def test_same_identity_but_wrong_size_is_caught(self):
+        planned, missing, rows, metadata = self._case()
+        metadata[0]["file_size_bytes"] = 0
+        problems = self._problems(planned, missing, rows, metadata)
+        self.assertTrue(any("packed size 0 differs from planned 3" in item
+                            for item in problems), problems)
+
+    def test_fetch_count_must_account_for_every_planned_file(self):
+        planned, missing, rows, metadata = self._case()
+        problems = self._problems(planned, [], rows, metadata)
+        self.assertTrue(any("planned 3 file(s)" in item for item in problems),
+                        problems)
+
+
 if __name__ == "__main__":
     unittest.main()
