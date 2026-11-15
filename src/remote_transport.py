@@ -78,11 +78,19 @@ class RemoteTarStoreResult:
 
 
 def _stored_tar_command(remote_base):
-    """The pinned first-version producer dialect; paths arrive only on stdin."""
+    """The pinned first-version producer dialect; paths arrive only on stdin.
+
+    ``--hard-dereference`` (GNU tar >= 1.23): without it, the second name of a
+    hard-linked pair in one container is written as a zero-byte link entry
+    instead of a file. The strict reader rightly refuses that entry, so such a
+    chunk failed on every attempt (audit H11). With it every planned name is a
+    regular member carrying its own bytes, and restore never depends on
+    another member being present.
+    """
     return (
         f"LC_ALL=C tar -C {shlex.quote(str(remote_base))} -b 512 "
-        "--format=pax --sparse --sparse-version=1.0 --no-recursion "
-        "--ignore-failed-read -cf - --null -T -"
+        "--format=pax --sparse --sparse-version=1.0 --hard-dereference "
+        "--no-recursion --ignore-failed-read -cf - --null -T -"
     )
 
 
@@ -792,8 +800,12 @@ def _remote_tar_fetch(remote_user, remote_host, remote_base, rel_paths, local_de
     # filter below matches literal English diagnostics, and a localized remote
     # would otherwise turn every legitimately-missing/unreadable file into a
     # fatal fetch error.
+    # --hard-dereference: ship every hard-linked name as a file with its own
+    # bytes. A link entry whose target is in another batch or chunk cannot be
+    # extracted locally and failed the fetch on every attempt.
     tar_core = (
         f"LC_ALL=C tar -C {shlex.quote(remote_base)} -b 512 --sparse "
+        "--hard-dereference "
         "--no-recursion --ignore-failed-read -cf - --null -T -"
     )
     if use_mbuffer:
