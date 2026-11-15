@@ -14,7 +14,7 @@ to do to data that already exists. These tests assert the properties that make
   explicit execute + confirmation + verified backup, with no archiver running;
 * the rollback refuses to drop a populated frontier table.
 
-Isolated-PostgreSQL behaviour lives in ``tests/test_pg_integration.py``.
+Isolated-PostgreSQL behaviour lives in ``tests/test_db_integration.py``.
 """
 from source_facts import code_text
 import os

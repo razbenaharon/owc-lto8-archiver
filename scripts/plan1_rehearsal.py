@@ -194,7 +194,7 @@ def main(argv=None):
         print("=" * 78)
         print("PLAN 1 REHEARSAL — stage 2: isolated PostgreSQL")
         print("=" * 78)
-        record = run_suite(["tests/test_pg_integration.py"],
+        record = run_suite(["tests/test_db_integration.py"],
                            "isolated PostgreSQL", verbose=args.verbose)
         ran_nothing = ("skipped" in record["summary"]
                        and "passed" not in record["summary"])
