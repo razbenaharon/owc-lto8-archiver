@@ -71,31 +71,36 @@ def _start_windows_update_guard(cfg: ConfigManager):
 
 
 def run_archiver(cfg: ConfigManager, db: "PgDatabaseManager"):
+    """Menu option 1. Returns an :class:`ExitCode` value (0 when nothing
+    failed) so a failed local run is visible in the process exit code."""
     # Cross-process single-writer guard: the in-process tape I/O lock cannot
     # stop a second `python run.py` instance from interleaving tape writes.
     try:
         db.acquire_archiver_lock()
     except RuntimeError as e:
         print(str(e))
-        return
+        return int(ExitCode.FATAL_CONFIG)
 
     proceed, wu_guard = _start_windows_update_guard(cfg)
     if not proceed:
         db.release_archiver_lock()
-        return
+        return int(ExitCode.TRANSIENT_RESUMABLE)
 
     added_exclusion = _prepare_robocopy_exclusion()
     reset_cancel()
     install_cancel_handler()
     print("[LOCAL] Press Ctrl+C at any time to stop safely "
           "(the session is saved and can be resumed).")
+    code = int(ExitCode.COMPLETED)
     try:
         LocalOrchestrator(cfg, db).run()
     except RuntimeError as e:
         get_logger().exception("local archive run stopped")
         print(str(e))
+        code = int(ExitCode.FATAL_CONFIG)
     except KeyboardInterrupt:
         print("\n[LOCAL] Interrupted. Session state saved — re-run to resume.")
+        code = int(ExitCode.USER_STOP)
     finally:
         # Mirror run_remote_archiver: make sure no robocopy child survives,
         # restore CPU affinity and default Ctrl+C behaviour, then drop the
@@ -110,6 +115,7 @@ def run_archiver(cfg: ConfigManager, db: "PgDatabaseManager"):
         if wu_guard:
             resume_windows_updates()
         db.release_archiver_lock()
+    return code
 
 
 def run_remote_archiver(cfg: ConfigManager, db: "PgDatabaseManager",
@@ -408,6 +414,15 @@ def main():
     # result, that result's exit code is preserved rather than replaced by a
     # generic EOF code — the original failure (a network stop, say) wins.
     last_result = None
+    # The most recent FAILED non-remote action (local archive, restore,
+    # database backup). The menu used to print such an error and then exit 0,
+    # so a scheduled or piped run could not tell failure from success.
+    failure_code = 0
+
+    def _exit_code():
+        code = int(getattr(last_result, "exit_code", 0)) if last_result else 0
+        return code or failure_code
+
     while True:
         print("\n" + "=" * 60)
         print("  MAIN MENU")
@@ -430,7 +445,7 @@ def main():
             # stdin is closed (e.g. a detached run). Exit cleanly with no
             # traceback. If a sub-flow already produced a terminal result,
             # preserve its exit code; otherwise a neutral clean exit.
-            code = int(getattr(last_result, "exit_code", 0)) if last_result else 0
+            code = _exit_code()
             reason = getattr(last_result, "reason", None)
             print("\n[MENU] Standard input closed; exiting cleanly"
                   + (f" (last result: {reason})." if reason else "."))
@@ -441,7 +456,7 @@ def main():
             raise SystemExit(code)
 
         if choice == '1':
-            run_archiver(cfg, db)
+            failure_code = int(run_archiver(cfg, db) or 0) or failure_code
 
         elif choice == '2':
             added_exclusion = _prepare_robocopy_exclusion()
@@ -456,6 +471,7 @@ def main():
                 # e.g. tape-verify cancelled — return to the menu, don't exit.
                 get_logger().exception("restore run stopped")
                 print(str(e))
+                failure_code = int(ExitCode.FATAL_CONFIG)
             except KeyboardInterrupt:
                 print("\n[RESTORE] Interrupted.")
             finally:
@@ -514,14 +530,17 @@ def main():
             try:
                 path = create_database_backup(cfg)
             except RuntimeError as e:
+                get_logger().exception("database backup failed")
                 print(str(e))
+                failure_code = int(ExitCode.FATAL_CONFIG)
             else:
                 print(f"[DB BACKUP] PostgreSQL dump created: {path}")
 
         elif choice == '0':
             print("Goodbye.")
             db.close()
-            break
+            # Returned to run.py, which turns it into the process exit code.
+            return _exit_code()
 
         else:
             print("[ERROR] Invalid selection.")
