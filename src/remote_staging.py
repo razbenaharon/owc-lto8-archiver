@@ -30,9 +30,11 @@ import shutil
 import threading
 import time
 import uuid
+import zipfile
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 from .constants import LOCAL_STAGING_RESERVE_BYTES
 from .db import _apply_canonical_remote_paths
@@ -48,14 +50,17 @@ from .archive_artifacts import (
 from .packer import LTOPacker, StagingSpaceError
 from .paths import (_LEGACY_PATH_LIMIT, _dir_tree_size,
                      _disambiguate_local_rel, _exceeds_legacy_path_limit,
-                     _long, _remote_fetch_base_and_rel,
+                     _local_collision_key, _long, _remote_fetch_base_and_rel,
                      remote_store_base_and_rel,
-                    _reserved_name_component, _winsafe_extracted_rel)
+                    _reserved_name_component, _resolve_extracted_path,
+                    _winsafe_extracted_rel)
 from .pipeline_types import (
     ArtifactKind, ArtifactReadiness, ChunkStatus, ContainerFormat,
-    ContainerValidationState, StagedArtifact, StagedChunk, StagedContainer)
+    ContainerValidationState, SourceDisposition, StagedArtifact, StagedChunk,
+    StagedContainer)
 from .ram_telemetry import RamStageSampler
-from .remote_transport import _remote_tar_fetch, _remote_tar_store
+from .remote_transport import (_remote_source_status_probe,
+                               _remote_tar_fetch, _remote_tar_store)
 from .tar_container import validate_stored_tar_part
 from .runtime import (CANCEL, _fmt_eta, _phase, _progress_done, _progress_line,
                       _status)
@@ -86,6 +91,70 @@ def _fetch_watchdog_action(*, cur, last_growth_at, now, total_bytes,
     if stall_timeout and (now - last_growth_at) >= stall_timeout:
         return 'stall'
     return None
+
+
+class _FetchPauseState:
+    """Marks the stretches in which the fetch is waiting on purpose.
+
+    The ResourceGovernor can hold the producer between tar streams for as long
+    as RAM or the tape needs. Staging does not grow meanwhile, which is
+    exactly what a wedged stream looks like to the stall watchdog; without
+    this marker a back-pressure pause longer than ``fetch_stall_timeout``
+    aborted a healthy fetch and stopped the run (audit M10b)."""
+
+    def __init__(self, clock=time.time):
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._depth = 0
+        self._resumed_at = None
+
+    @contextmanager
+    def paused(self):
+        with self._lock:
+            self._depth += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._depth -= 1
+                self._resumed_at = self._clock()
+
+    def snapshot(self):
+        """``(paused_now, last_resume_time_or_None)``."""
+        with self._lock:
+            return self._depth > 0, self._resumed_at
+
+
+class _FetchProgressClock:
+    """What the watchdog may conclude from successive staging sizes.
+
+    * ``observe`` returns the bytes fetched *by this attempt*: whatever was
+      already in the fetch dir when it started (a resume after a crash) is the
+      baseline and is not counted against the remaining plan. Counting it made
+      a resume that already held two thirds of the chunk look like a 3x
+      overrun (audit M10c; see incident 008).
+    * Any change in the staged size is life, not only a new maximum. A Stored
+      TAR chunk drops back to zero each time a container is published, and the
+      next container then looked stalled until it outgrew the previous one
+      (audit M10a).
+    * A deliberate pause is not a stall; the stall clock restarts when it ends.
+    """
+
+    def __init__(self, started_at, baseline_bytes=0):
+        self.baseline_bytes = max(0, int(baseline_bytes or 0))
+        self.last_growth_at = started_at
+        self._last_raw = None
+
+    def observe(self, raw_bytes, now, paused=False, resumed_at=None):
+        raw_bytes = int(raw_bytes)
+        if self._last_raw is None or raw_bytes != self._last_raw:
+            self.last_growth_at = now
+        self._last_raw = raw_bytes
+        if paused:
+            self.last_growth_at = now
+        elif resumed_at is not None and resumed_at > self.last_growth_at:
+            self.last_growth_at = min(now, resumed_at)
+        return max(0, raw_bytes - self.baseline_bytes)
 
 
 @dataclass(frozen=True)
@@ -376,6 +445,143 @@ def _enum_value(value):
     return getattr(value, "value", value)
 
 
+class ChunkReconciliationError(RuntimeError):
+    """A packed chunk does not hold exactly the files that were fetched."""
+
+
+def _slash(path):
+    return str(path or "").replace("\\", "/")
+
+
+def reconcile_packed_chunk(planned_rows, source_missing_files,
+                           fetched_file_count, manifest_rows, metadata,
+                           pack_dir=None):
+    """Compare plan, fetch and pack; return a list of discrepancies.
+
+    The packer records a per-file failure in the skip list and carries on, so
+    its return value alone cannot show that a file was dropped (audit H7).
+    This is the gate between packing and the tape writer: an empty list means
+    every planned file is either positively source-missing or present in the
+    pack exactly once at its fetched size, and nothing else is in the pack.
+
+    ``manifest_rows`` are the chunk's rows re-read after the fetch (they carry
+    ``local_rel_path``); ``metadata`` is the packer's output. With
+    ``pack_dir`` the staged artifacts themselves are inspected too: each ZIP's
+    central directory and each loose file's size must agree with the metadata.
+    """
+    problems = []
+    planned = list(planned_rows)
+    missing_paths = {item['remote_path'] for item in source_missing_files}
+    expected_count = len(planned) - len(missing_paths)
+    if len({row['remote_path'] for row in planned}) != len(planned):
+        problems.append("the plan lists a source path more than once")
+    if len(missing_paths) != len(source_missing_files):
+        problems.append("a source-missing file is listed more than once")
+    if not missing_paths <= {row['remote_path'] for row in planned}:
+        problems.append("a source-missing file is not part of the plan")
+    if int(fetched_file_count) != expected_count:
+        problems.append(
+            f"planned {len(planned):,} file(s), {len(missing_paths):,} "
+            f"confirmed missing at source, but {int(fetched_file_count):,} "
+            "fetched")
+    if len(metadata) != int(fetched_file_count):
+        problems.append(
+            f"{int(fetched_file_count):,} file(s) fetched but "
+            f"{len(metadata):,} packed")
+
+    packed = {}
+    for item in metadata:
+        stored = _slash(item.get('stored_path'))
+        if stored in packed:
+            problems.append(f"packed twice: {stored}")
+        packed[stored] = item
+
+    local_by_remote = {
+        row['remote_path']: row.get('local_rel_path') for row in manifest_rows}
+    expected_local = set()
+    for row in planned:
+        remote_path = row['remote_path']
+        if remote_path in missing_paths:
+            continue
+        local_rel = local_by_remote.get(remote_path)
+        if not local_rel:
+            problems.append(f"no staged path recorded for: {remote_path}")
+            continue
+        local_rel = _slash(local_rel)
+        expected_local.add(local_rel)
+        item = packed.get(local_rel)
+        if item is None:
+            problems.append(f"fetched but not packed: {remote_path}")
+            continue
+        if int(item.get('file_size_bytes', -1)) != int(row['file_size_bytes']):
+            problems.append(
+                f"packed size {item.get('file_size_bytes')} differs from "
+                f"planned {row['file_size_bytes']}: {remote_path}")
+    for stored in packed:
+        if stored not in expected_local:
+            problems.append(f"packed but not planned: {stored}")
+
+    if pack_dir is not None and not problems:
+        problems.extend(_pack_artifact_discrepancies(pack_dir, metadata))
+    return problems
+
+
+def _pack_artifact_discrepancies(pack_dir, metadata):
+    """Check the staged ZIPs and loose files against the packer metadata."""
+    problems = []
+    by_container = defaultdict(dict)
+    for item in metadata:
+        stored = _slash(item.get('stored_path'))
+        size = int(item.get('file_size_bytes', -1))
+        if item.get('is_packed'):
+            by_container[item.get('container_name')][stored] = size
+            continue
+        path = os.path.join(pack_dir, stored.replace('/', os.sep))
+        try:
+            actual = os.path.getsize(_long(path))
+        except OSError as exc:
+            problems.append(f"loose file is not in the pack: {stored} ({exc})")
+            continue
+        if actual != size:
+            problems.append(
+                f"loose file is {actual} B in the pack, expected {size} B: "
+                f"{stored}")
+    for container, members in by_container.items():
+        path = os.path.join(pack_dir, str(container))
+        try:
+            with zipfile.ZipFile(_long(path)) as archive:
+                actual = {}
+                for info in archive.infolist():
+                    if info.filename in actual:
+                        problems.append(
+                            f"{container} holds {info.filename} twice")
+                    actual[info.filename] = info.file_size
+        except (OSError, zipfile.BadZipFile) as exc:
+            problems.append(f"bundle {container} is unreadable: {exc}")
+            continue
+        if actual != members:
+            absent = sorted(set(members) - set(actual))
+            extra = sorted(set(actual) - set(members))
+            wrong = sorted(name for name in set(members) & set(actual)
+                           if members[name] != actual[name])
+            problems.append(
+                f"bundle {container} disagrees with its metadata: "
+                f"{len(absent)} absent, {len(extra)} undeclared, "
+                f"{len(wrong)} wrong-sized "
+                f"(e.g. {(absent + extra + wrong)[:3]})")
+    return problems
+
+
+# The only remote observations that may excuse a planned file from a chunk.
+# Each is a positive statement by the source host about that exact name; a
+# file that merely failed to appear locally is never one of them.
+_CONFIRMED_ABSENT_DISPOSITIONS = frozenset({
+    SourceDisposition.SOURCE_MISSING,
+    SourceDisposition.SOURCE_PERMISSION_DENIED,
+    SourceDisposition.SOURCE_UNREADABLE,
+})
+
+
 def _serialize_staged_container(item):
     data = dict(item.__dict__)
     for key in ("container_format", "validation_state",
@@ -392,12 +598,25 @@ def _serialize_staged_artifact(item):
     return data
 
 
+#: ``remote_worker_attempts.attempt_kind`` for a Stored TAR container build.
+_STORED_TAR_ATTEMPT_KIND = "pack"
+
+
 class RemoteChunkStager:
     """Fetch + pack one chunk onto local staging. Never touches the tape."""
 
     def __init__(self, host):
         #: The RemoteOrchestrator façade that owns session state and config.
         self.host = host
+        #: Deliberate governor waits, visible to the staging watchdog.
+        self._fetch_pause = _FetchPauseState()
+
+    def _governor_fetch_continue(self):
+        """Governor checkpoint between fetch steps, announced as a pause."""
+        governor = getattr(self.host, 'governor', None)
+        if governor:
+            with self._fetch_pause.paused():
+                governor.wait_or_pause("fetch", "continue")
 
     def _start_stored_tar_attempt(self, owner, session_id, chunk_index):
         """Persist process identity so a restart can prove this owner dead."""
@@ -407,22 +626,33 @@ class RemoteChunkStager:
         started_at = None
         try:
             import psutil
-            started_at = psutil.Process(os.getpid()).create_time()
+            # The column is TIMESTAMPTZ; psutil reports an epoch float.
+            started_at = datetime.fromtimestamp(
+                psutil.Process(os.getpid()).create_time(), tz=timezone.utc)
         except Exception:
             # PID absence after a crash remains useful evidence.  If the PID is
             # later reused, missing creation identity correctly blocks reclaim.
             pass
         try:
+            # attempt_kind must be one the schema accepts (migration 014:
+            # scan/fetch/pack/write). A Stored TAR build is this chunk's pack
+            # stage. The old value 'stored_tar_build' violated the CHECK, the
+            # insert always failed, and the swallowed error left every build
+            # without the owner evidence crash recovery needs (audit M4b).
             return starter(
-                owner_token=owner, attempt_kind="stored_tar_build",
+                owner_token=owner, attempt_kind=_STORED_TAR_ATTEMPT_KIND,
                 session_id=session_id, chunk_index=chunk_index,
                 local_pid=os.getpid(),
                 local_process_started_at=started_at)
-        except Exception:
-            get_logger().warning(
-                "could not record a durable Stored TAR build attempt; a crash "
-                "will require fail-closed owner reconciliation", exc_info=True)
-            return None
+        except Exception as exc:
+            get_logger().error(
+                "could not record a durable Stored TAR build attempt",
+                exc_info=True)
+            raise RuntimeError(
+                "[STAGING] could not record the Stored TAR build attempt for "
+                f"chunk {chunk_index + 1}; refusing to build a container "
+                f"whose owner could not be proven after a crash: {exc}"
+            ) from exc
 
     def _finish_stored_tar_attempt(self, attempt_id):
         if attempt_id is None:
@@ -834,7 +1064,17 @@ class RemoteChunkStager:
                 source_missing_files.extend(loose_missing)
                 if not fetch_ok:
                     raise RuntimeError("large-file fetch failed")
+                # Re-read the rows: only the durable copy carries the
+                # local_rel_path the fetch just recorded.
+                reader = getattr(self.host.db, "get_chunk_files", None)
+                fresh_rows = (
+                    [row for row in reader(session_id, chunk_index)
+                     if row['manifest_id'] is not None
+                     and int(row['manifest_id']) in loose_ids]
+                    if callable(reader) else loose_rows)
+                loose_metadata = []
                 if loose_count:
+                    self._assert_loose_targets_free(fetch_dir, pack_dir)
                     packer = LTOPacker(
                         self.host.cfg.max_zip_size_gb,
                         index_min_file_mb=self.host.cfg.index_min_file_mb,
@@ -842,6 +1082,11 @@ class RemoteChunkStager:
                             self.host.cfg.index_packed_small_files),
                         manifest_enabled=False,
                     )
+                    # 'merge', not 'reuse': the pack already holds this
+                    # chunk's TAR/sidecar/manifest artifacts. 'reuse' returned
+                    # an empty list for any non-empty pack, so the large files
+                    # were never copied and were then deleted with the fetch
+                    # dir (audit H12).
                     loose_metadata = packer.run(
                         source=fetch_dir,
                         dest=pack_dir,
@@ -850,13 +1095,24 @@ class RemoteChunkStager:
                         source_name='remote',
                         session_id=session_id,
                         chunk_index=chunk_index,
-                        on_existing='reuse',
+                        on_existing='merge',
                         governor=getattr(self.host, 'governor', None),
                         pack_file_batch_size=self.host.pack_file_batch_size,
                         pack_parallel_workers=1,
                     )
+                # Same gate as the ZIP path (audit H7): every planned large
+                # file is positively missing or in the pack at its size.
+                problems = reconcile_packed_chunk(
+                    loose_rows, loose_missing, loose_count, fresh_rows,
+                    loose_metadata or [], pack_dir=pack_dir)
+                if problems:
+                    raise ChunkReconciliationError(
+                        f"[PACK] Chunk {chunk_index + 1} large files failed "
+                        "reconciliation and were NOT queued for tape: "
+                        + "; ".join(problems[:5]))
+                if loose_count:
                     canonical_count = _apply_canonical_remote_paths(
-                        loose_metadata, loose_rows)
+                        loose_metadata, fresh_rows)
                     if canonical_count != len(loose_metadata):
                         raise RuntimeError(
                             "[DB] Refusing to index temporary loose staging "
@@ -932,6 +1188,23 @@ class RemoteChunkStager:
                 self.host._cleanup_dir(fetch_dir)
                 self.host._cleanup_dir(pack_dir)
             raise
+
+    @staticmethod
+    def _assert_loose_targets_free(fetch_dir, pack_dir):
+        """Refuse to copy a large file over an object already in the pack.
+
+        Loose files keep their source-relative path inside the pack, next to
+        the chunk's containers and metadata artifacts. A source file whose
+        path equals one of those names must stop the chunk, not replace it."""
+        for root, _dirs, files in os.walk(_long(fetch_dir)):
+            for name in files:
+                rel = os.path.relpath(os.path.join(root, name),
+                                      _long(fetch_dir))
+                target = os.path.join(pack_dir, rel)
+                if os.path.lexists(_long(target)):
+                    raise RuntimeError(
+                        "[PACK] large file would overwrite an existing pack "
+                        f"object: {rel}")
 
     def _reservation_for_chunk(
             self, planned_bytes, planned_files, *, session_id=None,
@@ -1288,8 +1561,15 @@ class RemoteChunkStager:
         # LTOPacker necessarily sees temporary Windows staging paths. Replace
         # them before logging/indexing with the durable canonical remote paths
         # persisted in the remote manifest.
+        manifest_rows = self.host.db.get_chunk_files(session_id, chunk_index)
+        # The gate between packing and the tape writer (audit H7): the pack
+        # must hold exactly the fetched files. Checked before the staging
+        # paths are rewritten, while stored_path still names the fetched file.
+        self._require_reconciled_pack(
+            session_id, chunk_index, chunk_files, source_missing_files,
+            fetched_file_count, manifest_rows, metadata, fetch_dir, pack_dir)
         canonical_count = _apply_canonical_remote_paths(
-            metadata, self.host.db.get_chunk_files(session_id, chunk_index))
+            metadata, manifest_rows)
         if canonical_count != len(metadata):
             self.host.db.update_chunk_status(session_id, chunk_index,
                 ChunkStatus.FETCH_FAILED.value)
@@ -1335,6 +1615,55 @@ class RemoteChunkStager:
             session_id=session_id,
             packaging_format=chunk_format,
         )
+
+    def _require_reconciled_pack(
+            self, session_id, chunk_index, planned_rows, source_missing_files,
+            fetched_file_count, manifest_rows, metadata, fetch_dir, pack_dir):
+        """Fail the chunk unless plan, fetch and pack agree file for file.
+
+        On a mismatch the chunk is marked ``fetch_failed`` (resumable), the
+        raw fetch is dropped, and the pack is set aside under a
+        ``.reconcile_failed`` name for diagnosis: it is never handed to the
+        writer and can never be picked up as a resumable pack."""
+        problems = reconcile_packed_chunk(
+            planned_rows, source_missing_files, fetched_file_count,
+            manifest_rows, metadata, pack_dir=pack_dir)
+        if not problems:
+            return
+        kept = self._quarantine_failed_pack(pack_dir)
+        if not CANCEL.is_set():
+            self.host.db.update_chunk_status(
+                session_id, chunk_index, ChunkStatus.FETCH_FAILED.value)
+        self.host._cleanup_dir(fetch_dir)
+        shown = "; ".join(problems[:5])
+        more = (f" (+{len(problems) - 5} more)" if len(problems) > 5 else "")
+        message = (
+            f"[PACK] Chunk {chunk_index + 1} failed reconciliation and was "
+            f"NOT queued for tape: {shown}{more}. "
+            + (f"The pack is kept for diagnosis at {kept}."
+               if kept else "The pack could not be set aside and was left "
+                            f"at {pack_dir}."))
+        get_logger().error("chunk_reconciliation_failed: %s", message)
+        print(f"\n{message}")
+        raise ChunkReconciliationError(message)
+
+    def _quarantine_failed_pack(self, pack_dir):
+        """Rename a rejected pack out of the writer's and resume's reach."""
+        if not os.path.isdir(_long(pack_dir)):
+            return None
+        kept = pack_dir + ".reconcile_failed"
+        try:
+            if os.path.exists(_long(kept)):
+                # Keep at most one rejected pack per chunk so repeated
+                # failures cannot fill the staging volume.
+                shutil.rmtree(_long(kept))
+            os.rename(_long(pack_dir), _long(kept))
+        except OSError:
+            get_logger().warning(
+                "could not set aside the rejected pack %s", pack_dir,
+                exc_info=True)
+            return None
+        return kept
 
     def _discard_desc(self, desc):
         """Drop a staged-but-unused chunk: clean its dirs and free its budget."""
@@ -1559,15 +1888,50 @@ class RemoteChunkStager:
         records = []
         pending = []        # primary files: extracted at their sanitized path
         collisions = []     # renamed files: fetched individually, then moved
-        claimed = {}        # case-folded local_rel -> remote rel that owns it
+        claimed = {}        # collision key of local_rel -> owning remote rel
         fetching_ids = []
+        chunk_files = list(chunk_files)
 
-        for row in chunk_files:
+        # A row already marked source_missing is only an earlier run's opinion.
+        # Ask the source again before letting the chunk go on without the
+        # file: an older build recorded files as missing that were merely
+        # extracted under a different Unicode form (audit H9).
+        recorded_missing = [
+            (index, row) for index, row in enumerate(chunk_files)
+            if row['status'] == 'source_missing']
+        still_missing = set()
+        if recorded_missing:
+            by_base = defaultdict(list)
+            for index, row in recorded_missing:
+                try:
+                    remote_base, rel = _remote_fetch_base_and_rel(
+                        self.host.remote_path, row['remote_path'])
+                except ValueError:
+                    # Unaddressable by the fetch path: nothing to re-ask.
+                    still_missing.add(index)
+                    continue
+                by_base[remote_base].append((index, rel))
+            for remote_base, items in by_base.items():
+                verdicts, error = self._confirm_source_absence(
+                    remote_base, [rel for _, rel in items])
+                if error:
+                    print(f"\n[REMOTE] Could not re-confirm recorded missing "
+                          f"source files: {error}")
+                    self.host._note_fetch_failure(error)
+                    return False, source_missing_files, fetched_file_count
+                for position, (index, rel) in enumerate(items):
+                    if verdicts.get(position) in _CONFIRMED_ABSENT_DISPOSITIONS:
+                        still_missing.add(index)
+                    else:
+                        print(f"[REMOTE] Recorded as missing but present at "
+                              f"the source - fetching it now: {rel}")
+
+        for row_index, row in enumerate(chunk_files):
             remote_fpath = row['remote_path']
             fsize        = row['file_size_bytes']
             manifest_id  = row['manifest_id']
 
-            if row['status'] == 'source_missing':
+            if row['status'] == 'source_missing' and row_index in still_missing:
                 source_missing_files.append({
                     'manifest_id': manifest_id,
                     'remote_path': remote_fpath,
@@ -1596,14 +1960,14 @@ class RemoteChunkStager:
             # rel is the true remote path (sent verbatim to remote tar); the
             # local copy lands under the name the Windows extractor can write.
             local_rel = _winsafe_extracted_rel(rel)
-            key = local_rel.casefold()
+            key = _local_collision_key(local_rel)
             collided = key in claimed
             if collided:
                 # Two distinct remote names map to the same on-disk path —
                 # rename this one so neither file is silently overwritten.
                 clash_with = claimed[key]
                 local_rel  = _disambiguate_local_rel(local_rel, claimed)
-                key        = local_rel.casefold()
+                key        = _local_collision_key(local_rel)
                 print(f"[REMOTE] Name collision: '{rel}' and '{clash_with}' map "
                       f"to the same Windows path — fetching the former as "
                       f"'{local_rel}'.")
@@ -1627,8 +1991,7 @@ class RemoteChunkStager:
                 (row, remote_base, rel, local_rel, local_path))
 
         for start in range(0, len(fetching_ids), self.host.metadata_batch_size):
-            if governor := getattr(self.host, 'governor', None):
-                governor.wait_or_pause("fetch", "continue")
+            self._governor_fetch_continue()
             batch_ids = fetching_ids[start:start + self.host.metadata_batch_size]
             self.host.db.update_manifest_rows_fetching(
                 batch_ids, session_id=session_id)
@@ -1646,8 +2009,11 @@ class RemoteChunkStager:
 
             fetch_stop  = threading.Event()
             fetch_abort = threading.Event()
-            self.host._start_fetch_monitor(fetch_stop, fetch_abort, fetch_dir,
-                                      todo_bytes)
+            # todo_bytes covers only what is still to fetch, so the watchdog
+            # must not count what an interrupted run already left here.
+            self.host._start_fetch_monitor(
+                fetch_stop, fetch_abort, fetch_dir, todo_bytes,
+                baseline_bytes=_dir_tree_size(fetch_dir))
 
             pending_by_base = defaultdict(list)
             for row, remote_base, rel, local_rel, local_path in pending:
@@ -1671,8 +2037,7 @@ class RemoteChunkStager:
                     for remote_base, base_batch in work_items:
                         if CANCEL.is_set():
                             return False, source_missing_files, fetched_file_count
-                        if governor := getattr(self.host, 'governor', None):
-                            governor.wait_or_pause("fetch", "continue")
+                        self._governor_fetch_continue()
                         ok, err = self.host._fetch_one_batch(
                             remote_base, base_batch, fetch_dir, fetch_abort)
                         if not ok:
@@ -1705,11 +2070,31 @@ class RemoteChunkStager:
             item['manifest_id'] for item in source_missing_files
         }
         fetched_updates = []
-        for row, _, rel, local_rel, local_path in records:
+        listing_cache = {}
+        absent = []         # locally absent; needs the source's confirmation
+        for row, remote_base, rel, local_rel, local_path in records:
             fsize       = row['file_size_bytes']
             manifest_id = row['manifest_id']
-            if manifest_id in source_missing_ids:
+            if manifest_id is not None and manifest_id in source_missing_ids:
                 continue
+            if not os.path.exists(_long(local_path)):
+                # The extractor may have written the name in another Unicode
+                # normalisation form (libarchive composes to NFC on Windows;
+                # macOS-origin names are decomposed). Look for that before
+                # believing the file is gone.
+                found, found_rel, ambiguous = _resolve_extracted_path(
+                    fetch_dir, local_rel, listing_cache)
+                if ambiguous:
+                    msg = (f"refusing to guess which staged file is "
+                           f"'{row['remote_path']}': several local names "
+                           "differ from it only by Unicode normalisation.")
+                    print(f"\n[REMOTE] {msg}")
+                    self.host.db.update_manifest_row(
+                        manifest_id, session_id=session_id,
+                        status='fetch_failed', error_msg=msg[:500])
+                    return False, source_missing_files, fetched_file_count
+                if found is not None:
+                    local_path, local_rel = found, found_rel
             if not os.path.exists(_long(local_path)):
                 # An absent file is normally a genuine remote omission (the
                 # remote tar emitted a tolerated "Cannot stat"). But if the
@@ -1732,24 +2117,7 @@ class RemoteChunkStager:
                         manifest_id, session_id=session_id,
                         status='fetch_failed', error_msg=msg[:500])
                     return False, source_missing_files, fetched_file_count
-                detail = {
-                    'manifest_id': manifest_id,
-                    'remote_path': row['remote_path'],
-                    'file_size_bytes': fsize,
-                }
-                source_missing_files.append(detail)
-                source_missing_ids.add(manifest_id)
-                self.host.skipped_tracker.add(
-                    'remote', row['remote_path'], "missing after tar fetch",
-                    'fetch', session_id=session_id, chunk_index=chunk_index)
-                print(f"[REMOTE] Source missing; skipped: {row['remote_path']}")
-                self.host.db.update_manifest_row(
-                    manifest_id,
-                    session_id=session_id,
-                    status='source_missing',
-                    local_rel_path=None,
-                    error_msg="missing after tar fetch",
-                )
+                absent.append((row, remote_base, rel))
                 continue
 
             try:
@@ -1779,14 +2147,115 @@ class RemoteChunkStager:
                 return False, source_missing_files, fetched_file_count
 
             fetched_updates.append((local_rel, manifest_id))
+
+        # "Not on disk" is not evidence about the source. A file is recorded
+        # source_missing only when the remote host itself says so; otherwise
+        # the chunk fails loudly and stays resumable, because completing it
+        # would archive the chunk without a file that still exists.
+        if absent and not self._record_confirmed_absent(
+                session_id, chunk_index, absent, source_missing_files):
+            return False, source_missing_files, fetched_file_count
+
         for start in range(0, len(fetched_updates), self.host.metadata_batch_size):
-            if governor := getattr(self.host, 'governor', None):
-                governor.wait_or_pause("fetch", "continue")
+            self._governor_fetch_continue()
             self.host.db.update_manifest_rows_fetched(
                 fetched_updates[start:start + self.host.metadata_batch_size],
                 session_id=session_id)
         fetched_file_count = len(fetched_updates)
         return True, source_missing_files, fetched_file_count
+
+    def _confirm_source_absence(self, remote_base, rel_paths, abort_evt=None):
+        """Ask the source host what became of ``rel_paths``.
+
+        Returns ``(verdicts, error)``. ``verdicts`` maps the position of a
+        path in ``rel_paths`` to its :class:`SourceDisposition` for every path
+        the remote reports as anything other than a present, readable regular
+        file; a position that is absent from the mapping is *present*.
+        ``error`` is a message when the question could not be answered, in
+        which case nothing may be concluded."""
+        rel_paths = list(rel_paths)
+        if not rel_paths:
+            return {}, None
+        try:
+            diagnostics, unresolved = _remote_source_status_probe(
+                self.host.remote_user, self.host.remote_host, remote_base,
+                list(enumerate(rel_paths)),
+                password=self.host.remote_password,
+                cipher=self.host.ssh_cipher,
+                fetch_cores=self.host.fetch_cores, abort_evt=abort_evt)
+        except Exception as exc:  # noqa: BLE001 - reported, never guessed
+            return {}, f"source status probe failed: {exc}"
+        if unresolved:
+            return {}, "; ".join(str(item) for item in unresolved)
+        verdicts = {}
+        for item in diagnostics:
+            position = int(item.plan_ordinal)
+            if not 0 <= position < len(rel_paths) \
+                    or item.path != rel_paths[position]:
+                return {}, ("source status probe answered for a path that "
+                            "was not asked about")
+            verdicts[position] = item.disposition
+        return verdicts, None
+
+    def _record_confirmed_absent(self, session_id, chunk_index, absent,
+                                 source_missing_files):
+        """Record locally-absent files as source_missing only on proof.
+
+        ``absent`` is ``[(row, remote_base, rel), ...]``. Returns False (after
+        marking the offending rows ``fetch_failed``) when the source could not
+        be asked or reports any of them as still present."""
+        by_base = defaultdict(list)
+        for row, remote_base, rel in absent:
+            by_base[remote_base].append((row, rel))
+        confirmed = []
+        for remote_base, items in by_base.items():
+            verdicts, error = self._confirm_source_absence(
+                remote_base, [rel for _, rel in items])
+            if error:
+                msg = (f"{len(items)} file(s) did not arrive and the source "
+                       f"could not confirm they are gone: {error}")
+                print(f"\n[REMOTE] {msg}")
+                self.host._note_fetch_failure(error)
+                self.host.db.update_manifest_rows_fetch_failed(
+                    (row['manifest_id'] for row, _ in items), msg[:500],
+                    session_id=session_id)
+                return False
+            for position, (row, rel) in enumerate(items):
+                disposition = verdicts.get(position)
+                if disposition not in _CONFIRMED_ABSENT_DISPOSITIONS:
+                    state = (disposition.value if disposition is not None
+                             else "present")
+                    msg = (f"refusing to skip '{row['remote_path']}': it was "
+                           f"not staged locally but the source reports it "
+                           f"as {state}.")
+                    print(f"\n[REMOTE] {msg}")
+                    self.host.db.update_manifest_row(
+                        row['manifest_id'], session_id=session_id,
+                        status='fetch_failed', error_msg=msg[:500])
+                    return False
+                confirmed.append((row, disposition))
+        for row, disposition in confirmed:
+            reason = ("missing after tar fetch"
+                      if disposition is SourceDisposition.SOURCE_MISSING
+                      else f"{disposition.value} after tar fetch")
+            source_missing_files.append({
+                'manifest_id': row['manifest_id'],
+                'remote_path': row['remote_path'],
+                'file_size_bytes': row['file_size_bytes'],
+            })
+            self.host.skipped_tracker.add(
+                'remote', row['remote_path'], reason,
+                'fetch', session_id=session_id, chunk_index=chunk_index)
+            print(f"[REMOTE] Source missing (confirmed by the source host); "
+                  f"skipped: {row['remote_path']}")
+            self.host.db.update_manifest_row(
+                row['manifest_id'],
+                session_id=session_id,
+                status='source_missing',
+                local_rel_path=None,
+                error_msg=reason,
+            )
+        return True
 
     def _fetch_one_batch(self, remote_base, base_batch, fetch_dir, fetch_abort):
         """Fetch one metadata-sized batch as a single tar stream.
@@ -1906,8 +2375,7 @@ class RemoteChunkStager:
             for item in work_items:
                 if CANCEL.is_set() or fetch_abort.is_set():
                     break
-                if governor:
-                    governor.wait_or_pause("fetch", "continue")
+                self._governor_fetch_continue()
                 futures.append(pool.submit(_worker, item))
             for fut in futures:
                 fut.result()
@@ -1935,8 +2403,7 @@ class RemoteChunkStager:
             for row, remote_base, rel, _local_rel, local_path in collisions:
                 if CANCEL.is_set():
                     return False
-                if governor := getattr(self.host, 'governor', None):
-                    governor.wait_or_pause("fetch", "continue")
+                self._governor_fetch_continue()
                 tmp = os.path.join(collide_root, str(row['manifest_id']))
                 shutil.rmtree(_long(tmp), ignore_errors=True)
                 os.makedirs(_long(tmp), exist_ok=True)
@@ -1968,6 +2435,13 @@ class RemoteChunkStager:
                 natural = os.path.join(
                     tmp, _winsafe_extracted_rel(rel).replace('/', os.sep))
                 if not os.path.exists(_long(natural)):
+                    # Alone in tmp, a name that differs only by Unicode form
+                    # can only be this file.
+                    found, _found_rel, ambiguous = _resolve_extracted_path(
+                        tmp, _winsafe_extracted_rel(rel))
+                    if found is not None and not ambiguous:
+                        natural = found
+                if not os.path.exists(_long(natural)):
                     # As in _fetch_chunk: a reserved-name or over-MAX_PATH
                     # target is a local write failure, not a remote omission —
                     # surface it loudly (resumable) instead of source_missing.
@@ -1987,21 +2461,10 @@ class RemoteChunkStager:
                             status='fetch_failed',
                             error_msg=msg[:500])
                         return False
-                    detail = {
-                        'manifest_id': row['manifest_id'],
-                        'remote_path': row['remote_path'],
-                        'file_size_bytes': row['file_size_bytes'],
-                    }
-                    source_missing_files.append(detail)
-                    self.host.skipped_tracker.add(
-                        'remote', row['remote_path'], "missing after tar fetch",
-                        'fetch', session_id=session_id, chunk_index=None)
-                    print(f"[REMOTE] Source missing; skipped: {row['remote_path']}")
-                    self.host.db.update_manifest_row(
-                        row['manifest_id'], session_id=session_id,
-                        status='source_missing',
-                        local_rel_path=None,
-                        error_msg="missing after tar fetch")
+                    if not self._record_confirmed_absent(
+                            session_id, None, [(row, remote_base, rel)],
+                            source_missing_files):
+                        return False
                     continue
 
                 os.makedirs(_long(os.path.dirname(local_path)), exist_ok=True)
@@ -2020,7 +2483,8 @@ class RemoteChunkStager:
 
     def _start_fetch_monitor(
             self, stop_evt, abort_evt, fetch_dir, total_bytes,
-            tar_part_paths=None, tar_part_paths_lock=None, label="FETCH"):
+            tar_part_paths=None, tar_part_paths_lock=None, label="FETCH",
+            baseline_bytes=0):
         """Live remote->PC throughput, plus a staging watchdog.
 
         Progress is the fetch dir's logical growth. The watchdog fires
@@ -2030,9 +2494,13 @@ class RemoteChunkStager:
         chunk exceeds its planned bytes by fetch_overrun_abort_factor. Any
         overrun past the warn threshold is reported loudly (the plan's sizes
         come from the scan, so a growing or sparse-expanded remote file shows
-        up here first)."""
+        up here first).
+
+        ``baseline_bytes`` is what the fetch dir already held when this
+        attempt began; ``total_bytes`` is compared with growth beyond it."""
         abort_factor = getattr(self.host, "fetch_abort_factor", 2.0)
         stall_timeout = getattr(self.host, "fetch_stall_timeout", 600)
+        pause_state = self._fetch_pause
 
         def _alarm(msg):
             print(f"\n[FETCH][ALERT] {msg}")
@@ -2050,14 +2518,13 @@ class RemoteChunkStager:
             # hit exactly this — a ~2.5h fetch/stage hang on 2026-07-15 — so the
             # watchdog is the safety net that turns an infinite hang into a
             # bounded, resumable retry.
-            max_seen = 0
-            last_growth_at = time.time()
+            progress = _FetchProgressClock(time.time(), baseline_bytes)
             previous_snapshot = None
             part_last_growth = {}
             while not stop_evt.wait(interval):
                 walk_start = time.time()
                 if tar_part_paths is None:
-                    cur = _dir_tree_size(fetch_dir)
+                    raw = _dir_tree_size(fetch_dir)
                     snapshot = None
                 else:
                     lock = tar_part_paths_lock or threading.Lock()
@@ -2065,8 +2532,19 @@ class RemoteChunkStager:
                         parts = list(tar_part_paths)
                     snapshot = _staging_progress_snapshot(
                         parts, (fetch_dir,))
-                    cur = int(snapshot["total_bytes"])
+                    raw = int(snapshot["total_bytes"])
                 now   = time.time()
+                paused, resumed_at = pause_state.snapshot()
+                cur = progress.observe(raw, now, paused=paused,
+                                       resumed_at=resumed_at)
+                last_growth_at = progress.last_growth_at
+                # A deliberate pause restarts every per-part stall clock too.
+                pause_mark = now if paused else resumed_at
+                if pause_mark is not None:
+                    pause_mark = min(now, pause_mark)
+                    for path, seen_at in list(part_last_growth.items()):
+                        if seen_at < pause_mark:
+                            part_last_growth[path] = pause_mark
                 # Rewalking a chunk with many small files is itself expensive;
                 # keep the scan overhead under ~10% of the monitor's cycle.
                 interval = min(30, max(2, (now - walk_start) * 10))
@@ -2082,9 +2560,6 @@ class RemoteChunkStager:
                 )
                 prev_bytes = cur
                 prev_time  = now
-                if cur > max_seen:
-                    max_seen = cur
-                    last_growth_at = now
 
                 if (total_bytes and not overrun_warned
                         and cur > total_bytes * _FETCH_OVERRUN_WARN_FACTOR):
@@ -2182,7 +2657,8 @@ class RemoteChunkStager:
         if os.path.exists(_long(path)):
             governor = getattr(self.host, 'governor', None)
             if governor:
-                governor.wait_until(governor.can_cleanup, "cleanup")
+                with self._fetch_pause.paused():
+                    governor.wait_until(governor.can_cleanup, "cleanup")
             try:
                 if governor:
                     with governor.mark_cleanup_active():

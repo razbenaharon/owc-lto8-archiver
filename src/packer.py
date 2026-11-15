@@ -586,6 +586,8 @@ class LTOPacker:
                       they must never block on stdin, and a failed rmtree
                       raises so the chunk stays resumable)
             'reuse' — keep the existing staging, return []
+            'merge' — keep the existing staging and pack the source into it
+                      (the caller guarantees no target path is occupied)
 
         pack_parallel_workers > 1 shards the file list across that many worker
         threads, each writing its own uniquely-named bundle(s)/manifest(s) via
@@ -605,6 +607,10 @@ class LTOPacker:
                 print("[PACKER] Using existing staging. DB metadata for "
                       "packed files will not be generated.")
                 return []
+            elif on_existing == 'merge':
+                # The caller owns dest, has already placed other objects in
+                # it, and has checked that no source file maps onto one.
+                pass
             else:
                 print(f"\n[WARNING] Staging directory is not empty: {dest}")
                 print("1. Delete staging and repack from scratch")

@@ -2,6 +2,7 @@
 import os
 import re
 import posixpath
+import unicodedata
 
 
 def _safe_log_token(value, default='item'):
@@ -225,10 +226,15 @@ def _remote_fetch_base_and_rel(configured_remote_path, remote_fpath):
     configured_remote_path may be either a directory or a single file.
     """
     remote_root = (configured_remote_path or '').replace('\\', '/').strip()
-    scanned_path = (remote_fpath or '').replace('\\', '/').strip()
+    # The scanned path is a real remote file name: whitespace at either end is
+    # significant on Linux. Stripping it used to request "name" for a file
+    # called "name " -- and, when a same-sized sibling "name" existed, record
+    # the sibling's bytes as this file (audit H8). Only the *configured* root
+    # is config text and may be trimmed.
+    scanned_path = (remote_fpath or '').replace('\\', '/')
     if not remote_root:
         raise ValueError("empty configured remote path")
-    if not scanned_path:
+    if not scanned_path.strip():
         raise ValueError("empty scanned remote path")
 
     remote_root = posixpath.normpath(remote_root)
@@ -268,7 +274,59 @@ def _winsafe_extracted_rel(rel):
             continue
         part = part.translate(_WIN_RESERVED_TABLE).rstrip(' .')
         out.append(part or '_')
-    return '/'.join(out)
+    # libarchive converts UTF-8 member names to NFC when it extracts on
+    # Windows, so a decomposed (macOS-style) remote name lands on disk composed.
+    return unicodedata.normalize('NFC', '/'.join(out))
+
+
+def _local_collision_key(local_rel):
+    """Key under which two staged paths are the same file on this host.
+
+    NTFS is case-insensitive and the Windows extractor composes Unicode, so two
+    remote names that differ only in case or in normalisation form (NFC vs NFD)
+    would be written onto one local path, the second silently replacing the
+    first. They must share a key so the collision guard keeps them apart."""
+    text = unicodedata.normalize('NFC', str(local_rel or ''))
+    return unicodedata.normalize('NFC', text.casefold())
+
+
+def _resolve_extracted_path(root, local_rel, listing_cache=None):
+    """Find where ``local_rel`` really landed under ``root``.
+
+    Returns ``(path, actual_rel, ambiguous)``; ``path`` is ``None`` when no
+    entry matches. The exact name is preferred; otherwise each missing
+    component is matched against the directory listing by Unicode
+    normalisation form only (never by content or size), because an extractor
+    may store ``e`` + combining accent as one composed character or vice
+    versa. ``ambiguous`` is True when more than one on-disk entry is
+    normalisation-equivalent to a component: the caller must fail loudly
+    rather than guess which file is meant."""
+    cache = listing_cache if listing_cache is not None else {}
+    current = root
+    actual_parts = []
+    for part in [item for item in str(local_rel).split('/') if item]:
+        candidate = os.path.join(current, part)
+        if os.path.lexists(_long(candidate)):
+            actual = part
+        else:
+            names = cache.get(current)
+            if names is None:
+                try:
+                    names = os.listdir(_long(current))
+                except OSError:
+                    names = []
+                cache[current] = names
+            wanted = unicodedata.normalize('NFC', part)
+            matches = [name for name in names
+                       if unicodedata.normalize('NFC', name) == wanted]
+            if len(matches) > 1:
+                return None, None, True
+            if not matches:
+                return None, None, False
+            actual = matches[0]
+        actual_parts.append(actual)
+        current = os.path.join(current, actual)
+    return current, '/'.join(actual_parts), False
 
 
 _LEGACY_PATH_LIMIT = 260
@@ -324,7 +382,8 @@ def _disambiguate_local_rel(local_rel, claimed):
     "a:b" and "a?b" both become "a_b"); NTFS is also case-insensitive. When
     that happens the second file would overwrite the first, so we insert a
     "~N" tag before the extension of the final component until the full path
-    is unique. `claimed` holds the case-folded paths already taken."""
+    is unique. `claimed` holds the `_local_collision_key` of every path
+    already taken."""
     head, _, tail = local_rel.rpartition('/')
     dot = tail.rfind('.')
     stem, ext = (tail[:dot], tail[dot:]) if dot > 0 else (tail, '')
@@ -332,6 +391,6 @@ def _disambiguate_local_rel(local_rel, claimed):
     while True:
         cand_tail = f"{stem}~{n}{ext}"
         cand = f"{head}/{cand_tail}" if head else cand_tail
-        if cand.casefold() not in claimed:
+        if _local_collision_key(cand) not in claimed:
             return cand
         n += 1

@@ -378,6 +378,11 @@ class DirectoryFrontierCoordinator:
 
         self.attempt_id = None
         self.directories_listed = 0
+        #: Running totals of what this run published as ready segments, so the
+        #: scan coordinator can tell when a chunk's worth has accumulated
+        #: without querying the segment table after every directory.
+        self.segment_files_published = 0
+        self.segment_bytes_published = 0
         self.segments_published = 0
         self._scanner = None
 
@@ -450,6 +455,9 @@ class DirectoryFrontierCoordinator:
         # already exist on disk, never the other way round.
         if listing.files:
             self._publish_segment(directory_id, listing)
+            self.segment_files_published += len(listing.files)
+            self.segment_bytes_published += sum(
+                int(size) for _path, size in listing.files)
 
         if listing.directories:
             base = int(claimed["traversal_ordinal"]) + 1
@@ -979,6 +987,11 @@ class SegmentChunkPublisher:
         return (chunk_index + 1, result["file_count"], result["byte_total"])
 
 
+#: Most ready segments examined when choosing what fills a chunk. One segment
+#: holds at least one file, so this also bounds how many can wait unsealed.
+_READY_SEGMENT_SCAN_LIMIT = 100_000
+
+
 class FrontierScanCoordinator:
     """**The production scanner.** Traversal and planning, one directory at a time.
 
@@ -1048,6 +1061,14 @@ class FrontierScanCoordinator:
             stored_tar_write_enabled=stored_tar_write_enabled,
             stored_tar_reader_contract_version=(
                 stored_tar_reader_contract_version))
+        # Deferred-sealing bookkeeping (see _publish_filled).
+        self._limits_known = False
+        self._limits = None
+        self._pending_known = False
+        self._pending_files = 0
+        self._pending_bytes = 0
+        self._seen_files_published = 0
+        self._seen_bytes_published = 0
 
     def _stopping(self):
         return CANCEL.is_set() or self.stop_event.is_set()
@@ -1086,10 +1107,156 @@ class FrontierScanCoordinator:
             self._on_chunk_published(chunk_index)
 
     def _publish(self):
-        """Seal whatever is ready. Returns False when publication halted."""
-        self.publisher.halted = False
-        self.publisher.publish_ready_segments(self.state.next_chunk_index)
-        return not self.publisher.halted
+        """Seal whatever is ready. Returns False when publication halted.
+
+        Used once traversal has ended (and as the per-directory step when the
+        builder's limits are unknown). Whole chunks' worth of waiting segments
+        are sealed first, one chunk at a time, so that what is left for the
+        closing pass fits a single chunk."""
+        limits = self._chunk_limits()
+        if limits is not None and not self._seal_full_prefixes(limits):
+            return False
+        while True:
+            self.publisher.halted = False
+            before = self._ready_segment_ids(limit=1)
+            # One wide pass, not the publisher's default 50 segments: a narrow
+            # pass flushes its own tail, which would cut the waiting segments
+            # into a chunk per 50 directories.
+            self.publisher.publish_ready_segments(
+                self.state.next_chunk_index, limit=_READY_SEGMENT_SCAN_LIMIT)
+            if self.publisher.halted:
+                return False
+            after = self._ready_segment_ids(limit=1)
+            if not after or after == before or self._stopping():
+                return True
+
+    def _ready_segment_ids(self, limit):
+        return [segment["scan_segment_id"]
+                for segment in self.db.get_ready_segments(
+                    self.session_id, limit=limit)]
+
+    def _chunk_limits(self):
+        """``(budget_bytes, max_files, estimate)`` of the chunk builder.
+
+        ``None`` when the builder does not expose a planner, in which case the
+        coordinator cannot tell how full a chunk would be and keeps sealing
+        after every directory."""
+        if self._limits_known:
+            return self._limits
+        self._limits_known = True
+        self._limits = None
+        try:
+            planner = getattr(self.publisher._builder_factory(), "planner",
+                              None)
+            budget = int(planner.budget_bytes)
+            unit = int(planner.alloc_unit)
+            padding = float(planner.padding_factor)
+            max_files = planner.max_files
+        except Exception:
+            return None
+        if budget <= 0:
+            return None
+
+        def estimate(file_count, byte_count):
+            # Never below the builder's own per-file footprint sum: each file
+            # rounds up by less than one allocation unit.
+            return int((int(byte_count) + int(file_count) * unit) * padding)
+
+        self._limits = (budget, max_files, estimate)
+        return self._limits
+
+    def _publish_filled(self):
+        """Seal only chunks that more discovery could not make any fuller.
+
+        The frontier publishes one ready segment per directory. Sealing after
+        every directory therefore produced one chunk per directory: 200 small
+        directories became 200 tiny chunks instead of one (audit H10), which
+        throws away the sequential-write benefit the chunk size exists for.
+
+        Segments are durable as soon as they are ready, so nothing is lost by
+        letting them wait. A prefix of the ready segments (in the publisher's
+        own stable order) is sealed only when the NEXT segment would not fit
+        the same chunk; whatever still fits stays ready, to be joined by later
+        directories or sealed by the final :meth:`_publish`.
+
+        The invariants are untouched because the sealing itself is the
+        unchanged ``publish_ready_segments``: whole segments only, known files
+        filtered before the builder, every contributing segment retired after
+        the flush, and a sealed chunk never reopened.
+
+        Returns False when the gate or the tape budget halted publication.
+        """
+        limits = self._chunk_limits()
+        if limits is None:
+            return self._publish()
+        budget, max_files, estimate = limits
+
+        frontier = self.frontier
+        self._pending_files += (
+            frontier.segment_files_published - self._seen_files_published)
+        self._pending_bytes += (
+            frontier.segment_bytes_published - self._seen_bytes_published)
+        self._seen_files_published = frontier.segment_files_published
+        self._seen_bytes_published = frontier.segment_bytes_published
+        if not self._pending_known:
+            # Segments an interrupted run left ready count too.
+            self._refresh_pending()
+        if (estimate(self._pending_files, self._pending_bytes) <= budget
+                and not (max_files and self._pending_files > max_files)):
+            return True
+        return self._seal_full_prefixes(limits)
+
+    def _seal_full_prefixes(self, limits):
+        """Seal leading ready segments while they overflow one chunk.
+
+        Returns False when the gate or the tape budget halted publication."""
+        budget, max_files, estimate = limits
+        while not self._stopping():
+            segments = self.db.get_ready_segments(
+                self.session_id, limit=_READY_SEGMENT_SCAN_LIMIT)
+            blocked = set(self.publisher.blocked_segments)
+            files = size = 0
+            take = None
+            for position, segment in enumerate(segments):
+                if segment["scan_segment_id"] in blocked:
+                    continue
+                seg_files = int(segment.get("file_count") or 0)
+                seg_bytes = int(segment.get("byte_count") or 0)
+                over = (estimate(files + seg_files, size + seg_bytes) > budget
+                        or (max_files and files + seg_files > max_files))
+                if over:
+                    # This segment does not fit with the ones before it. Seal
+                    # those; if it is first, it is larger than a chunk on its
+                    # own and is sealed by itself.
+                    take = position if files else position + 1
+                    break
+                files += seg_files
+                size += seg_bytes
+            if take is None and len(segments) >= _READY_SEGMENT_SCAN_LIMIT:
+                take = len(segments)           # bound what waits in memory
+            if take is None:
+                self._pending_files, self._pending_bytes = files, size
+                return True
+            head = [segment["scan_segment_id"] for segment in segments[:take]]
+            self.publisher.halted = False
+            self.publisher.publish_ready_segments(
+                self.state.next_chunk_index, limit=take)
+            if self.publisher.halted:
+                return False
+            if self._ready_segment_ids(limit=take) == head:
+                # Nothing was retired (blocked segments at the head): do not
+                # spin; the final publish reports what is left.
+                return True
+        return True
+
+    def _refresh_pending(self):
+        self._pending_known = True
+        segments = self.db.get_ready_segments(
+            self.session_id, limit=_READY_SEGMENT_SCAN_LIMIT)
+        self._pending_files = sum(
+            int(segment.get("file_count") or 0) for segment in segments)
+        self._pending_bytes = sum(
+            int(segment.get("byte_count") or 0) for segment in segments)
 
     def _mark_scan_complete_if_every_scope_is_final(self):
         """Set the session's scan-complete flag — from traversal, only.
@@ -1130,9 +1297,12 @@ class FrontierScanCoordinator:
     def run(self):
         """Explore the frontier and plan what it discovers.
 
-        Traversal and planning interleave deliberately: publishing after each
-        directory keeps the stager fed while exploration continues, and means
-        an interrupted run has already sealed everything it could.
+        Traversal and planning interleave deliberately: a chunk is sealed as
+        soon as the directories discovered so far fill it, which keeps the
+        stager fed while exploration continues. Directories that do not yet
+        fill a chunk wait as durable ready segments (see
+        :meth:`_publish_filled`) and are sealed when later directories join
+        them, or by the final publish once traversal ends.
         """
         state = self.state
         # Ownership evidence: the attempt row carries the owner token, PID and
@@ -1144,7 +1314,7 @@ class FrontierScanCoordinator:
             self.frontier.establish_scopes()
             while not self._stopping():
                 claimed = self.frontier.process_one_directory()
-                if not self._publish():
+                if not self._publish_filled():
                     return                     # gate or budget stopped us
                 if not claimed:
                     break

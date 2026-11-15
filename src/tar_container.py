@@ -416,8 +416,19 @@ def _consume_sparse_payload(stream: _CountingInput, physical_size: int,
         length, used = _read_sparse_line(
             stream, remaining, f"extent {index} length")
         remaining -= used
-        if length <= 0:
-            raise StoredTarError("GNU sparse extents must have positive length")
+        if length == 0:
+            # GNU tar closes the map of a file that ENDS in a hole (including
+            # a file that is nothing but a hole) with one zero-length extent
+            # at the logical end of file. It stores no bytes; it only states
+            # the size. That exact shape is accepted and nothing looser: a
+            # zero-length extent anywhere else is still a malformed map.
+            if index != extent_count - 1 or offset != logical_size:
+                raise StoredTarError(
+                    "GNU sparse extents must have positive length")
+            if offset < previous_end:
+                raise StoredTarError(
+                    "invalid or overlapping GNU sparse extent")
+            continue
         if offset < previous_end or offset + length > logical_size:
             raise StoredTarError("invalid or overlapping GNU sparse extent")
         previous_end = offset + length
