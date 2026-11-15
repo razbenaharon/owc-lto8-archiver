@@ -1,0 +1,6084 @@
+{
+ "constraints": {
+  "archive_artifacts": [
+   [
+    "c",
+    "archive_artifacts_artifact_kind_check"
+   ],
+   [
+    "c",
+    "archive_artifacts_artifact_size_bytes_check"
+   ],
+   [
+    "c",
+    "archive_artifacts_artifact_version_check"
+   ],
+   [
+    "f",
+    "archive_artifacts_chunk_fk"
+   ],
+   [
+    "c",
+    "archive_artifacts_chunk_index_check"
+   ],
+   [
+    "f",
+    "archive_artifacts_container_fk"
+   ],
+   [
+    "c",
+    "archive_artifacts_locator_distinct_ck"
+   ],
+   [
+    "p",
+    "archive_artifacts_pkey"
+   ],
+   [
+    "c",
+    "archive_artifacts_readiness_state_check"
+   ],
+   [
+    "c",
+    "archive_artifacts_ready_ck"
+   ],
+   [
+    "c",
+    "archive_artifacts_scope_ck"
+   ]
+  ],
+  "archive_bundles": [
+   [
+    "f",
+    "archive_bundles_container_fk"
+   ],
+   [
+    "c",
+    "archive_bundles_container_format_ck"
+   ],
+   [
+    "p",
+    "archive_bundles_pkey"
+   ],
+   [
+    "f",
+    "archive_bundles_tape_label_fkey"
+   ],
+   [
+    "u",
+    "archive_bundles_tape_label_tape_path_key"
+   ],
+   [
+    "u",
+    "uq_archive_bundles_id_tape"
+   ]
+  ],
+  "archive_container_members": [
+   [
+    "c",
+    "archive_container_members_chunk_index_check"
+   ],
+   [
+    "c",
+    "archive_container_members_container_ck"
+   ],
+   [
+    "f",
+    "archive_container_members_container_id_session_id_chunk_in_fkey"
+   ],
+   [
+    "c",
+    "archive_container_members_container_ordinal_check"
+   ],
+   [
+    "c",
+    "archive_container_members_estimated_tar_bytes_check"
+   ],
+   [
+    "c",
+    "archive_container_members_expected_logical_bytes_check"
+   ],
+   [
+    "p",
+    "archive_container_members_pkey"
+   ],
+   [
+    "f",
+    "archive_container_members_plan_file_id_fkey"
+   ],
+   [
+    "c",
+    "archive_container_members_plan_ordinal_check"
+   ],
+   [
+    "c",
+    "archive_container_members_remote_path_check"
+   ],
+   [
+    "f",
+    "archive_container_members_session_id_chunk_index_fkey"
+   ],
+   [
+    "u",
+    "archive_container_members_session_id_chunk_index_plan_ordin_key"
+   ],
+   [
+    "c",
+    "archive_container_members_storage_class_check"
+   ]
+  ],
+  "archive_containers": [
+   [
+    "c",
+    "archive_containers_actual_artifact_bytes_check"
+   ],
+   [
+    "c",
+    "archive_containers_catalog_ck"
+   ],
+   [
+    "c",
+    "archive_containers_catalog_state_check"
+   ],
+   [
+    "f",
+    "archive_containers_chunk_format_fk"
+   ],
+   [
+    "c",
+    "archive_containers_chunk_index_check"
+   ],
+   [
+    "c",
+    "archive_containers_container_format_check"
+   ],
+   [
+    "c",
+    "archive_containers_container_name_check"
+   ],
+   [
+    "c",
+    "archive_containers_container_ordinal_check"
+   ],
+   [
+    "c",
+    "archive_containers_dialect_ck"
+   ],
+   [
+    "c",
+    "archive_containers_estimated_archive_bytes_check"
+   ],
+   [
+    "c",
+    "archive_containers_expected_logical_bytes_check"
+   ],
+   [
+    "c",
+    "archive_containers_expected_member_count_check"
+   ],
+   [
+    "c",
+    "archive_containers_format_version_check"
+   ],
+   [
+    "u",
+    "archive_containers_id_format_uq"
+   ],
+   [
+    "u",
+    "archive_containers_identity_uq"
+   ],
+   [
+    "c",
+    "archive_containers_observed_ck"
+   ],
+   [
+    "c",
+    "archive_containers_observed_logical_bytes_check"
+   ],
+   [
+    "c",
+    "archive_containers_observed_member_count_check"
+   ],
+   [
+    "u",
+    "archive_containers_ordinal_uq"
+   ],
+   [
+    "p",
+    "archive_containers_pkey"
+   ],
+   [
+    "c",
+    "archive_containers_ready_pair_ck"
+   ],
+   [
+    "c",
+    "archive_containers_storage_class_check"
+   ],
+   [
+    "f",
+    "archive_containers_tape_generation_id_fkey"
+   ],
+   [
+    "f",
+    "archive_containers_tape_label_fkey"
+   ],
+   [
+    "c",
+    "archive_containers_tape_locator_ck"
+   ],
+   [
+    "c",
+    "archive_containers_validated_part_ck"
+   ],
+   [
+    "c",
+    "archive_containers_validation_state_check"
+   ],
+   [
+    "c",
+    "archive_containers_writer_ck"
+   ],
+   [
+    "c",
+    "archive_containers_writer_state_check"
+   ]
+  ],
+  "archive_directories": [
+   [
+    "c",
+    "archive_directories_canonical_path_check"
+   ],
+   [
+    "c",
+    "archive_directories_depth_check"
+   ],
+   [
+    "c",
+    "archive_directories_name_check"
+   ],
+   [
+    "c",
+    "archive_directories_parent_ck"
+   ],
+   [
+    "f",
+    "archive_directories_parent_directory_id_fkey"
+   ],
+   [
+    "p",
+    "archive_directories_pkey"
+   ],
+   [
+    "c",
+    "archive_directories_root_depth_ck"
+   ],
+   [
+    "c",
+    "archive_directories_source_host_check"
+   ],
+   [
+    "u",
+    "archive_directories_source_path_uq"
+   ]
+  ],
+  "archive_runs": [
+   [
+    "f",
+    "archive_runs_local_session_id_fkey"
+   ],
+   [
+    "p",
+    "archive_runs_pkey"
+   ],
+   [
+    "c",
+    "archive_runs_remote_chunk_index_ck"
+   ],
+   [
+    "f",
+    "archive_runs_remote_session_id_fkey"
+   ],
+   [
+    "u",
+    "archive_runs_run_label_tape_label_key"
+   ],
+   [
+    "c",
+    "archive_runs_session_kind_check"
+   ],
+   [
+    "c",
+    "archive_runs_session_kind_ck"
+   ],
+   [
+    "f",
+    "archive_runs_tape_generation_fk"
+   ],
+   [
+    "f",
+    "archive_runs_tape_label_fkey"
+   ]
+  ],
+  "catalog_directories": [
+   [
+    "f",
+    "catalog_directories_parent_id_fkey"
+   ],
+   [
+    "p",
+    "catalog_directories_pkey"
+   ],
+   [
+    "f",
+    "catalog_directories_tape_label_fkey"
+   ],
+   [
+    "u",
+    "catalog_directories_tape_label_normalized_path_key"
+   ]
+  ],
+  "container_format_schema_authority": [
+   [
+    "c",
+    "container_format_schema_authority_authority_version_check"
+   ],
+   [
+    "u",
+    "container_format_schema_authority_authority_version_key"
+   ],
+   [
+    "p",
+    "container_format_schema_authority_pkey"
+   ],
+   [
+    "c",
+    "container_format_schema_authority_schema_fingerprint_check"
+   ]
+  ],
+  "container_format_schema_metadata": [
+   [
+    "c",
+    "container_format_schema_metadata_migration_checksum_check"
+   ],
+   [
+    "p",
+    "container_format_schema_metadata_pkey"
+   ],
+   [
+    "c",
+    "container_format_schema_metadata_schema_fingerprint_check"
+   ],
+   [
+    "c",
+    "container_format_schema_metadata_singleton_check"
+   ]
+  ],
+  "directory_archive_bundles": [
+   [
+    "f",
+    "directory_archive_bundles_archive_run_id_fkey"
+   ],
+   [
+    "c",
+    "directory_archive_bundles_artifact_bytes_ck"
+   ],
+   [
+    "c",
+    "directory_archive_bundles_byte_count_check"
+   ],
+   [
+    "f",
+    "directory_archive_bundles_container_fk"
+   ],
+   [
+    "c",
+    "directory_archive_bundles_container_format_ck"
+   ],
+   [
+    "c",
+    "directory_archive_bundles_file_count_check"
+   ],
+   [
+    "f",
+    "directory_archive_bundles_generation_fk"
+   ],
+   [
+    "c",
+    "directory_archive_bundles_large_file_bytes_check"
+   ],
+   [
+    "c",
+    "directory_archive_bundles_large_file_count_check"
+   ],
+   [
+    "f",
+    "directory_archive_bundles_local_session_id_fkey"
+   ],
+   [
+    "p",
+    "directory_archive_bundles_pkey"
+   ],
+   [
+    "c",
+    "directory_archive_bundles_record_key_check"
+   ],
+   [
+    "u",
+    "directory_archive_bundles_record_key_key"
+   ],
+   [
+    "f",
+    "directory_archive_bundles_remote_session_id_fkey"
+   ],
+   [
+    "c",
+    "directory_archive_bundles_small_file_bytes_check"
+   ],
+   [
+    "c",
+    "directory_archive_bundles_small_file_count_check"
+   ],
+   [
+    "f",
+    "directory_archive_bundles_tape_label_fkey"
+   ],
+   [
+    "u",
+    "uq_dir_bundles_id_tape"
+   ]
+  ],
+  "directory_archive_parts": [
+   [
+    "c",
+    "directory_archive_parts_catalog_state_check"
+   ],
+   [
+    "c",
+    "directory_archive_parts_catalog_writer_ck"
+   ],
+   [
+    "f",
+    "directory_archive_parts_chunk_fk"
+   ],
+   [
+    "c",
+    "directory_archive_parts_chunk_index_check"
+   ],
+   [
+    "f",
+    "directory_archive_parts_container_fk"
+   ],
+   [
+    "c",
+    "directory_archive_parts_direct_archived_bytes_check"
+   ],
+   [
+    "c",
+    "directory_archive_parts_direct_archived_count_check"
+   ],
+   [
+    "c",
+    "directory_archive_parts_direct_expected_bytes_check"
+   ],
+   [
+    "c",
+    "directory_archive_parts_direct_expected_count_check"
+   ],
+   [
+    "c",
+    "directory_archive_parts_direct_source_changed_bytes_check"
+   ],
+   [
+    "c",
+    "directory_archive_parts_direct_source_changed_count_check"
+   ],
+   [
+    "c",
+    "directory_archive_parts_direct_source_missing_bytes_check"
+   ],
+   [
+    "c",
+    "directory_archive_parts_direct_source_missing_count_check"
+   ],
+   [
+    "c",
+    "directory_archive_parts_direct_source_permission_denied_b_check"
+   ],
+   [
+    "c",
+    "directory_archive_parts_direct_source_permission_denied_c_check"
+   ],
+   [
+    "c",
+    "directory_archive_parts_direct_source_unreadable_bytes_check"
+   ],
+   [
+    "c",
+    "directory_archive_parts_direct_source_unreadable_count_check"
+   ],
+   [
+    "c",
+    "directory_archive_parts_direct_unresolved_bytes_check"
+   ],
+   [
+    "c",
+    "directory_archive_parts_direct_unresolved_count_check"
+   ],
+   [
+    "f",
+    "directory_archive_parts_directory_id_fkey"
+   ],
+   [
+    "c",
+    "directory_archive_parts_evidence_generation_check"
+   ],
+   [
+    "c",
+    "directory_archive_parts_exact_route_ck"
+   ],
+   [
+    "c",
+    "directory_archive_parts_exactly_one_identity_ck"
+   ],
+   [
+    "c",
+    "directory_archive_parts_local_validation_state_check"
+   ],
+   [
+    "c",
+    "directory_archive_parts_locator_ck"
+   ],
+   [
+    "c",
+    "directory_archive_parts_loose_key_ck"
+   ],
+   [
+    "f",
+    "directory_archive_parts_loose_record_fk"
+   ],
+   [
+    "c",
+    "directory_archive_parts_outcome_bytes_ck"
+   ],
+   [
+    "c",
+    "directory_archive_parts_outcome_total_ck"
+   ],
+   [
+    "p",
+    "directory_archive_parts_pkey"
+   ],
+   [
+    "f",
+    "directory_archive_parts_plan_manifest_artifact_id_fkey"
+   ],
+   [
+    "c",
+    "directory_archive_parts_restore_format_check"
+   ],
+   [
+    "c",
+    "directory_archive_parts_route_tuple_ck"
+   ],
+   [
+    "c",
+    "directory_archive_parts_routing_precision_check"
+   ],
+   [
+    "f",
+    "directory_archive_parts_sidecar_artifact_id_fkey"
+   ],
+   [
+    "c",
+    "directory_archive_parts_source_base_path_check"
+   ],
+   [
+    "c",
+    "directory_archive_parts_storage_class_check"
+   ],
+   [
+    "c",
+    "directory_archive_parts_storage_identity_ck"
+   ],
+   [
+    "c",
+    "directory_archive_parts_stored_path_check"
+   ],
+   [
+    "f",
+    "directory_archive_parts_tape_generation_id_fkey"
+   ],
+   [
+    "f",
+    "directory_archive_parts_tape_label_fkey"
+   ],
+   [
+    "f",
+    "directory_archive_parts_terminal_manifest_artifact_id_fkey"
+   ],
+   [
+    "c",
+    "directory_archive_parts_writer_state_check"
+   ]
+  ],
+  "directory_archive_stats": [
+   [
+    "f",
+    "directory_archive_stats_archive_run_id_fkey"
+   ],
+   [
+    "c",
+    "directory_archive_stats_direct_bytes_check"
+   ],
+   [
+    "c",
+    "directory_archive_stats_direct_file_count_check"
+   ],
+   [
+    "c",
+    "directory_archive_stats_large_file_bytes_check"
+   ],
+   [
+    "c",
+    "directory_archive_stats_large_file_count_check"
+   ],
+   [
+    "f",
+    "directory_archive_stats_local_session_id_fkey"
+   ],
+   [
+    "c",
+    "directory_archive_stats_packed_bundle_count_check"
+   ],
+   [
+    "p",
+    "directory_archive_stats_pkey"
+   ],
+   [
+    "c",
+    "directory_archive_stats_record_key_check"
+   ],
+   [
+    "u",
+    "directory_archive_stats_record_key_key"
+   ],
+   [
+    "c",
+    "directory_archive_stats_recursive_bytes_check"
+   ],
+   [
+    "c",
+    "directory_archive_stats_recursive_file_count_check"
+   ],
+   [
+    "f",
+    "directory_archive_stats_remote_session_id_fkey"
+   ],
+   [
+    "c",
+    "directory_archive_stats_small_file_bytes_check"
+   ],
+   [
+    "c",
+    "directory_archive_stats_small_file_count_check"
+   ],
+   [
+    "f",
+    "directory_archive_stats_tape_label_fkey"
+   ]
+  ],
+  "directory_completeness": [
+   [
+    "c",
+    "directory_completeness_derived_status_ck"
+   ],
+   [
+    "c",
+    "directory_completeness_direct_archived_bytes_check"
+   ],
+   [
+    "c",
+    "directory_completeness_direct_archived_file_count_check"
+   ],
+   [
+    "c",
+    "directory_completeness_direct_expected_bytes_check"
+   ],
+   [
+    "c",
+    "directory_completeness_direct_expected_file_count_check"
+   ],
+   [
+    "c",
+    "directory_completeness_direct_source_changed_count_check"
+   ],
+   [
+    "c",
+    "directory_completeness_direct_source_missing_count_check"
+   ],
+   [
+    "c",
+    "directory_completeness_direct_source_permission_denied_co_check"
+   ],
+   [
+    "c",
+    "directory_completeness_direct_source_unreadable_count_check"
+   ],
+   [
+    "c",
+    "directory_completeness_direct_unresolved_count_check"
+   ],
+   [
+    "f",
+    "directory_completeness_directory_id_fkey"
+   ],
+   [
+    "c",
+    "directory_completeness_pinned_artifact_evidence_generatio_check"
+   ],
+   [
+    "c",
+    "directory_completeness_pinned_frontier_generation_check"
+   ],
+   [
+    "p",
+    "directory_completeness_pkey"
+   ],
+   [
+    "c",
+    "directory_completeness_recursive_archived_bytes_check"
+   ],
+   [
+    "c",
+    "directory_completeness_recursive_archived_file_count_check"
+   ],
+   [
+    "c",
+    "directory_completeness_recursive_ck"
+   ],
+   [
+    "c",
+    "directory_completeness_recursive_expected_bytes_check"
+   ],
+   [
+    "c",
+    "directory_completeness_recursive_expected_file_count_check"
+   ],
+   [
+    "c",
+    "directory_completeness_recursive_source_changed_count_check"
+   ],
+   [
+    "c",
+    "directory_completeness_recursive_source_missing_count_check"
+   ],
+   [
+    "c",
+    "directory_completeness_recursive_source_permission_denied_check"
+   ],
+   [
+    "c",
+    "directory_completeness_recursive_source_unreadable_count_check"
+   ],
+   [
+    "c",
+    "directory_completeness_recursive_unresolved_count_check"
+   ],
+   [
+    "c",
+    "directory_completeness_required_archive_ck"
+   ],
+   [
+    "f",
+    "directory_completeness_session_id_fkey"
+   ],
+   [
+    "c",
+    "directory_completeness_status_check"
+   ],
+   [
+    "c",
+    "directory_completeness_terminal_partition_ck"
+   ]
+  ],
+  "directory_scan_coverage": [
+   [
+    "c",
+    "directory_scan_coverage_coverage_state_check"
+   ],
+   [
+    "c",
+    "directory_scan_coverage_direct_discovered_bytes_check"
+   ],
+   [
+    "c",
+    "directory_scan_coverage_direct_discovered_directory_count_check"
+   ],
+   [
+    "c",
+    "directory_scan_coverage_direct_discovered_file_count_check"
+   ],
+   [
+    "f",
+    "directory_scan_coverage_directory_id_fkey"
+   ],
+   [
+    "c",
+    "directory_scan_coverage_error_ck"
+   ],
+   [
+    "c",
+    "directory_scan_coverage_error_count_check"
+   ],
+   [
+    "c",
+    "directory_scan_coverage_excluded_count_check"
+   ],
+   [
+    "c",
+    "directory_scan_coverage_frontier_generation_check"
+   ],
+   [
+    "u",
+    "directory_scan_coverage_generation_uq"
+   ],
+   [
+    "p",
+    "directory_scan_coverage_pkey"
+   ],
+   [
+    "c",
+    "directory_scan_coverage_recursive_ck"
+   ],
+   [
+    "c",
+    "directory_scan_coverage_recursive_discovered_bytes_check"
+   ],
+   [
+    "c",
+    "directory_scan_coverage_recursive_discovered_directory_co_check"
+   ],
+   [
+    "c",
+    "directory_scan_coverage_recursive_discovered_file_count_check"
+   ],
+   [
+    "f",
+    "directory_scan_coverage_scan_scope_id_fkey"
+   ],
+   [
+    "f",
+    "directory_scan_coverage_session_id_fkey"
+   ]
+  ],
+  "directory_tree_index": [
+   [
+    "f",
+    "directory_tree_index_archive_run_id_fkey"
+   ],
+   [
+    "f",
+    "directory_tree_index_bundle_id_fkey"
+   ],
+   [
+    "c",
+    "directory_tree_index_depth_check"
+   ],
+   [
+    "c",
+    "directory_tree_index_direct_bytes_check"
+   ],
+   [
+    "c",
+    "directory_tree_index_direct_file_count_check"
+   ],
+   [
+    "c",
+    "directory_tree_index_direct_large_file_bytes_check"
+   ],
+   [
+    "c",
+    "directory_tree_index_direct_large_file_count_check"
+   ],
+   [
+    "c",
+    "directory_tree_index_direct_small_file_bytes_check"
+   ],
+   [
+    "c",
+    "directory_tree_index_direct_small_file_count_check"
+   ],
+   [
+    "f",
+    "directory_tree_index_local_session_id_fkey"
+   ],
+   [
+    "p",
+    "directory_tree_index_pkey"
+   ],
+   [
+    "c",
+    "directory_tree_index_record_key_check"
+   ],
+   [
+    "u",
+    "directory_tree_index_record_key_key"
+   ],
+   [
+    "c",
+    "directory_tree_index_recursive_bytes_check"
+   ],
+   [
+    "c",
+    "directory_tree_index_recursive_file_count_check"
+   ],
+   [
+    "c",
+    "directory_tree_index_recursive_large_file_bytes_check"
+   ],
+   [
+    "c",
+    "directory_tree_index_recursive_large_file_count_check"
+   ],
+   [
+    "c",
+    "directory_tree_index_recursive_small_file_bytes_check"
+   ],
+   [
+    "c",
+    "directory_tree_index_recursive_small_file_count_check"
+   ],
+   [
+    "f",
+    "directory_tree_index_remote_session_id_fkey"
+   ],
+   [
+    "f",
+    "directory_tree_index_tape_label_fkey"
+   ],
+   [
+    "f",
+    "fk_dir_tree_bundle_tape"
+   ]
+  ],
+  "files_index": [
+   [
+    "c",
+    "ck_packed_has_bundle"
+   ],
+   [
+    "f",
+    "files_index_archive_run_id_fkey"
+   ],
+   [
+    "f",
+    "files_index_bundle_id_fkey"
+   ],
+   [
+    "f",
+    "files_index_directory_id_fkey"
+   ],
+   [
+    "c",
+    "files_index_file_size_bytes_check"
+   ],
+   [
+    "f",
+    "files_index_local_session_id_fkey"
+   ],
+   [
+    "p",
+    "files_index_pkey"
+   ],
+   [
+    "c",
+    "files_index_record_key_check"
+   ],
+   [
+    "f",
+    "files_index_tape_label_fkey"
+   ],
+   [
+    "f",
+    "fk_files_bundle_tape"
+   ],
+   [
+    "f",
+    "fk_files_remote_session"
+   ],
+   [
+    "u",
+    "uq_files_record_key"
+   ]
+  ],
+  "local_chunks_manifest": [
+   [
+    "c",
+    "local_chunks_manifest_chunk_index_check"
+   ],
+   [
+    "c",
+    "local_chunks_manifest_dir_size_bytes_check"
+   ],
+   [
+    "p",
+    "local_chunks_manifest_pkey"
+   ],
+   [
+    "f",
+    "local_chunks_manifest_session_id_fkey"
+   ],
+   [
+    "c",
+    "local_chunks_manifest_status_check"
+   ],
+   [
+    "f",
+    "local_chunks_manifest_tape_label_fkey"
+   ]
+  ],
+  "local_manifest_catalog_aggregates": [
+   [
+    "c",
+    "local_manifest_catalog_aggregates_direct_bytes_check"
+   ],
+   [
+    "c",
+    "local_manifest_catalog_aggregates_direct_file_count_check"
+   ],
+   [
+    "f",
+    "local_manifest_catalog_aggregates_directory_id_fkey"
+   ],
+   [
+    "f",
+    "local_manifest_catalog_aggregates_export_id_fkey"
+   ],
+   [
+    "p",
+    "local_manifest_catalog_aggregates_pkey"
+   ],
+   [
+    "c",
+    "local_manifest_catalog_aggregates_recursive_bytes_check"
+   ],
+   [
+    "c",
+    "local_manifest_catalog_aggregates_recursive_file_count_check"
+   ]
+  ],
+  "local_manifest_export_rows": [
+   [
+    "c",
+    "local_manifest_export_rows_check"
+   ],
+   [
+    "f",
+    "local_manifest_export_rows_export_id_fkey"
+   ],
+   [
+    "c",
+    "local_manifest_export_rows_file_size_bytes_check"
+   ],
+   [
+    "p",
+    "local_manifest_export_rows_pkey"
+   ],
+   [
+    "c",
+    "local_manifest_export_rows_source_record_key_check"
+   ]
+  ],
+  "local_manifest_exports": [
+   [
+    "p",
+    "local_manifest_exports_pkey"
+   ],
+   [
+    "c",
+    "local_manifest_exports_status_check"
+   ],
+   [
+    "c",
+    "local_manifest_exports_threshold_bytes_check"
+   ]
+  ],
+  "local_manifest_folder_aggregates": [
+   [
+    "c",
+    "local_manifest_folder_aggreg_recursive_uncovered_file_cou_check"
+   ],
+   [
+    "c",
+    "local_manifest_folder_aggrega_direct_uncovered_file_count_check"
+   ],
+   [
+    "u",
+    "local_manifest_folder_aggrega_export_id_source_host_tape_la_key"
+   ],
+   [
+    "c",
+    "local_manifest_folder_aggregate_recursive_uncovered_bytes_check"
+   ],
+   [
+    "c",
+    "local_manifest_folder_aggregates_direct_bytes_check"
+   ],
+   [
+    "c",
+    "local_manifest_folder_aggregates_direct_file_count_check"
+   ],
+   [
+    "c",
+    "local_manifest_folder_aggregates_direct_uncovered_bytes_check"
+   ],
+   [
+    "f",
+    "local_manifest_folder_aggregates_export_id_fkey"
+   ],
+   [
+    "p",
+    "local_manifest_folder_aggregates_pkey"
+   ],
+   [
+    "c",
+    "local_manifest_folder_aggregates_recursive_bytes_check"
+   ],
+   [
+    "c",
+    "local_manifest_folder_aggregates_recursive_file_count_check"
+   ],
+   [
+    "f",
+    "local_manifest_folder_aggregates_tape_label_fkey"
+   ]
+  ],
+  "local_manifest_segments": [
+   [
+    "c",
+    "local_manifest_segments_compressed_bytes_check"
+   ],
+   [
+    "c",
+    "local_manifest_segments_covered_bytes_check"
+   ],
+   [
+    "c",
+    "local_manifest_segments_covered_rows_check"
+   ],
+   [
+    "f",
+    "local_manifest_segments_export_id_fkey"
+   ],
+   [
+    "c",
+    "local_manifest_segments_original_bytes_check"
+   ],
+   [
+    "p",
+    "local_manifest_segments_pkey"
+   ],
+   [
+    "c",
+    "local_manifest_segments_row_count_check"
+   ],
+   [
+    "c",
+    "local_manifest_segments_sha256_hex_check"
+   ],
+   [
+    "c",
+    "local_manifest_segments_uncovered_bytes_check"
+   ],
+   [
+    "c",
+    "local_manifest_segments_uncovered_rows_check"
+   ]
+  ],
+  "local_sessions": [
+   [
+    "c",
+    "local_sessions_backup_mode_check"
+   ],
+   [
+    "p",
+    "local_sessions_pkey"
+   ],
+   [
+    "c",
+    "local_sessions_status_check"
+   ],
+   [
+    "c",
+    "local_sessions_total_chunks_check"
+   ],
+   [
+    "u",
+    "uq_local_sessions_label"
+   ]
+  ],
+  "manifest_directory_catalog_schema_metadata": [
+   [
+    "c",
+    "manifest_directory_catalog_schema_meta_migration_checksum_check"
+   ],
+   [
+    "c",
+    "manifest_directory_catalog_schema_meta_schema_fingerprint_check"
+   ],
+   [
+    "p",
+    "manifest_directory_catalog_schema_metadata_pkey"
+   ],
+   [
+    "c",
+    "manifest_directory_catalog_schema_metadata_singleton_check"
+   ]
+  ],
+  "remote_chunk_plan_source_transitions": [
+   [
+    "f",
+    "remote_chunk_plan_source_tran_new_plan_manifest_artifact_i_fkey"
+   ],
+   [
+    "f",
+    "remote_chunk_plan_source_tran_prior_plan_manifest_artifact_fkey"
+   ],
+   [
+    "f",
+    "remote_chunk_plan_source_transition_chunk_fk"
+   ],
+   [
+    "c",
+    "remote_chunk_plan_source_transition_direction_ck"
+   ],
+   [
+    "c",
+    "remote_chunk_plan_source_transition_equivalence_confirmed_check"
+   ],
+   [
+    "c",
+    "remote_chunk_plan_source_transitions_approval_identity_check"
+   ],
+   [
+    "c",
+    "remote_chunk_plan_source_transitions_chunk_index_check"
+   ],
+   [
+    "p",
+    "remote_chunk_plan_source_transitions_pkey"
+   ],
+   [
+    "c",
+    "remote_chunk_plan_source_transitions_plan4_evidence_id_check"
+   ],
+   [
+    "c",
+    "remote_chunk_plan_source_transitions_plan4_gate_id_check"
+   ]
+  ],
+  "remote_chunk_scan_segments": [
+   [
+    "c",
+    "remote_chunk_scan_segments_check"
+   ],
+   [
+    "c",
+    "remote_chunk_scan_segments_chunk_index_check"
+   ],
+   [
+    "c",
+    "remote_chunk_scan_segments_first_scan_ordinal_check"
+   ],
+   [
+    "c",
+    "remote_chunk_scan_segments_last_scan_ordinal_check"
+   ],
+   [
+    "p",
+    "remote_chunk_scan_segments_pkey"
+   ],
+   [
+    "u",
+    "remote_chunk_scan_segments_scan_segment_id_first_scan_ordin_key"
+   ],
+   [
+    "f",
+    "remote_chunk_scan_segments_scan_segment_id_fkey"
+   ],
+   [
+    "f",
+    "remote_chunk_scan_segments_session_id_chunk_index_fkey"
+   ]
+  ],
+  "remote_chunk_transition_overrides": [
+   [
+    "c",
+    "remote_chunk_transition_overrides_authorized_by_check"
+   ],
+   [
+    "c",
+    "remote_chunk_transition_overrides_chunk_index_check"
+   ],
+   [
+    "c",
+    "remote_chunk_transition_overrides_distinct_ck"
+   ],
+   [
+    "c",
+    "remote_chunk_transition_overrides_from_status_check"
+   ],
+   [
+    "c",
+    "remote_chunk_transition_overrides_override_name_check"
+   ],
+   [
+    "p",
+    "remote_chunk_transition_overrides_pkey"
+   ],
+   [
+    "c",
+    "remote_chunk_transition_overrides_reason_check"
+   ],
+   [
+    "c",
+    "remote_chunk_transition_overrides_to_status_check"
+   ]
+  ],
+  "remote_chunks": [
+   [
+    "c",
+    "remote_chunks_chunk_index_check"
+   ],
+   [
+    "c",
+    "remote_chunks_final_disposition_complete_ck"
+   ],
+   [
+    "c",
+    "remote_chunks_final_disposition_nonnegative_ck"
+   ],
+   [
+    "u",
+    "remote_chunks_identity_format_uq"
+   ],
+   [
+    "c",
+    "remote_chunks_manifest_authority_ck"
+   ],
+   [
+    "c",
+    "remote_chunks_membership_state_check"
+   ],
+   [
+    "c",
+    "remote_chunks_packaging_format_ck"
+   ],
+   [
+    "p",
+    "remote_chunks_pkey"
+   ],
+   [
+    "f",
+    "remote_chunks_plan_manifest_artifact_fk"
+   ],
+   [
+    "c",
+    "remote_chunks_plan_ordinal_scope_ck"
+   ],
+   [
+    "c",
+    "remote_chunks_plan_source_ck"
+   ],
+   [
+    "c",
+    "remote_chunks_sealed_expectations_check"
+   ],
+   [
+    "f",
+    "remote_chunks_session_id_fkey"
+   ],
+   [
+    "c",
+    "remote_chunks_status_check"
+   ],
+   [
+    "c",
+    "remote_chunks_stored_tar_max_size_bytes_check"
+   ],
+   [
+    "f",
+    "remote_chunks_terminal_manifest_artifact_fk"
+   ]
+  ],
+  "remote_file_state": [
+   [
+    "p",
+    "remote_file_state_pkey"
+   ],
+   [
+    "f",
+    "remote_file_state_plan_file_id_fkey"
+   ],
+   [
+    "f",
+    "remote_file_state_session_id_fkey"
+   ],
+   [
+    "c",
+    "remote_file_state_status_check"
+   ]
+  ],
+  "remote_frontier_bootstraps": [
+   [
+    "p",
+    "remote_frontier_bootstraps_pkey"
+   ],
+   [
+    "f",
+    "remote_frontier_bootstraps_session_id_fkey"
+   ],
+   [
+    "c",
+    "remote_frontier_bootstraps_state_check"
+   ]
+  ],
+  "remote_packaging_boundaries": [
+   [
+    "c",
+    "remote_packaging_boundaries_approval_id_check"
+   ],
+   [
+    "c",
+    "remote_packaging_boundaries_approval_reason_check"
+   ],
+   [
+    "c",
+    "remote_packaging_boundaries_check"
+   ],
+   [
+    "c",
+    "remote_packaging_boundaries_first_stored_tar_chunk_index_check"
+   ],
+   [
+    "p",
+    "remote_packaging_boundaries_pkey"
+   ],
+   [
+    "f",
+    "remote_packaging_boundaries_session_id_fkey"
+   ]
+  ],
+  "remote_packaging_boundary_chunks": [
+   [
+    "c",
+    "remote_packaging_boundary_chunks_assigned_format_check"
+   ],
+   [
+    "c",
+    "remote_packaging_boundary_chunks_check"
+   ],
+   [
+    "c",
+    "remote_packaging_boundary_chunks_chunk_index_check"
+   ],
+   [
+    "c",
+    "remote_packaging_boundary_chunks_classification_check"
+   ],
+   [
+    "p",
+    "remote_packaging_boundary_chunks_pkey"
+   ],
+   [
+    "c",
+    "remote_packaging_boundary_chunks_plan_logical_bytes_check"
+   ],
+   [
+    "c",
+    "remote_packaging_boundary_chunks_plan_member_count_check"
+   ],
+   [
+    "c",
+    "remote_packaging_boundary_chunks_prefix_evidence_basis_check"
+   ],
+   [
+    "f",
+    "remote_packaging_boundary_chunks_session_id_chunk_index_fkey"
+   ],
+   [
+    "f",
+    "remote_packaging_boundary_chunks_session_id_fkey"
+   ]
+  ],
+  "remote_plan_files": [
+   [
+    "c",
+    "remote_plan_files_chunk_index_check"
+   ],
+   [
+    "c",
+    "remote_plan_files_ordinal_check"
+   ],
+   [
+    "p",
+    "remote_plan_files_pkey"
+   ],
+   [
+    "f",
+    "remote_plan_files_plan_id_fkey"
+   ],
+   [
+    "u",
+    "remote_plan_files_plan_id_snapshot_file_id_key"
+   ],
+   [
+    "f",
+    "remote_plan_files_snapshot_file_id_fkey"
+   ]
+  ],
+  "remote_plans": [
+   [
+    "c",
+    "remote_plans_chunk_count_check"
+   ],
+   [
+    "u",
+    "remote_plans_fingerprint_key"
+   ],
+   [
+    "p",
+    "remote_plans_pkey"
+   ],
+   [
+    "f",
+    "remote_plans_snapshot_id_fkey"
+   ]
+  ],
+  "remote_scan_directories": [
+   [
+    "c",
+    "remote_scan_directories_child_directory_count_check"
+   ],
+   [
+    "c",
+    "remote_scan_directories_direct_byte_count_check"
+   ],
+   [
+    "c",
+    "remote_scan_directories_direct_file_count_check"
+   ],
+   [
+    "c",
+    "remote_scan_directories_error_count_check"
+   ],
+   [
+    "c",
+    "remote_scan_directories_listing_state_check"
+   ],
+   [
+    "f",
+    "remote_scan_directories_parent_directory_id_fkey"
+   ],
+   [
+    "p",
+    "remote_scan_directories_pkey"
+   ],
+   [
+    "c",
+    "remote_scan_directories_planning_state_check"
+   ],
+   [
+    "u",
+    "remote_scan_directories_scan_scope_id_canonical_path_key"
+   ],
+   [
+    "f",
+    "remote_scan_directories_scan_scope_id_fkey"
+   ],
+   [
+    "u",
+    "remote_scan_directories_scan_scope_id_traversal_ordinal_key"
+   ],
+   [
+    "c",
+    "remote_scan_directories_subtree_coverage_state_check"
+   ]
+  ],
+  "remote_scan_errors": [
+   [
+    "c",
+    "remote_scan_errors_disposition_check"
+   ],
+   [
+    "p",
+    "remote_scan_errors_pkey"
+   ],
+   [
+    "f",
+    "remote_scan_errors_scan_directory_id_fkey"
+   ],
+   [
+    "f",
+    "remote_scan_errors_scan_scope_id_fkey"
+   ]
+  ],
+  "remote_scan_scopes": [
+   [
+    "c",
+    "remote_scan_scopes_coverage_state_check"
+   ],
+   [
+    "p",
+    "remote_scan_scopes_pkey"
+   ],
+   [
+    "c",
+    "remote_scan_scopes_scope_kind_check"
+   ],
+   [
+    "c",
+    "remote_scan_scopes_scope_ordinal_check"
+   ],
+   [
+    "f",
+    "remote_scan_scopes_session_id_fkey"
+   ],
+   [
+    "u",
+    "remote_scan_scopes_session_id_scope_ordinal_key"
+   ],
+   [
+    "u",
+    "remote_scan_scopes_session_id_source_root_key"
+   ]
+  ],
+  "remote_scan_segments": [
+   [
+    "c",
+    "remote_scan_segments_artifact_size_bytes_check"
+   ],
+   [
+    "c",
+    "remote_scan_segments_byte_count_check"
+   ],
+   [
+    "c",
+    "remote_scan_segments_check"
+   ],
+   [
+    "c",
+    "remote_scan_segments_file_count_check"
+   ],
+   [
+    "c",
+    "remote_scan_segments_first_scan_ordinal_check"
+   ],
+   [
+    "c",
+    "remote_scan_segments_last_scan_ordinal_check"
+   ],
+   [
+    "c",
+    "remote_scan_segments_legacy_import_state_check"
+   ],
+   [
+    "c",
+    "remote_scan_segments_locator_check"
+   ],
+   [
+    "p",
+    "remote_scan_segments_pkey"
+   ],
+   [
+    "c",
+    "remote_scan_segments_ready_cursor_check"
+   ],
+   [
+    "u",
+    "remote_scan_segments_scan_directory_id_first_scan_ordinal_key"
+   ],
+   [
+    "f",
+    "remote_scan_segments_scan_directory_id_fkey"
+   ],
+   [
+    "c",
+    "remote_scan_segments_state_check"
+   ]
+  ],
+  "remote_session_plan_transitions": [
+   [
+    "c",
+    "remote_session_plan_transiti_first_chunk_after_transition_check"
+   ],
+   [
+    "c",
+    "remote_session_plan_transiti_last_chunk_before_transition_check"
+   ],
+   [
+    "c",
+    "remote_session_plan_transitions_approval_ck"
+   ],
+   [
+    "c",
+    "remote_session_plan_transitions_boundary_ck"
+   ],
+   [
+    "u",
+    "remote_session_plan_transitions_epoch_uq"
+   ],
+   [
+    "c",
+    "remote_session_plan_transitions_evidence_ck"
+   ],
+   [
+    "c",
+    "remote_session_plan_transitions_new_plan_source_check"
+   ],
+   [
+    "p",
+    "remote_session_plan_transitions_pkey"
+   ],
+   [
+    "c",
+    "remote_session_plan_transitions_prior_plan_source_check"
+   ],
+   [
+    "c",
+    "remote_session_plan_transitions_scan_frontier_generation_check"
+   ],
+   [
+    "f",
+    "remote_session_plan_transitions_session_id_fkey"
+   ],
+   [
+    "c",
+    "remote_session_plan_transitions_sources_ck"
+   ],
+   [
+    "c",
+    "remote_session_plan_transitions_state_check"
+   ],
+   [
+    "c",
+    "remote_session_plan_transitions_transition_epoch_check"
+   ]
+  ],
+  "remote_sessions": [
+   [
+    "c",
+    "remote_sessions_chunk_count_check"
+   ],
+   [
+    "c",
+    "remote_sessions_default_packaging_format_ck"
+   ],
+   [
+    "p",
+    "remote_sessions_pkey"
+   ],
+   [
+    "f",
+    "remote_sessions_plan_id_fkey"
+   ],
+   [
+    "c",
+    "remote_sessions_status_check"
+   ],
+   [
+    "f",
+    "remote_sessions_tape_label_fkey"
+   ],
+   [
+    "c",
+    "remote_sessions_total_bytes_check"
+   ],
+   [
+    "c",
+    "remote_sessions_total_files_check"
+   ],
+   [
+    "u",
+    "uq_remote_sessions_label"
+   ]
+  ],
+  "remote_snapshot_files": [
+   [
+    "c",
+    "remote_snapshot_files_file_size_bytes_check"
+   ],
+   [
+    "p",
+    "remote_snapshot_files_pkey"
+   ],
+   [
+    "f",
+    "remote_snapshot_files_snapshot_id_fkey"
+   ],
+   [
+    "u",
+    "remote_snapshot_files_snapshot_id_remote_path_key"
+   ]
+  ],
+  "remote_snapshots": [
+   [
+    "u",
+    "remote_snapshots_fingerprint_key"
+   ],
+   [
+    "p",
+    "remote_snapshots_pkey"
+   ],
+   [
+    "c",
+    "remote_snapshots_total_bytes_check"
+   ],
+   [
+    "c",
+    "remote_snapshots_total_files_check"
+   ]
+  ],
+  "remote_worker_attempts": [
+   [
+    "c",
+    "remote_worker_attempts_attempt_kind_check"
+   ],
+   [
+    "c",
+    "remote_worker_attempts_chunk_index_check"
+   ],
+   [
+    "p",
+    "remote_worker_attempts_pkey"
+   ],
+   [
+    "f",
+    "remote_worker_attempts_scan_directory_id_fkey"
+   ],
+   [
+    "f",
+    "remote_worker_attempts_session_id_fkey"
+   ],
+   [
+    "c",
+    "remote_worker_attempts_terminal_state_check"
+   ]
+  ],
+  "tape_generations": [
+   [
+    "c",
+    "tape_generations_generation_check"
+   ],
+   [
+    "p",
+    "tape_generations_pkey"
+   ],
+   [
+    "f",
+    "tape_generations_reset_operation_id_fkey"
+   ],
+   [
+    "c",
+    "tape_generations_state_check"
+   ],
+   [
+    "f",
+    "tape_generations_tape_id_fkey"
+   ],
+   [
+    "u",
+    "tape_generations_tape_id_generation_key"
+   ]
+  ],
+  "tape_reset_operations": [
+   [
+    "c",
+    "tape_reset_generation_ck"
+   ],
+   [
+    "c",
+    "tape_reset_operations_backup_sha256_check"
+   ],
+   [
+    "c",
+    "tape_reset_operations_impact_report_sha256_check"
+   ],
+   [
+    "c",
+    "tape_reset_operations_new_generation_check"
+   ],
+   [
+    "c",
+    "tape_reset_operations_old_generation_check"
+   ],
+   [
+    "p",
+    "tape_reset_operations_pkey"
+   ],
+   [
+    "c",
+    "tape_reset_operations_restore_list_sha256_check"
+   ],
+   [
+    "f",
+    "tape_reset_operations_target_tape_id_fkey"
+   ],
+   [
+    "c",
+    "tape_reset_state_ck"
+   ]
+  ],
+  "tapes": [
+   [
+    "p",
+    "tapes_pkey"
+   ],
+   [
+    "c",
+    "tapes_status_check"
+   ],
+   [
+    "c",
+    "tapes_used_space_check"
+   ],
+   [
+    "u",
+    "tapes_volume_label_key"
+   ]
+  ]
+ },
+ "indexes": [
+  "idx_archive_container_members_container",
+  "idx_archive_runs_local_session",
+  "idx_archive_runs_remote_session",
+  "idx_archive_runs_tape_label",
+  "idx_catalog_dirs_parent",
+  "idx_catalog_dirs_parent_id",
+  "idx_directory_bundles_manifest",
+  "idx_directory_bundles_tape_path",
+  "idx_directory_stats_tape_path",
+  "idx_directory_tree_bundle",
+  "idx_directory_tree_parent",
+  "idx_directory_tree_path",
+  "idx_directory_tree_path_trgm",
+  "idx_files_backup_date_tape",
+  "idx_files_bundle",
+  "idx_files_catalog_name_trgm",
+  "idx_files_dir_date",
+  "idx_files_dir_name",
+  "idx_files_dir_size",
+  "idx_files_local_chunk",
+  "idx_files_original_path_trgm",
+  "idx_files_remote_chunk",
+  "idx_files_run",
+  "idx_files_src_host",
+  "idx_files_tape",
+  "idx_local_manifest_catalog_directory",
+  "idx_local_manifest_folder_path",
+  "idx_local_manifest_rows_eligible",
+  "idx_local_manifest_rows_prune_pending",
+  "idx_local_manifest_rows_skip_reason",
+  "idx_local_manifest_session_chunk",
+  "idx_local_manifest_tape_label",
+  "idx_local_sessions_active_source",
+  "idx_remote_chunk_transition_overrides_open",
+  "idx_remote_file_state_plan_file_id",
+  "idx_remote_plan_chunk",
+  "idx_remote_plan_files_snapshot_file_id",
+  "idx_remote_plans_snapshot_id",
+  "idx_remote_sessions_active_source",
+  "idx_remote_sessions_plan_id",
+  "idx_remote_sessions_tape_label",
+  "ix_archive_directories_parent",
+  "ix_directory_archive_parts_restore",
+  "ix_directory_completeness_status",
+  "ix_directory_scan_coverage_session_generation",
+  "ix_remote_chunk_scan_segments_chunk",
+  "ix_remote_scan_directories_claimable",
+  "ix_remote_scan_errors_directory",
+  "ix_remote_scan_segments_consumable",
+  "ix_remote_session_plan_effective_boundary",
+  "ix_remote_worker_attempts_live",
+  "uq_archive_artifacts_chunk_kind_version",
+  "uq_archive_artifacts_container_kind_version",
+  "uq_archive_artifacts_ready_plan_chunk",
+  "uq_archive_runs_remote_chunk_generation",
+  "uq_directory_archive_parts_container",
+  "uq_directory_archive_parts_loose",
+  "uq_remote_chunk_plan_source_transition",
+  "uq_remote_chunk_plan_transition_artifact",
+  "uq_remote_chunks_plan_manifest_artifact",
+  "uq_remote_chunks_terminal_manifest_artifact",
+  "uq_remote_frontier_bootstrap_open",
+  "uq_remote_plan_files_chunk_ordinal",
+  "uq_remote_session_plan_active_boundary",
+  "uq_tape_generations_one_active",
+  "uq_tape_reset_open_operation"
+ ],
+ "tables": {
+  "archive_artifacts": [
+   {
+    "identity": true,
+    "name": "artifact_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "session_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "chunk_index",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "container_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "artifact_kind",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "artifact_version",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "local_locator",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "tape_locator",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "artifact_size_bytes",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "readiness_state",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "publication_started_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "published_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "tape_published_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "created_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "updated_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "archive_bundles": [
+   {
+    "identity": true,
+    "name": "bundle_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "tape_label",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "tape_path",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "container_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "container_format",
+    "nullable": false,
+    "type": "text"
+   }
+  ],
+  "archive_container_members": [
+   {
+    "identity": false,
+    "name": "session_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "chunk_index",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "plan_file_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "plan_ordinal",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "storage_class",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "container_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "container_ordinal",
+    "nullable": true,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "remote_path",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "expected_logical_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "estimated_tar_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "created_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "archive_containers": [
+   {
+    "identity": true,
+    "name": "container_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "session_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "chunk_index",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "container_ordinal",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "container_format",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "format_version",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "tar_dialect",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "storage_class",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "container_name",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "temporary_data_locator",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "permanent_local_metadata_locator",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "tape_label",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "tape_path",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "tape_generation_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "expected_member_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "expected_logical_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "observed_member_count",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "observed_logical_bytes",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "actual_artifact_bytes",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "validation_state",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "writer_state",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "catalog_state",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "owner_token",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "lease_expires_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "validation_started_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "validated_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "writer_started_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "writer_completed_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "catalog_committed_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "created_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "updated_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "estimated_archive_bytes",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "validated_part_locator",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "validation_summary",
+    "nullable": true,
+    "type": "jsonb"
+   },
+   {
+    "identity": false,
+    "name": "disposition_counts",
+    "nullable": true,
+    "type": "jsonb"
+   }
+  ],
+  "archive_directories": [
+   {
+    "identity": true,
+    "name": "directory_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "source_host",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "canonical_path",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "parent_directory_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "name",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "depth",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "created_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "updated_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "archive_runs": [
+   {
+    "identity": true,
+    "name": "run_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "run_label",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "tape_label",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "session_kind",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "local_session_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "remote_session_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "started_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "completed_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "remote_chunk_index",
+    "nullable": true,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "tape_generation_id",
+    "nullable": true,
+    "type": "bigint"
+   }
+  ],
+  "catalog_directories": [
+   {
+    "identity": true,
+    "name": "directory_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "tape_label",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "parent_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "name",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "normalized_path",
+    "nullable": false,
+    "type": "text"
+   }
+  ],
+  "container_format_schema_authority": [
+   {
+    "identity": true,
+    "name": "authority_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "authority_version",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "schema_fingerprint",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "migration_checksums",
+    "nullable": false,
+    "type": "jsonb"
+   },
+   {
+    "identity": false,
+    "name": "contract_definition",
+    "nullable": false,
+    "type": "jsonb"
+   },
+   {
+    "identity": false,
+    "name": "applied_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "container_format_schema_metadata": [
+   {
+    "identity": false,
+    "name": "singleton",
+    "nullable": false,
+    "type": "boolean"
+   },
+   {
+    "identity": false,
+    "name": "schema_version",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "required_reader_contract_version",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "stored_tar_dialect",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "migration_checksum",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "schema_fingerprint",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "applied_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "directory_archive_bundles": [
+   {
+    "identity": true,
+    "name": "bundle_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "source_host",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "original_dir_path",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "tape_label",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "archive_run_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "local_session_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "remote_session_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "chunk_index",
+    "nullable": true,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "stored_bundle_path",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "manifest_path",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "manifest_format",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "manifest_compression",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "byte_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "small_file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "small_file_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "large_file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "large_file_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "backup_date",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "record_key",
+    "nullable": false,
+    "type": "bytea"
+   },
+   {
+    "identity": false,
+    "name": "container_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "container_format",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "tape_generation_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "actual_artifact_bytes",
+    "nullable": true,
+    "type": "bigint"
+   }
+  ],
+  "directory_archive_parts": [
+   {
+    "identity": true,
+    "name": "part_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "directory_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "session_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "chunk_index",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "container_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "loose_record_key",
+    "nullable": true,
+    "type": "bytea"
+   },
+   {
+    "identity": false,
+    "name": "tape_generation_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "storage_class",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "evidence_generation",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_expected_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_expected_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_archived_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_archived_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_source_missing_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_source_missing_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_source_permission_denied_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_source_permission_denied_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_source_unreadable_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_source_unreadable_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_source_changed_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_source_changed_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_unresolved_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_unresolved_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "plan_manifest_artifact_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "sidecar_artifact_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "terminal_manifest_artifact_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "plan_artifact_locator",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "sidecar_artifact_locator",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "terminal_artifact_locator",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "local_validation_state",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "writer_state",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "catalog_state",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "restore_format",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "tape_label",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "stored_path",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "source_base_path",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "container_member_candidate",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "routing_precision",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "created_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "updated_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "directory_archive_stats": [
+   {
+    "identity": true,
+    "name": "stat_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "source_host",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "original_dir_path",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "tape_label",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "archive_run_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "local_session_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "remote_session_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "chunk_index",
+    "nullable": true,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "stored_root_path",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "direct_file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "recursive_file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "recursive_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "small_file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "small_file_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "large_file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "large_file_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "packed_bundle_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "backup_date",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "record_key",
+    "nullable": false,
+    "type": "bytea"
+   }
+  ],
+  "directory_completeness": [
+   {
+    "identity": false,
+    "name": "session_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "directory_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_expected_file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_expected_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_archived_file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_archived_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "recursive_expected_file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "recursive_expected_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "recursive_archived_file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "recursive_archived_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_source_missing_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_source_permission_denied_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_source_unreadable_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_source_changed_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_unresolved_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "recursive_source_missing_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "recursive_source_permission_denied_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "recursive_source_unreadable_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "recursive_source_changed_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "recursive_unresolved_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "scan_is_final",
+    "nullable": false,
+    "type": "boolean"
+   },
+   {
+    "identity": false,
+    "name": "all_planned_items_terminal",
+    "nullable": false,
+    "type": "boolean"
+   },
+   {
+    "identity": false,
+    "name": "all_required_items_archived",
+    "nullable": false,
+    "type": "boolean"
+   },
+   {
+    "identity": false,
+    "name": "all_parts_written",
+    "nullable": false,
+    "type": "boolean"
+   },
+   {
+    "identity": false,
+    "name": "all_writer_completions_succeeded",
+    "nullable": false,
+    "type": "boolean"
+   },
+   {
+    "identity": false,
+    "name": "all_parts_cataloged",
+    "nullable": false,
+    "type": "boolean"
+   },
+   {
+    "identity": false,
+    "name": "all_local_validation_succeeded",
+    "nullable": false,
+    "type": "boolean"
+   },
+   {
+    "identity": false,
+    "name": "has_ambiguous_evidence",
+    "nullable": false,
+    "type": "boolean"
+   },
+   {
+    "identity": false,
+    "name": "status",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "pinned_frontier_generation",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "pinned_artifact_evidence_generation",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "calculated_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "directory_scan_coverage": [
+   {
+    "identity": true,
+    "name": "coverage_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "directory_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "session_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "scan_scope_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "coverage_state",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "direct_discovered_file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_discovered_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_discovered_directory_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "recursive_discovered_file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "recursive_discovered_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "recursive_discovered_directory_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "excluded_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "error_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "frontier_generation",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "created_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "updated_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "directory_tree_index": [
+   {
+    "identity": true,
+    "name": "dir_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "source_host",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "original_dir_path",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "parent_original_dir_path",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "dir_name",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "depth",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "tape_label",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "archive_run_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "local_session_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "remote_session_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "chunk_index",
+    "nullable": true,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "bundle_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "stored_bundle_path",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "manifest_path",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "direct_file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "recursive_file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "recursive_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_small_file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_small_file_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "recursive_small_file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "recursive_small_file_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_large_file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_large_file_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "recursive_large_file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "recursive_large_file_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "backup_date",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "record_key",
+    "nullable": false,
+    "type": "bytea"
+   }
+  ],
+  "files_index": [
+   {
+    "identity": true,
+    "name": "file_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "original_path",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "file_size_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "tape_label",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "source_host",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "is_packed",
+    "nullable": false,
+    "type": "boolean"
+   },
+   {
+    "identity": false,
+    "name": "stored_path",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "local_session_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "local_chunk_index",
+    "nullable": true,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "bundle_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "record_key",
+    "nullable": false,
+    "type": "bytea"
+   },
+   {
+    "identity": false,
+    "name": "archive_run_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "directory_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "catalog_name",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "catalog_backup_date",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "remote_session_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "remote_chunk_index",
+    "nullable": true,
+    "type": "integer"
+   }
+  ],
+  "local_chunks_manifest": [
+   {
+    "identity": true,
+    "name": "manifest_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "session_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "chunk_index",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "top_level_dir",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "dir_size_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "status",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "tape_label",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "started_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "completed_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "updated_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "local_manifest_catalog_aggregates": [
+   {
+    "identity": false,
+    "name": "export_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "directory_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "recursive_file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "recursive_bytes",
+    "nullable": false,
+    "type": "bigint"
+   }
+  ],
+  "local_manifest_export_rows": [
+   {
+    "identity": false,
+    "name": "export_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "source_file_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "source_record_key",
+    "nullable": false,
+    "type": "bytea"
+   },
+   {
+    "identity": false,
+    "name": "tape_label",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "source_host",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "original_path",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "file_size_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "archive_run_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "local_session_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "remote_session_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "chunk_index",
+    "nullable": true,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "bundle_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "covered_by_directory_catalog",
+    "nullable": false,
+    "type": "boolean"
+   },
+   {
+    "identity": false,
+    "name": "eligible",
+    "nullable": false,
+    "type": "boolean"
+   },
+   {
+    "identity": false,
+    "name": "skip_reason",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "manifest_relpath",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "pruned_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "local_manifest_exports": [
+   {
+    "identity": true,
+    "name": "export_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "threshold_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "archive_root",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "hot_backup_path",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "status",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "candidate_rows",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "candidate_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "eligible_rows",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "eligible_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "skipped_rows",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "segment_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "validation_passed",
+    "nullable": false,
+    "type": "boolean"
+   },
+   {
+    "identity": false,
+    "name": "validation_report",
+    "nullable": true,
+    "type": "jsonb"
+   },
+   {
+    "identity": false,
+    "name": "prune_report",
+    "nullable": true,
+    "type": "jsonb"
+   },
+   {
+    "identity": false,
+    "name": "started_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "exported_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "validated_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "pruned_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "error_message",
+    "nullable": true,
+    "type": "text"
+   }
+  ],
+  "local_manifest_folder_aggregates": [
+   {
+    "identity": true,
+    "name": "aggregate_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "export_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "source_host",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "tape_label",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "original_dir_path",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "direct_file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_uncovered_file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_uncovered_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "recursive_file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "recursive_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "recursive_uncovered_file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "recursive_uncovered_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "backup_date",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "local_manifest_segments": [
+   {
+    "identity": false,
+    "name": "export_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "manifest_relpath",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "row_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "original_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "covered_rows",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "covered_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "uncovered_rows",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "uncovered_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "compressed_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "sha256_hex",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "created_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "local_sessions": [
+   {
+    "identity": true,
+    "name": "session_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "session_label",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "source_dir",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "total_chunks",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "backup_mode",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "created_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "completed_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "status",
+    "nullable": false,
+    "type": "text"
+   }
+  ],
+  "manifest_directory_catalog_schema_metadata": [
+   {
+    "identity": false,
+    "name": "singleton",
+    "nullable": false,
+    "type": "boolean"
+   },
+   {
+    "identity": false,
+    "name": "schema_version",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "migration_checksum",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "schema_fingerprint",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "applied_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "remote_chunk_plan_source_transitions": [
+   {
+    "identity": true,
+    "name": "chunk_plan_transition_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "session_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "chunk_index",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "from_plan_source",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "to_plan_source",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "prior_plan_manifest_artifact_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "new_plan_manifest_artifact_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "plan4_gate_id",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "plan4_evidence_id",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "approval_identity",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "equivalence_confirmed",
+    "nullable": false,
+    "type": "boolean"
+   },
+   {
+    "identity": false,
+    "name": "transitioned_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "remote_chunk_scan_segments": [
+   {
+    "identity": true,
+    "name": "chunk_segment_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "session_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "chunk_index",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "scan_segment_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "first_scan_ordinal",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "last_scan_ordinal",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "created_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "remote_chunk_transition_overrides": [
+   {
+    "identity": true,
+    "name": "override_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "session_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "chunk_index",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "from_status",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "to_status",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "override_name",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "reason",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "authorized_by",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "authorized_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "consumed_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "remote_chunks": [
+   {
+    "identity": false,
+    "name": "session_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "chunk_index",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "status",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "error_msg",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "updated_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "owner_token",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "lease_expires_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "attempt_id",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "membership_state",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "expected_file_count",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "expected_bytes",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "packaging_format",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "packaging_assigned_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "writer_started_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "writer_completed_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "catalog_committed_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "stored_tar_max_size_bytes",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "plan_source",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "plan_manifest_artifact_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "terminal_manifest_artifact_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "plan_ordinal_scope",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "final_archived_count",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "final_source_missing_count",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "final_source_permission_denied_count",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "final_source_unreadable_count",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "final_source_changed_count",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "final_unresolved_count",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "final_archived_bytes",
+    "nullable": true,
+    "type": "bigint"
+   }
+  ],
+  "remote_file_state": [
+   {
+    "identity": false,
+    "name": "session_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "plan_file_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "status",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "local_rel_path",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "error_msg",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "updated_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "remote_frontier_bootstraps": [
+   {
+    "identity": false,
+    "name": "bootstrap_id",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "session_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "source_host",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "state",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "scopes_created",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "directories_listed",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "segments_published",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "segments_imported",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "entries_covered",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "entries_new",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "entries_changed",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "coverage_final",
+    "nullable": false,
+    "type": "boolean"
+   },
+   {
+    "identity": false,
+    "name": "detail",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "created_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "updated_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "remote_packaging_boundaries": [
+   {
+    "identity": false,
+    "name": "session_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "first_stored_tar_chunk_index",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "last_existing_chunk_index",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "approval_id",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "approval_reason",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "database_evidence",
+    "nullable": false,
+    "type": "jsonb"
+   },
+   {
+    "identity": false,
+    "name": "local_staging_evidence",
+    "nullable": false,
+    "type": "jsonb"
+   },
+   {
+    "identity": false,
+    "name": "evidence_checked_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "created_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "remote_packaging_boundary_chunks": [
+   {
+    "identity": false,
+    "name": "session_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "chunk_index",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "classification",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "assigned_format",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "prefix_evidence_basis",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "plan_member_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "plan_logical_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "first_ordinal",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "last_ordinal",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "evidence",
+    "nullable": false,
+    "type": "jsonb"
+   }
+  ],
+  "remote_plan_files": [
+   {
+    "identity": true,
+    "name": "plan_file_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "plan_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "snapshot_file_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "chunk_index",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "ordinal",
+    "nullable": false,
+    "type": "integer"
+   }
+  ],
+  "remote_plans": [
+   {
+    "identity": true,
+    "name": "plan_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "snapshot_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "fingerprint",
+    "nullable": false,
+    "type": "bytea"
+   },
+   {
+    "identity": false,
+    "name": "chunk_count",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "created_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "remote_scan_directories": [
+   {
+    "identity": true,
+    "name": "scan_directory_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "scan_scope_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "canonical_path",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "parent_path",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "parent_directory_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "traversal_ordinal",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "listing_state",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "subtree_coverage_state",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "planning_state",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "last_committed_segment_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "observation_before",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "observation_after",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "observation_final",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "direct_file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "direct_byte_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "child_directory_count",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "error_count",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "owner_token",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "attempt_id",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "lease_expires_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "created_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "updated_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "remote_scan_errors": [
+   {
+    "identity": true,
+    "name": "scan_error_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "scan_scope_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "scan_directory_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "category",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "path",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "message",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "disposition",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "created_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "remote_scan_scopes": [
+   {
+    "identity": true,
+    "name": "scan_scope_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "session_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "scope_ordinal",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "scope_kind",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "source_root",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "coverage_state",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "planning_complete",
+    "nullable": false,
+    "type": "boolean"
+   },
+   {
+    "identity": false,
+    "name": "observation_final",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "created_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "updated_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "remote_scan_segments": [
+   {
+    "identity": true,
+    "name": "scan_segment_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "scan_directory_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "first_scan_ordinal",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "last_scan_ordinal",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "next_unconsumed_ordinal",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "locator",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "artifact_version",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "artifact_size_bytes",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "file_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "byte_count",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "first_canonical_path",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "last_canonical_path",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "state",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "legacy_import_state",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "legacy_imported_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "created_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "updated_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "remote_session_plan_transitions": [
+   {
+    "identity": true,
+    "name": "transition_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "session_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "transition_epoch",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "state",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "prior_plan_source",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "new_plan_source",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "last_chunk_before_transition",
+    "nullable": true,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "first_chunk_after_transition",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "scan_frontier_generation",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "evidence_report_locator",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "approval_identity",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "approved_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "created_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "updated_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "remote_sessions": [
+   {
+    "identity": true,
+    "name": "session_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "session_label",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "remote_host",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "remote_user",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "remote_path",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "tape_label",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "staging_dir",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "total_files",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "total_bytes",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "chunk_count",
+    "nullable": true,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "plan_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "scan_complete",
+    "nullable": false,
+    "type": "boolean"
+   },
+   {
+    "identity": false,
+    "name": "scan_error",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "created_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "completed_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "status",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "tape_generation",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "default_packaging_format",
+    "nullable": false,
+    "type": "text"
+   }
+  ],
+  "remote_snapshot_files": [
+   {
+    "identity": true,
+    "name": "snapshot_file_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "snapshot_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "remote_path",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "file_size_bytes",
+    "nullable": false,
+    "type": "bigint"
+   }
+  ],
+  "remote_snapshots": [
+   {
+    "identity": true,
+    "name": "snapshot_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "remote_host",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "remote_path",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "fingerprint",
+    "nullable": false,
+    "type": "bytea"
+   },
+   {
+    "identity": false,
+    "name": "total_files",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "total_bytes",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "created_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "remote_worker_attempts": [
+   {
+    "identity": false,
+    "name": "attempt_id",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "owner_token",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "session_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "chunk_index",
+    "nullable": true,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "scan_directory_id",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "attempt_kind",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "local_pid",
+    "nullable": true,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "local_process_started_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "remote_command_token",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "remote_process_group",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "lease_expires_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "heartbeat_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "terminal_state",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "created_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "updated_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "tape_generations": [
+   {
+    "identity": true,
+    "name": "generation_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "tape_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "volume_label",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "generation",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "state",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "formatted_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "retired_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "retired_reason",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "reset_operation_id",
+    "nullable": true,
+    "type": "text"
+   }
+  ],
+  "tape_reset_operations": [
+   {
+    "identity": false,
+    "name": "operation_id",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "target_tape_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "target_label",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "old_generation",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "new_generation",
+    "nullable": false,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "state",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "expected_drive",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "expected_drive_serial",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "expected_ltfs_gen",
+    "nullable": true,
+    "type": "integer"
+   },
+   {
+    "identity": false,
+    "name": "expected_vcr",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "backup_path",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "backup_sha256",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "restore_list_path",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "restore_list_sha256",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "shadow_database",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "impact_report_path",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "impact_report_sha256",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "impact",
+    "nullable": false,
+    "type": "jsonb"
+   },
+   {
+    "identity": false,
+    "name": "hardware_evidence",
+    "nullable": true,
+    "type": "jsonb"
+   },
+   {
+    "identity": false,
+    "name": "cleanup_evidence",
+    "nullable": true,
+    "type": "jsonb"
+   },
+   {
+    "identity": false,
+    "name": "error_message",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "created_at",
+    "nullable": false,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "hardware_started_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "hardware_succeeded_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "cleanup_succeeded_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "verified_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   }
+  ],
+  "tapes": [
+   {
+    "identity": true,
+    "name": "tape_id",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "volume_label",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "date_formatted",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "total_capacity",
+    "nullable": true,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "used_space",
+    "nullable": false,
+    "type": "bigint"
+   },
+   {
+    "identity": false,
+    "name": "status",
+    "nullable": false,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "status_reason",
+    "nullable": true,
+    "type": "text"
+   },
+   {
+    "identity": false,
+    "name": "status_changed_at",
+    "nullable": true,
+    "type": "timestamp with time zone"
+   },
+   {
+    "identity": false,
+    "name": "current_generation",
+    "nullable": false,
+    "type": "integer"
+   }
+  ]
+ },
+ "triggers": {
+  "archive_artifacts": [
+   "trg_archive_artifacts_container_format",
+   "trg_archive_artifacts_identity_write_once",
+   "trg_archive_artifacts_sealed_immutable"
+  ],
+  "archive_bundles": [
+   "trg_archive_bundles_format_write_once"
+  ],
+  "archive_containers": [
+   "trg_archive_containers_format_write_once",
+   "trg_archive_containers_tape_generation"
+  ],
+  "archive_directories": [
+   "trg_archive_directories_parent_guard"
+  ],
+  "container_format_schema_authority": [
+   "trg_container_format_schema_authority_v2_immutable"
+  ],
+  "container_format_schema_metadata": [
+   "trg_container_format_schema_metadata_immutable"
+  ],
+  "directory_archive_parts": [
+   "trg_directory_archive_parts_guard"
+  ],
+  "directory_scan_coverage": [
+   "trg_directory_scan_coverage_scope_guard"
+  ],
+  "manifest_directory_catalog_schema_metadata": [
+   "trg_manifest_directory_catalog_schema_metadata_immutable"
+  ],
+  "remote_chunk_plan_source_transitions": [
+   "trg_remote_chunk_plan_source_transitions_immutable"
+  ],
+  "remote_chunks": [
+   "trg_remote_chunks_initial_format",
+   "trg_remote_chunks_manifest_authority_deferred",
+   "trg_remote_chunks_packaging_write_once",
+   "trg_remote_chunks_plan_source_guard",
+   "trg_remote_chunks_status_transition"
+  ],
+  "remote_packaging_boundaries": [
+   "trg_remote_packaging_boundaries_immutable"
+  ],
+  "remote_packaging_boundary_chunks": [
+   "trg_remote_packaging_boundary_chunks_immutable"
+  ],
+  "remote_session_plan_transitions": [
+   "trg_remote_session_plan_transitions_guard"
+  ],
+  "remote_sessions": [
+   "trg_remote_sessions_packaging_default"
+  ]
+ },
+ "unique_indexes": [
+  "uq_archive_artifacts_chunk_kind_version",
+  "uq_archive_artifacts_container_kind_version",
+  "uq_archive_artifacts_ready_plan_chunk",
+  "uq_archive_runs_remote_chunk_generation",
+  "uq_directory_archive_parts_container",
+  "uq_directory_archive_parts_loose",
+  "uq_remote_chunk_plan_source_transition",
+  "uq_remote_chunk_plan_transition_artifact",
+  "uq_remote_chunks_plan_manifest_artifact",
+  "uq_remote_chunks_terminal_manifest_artifact",
+  "uq_remote_frontier_bootstrap_open",
+  "uq_remote_plan_files_chunk_ordinal",
+  "uq_remote_session_plan_active_boundary",
+  "uq_tape_generations_one_active",
+  "uq_tape_reset_open_operation"
+ ],
+ "views": {
+  "directory_catalog_status_v": [
+   "directory_id",
+   "source_host",
+   "canonical_path",
+   "directory_name",
+   "depth",
+   "parent_directory_id",
+   "parent_canonical_path",
+   "parent_name",
+   "session_id",
+   "session_label",
+   "child_count",
+   "child_directories",
+   "coverage_state",
+   "coverage_is_final",
+   "maximum_frontier_generation",
+   "coverage_generations",
+   "direct_expected_file_count",
+   "direct_expected_bytes",
+   "direct_archived_file_count",
+   "direct_archived_bytes",
+   "recursive_expected_file_count",
+   "recursive_expected_bytes",
+   "recursive_archived_file_count",
+   "recursive_archived_bytes",
+   "recursive_source_missing_count",
+   "recursive_source_permission_denied_count",
+   "recursive_source_unreadable_count",
+   "recursive_source_changed_count",
+   "recursive_unresolved_count",
+   "scan_is_final",
+   "all_planned_items_terminal",
+   "all_required_items_archived",
+   "all_parts_written",
+   "all_writer_completions_succeeded",
+   "all_parts_cataloged",
+   "all_local_validation_succeeded",
+   "has_ambiguous_evidence",
+   "completeness_status",
+   "pinned_frontier_generation",
+   "pinned_artifact_evidence_generation",
+   "calculated_at",
+   "part_id",
+   "chunk_index",
+   "plan_source",
+   "packaging_format",
+   "container_id",
+   "container_ordinal",
+   "container_name",
+   "container_format",
+   "loose_record_key",
+   "storage_class",
+   "evidence_generation",
+   "direct_expected_count",
+   "part_direct_expected_bytes",
+   "direct_archived_count",
+   "part_direct_archived_bytes",
+   "part_source_missing_count",
+   "part_source_missing_bytes",
+   "part_source_permission_denied_count",
+   "part_source_permission_denied_bytes",
+   "part_source_unreadable_count",
+   "part_source_unreadable_bytes",
+   "part_source_changed_count",
+   "part_source_changed_bytes",
+   "part_unresolved_count",
+   "part_unresolved_bytes",
+   "plan_manifest_artifact_id",
+   "sidecar_artifact_id",
+   "terminal_manifest_artifact_id",
+   "plan_artifact_locator",
+   "sidecar_artifact_locator",
+   "terminal_artifact_locator",
+   "local_validation_state",
+   "writer_state",
+   "catalog_state",
+   "restore_format",
+   "tape_label",
+   "tape_generation_id",
+   "tape_generation",
+   "tape_generation_state",
+   "stored_path",
+   "source_base_path",
+   "container_member_candidate",
+   "routing_precision",
+   "restore_route"
+  ]
+ }
+}
