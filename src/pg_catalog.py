@@ -188,15 +188,14 @@ class PgCatalogMixin:
                   LEFT JOIN tape_generations AS tg
                     ON tg.generation_id = COALESCE(
                         c.tape_generation_id, r.tape_generation_id)
-                  LEFT JOIN LATERAL (
-                    SELECT a.artifact_id, a.artifact_version,
-                           a.local_locator, a.tape_locator
-                    FROM archive_artifacts a
-                    WHERE a.container_id=c.container_id
-                      AND a.artifact_kind='tar_sidecar'
-                      AND a.readiness_state='ready'
-                    ORDER BY a.artifact_id DESC LIMIT 1
-                  ) sidecar ON TRUE"""
+                  LEFT JOIN archive_artifacts AS sidecar
+                    ON sidecar.artifact_id = (
+                        SELECT a.artifact_id
+                        FROM archive_artifacts a
+                        WHERE a.container_id=c.container_id
+                          AND a.artifact_kind='tar_sidecar'
+                          AND a.readiness_state='ready'
+                        ORDER BY a.artifact_id DESC LIMIT 1)"""
 
     def _container_restore_schema_available(self, conn):
         return all(self._table_exists_conn(conn, name) for name in (
@@ -1202,15 +1201,13 @@ class PgCatalogMixin:
                 "LEFT JOIN archive_containers c ON c.container_id=d.container_id "
                 "LEFT JOIN tape_generations tg ON tg.generation_id="
                 "COALESCE(c.tape_generation_id,d.tape_generation_id) "
-                "LEFT JOIN LATERAL ("
-                "  SELECT aa.artifact_id, aa.artifact_version, "
-                "         aa.local_locator, aa.tape_locator "
+                "LEFT JOIN archive_artifacts a ON a.artifact_id=("
+                "  SELECT aa.artifact_id "
                 "  FROM archive_artifacts aa "
                 "  WHERE aa.container_id=c.container_id "
                 "    AND aa.artifact_kind='tar_sidecar' "
                 "    AND aa.readiness_state='ready' "
-                "  ORDER BY aa.artifact_id DESC LIMIT 1"
-                ") a ON TRUE "
+                "  ORDER BY aa.artifact_id DESC LIMIT 1) "
                 "WHERE " + " AND ".join(where) +
                 " AND t.stored_bundle_path IS NOT NULL",
                 params,
