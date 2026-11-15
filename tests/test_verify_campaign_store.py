@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 _SCRIPT = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -232,6 +233,73 @@ class StillPassesTests(_Store):
         for container in receipt["containers"]:
             self.assertEqual(
                 verifier._container_shape_problems(container), [])
+
+
+class ResumeTrustTests(_Store):
+    """review F2: --resume may skip a re-hash only on recorded evidence."""
+
+    def setUp(self):
+        super().setUp()
+        self._write(self._good_receipt())
+        self.tar = os.path.join(self.chunk_dir, "container_0000.tar")
+        self.report = os.path.join(self.root, "report.json")
+
+    def _full(self, *extra):
+        return self._run("--report", self.report, *extra)
+
+    def _same_size_corruption(self, keep_mtime=False):
+        before = os.stat(self.tar)
+        with open(self.tar, "r+b") as handle:
+            handle.write(b"X")
+        if keep_mtime:
+            os.utime(self.tar, ns=(before.st_atime_ns, before.st_mtime_ns))
+        else:
+            os.utime(self.tar, ns=(before.st_atime_ns,
+                                   before.st_mtime_ns + 5_000_000_000))
+
+    def test_changed_container_is_rehashed_on_resume(self):
+        self.assertEqual(self._full()[0], 0)
+        self._same_size_corruption()
+        code, text = self._full("--resume")
+        self.assertNotEqual(code, 0)
+        self.assertIn("SHA-256 mismatch", text)
+
+    def test_unchanged_container_is_trusted_on_resume(self):
+        self.assertEqual(self._full()[0], 0)
+        with mock.patch.object(
+                verifier, "_sha256",
+                side_effect=AssertionError("must not re-hash")):
+            code, text = self._full("--resume")
+        self.assertEqual(code, 0, text)
+        # ...and the evidence survives into the new report for the next run.
+        with mock.patch.object(
+                verifier, "_sha256",
+                side_effect=AssertionError("must not re-hash")):
+            self.assertEqual(self._full("--resume")[0], 0)
+
+    def test_receipt_checksum_changed_since_the_report_forces_a_rehash(self):
+        self.assertEqual(self._full()[0], 0)
+        receipt = self._good_receipt()
+        receipt["containers"][0]["tar_sha256"] = "0" * 64
+        self._write(receipt, tar=False)
+        code, text = self._full("--resume")
+        self.assertNotEqual(code, 0)
+        self.assertIn("SHA-256 mismatch", text)
+
+    def test_old_report_without_evidence_forces_a_rehash(self):
+        self.assertEqual(self._full()[0], 0)
+        with open(self.report, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        for chunk in payload["chunks"]:
+            for container in chunk["containers"]:
+                for key in ("size", "mtime_ns", "tar_sha256"):
+                    container.pop(key, None)
+        with open(self.report, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        self._same_size_corruption(keep_mtime=True)
+        code, text = self._full("--resume")
+        self.assertNotEqual(code, 0)
+        self.assertIn("SHA-256 mismatch", text)
 
 
 if __name__ == "__main__":

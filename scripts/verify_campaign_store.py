@@ -313,13 +313,14 @@ def verify_chunk(root, index, chunk_dir, *, full, already_ok,
         listed.add(name)
         path = _resolve_container(root, chunk_dir, locator, name)
         try:
-            actual_size = os.path.getsize(path)
+            info = os.stat(path)
         except OSError as exc:
             entry.update(status="io_error" if _is_drive_io_error(exc, root) else "fail",
                          detail=f"missing or unreadable: {exc}")
             result["containers"].append(entry)
             problems.append(f"{name}: {entry['detail']}")
             continue
+        actual_size = info.st_size
         expected_size = container["tar_size"]
         entry["size_ok"] = actual_size == expected_size
         if not entry["size_ok"]:
@@ -328,12 +329,23 @@ def verify_chunk(root, index, chunk_dir, *, full, already_ok,
             problems.append(f"{name}: size mismatch")
             result["containers"].append(entry)
             continue
-        if full and name in already_ok:
+        # What a later --resume may rely on: this exact file state was hashed
+        # and matched this exact receipt checksum.
+        evidence = {"size": actual_size, "mtime_ns": info.st_mtime_ns,
+                    "tar_sha256": container["tar_sha256"]}
+        if full and _resume_evidence_matches(already_ok, name, evidence):
             entry["sha_ok"] = True
-            entry["detail"] = "sha verified in an earlier run (--resume)"
+            entry["detail"] = ("sha verified in an earlier run (--resume); "
+                               "size, mtime and receipt checksum unchanged")
+            entry.update(evidence)
         elif full:
             try:
                 entry["sha_ok"] = _sha256(path) == container.get("tar_sha256")
+                if entry["sha_ok"]:
+                    after = os.stat(path)
+                    if (after.st_size, after.st_mtime_ns) == (
+                            actual_size, info.st_mtime_ns):
+                        entry.update(evidence)
             except OSError as exc:
                 entry.update(status="io_error" if _is_drive_io_error(exc, root) else "fail",
                              detail=f"read failed: {exc}")
@@ -372,8 +384,33 @@ def verify_chunk(root, index, chunk_dir, *, full, already_ok,
     return result
 
 
+_RESUME_EVIDENCE_KEYS = ("size", "mtime_ns", "tar_sha256")
+
+
+def _resume_evidence_matches(already_ok, name, evidence):
+    """True only if an earlier report hashed THIS file state against THIS
+    receipt checksum.
+
+    A name alone proves nothing: the bytes can change at the same size, and
+    the receipt can change under an unchanged file. Anything short of an exact
+    match on size, mtime and receipt checksum - including an older report that
+    recorded no evidence - means "hash it again".
+    """
+    if not isinstance(already_ok, dict):
+        return False
+    recorded = already_ok.get(name)
+    return (isinstance(recorded, dict)
+            and all(recorded.get(key) is not None
+                    and recorded.get(key) == evidence[key]
+                    for key in _RESUME_EVIDENCE_KEYS))
+
+
 def _resume_index(report_path):
-    """{chunk_index: {container names already sha-verified}} from a report."""
+    """{chunk_index: {container name: recorded evidence}} from a report.
+
+    Only containers the earlier run sha-verified are listed; the evidence is
+    whatever that report recorded (possibly nothing, for an older report).
+    """
     already = {}
     try:
         with open(report_path, encoding="utf-8") as handle:
@@ -381,7 +418,8 @@ def _resume_index(report_path):
     except (OSError, json.JSONDecodeError):
         return already
     for chunk in previous.get("chunks") or []:
-        names = {c["name"] for c in chunk.get("containers") or []
+        names = {c["name"]: {key: c.get(key) for key in _RESUME_EVIDENCE_KEYS}
+                 for c in chunk.get("containers") or []
                  if c.get("sha_ok") is True}
         if names:
             already[int(chunk["chunk_index"])] = names
