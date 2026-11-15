@@ -31,6 +31,24 @@ if TYPE_CHECKING:
 
 RESTORE_PAGE_SIZE = 250
 
+# Characters NTFS refuses in a name component, plus ':' which Windows reads as
+# a drive separator or an alternate-data-stream marker. A stored name may carry
+# any of them (the sources are POSIX hosts), so they are neutralised, never
+# interpreted.
+_UNSAFE_NAME_CHARS = {ord(c): '_' for c in '<>:"|?*'}
+_UNSAFE_NAME_CHARS.update({i: '_' for i in range(32)})
+
+# DOS device names. Opening "restore\\NUL" or "restore\\COM1.txt" reaches the
+# device, not a file, so a restore "succeeds" while writing nothing.
+_RESERVED_DEVICE_NAMES = frozenset(
+    {'CON', 'PRN', 'AUX', 'NUL', 'CONIN$', 'CONOUT$', 'CLOCK$'}
+    | {f'{port}{digit}' for port in ('COM', 'LPT')
+       for digit in '0123456789¹²³'})
+
+
+class RestoreContainmentError(RuntimeError):
+    """A restore destination would fall outside the chosen restore directory."""
+
 
 class LTORetriever:
     def __init__(self, db: "PgDatabaseManager", tape_drive: str,
@@ -100,12 +118,62 @@ class LTORetriever:
 
     @staticmethod
     def _safe_restore_relpath(rel_path):
+        """Reduce an untrusted stored name to a harmless relative path.
+
+        Stored names and original paths are catalog/manifest/container data.
+        Every component that could steer the write somewhere else is dropped
+        or neutralised here: separators of either kind (so absolute, UNC and
+        ``\\\\?\\`` forms lose their root), ``.``/``..``, bare drive specs,
+        ``:`` anywhere in a component (``sub/Z:evil`` used to be re-rooted on
+        drive Z by ``os.path.join``; ``name:stream`` opened an alternate data
+        stream), trailing dots/spaces (Windows strips them, aliasing another
+        name) and DOS device names. The result is still only *probably* safe:
+        ``_contained_restore_path`` asserts it independently.
+        """
         parts = []
-        for part in re.split(r'[\\/]+', rel_path or ''):
+        for part in re.split(r'[\\/]+', str(rel_path or '')):
             if not part or part in ('.', '..') or part.endswith(':'):
                 continue
+            part = part.translate(_UNSAFE_NAME_CHARS).rstrip(' .')
+            if not part:
+                continue
+            stem = part.split('.', 1)[0].rstrip(' ').upper()
+            if stem in _RESERVED_DEVICE_NAMES:
+                part = '_' + part
             parts.append(part)
         return os.path.join(*parts) if parts else ''
+
+    def _contained_restore_path(self, rel_path):
+        """Join ``rel_path`` under ``restore_dir`` and prove it stays there.
+
+        This is the single containment gate every restore path goes through.
+        It does not trust the sanitiser: anything rooted, drive-qualified or
+        empty is refused outright, and the fully resolved destination
+        (symlinks and junctions included) must lie strictly inside the
+        resolved restore directory.
+        """
+        rel = str(rel_path or '')
+        if (not rel or os.path.isabs(rel) or os.path.splitdrive(rel)[0]
+                or rel.startswith(('\\', '/')) or ':' in rel):
+            raise RestoreContainmentError(
+                f"[RESTORE] Refusing unsafe restore name: {rel_path!r}")
+        candidate = os.path.join(self.restore_dir, rel)
+        root = os.path.normcase(os.path.realpath(self.restore_dir))
+        final = os.path.normcase(os.path.realpath(candidate))
+        try:
+            inside = final != root and os.path.commonpath([root, final]) == root
+        except ValueError:          # different drives cannot contain each other
+            inside = False
+        if not inside:
+            raise RestoreContainmentError(
+                f"[RESTORE] Refusing to restore outside {self.restore_dir!r}: "
+                f"{rel_path!r}")
+        return candidate
+
+    def _safe_destination(self, rel_path):
+        """Contained, non-clobbering destination for one untrusted name."""
+        return self._unique_dest_path(self._contained_restore_path(
+            self._safe_restore_relpath(rel_path)))
 
     def _resolve_tape_path(self, path):
         """Remap the catalog's stored drive letter to the configured LTFS drive.
@@ -140,8 +208,7 @@ class LTORetriever:
         if restore_base and original and self._path_is_under(original, restore_base):
             mod = self._source_path_module(original)
             rel_path = mod.relpath(original, restore_base)
-        safe_rel = self._safe_restore_relpath(rel_path or record['file_name'])
-        return self._unique_dest_path(os.path.join(self.restore_dir, safe_rel))
+        return self._safe_destination(rel_path or record['file_name'])
 
     @staticmethod
     def _route_container_format(record):
@@ -1036,8 +1103,7 @@ class LTORetriever:
                     rel = (canonical[len(restore_base):]
                            if restore_base and canonical.startswith(restore_base)
                            else canonical)
-                    dst = self._unique_dest_path(os.path.join(
-                        self.restore_dir, self._safe_restore_relpath(rel)))
+                    dst = self._safe_destination(rel)
                     os.makedirs(os.path.dirname(os.path.abspath(dst)),
                                 exist_ok=True)
                     with zf.open(entry) as zsrc, open(dst, "wb") as out:
