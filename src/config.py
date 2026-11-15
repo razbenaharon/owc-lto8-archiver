@@ -54,7 +54,8 @@ class Opt(NamedTuple):
     above: Optional[float] = None        # exclusive lower bound
     choices: Tuple[str, ...] = ()
     # live    - read and acted on
-    # inert   - still read by a property, but nothing consumes it
+    # inert   - validated and accepted, but nothing reads it: it has no
+    #           effect, and a config that sets it gets a notice saying so
     # retired - no reader at all; accepted so an old config.ini still loads
     status: str = 'live'
     note: str = ''
@@ -257,15 +258,6 @@ INTENTIONALLY_UNDOCUMENTED = {
     ('TELEGRAM', 'chat_id'): "secret - set TELEGRAM_CHAT_ID in .env",
     # Looked for only in order to warn that it does nothing.
     ('REMOTE', 'incremental_scan'): "retired; detected only to warn",
-    # Inert: a property still reads them, nothing acts on the value. Offering
-    # them in the example would promise an effect that does not exist.
-    ('CATALOG', 'index_directory_stats'): "inert - see CONFIG_SCHEMA",
-    ('CATALOG', 'index_full_directory_tree'): "inert - see CONFIG_SCHEMA",
-    ('CATALOG', 'prefer_directory_containers'): "inert - see CONFIG_SCHEMA",
-    ('REMOTE', 'large_file_min_mb'): "inert - see CONFIG_SCHEMA",
-    ('PERFORMANCE', 'pipeline_profile'): "inert - see CONFIG_SCHEMA",
-    ('PERFORMANCE', 'fetch_target_mbs'): "inert - see CONFIG_SCHEMA",
-    ('LOCAL_MANIFEST_ARCHIVE', 'search_limit'): "inert - see CONFIG_SCHEMA",
 }
 
 
@@ -777,15 +769,6 @@ class ConfigManager:
     def index_packed_small_files(self):
         return self._get_bool('CATALOG', 'index_packed_small_files', False)
     @property
-    def index_directory_stats(self):
-        return self._get_bool('CATALOG', 'index_directory_stats', True)
-    @property
-    def index_full_directory_tree(self):
-        return self._get_bool('CATALOG', 'index_full_directory_tree', True)
-    @property
-    def prefer_directory_containers(self):
-        return self._get_bool('CATALOG', 'prefer_directory_containers', True)
-    @property
     def small_file_manifest_enabled(self):
         return self._get_bool('CATALOG', 'small_file_manifest_enabled', True)
     @property
@@ -831,17 +814,8 @@ class ConfigManager:
     # new-session path. An existing config.ini may still contain the keys;
     # configparser ignores keys nothing asks for, so no operator action is
     # needed. Plan 1 Task 2.3's directory frontier introduces its own settings.
-    @property
-    def large_file_min_mb(self):
-        """Threshold above which a file is archived loose rather than packed.
-
-        Retained (unlike its directory-first siblings) because it is a real
-        archival policy figure, defaulting to the catalog's own
-        ``index_min_file_mb``, and Plans 2-3 size loose/stored-TAR behaviour on
-        it. It currently has no reader in the remote path.
-        """
-        return self._get_float('REMOTE', 'large_file_min_mb',
-                               self.index_min_file_mb)
+    # ``large_file_min_mb`` never had a reader in the remote path either; it
+    # stays in CONFIG_SCHEMA as inert so an old file loads with a notice.
     @property
     def remote_tape_label(self):
         """The cartridge a NEW remote session should target (Plan 1 Task 1.4).
@@ -861,11 +835,6 @@ class ConfigManager:
         return (self.config.get('REMOTE', 'tape_label', fallback='') or '').strip()
 
     # --- [PERFORMANCE] : continuous-streaming pipeline tuning -----------------
-    @property
-    def pipeline_profile(self):
-        return self.config.get(
-            'PERFORMANCE', 'pipeline_profile',
-            fallback='tape_first_controlled').strip()
     @property
     def chunk_cap_gb(self):
         return self._get_float('PERFORMANCE', 'chunk_cap_gb', 50)
@@ -1039,9 +1008,6 @@ class ConfigManager:
     @property
     def ram_hard_limit_pct(self):
         return self._get_float('PERFORMANCE', 'ram_hard_limit_pct', 85)
-    @property
-    def fetch_target_mbs(self):
-        return self._get_float('PERFORMANCE', 'fetch_target_mbs', 100)
     @property
     def fetch_min_free_ram_gb(self):
         return self._get_float('PERFORMANCE', 'fetch_min_free_ram_gb', 16)
@@ -1250,11 +1216,6 @@ class ConfigManager:
         return _clean_config_path(self.config.get(
             'LOCAL_MANIFEST_ARCHIVE', 'root',
             fallback=os.path.join(PROJECT_ROOT, 'LOCAL_MANIFEST_ARCHIVE')))
-
-    @property
-    def local_manifest_search_limit(self):
-        return self._get_int(
-            'LOCAL_MANIFEST_ARCHIVE', 'search_limit', 500, minimum=1)
 
     @property
     def windows_update_guard(self):
