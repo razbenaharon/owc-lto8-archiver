@@ -15,6 +15,27 @@ MAX_TELEGRAM_TEXT = 3900
 # .env, and set this to False.
 TELEGRAM_BOT_RETIRED = True
 
+_retired_note_shown = False
+
+
+def _note_retired_once(warn):
+    """Say once per process that `[TELEGRAM] enabled = true` does nothing.
+
+    Without this an operator who enabled notifications would simply never
+    receive one, with no hint why. The [TELEGRAM] keys themselves stay valid
+    settings, so an existing config.ini loads without any other notice.
+    """
+    global _retired_note_shown
+    if _retired_note_shown:
+        return
+    _retired_note_shown = True
+    try:
+        warn("[TELEGRAM] Notifications are retired in this release: "
+             "[TELEGRAM] enabled = true has no effect, and nothing is sent. "
+             "Set it to false to hide this note.")
+    except Exception:
+        pass
+
 
 def _clean_secret(value):
     value = (value or "").strip()
@@ -74,6 +95,9 @@ class TelegramNotifier:
 
     @classmethod
     def from_config(cls, cfg, warn=print):
+        if TELEGRAM_BOT_RETIRED and getattr(
+                cfg, "telegram_enabled", False) is True:
+            _note_retired_once(warn)
         return cls(
             enabled=(not TELEGRAM_BOT_RETIRED
                      and getattr(cfg, "telegram_enabled", False)),
