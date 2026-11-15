@@ -5,7 +5,7 @@ import os
 from .cli_errors import OperationalError
 from .logsetup import get_logger
 from .pipeline_types import ChunkStatus
-from .db_backend import lease_deadline
+from .db_backend import as_timestamp, lease_deadline
 from .pg_core import (_coerce_timestamp_kwargs, _now_utc, _row, _rows,
                       _valid_columns)
 
@@ -2233,7 +2233,19 @@ class PgSessionMixin:
         if it were the footprint once produced a wrong conclusion that a
         session's completed work had been destroyed.
         """
-        return self._run_read(
+        def typed(rows):
+            # min()/max() of a timestamp is an expression: an engine without
+            # typed expression results returns text. Normalise (a no-op for
+            # the datetimes PostgreSQL returns).
+            out = []
+            for row in rows:
+                row = dict(row)
+                row["first_run"] = as_timestamp(row["first_run"])
+                row["last_run"] = as_timestamp(row["last_run"])
+                out.append(row)
+            return _rows(out)
+
+        return typed(self._run_read(
             lambda conn: conn.execute(
                 """SELECT r.tape_label,
                           count(DISTINCT r.run_id)      AS runs,
@@ -2248,7 +2260,7 @@ class PgSessionMixin:
                    ORDER BY r.tape_label""",
                 (session_id,),
             ).fetchall(),
-            f"tape footprint for session {session_id}")
+            f"tape footprint for session {session_id}"))
 
     def find_sessions_sharing_plan(self, session_id):
         """Other sessions on the SAME plan or snapshot. Read-only.

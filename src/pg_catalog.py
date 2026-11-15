@@ -1045,7 +1045,7 @@ class PgCatalogMixin:
 
     def list_backup_sessions(self):
         with self._pool.connection() as conn:
-            return _rows(conn.execute("""
+            rows = _rows(conn.execute("""
                 SELECT DATE(f.catalog_backup_date) AS session_date,
                        f.tape_label, COUNT(*) AS file_count,
                        SUM(f.file_size_bytes) AS total_bytes
@@ -1053,6 +1053,11 @@ class PgCatalogMixin:
                 GROUP BY DATE(f.catalog_backup_date), f.tape_label
                 ORDER BY session_date DESC
             """).fetchall())
+        # DATE(...) is an expression: normalise to a ``datetime.date`` (what
+        # PostgreSQL already returns) so callers see one type everywhere.
+        for row in rows:
+            row["session_date"] = as_day(row["session_date"])
+        return rows
 
     def search_by_session(self, session_date, tape_label, limit=None,
                           offset=None, after_id=None):
