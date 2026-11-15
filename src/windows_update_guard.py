@@ -77,6 +77,9 @@ _SCCM_REBOOT_DATA = (
 # a healthy client. The cap only exists so a wedged WMI service cannot stall a
 # pre-write check indefinitely.
 _SCCM_QUERY_TIMEOUT_S = 20
+# The Configuration Manager client service ("SMS Agent Host"). Its presence is
+# what distinguishes "no SCCM on this host" from "SCCM could not be asked".
+_SCCM_SERVICE_KEY = r"SYSTEM\CurrentControlSet\Services\CcmExec"
 
 # SCCM reports "no deadline" as the epoch rather than a null.
 _SCCM_EPOCH_YEAR = 1970
@@ -432,6 +435,34 @@ def _sccm_registry_reboot_data():
         return False
 
 
+def _sccm_client_installed():
+    """Is a Configuration Manager client present on this host at all?
+
+    Returns True / False, or None when that could not be established.
+
+    The evidence is the client's Windows service (``CcmExec``, "SMS Agent
+    Host") — the very process that took the 2026-07-15 restart. This is what
+    separates the two cases a failed SDK query cannot tell apart on its own:
+
+    * no service  -> there is no SCCM here; nothing can stage an SCCM restart
+      (the normal case for anyone running this outside a managed fleet);
+    * service present, SDK unusable -> SCCM exists but could not be asked.
+
+    Any doubt (no registry access, an unexpected error) is None, which callers
+    treat like "present": unknown is never silently "not installed".
+    """
+    if winreg is None:
+        return None
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _SCCM_SERVICE_KEY,
+                            0, winreg.KEY_READ):
+            return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return None
+
+
 def sccm_reboot_status():
     """Ask the Configuration Manager client whether it intends to restart.
 
@@ -466,22 +497,44 @@ def sccm_reboot_status():
         raw = _sccm_query_client_sdk()
     except Exception as e:
         msg = str(e)
-        # A host with no Configuration Manager client is a legitimate, fully
-        # determinate state — there is no SCCM to stage a restart. That is very
-        # different from a client that exists but would not answer.
-        if "Invalid namespace" in msg or "InvalidNamespace" in msg:
-            info["determinate"] = True
-            log.debug("sccm_reboot_check_completed: no SCCM client installed")
-            return info
-        info["error"] = msg
-        log.warning("sccm_check_failed: %s", msg)
+        no_namespace = "Invalid namespace" in msg or "InvalidNamespace" in msg
+
         if info["registry_reboot_data"]:
-            # The SDK is unreachable but SCCM has staged restart data. Report
-            # the restart; a false alarm costs one clean stop, a missed one
-            # costs the index.
+            # The SDK is unreachable — or its namespace is gone — but SCCM has
+            # staged restart data. Report the restart; a false alarm costs one
+            # clean stop, a missed one costs the index. This is checked BEFORE
+            # the "no SCCM here" shortcut: a missing namespace used to return
+            # "no restart pending" even with this evidence on the table.
+            info["error"] = msg
             info["reboot_pending"] = True
+            log.warning("sccm_check_failed: %s", msg)
             log.warning("sccm_reboot_pending: from registry RebootData "
                         "(client SDK unreachable)")
+            return info
+
+        client = _sccm_client_installed()
+        if client is False:
+            # A host with no Configuration Manager client is a legitimate,
+            # fully determinate state — there is no SCCM to stage a restart,
+            # so only the Windows signals apply. This must not block: it is
+            # the normal case outside a managed fleet, and it holds whatever
+            # the query's error text was.
+            info["determinate"] = True
+            log.debug("sccm_reboot_check_completed: no SCCM client installed "
+                      "(query said: %s)", msg)
+            return info
+
+        # The client is present (or its presence could not be established) and
+        # it could not be asked. That is UNKNOWN, never "clear" — including a
+        # missing namespace, which on a host that does have the client means a
+        # broken or mid-repair client, not the absence of SCCM.
+        if no_namespace:
+            msg = ("the SCCM client "
+                   + ("service is installed" if client else
+                      "may be installed (could not be checked)")
+                   + f" but its WMI namespace is unavailable: {msg}")
+        info["error"] = msg
+        log.warning("sccm_check_failed: %s", msg)
         return info
 
     info["installed"] = True

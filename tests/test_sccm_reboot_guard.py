@@ -44,6 +44,13 @@ class SccmRebootStatusTests(unittest.TestCase):
                                 return_value=False)
         reg.start()
         self.addCleanup(reg.stop)
+        # Audit M1: a failed SDK query is now disambiguated by whether the
+        # SCCM client service exists. Pin it (a managed host) so these tests
+        # never read the developer machine's real registry.
+        client = mock.patch.object(wug, "_sccm_client_installed",
+                                   return_value=True)
+        client.start()
+        self.addCleanup(client.stop)
 
     def test_reboot_pending_is_reported(self):
         with mock.patch.object(wug, "_sccm_query_client_sdk",
@@ -94,7 +101,9 @@ class SccmRebootStatusTests(unittest.TestCase):
         """No client means nothing can stage an SCCM restart. Not an error."""
         with mock.patch.object(
                 wug, "_sccm_query_client_sdk",
-                side_effect=RuntimeError("Invalid namespace root\\ccm")):
+                side_effect=RuntimeError("Invalid namespace root\\ccm")), \
+             mock.patch.object(wug, "_sccm_client_installed",
+                               return_value=False):
             s = wug.sccm_reboot_status()
         self.assertTrue(s["determinate"])
         self.assertFalse(s["reboot_pending"])
@@ -557,16 +566,21 @@ class PreTapeWriteGateTests(unittest.TestCase):
             reasons, _ = self.orch._pre_tape_write_reboot_check(37, self.desc, "T")
         self.assertEqual(reasons, [])
 
-    def test_gate_failure_falls_back_to_critical_windows_markers(self):
-        """The gate must never be the thing that takes the pipeline down."""
+    def test_gate_failure_keeps_critical_windows_markers_and_fails_closed(self):
+        """The gate must never be the thing that takes the pipeline down — but
+        (audit M1) an unevaluable restart state is not "clear" either: the
+        Windows markers are kept and the unknown is added as a blocking
+        reason, instead of the SCCM answer being silently dropped."""
         with mock.patch.object(ro, "assess_reboot_state",
                                side_effect=RuntimeError("boom")), \
              mock.patch.object(ro, "pending_reboot_reasons",
                                return_value=["CBS restart pending"]) as legacy:
             reasons, sccm = self.orch._pre_tape_write_reboot_check(
                 37, self.desc, "T")
-        self.assertEqual(reasons, ["CBS restart pending"])
-        self.assertIsNone(sccm)
+        self.assertEqual(reasons[0], "CBS restart pending")
+        self.assertEqual(len(reasons), 2)
+        self.assertIn("could not be evaluated", reasons[1])
+        self.assertFalse(sccm["determinate"])
         # The fallback must not resurrect the warning-only marker.
         self.assertIs(legacy.call_args.kwargs["include_soft"], False)
 
