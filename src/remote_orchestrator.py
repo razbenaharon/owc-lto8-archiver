@@ -439,9 +439,9 @@ class RemoteOrchestrator:
             err, retry_attempt=retry_attempt, next_retry_delay=next_retry_delay)
 
     def _fetch_batches_parallel(self, work_items, fetch_dir, fetch_abort,
-                                streams):
+                                session_id, streams):
         return self._stager()._fetch_batches_parallel(
-            work_items, fetch_dir, fetch_abort, streams)
+            work_items, fetch_dir, fetch_abort, session_id, streams)
 
     def _fetch_collisions(self, session_id, collisions, fetch_dir,
                           fetch_abort, *args, **kwargs):
