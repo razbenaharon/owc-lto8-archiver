@@ -171,7 +171,7 @@ become tracked; CI runs the same gate plus the test suite.
 - [IBM LTFS SDE](https://www.ibm.com/products/linear-tape-file-system) installed to `C:\Program Files\IBM\LTFS\`
 - OWC Mercury Pro LTO-8 (or compatible LTFS-formatted LTO drive)
 - OpenSSH client tools for remote archive mode
-- PostgreSQL 17, either local via `docker compose up -d db` or an existing server
+- A catalog database: the built-in SQLite backend (no setup), or PostgreSQL 17 — local via `docker compose up -d db` or an existing server
 - `PySide6` (required only for the DB Inspector GUI): `pip install PySide6`
 
 These installers are **not** bundled in this repository (they are proprietary). Download
@@ -198,6 +198,12 @@ staging_dir = C:\path\to\staging\area
 restore_dir = C:\path\to\restored\files
 
 [DATABASE]
+; sqlite: one local file, created automatically (nothing to install).
+; postgresql: an external server. A config with no "backend" line keeps
+; using PostgreSQL. See docs/sqlite_backend.md.
+backend = sqlite
+sqlite_path = lto_archive.sqlite3
+; PostgreSQL only:
 host = localhost
 port = 5432
 dbname = lto_archive

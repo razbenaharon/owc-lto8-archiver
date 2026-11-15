@@ -1,18 +1,20 @@
-"""PostgreSQL database factory and shared catalog identity helpers."""
+"""Database factory (SQLite or PostgreSQL) and shared catalog identity helpers."""
 import hashlib
 
 
 class DatabaseManager:
-    """Removed SQLite manager placeholder.
+    """Placeholder for the pre-PostgreSQL manager class, removed long ago.
 
-    The archive catalog is PostgreSQL-only. Use ``create_database_manager(cfg)``
-    so connection handling and error messages stay consistent.
+    The catalog backend is chosen by ``[DATABASE] backend``. Always use
+    ``create_database_manager(cfg)`` so connection handling and error messages
+    stay consistent.
     """
 
     def __new__(cls, *args, **kwargs):
         raise RuntimeError(
-            "[DB] SQLite DatabaseManager has been removed. Configure PostgreSQL "
-            "in [DATABASE] and call create_database_manager(cfg)."
+            "[DB] The legacy DatabaseManager class has been removed. Set "
+            "[DATABASE] backend (sqlite or postgresql) and call "
+            "create_database_manager(cfg)."
         )
 
 
@@ -99,7 +101,18 @@ def _apply_canonical_remote_paths(metadata, manifest_rows):
 
 
 def create_database_manager(cfg):
-    """Return the PostgreSQL database manager."""
+    """Return the catalog manager for ``[DATABASE] backend``.
+
+    SQLite needs nothing installed: the database file and the complete schema
+    are created automatically the first time it is opened.
+    """
+    from . import db_backend
+
+    if db_backend.is_sqlite(cfg):
+        from .sqlite_db import SqliteDatabaseManager
+
+        return SqliteDatabaseManager(cfg.db_dsn)
+
     from .pg_db import PgDatabaseManager
 
     try:

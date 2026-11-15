@@ -31,6 +31,8 @@ except ImportError:                          # pragma: no cover - guard handles 
     psycopg = None
     dict_row = None
 
+from db_backends import (create_test_db, each_backend, postgresql_only,
+                         sqlite_only)
 from pg_test_guard import (SKIP_REASON, create_test_database,
                            drop_test_database, pg_available)
 from test_directory_catalog_pg import _DirectoryCatalogFixture
@@ -77,7 +79,7 @@ class _ResetFixture(_DirectoryCatalogFixture):
             f"SELECT count(*) AS n FROM {table} WHERE {where}")[0]["n"]
 
 
-@unittest.skipUnless(_pg_available(), SKIP_REASON)
+@each_backend
 class ResetCleanupContainerTablesTests(_ResetFixture, unittest.TestCase):
     def test_used_space_counts_a_copied_container_before_the_reset(self):
         self.assertEqual(self.db.recalculate_tape_used_space("T_A"), 600)
@@ -141,7 +143,7 @@ class ResetCleanupContainerTablesTests(_ResetFixture, unittest.TestCase):
         self.assertEqual(self._count("files_index", "tape_label='T_B'"), 1)
 
 
-@unittest.skipUnless(_pg_available(), SKIP_REASON)
+@each_backend
 class ResetResumeTests(_ResetFixture, unittest.TestCase):
     """execute_reset end to end, with every hardware call patched."""
 
@@ -287,7 +289,7 @@ class ResetResumeTests(_ResetFixture, unittest.TestCase):
         self.assertEqual(self.formats, 0)
 
 
-@unittest.skipUnless(_pg_available(), SKIP_REASON)
+@each_backend
 class RenameWithContainersTests(_ResetFixture, unittest.TestCase):
     def test_a_rename_carries_containers_and_restore_routes(self):
         """Used to fail: the new tables still referenced the old label."""
@@ -310,7 +312,7 @@ class RenameWithContainersTests(_ResetFixture, unittest.TestCase):
         restore routes hold a foreign key on that key. The rename is refused
         by the database and must roll back completely - never half-renamed.
         """
-        with self.assertRaises(psycopg.errors.ForeignKeyViolation):
+        with self.assertRaises(self.tdb.errors.ForeignKeyViolation):
             self.db.rename_tape("T_A", "T_NEW")
         self.assertEqual(self._count("tapes", "volume_label='T_NEW'"), 0)
         self.assertEqual(self._count("files_index"), 1)
@@ -318,13 +320,14 @@ class RenameWithContainersTests(_ResetFixture, unittest.TestCase):
         self.assertEqual(self.db.get_active_tape_generation("T_A"), 1)
 
 
-@unittest.skipUnless(_pg_available(), SKIP_REASON)
+@each_backend
 class RenameAndDeleteTests(unittest.TestCase):
     def setUp(self):
         from src.pg_db import PgDatabaseManager
 
-        self.dbname, self.conninfo = create_test_database("lto_m3c")
-        self.db = PgDatabaseManager(self.conninfo)
+        self.tdb = create_test_db(getattr(self, 'BACKEND', None) or 'postgresql', "lto_m3c")
+        self.dbname, self.conninfo = self.tdb.name, self.tdb.conninfo
+        self.db = self.tdb.manager(migrations="startup")
         self.addCleanup(self._drop)
 
     def _drop(self):
@@ -332,14 +335,10 @@ class RenameAndDeleteTests(unittest.TestCase):
             self.db.close()
         except Exception:
             pass
-        drop_test_database(self.dbname)
+        self.tdb.drop()
 
     def _q(self, sql, params=()):
-        with cast(Any, psycopg).connect(
-                self.conninfo, autocommit=True,
-                row_factory=cast(Any, dict_row)) as conn:
-            cur = conn.execute(sql, params)
-            return cur.fetchall() if cur.description else []
+        return self.tdb.run(sql, params)
 
     def _reset_twice(self, label):
         """Leave ``label`` at generation 3 with two retired generations."""
@@ -350,7 +349,8 @@ class RenameAndDeleteTests(unittest.TestCase):
                    state,formatted_at)
                SELECT tape_id,volume_label,g,
                       CASE WHEN g=3 THEN 'active' ELSE 'retired' END, now()
-               FROM tapes, (VALUES (2),(3)) AS v(g) WHERE volume_label=%s""",
+               FROM tapes, (SELECT 2 AS g UNION ALL SELECT 3) v
+               WHERE volume_label=%s""",
             (label,))
         self._q("UPDATE tapes SET current_generation=3 WHERE volume_label=%s",
                 (label,))

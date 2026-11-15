@@ -16,6 +16,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import db_backend
 from .constants import DEFAULT_TAPE_CAPACITY_GB, LTFS_DIR, PROJECT_ROOT
 from .ltfs import get_volume_label
 from .runtime import _acquire_tape_io_lock, _release_tape_io_lock
@@ -168,10 +169,7 @@ def latest_chunk_write_evidence(summary_path=SUMMARY):
 
 
 def _table_exists(conn, table):
-    return conn.execute(
-        """SELECT 1 FROM information_schema.tables
-           WHERE table_schema='public' AND table_name=%s""", (table,)
-    ).fetchone() is not None
+    return db_backend.table_exists(conn, table)
 
 
 def _label_rows(conn, table, key_columns, label):
@@ -276,15 +274,8 @@ def build_impact_report(db, *, operation_id, tape_label, identity,
                 ("directory_tree_index", "dir_id"),
                 ("local_manifest_folder_aggregates", "aggregate_id"))
         }
-        cascades = [dict(r) for r in conn.execute(
-            """SELECT c.conname,c.conrelid::regclass::text AS child_table,
-                      pg_get_constraintdef(c.oid) AS definition
-               FROM pg_constraint c WHERE c.contype='f'
-                 AND c.confrelid='tapes'::regclass
-               ORDER BY child_table,c.conname""").fetchall()]
-        db_identity = dict(conn.execute(
-            """SELECT current_database() AS database,current_user AS username,
-                      pg_database_size(current_database()) AS bytes""").fetchone())
+        cascades = db_backend.foreign_keys_referencing(conn, "tapes")
+        db_identity = db_backend.database_identity(conn)
 
     return {
         "schema_version": 1,

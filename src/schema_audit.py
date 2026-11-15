@@ -999,6 +999,8 @@ def _historical_dry_run(conn: Any, installed: dict[str, Any], counts: dict[str, 
 
 def audit_schema_provenance(conn: Any, *, repository_root: str | os.PathLike[str] = PROJECT_ROOT) -> dict[str, Any]:
     """Return a structured, read-only audit for one selected DB connection."""
+    from . import db_backend
+    db_backend.require_postgresql(conn, "schema_audit")
     root = Path(repository_root)
     installed = _installed_schema(conn)
     repo = _repo_ddl_inventory(root)
@@ -1063,6 +1065,8 @@ def audit_schema_provenance(conn: Any, *, repository_root: str | os.PathLike[str
 
 def audit_manager(manager: Any, *, repository_root: str | os.PathLike[str] = PROJECT_ROOT) -> dict[str, Any]:
     """Run the audit through a manager opened with ``init_schema=False``."""
+    from . import db_backend
+    db_backend.require_postgresql(manager, "schema_audit")
     with manager._pool.connection() as conn:
         return audit_schema_provenance(conn, repository_root=repository_root)
 

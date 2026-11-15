@@ -14,6 +14,8 @@ import uuid
 from datetime import datetime, timezone
 from unittest import mock
 
+from db_backends import (create_test_db, each_backend, postgresql_only,
+                         sqlite_only)
 from pg_test_guard import (SKIP_REASON, create_test_database,
                            drop_test_database, pg_available)
 from src import inspector_repository
@@ -102,7 +104,7 @@ def _pg_available():
         return False
 
 
-@unittest.skipUnless(_pg_available(), SKIP_REASON)
+@each_backend
 class DeleteSessionWritePathTests(unittest.TestCase):
     """End to end against a throwaway database - never the live catalog."""
 
@@ -110,8 +112,9 @@ class DeleteSessionWritePathTests(unittest.TestCase):
     def setUpClass(cls):
         from src.pg_db import PgDatabaseManager
 
-        cls.dbname, cls.conninfo = create_test_database("lto_sessdel")
-        cls.db = PgDatabaseManager(cls.conninfo)
+        cls.tdb = create_test_db(getattr(cls, 'BACKEND', None) or 'postgresql', "lto_sessdel")
+        cls.dbname, cls.conninfo = cls.tdb.name, cls.tdb.conninfo
+        cls.db = cls.tdb.manager(migrations="startup")
         cls.db.apply_directory_catalog_schema()
         cls.db.register_tape("Tape_T")
 
@@ -121,11 +124,11 @@ class DeleteSessionWritePathTests(unittest.TestCase):
             cls.db.close()
         except Exception:
             pass
-        drop_test_database(cls.dbname)
+        cls.tdb.drop()
 
     def _exec(self, sql, params=()):
         with self.db._pool.connection() as conn:
-            conn.execute(sql, params)
+            conn.execute(self.tdb.adapt(sql), params)
 
     def _count(self, sql, params=()):
         with self.db._pool.connection() as conn:

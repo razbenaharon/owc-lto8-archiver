@@ -4,22 +4,12 @@
 Moving either back into the pool lets the pipeline write the chunk a second
 time. Before this fix every pipeline call site went through
 ``update_chunk_status``, which skipped the matrix, and nothing in the database
-stopped a raw UPDATE. These tests run against disposable PostgreSQL.
+stopped a raw UPDATE. The database suites run on every backend (SQLite
+always, PostgreSQL when ``LTO_TEST_PG_DSN`` is set).
 """
 import unittest
-from typing import Any, cast
 
-try:
-    import psycopg
-    from psycopg import errors as pg_errors
-    from psycopg.rows import dict_row
-except ImportError:                          # pragma: no cover - guard handles it
-    psycopg = None
-    pg_errors = None
-    dict_row = None
-
-from pg_test_guard import (SKIP_REASON, create_test_database,
-                           drop_test_database, pg_available)
+from db_backends import create_test_db, each_backend, postgresql_only
 
 from src.pipeline_types import (CHUNK_OVERRIDE_TRANSITIONS, CHUNK_TRANSITIONS,
                                 ChunkStatus, ChunkTransitionOverride,
@@ -27,10 +17,6 @@ from src.pipeline_types import (CHUNK_OVERRIDE_TRANSITIONS, CHUNK_TRANSITIONS,
                                 assert_chunk_override_transition)
 
 ALL_STATUSES = [status.value for status in ChunkStatus]
-
-
-def _pg_available():
-    return psycopg is not None and pg_available()
 
 
 class OverrideVocabularyTests(unittest.TestCase):
@@ -64,11 +50,12 @@ class OverrideVocabularyTests(unittest.TestCase):
 
 class _ChunkFixture:
     def setUp(self):
-        from src.pg_db import PgDatabaseManager
-
-        self.dbname, self.conninfo = create_test_database("lto_h5")
-        self.db = PgDatabaseManager(self.conninfo)
-        self.addCleanup(self._drop)
+        self.tdb = create_test_db(self.BACKEND, "lto_h5")
+        self.addCleanup(self.tdb.drop)
+        # "startup": PostgreSQL keeps the schema startup alone installs, as
+        # before; SQLite always has the complete schema.
+        self.db = self.tdb.manager(migrations="startup")
+        self.guard_error = self.tdb.errors.CheckGuard
         self.db.register_tape("H5T", 12000)
         snap = self._q(
             """INSERT INTO remote_snapshots (remote_host,remote_path,
@@ -88,28 +75,14 @@ class _ChunkFixture:
                        'active',1) RETURNING session_id""",
             (plan,))[0]["session_id"]
 
-    def _drop(self):
-        try:
-            self.db.close()
-        except Exception:
-            pass
-        drop_test_database(self.dbname)
-
     def _q(self, sql, params=()):
-        with cast(Any, psycopg).connect(
-                self.conninfo, autocommit=True,
-                row_factory=cast(Any, dict_row)) as conn:
-            cur = conn.execute(sql, params)
-            return cur.fetchall() if cur.description else []
+        return self.tdb.run(sql, params)
 
     def _chunk(self, status, index=0):
         """Create (or replace) a chunk directly in ``status``."""
         self._q("DELETE FROM remote_chunks WHERE session_id=%s "
                 "AND chunk_index=%s", (self.session_id, index))
-        self._q(
-            """INSERT INTO remote_chunks (session_id,chunk_index,status,
-                   updated_at) VALUES (%s,%s,%s,now())""",
-            (self.session_id, index, status))
+        self.tdb.insert_remote_chunk(self.session_id, index, status)
 
     def _status(self, index=0):
         return self._q(
@@ -129,7 +102,7 @@ class _ChunkFixture:
             (self.session_id,))
 
 
-@unittest.skipUnless(_pg_available(), SKIP_REASON)
+@each_backend
 class ValidatedSetterTests(_ChunkFixture, unittest.TestCase):
     """The pipeline's setter is no longer a way round the matrix."""
 
@@ -216,7 +189,7 @@ class ValidatedSetterTests(_ChunkFixture, unittest.TestCase):
         self.assertEqual(self._status(), "done")
 
 
-@unittest.skipUnless(_pg_available(), SKIP_REASON)
+@each_backend
 class DatabaseGuardTests(_ChunkFixture, unittest.TestCase):
     """Migration 020: even a raw UPDATE cannot break the rule."""
 
@@ -226,7 +199,7 @@ class DatabaseGuardTests(_ChunkFixture, unittest.TestCase):
                 continue
             with self.subTest(target=target):
                 self._chunk("backing")
-                with self.assertRaises(pg_errors.CheckViolation):
+                with self.assertRaises(self.guard_error):
                     self._raw_update(target)
                 self.assertEqual(self._status(), "backing")
 
@@ -236,14 +209,14 @@ class DatabaseGuardTests(_ChunkFixture, unittest.TestCase):
                 continue
             with self.subTest(target=target):
                 self._chunk("done")
-                with self.assertRaises(pg_errors.CheckViolation):
+                with self.assertRaises(self.guard_error):
                     self._raw_update(target)
                 self.assertEqual(self._status(), "done")
 
     def test_a_set_based_update_is_refused_as_a_whole(self):
         self._chunk("pending", 0)
         self._chunk("done", 1)
-        with self.assertRaises(pg_errors.CheckViolation):
+        with self.assertRaises(self.guard_error):
             self._q("UPDATE remote_chunks SET status='pending' "
                     "WHERE session_id=%s", (self.session_id,))
         self.assertEqual(self._status(1), "done")
@@ -264,6 +237,8 @@ class DatabaseGuardTests(_ChunkFixture, unittest.TestCase):
                 "updated_at=now() WHERE session_id=%s", (self.session_id,))
         self.assertEqual(self._status(), "done")
 
+    @postgresql_only("re-applies the PostgreSQL startup migration files "
+                     "and reads xmin / pg_trigger")
     def test_the_migration_is_idempotent_and_rewrites_nothing(self):
         self._chunk("backing", 0)
         self._chunk("done", 1)
@@ -279,11 +254,26 @@ class DatabaseGuardTests(_ChunkFixture, unittest.TestCase):
                WHERE tgrelid='remote_chunks'::regclass
                  AND tgname='trg_remote_chunks_status_transition'""")
         self.assertEqual(len(triggers), 1)
-        with self.assertRaises(pg_errors.CheckViolation):
+        with self.assertRaises(self.guard_error):
             self._raw_update("pending", 1)
 
 
-@unittest.skipUnless(_pg_available(), SKIP_REASON)
+    def test_reopening_the_catalog_keeps_the_guard_and_the_rows(self):
+        """Backend-neutral twin of the idempotency test: opening the same
+        database again installs nothing twice and the guard still holds."""
+        self._chunk("backing", 0)
+        self._chunk("done", 1)
+        before = self._q("SELECT chunk_index, status, updated_at "
+                         "FROM remote_chunks ORDER BY chunk_index")
+        self.tdb.manager(migrations="startup").close()
+        after = self._q("SELECT chunk_index, status, updated_at "
+                        "FROM remote_chunks ORDER BY chunk_index")
+        self.assertEqual(before, after)
+        with self.assertRaises(self.guard_error):
+            self._raw_update("pending", 1)
+
+
+@each_backend
 class NamedOverrideTests(_ChunkFixture, unittest.TestCase):
     """The only way backwards is explicit, named, audited and single-use."""
 
@@ -315,7 +305,7 @@ class NamedOverrideTests(_ChunkFixture, unittest.TestCase):
         self._raw_update("packing")
         self._raw_update("backing")
         self._raw_update("done")
-        with self.assertRaises(pg_errors.CheckViolation):
+        with self.assertRaises(self.guard_error):
             self._raw_update("pending")
         self.assertEqual(self._status(), "done")
 
@@ -328,9 +318,9 @@ class NamedOverrideTests(_ChunkFixture, unittest.TestCase):
                     override_name,reason,authorized_by)
                VALUES (%s,0,'done','pending','operator_reconciled','r','me')""",
             (self.session_id,))
-        with self.assertRaises(pg_errors.CheckViolation):
+        with self.assertRaises(self.guard_error):
             self._raw_update("pending", 1)
-        with self.assertRaises(pg_errors.CheckViolation):
+        with self.assertRaises(self.guard_error):
             self._raw_update("fetch_failed", 0)
         self._raw_update("pending", 0)
         self.assertEqual((self._status(0), self._status(1)),
@@ -372,7 +362,7 @@ class NamedOverrideTests(_ChunkFixture, unittest.TestCase):
         self.assertEqual(self._status(), "done")
 
 
-@unittest.skipUnless(_pg_available(), SKIP_REASON)
+@each_backend
 class TapeResetUsesTheNamedOverrideTests(_ChunkFixture, unittest.TestCase):
     """The reset is the one recovery that legitimately un-does 'done'."""
 

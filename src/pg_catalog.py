@@ -12,7 +12,7 @@ from .catalog_query import contains_pattern, prefix_pattern, substring_pattern
 from .catalog_v3 import catalog_directory_chain, catalog_file_name
 from .constants import DB_UPSERT_BATCH_SIZE, LEGACY_DEFAULT_SOURCE_HOST
 from .db import _derived_file_name, _file_record_key, _short_source_host
-from .pg_bulk import copy_rows
+from .db_backend import as_day, day_bounds
 from .pg_core import _as_utc, _now_utc, _rows
 from .pipeline_types import FileRecord
 from .runtime import CANCEL
@@ -189,15 +189,14 @@ class PgCatalogMixin:
                   LEFT JOIN tape_generations AS tg
                     ON tg.generation_id = COALESCE(
                         c.tape_generation_id, r.tape_generation_id)
-                  LEFT JOIN LATERAL (
-                    SELECT a.artifact_id, a.artifact_version,
-                           a.local_locator, a.tape_locator
-                    FROM archive_artifacts a
-                    WHERE a.container_id=c.container_id
-                      AND a.artifact_kind='tar_sidecar'
-                      AND a.readiness_state='ready'
-                    ORDER BY a.artifact_id DESC LIMIT 1
-                  ) sidecar ON TRUE"""
+                  LEFT JOIN archive_artifacts AS sidecar
+                    ON sidecar.artifact_id = (
+                        SELECT a.artifact_id
+                        FROM archive_artifacts a
+                        WHERE a.container_id=c.container_id
+                          AND a.artifact_kind='tar_sidecar'
+                          AND a.readiness_state='ready'
+                        ORDER BY a.artifact_id DESC LIMIT 1)"""
 
     def _container_restore_schema_available(self, conn):
         return all(self._table_exists_conn(conn, name) for name in (
@@ -520,31 +519,22 @@ class PgCatalogMixin:
             f"{column}=EXCLUDED.{column}"
             for column in columns if column != "record_key"
         )
-        conn.execute(
-            "CREATE TEMP TABLE _stage ON COMMIT DROP AS "
-            f"SELECT {col_sql} FROM files_index WITH NO DATA"
-        )
-        with conn.cursor() as cur:
-            copy_rows(cur, "_stage", columns, (
-                [row[column] for column in columns]
-                for row in normalized_by_key.values()
-            ))
+        self._create_stage_table_conn(conn, "_stage", "files_index", col_sql)
+        self._copy_rows_conn(conn, "_stage", columns, (
+            [row[column] for column in columns]
+            for row in normalized_by_key.values()
+        ))
         conflict = (
             f"DO UPDATE SET {update_sql}" if update_existing else "DO NOTHING")
-        # RETURNING (xmax = 0) distinguishes freshly inserted rows (xmax 0) from
-        # updated ones without a second membership scan. With DO NOTHING, only
-        # inserted rows are returned, so anything not returned was a skip.
-        affected = conn.execute(
-            f"""INSERT INTO files_index ({col_sql})
-                SELECT {col_sql} FROM _stage
-                ON CONFLICT (record_key) {conflict}
-                RETURNING (xmax = 0) AS inserted"""
-        ).fetchall()
-        inserted = sum(1 for row in affected if row["inserted"])
+        # The backend hook reports how many rows were freshly inserted and how
+        # many rows the statement touched at all. With DO NOTHING only inserted
+        # rows are touched, so anything not touched was a skip.
+        inserted, affected = self._upsert_from_stage_counts_conn(
+            conn, "files_index", "_stage", col_sql, "record_key", conflict)
         if update_existing:
             return {
                 "inserted": inserted,
-                "updated": len(affected) - inserted,
+                "updated": affected - inserted,
                 "skipped": 0,
             }
         return {
@@ -755,16 +745,13 @@ class PgCatalogMixin:
                     "container_id", "container_format",
                     "tape_generation_id", "actual_artifact_bytes",
                 )
-            conn.execute(
-                "CREATE TEMP TABLE _dir_bundles ON COMMIT DROP AS "
-                "SELECT " + ", ".join(bundle_columns) +
-                " FROM directory_archive_bundles WITH NO DATA"
-            )
-            with conn.cursor() as cur:
-                copy_rows(cur, "_dir_bundles", bundle_columns, (
-                    [row[column] for column in bundle_columns]
-                    for row in bundle_rows
-                ))
+            self._create_stage_table_conn(
+                conn, "_dir_bundles", "directory_archive_bundles",
+                ", ".join(bundle_columns))
+            self._copy_rows_conn(conn, "_dir_bundles", bundle_columns, (
+                [row[column] for column in bundle_columns]
+                for row in bundle_rows
+            ))
             update_sql = ", ".join(
                 f"{column}=EXCLUDED.{column}"
                 for column in bundle_columns if column != "record_key")
@@ -775,6 +762,9 @@ class PgCatalogMixin:
                 "INSERT INTO directory_archive_bundles ("
                 + ", ".join(bundle_columns) + ") "
                 "SELECT " + ", ".join(bundle_columns) + " FROM _dir_bundles "
+                # WHERE true: SQLite cannot tell "FROM t ON CONFLICT" from a
+                # join constraint; the no-op filter is valid on both engines.
+                "WHERE true "
                 f"ON CONFLICT (record_key) {conflict}"
             )
             db_bundle_ids = {
@@ -782,8 +772,8 @@ class PgCatalogMixin:
                 for row in conn.execute(
                     """SELECT bundle_id, record_key
                        FROM directory_archive_bundles
-                       WHERE record_key = ANY(%s)""",
-                    ([row["record_key"] for row in bundle_rows],),
+                       WHERE record_key IN (
+                           SELECT record_key FROM _dir_bundles)"""
                 ).fetchall()
             }
 
@@ -863,13 +853,10 @@ class PgCatalogMixin:
                 "large_file_bytes", "packed_bundle_count", "backup_date",
                 "record_key",
             )
-            conn.execute(
-                "CREATE TEMP TABLE _dir_stats ON COMMIT DROP AS "
-                "SELECT " + ", ".join(stats_columns) +
-                " FROM directory_archive_stats WITH NO DATA"
-            )
-            with conn.cursor() as cur:
-                copy_rows(cur, "_dir_stats", stats_columns, stats_rows)
+            self._create_stage_table_conn(
+                conn, "_dir_stats", "directory_archive_stats",
+                ", ".join(stats_columns))
+            self._copy_rows_conn(conn, "_dir_stats", stats_columns, stats_rows)
             stats_update = ", ".join(
                 f"{column}=EXCLUDED.{column}"
                 for column in stats_columns if column != "record_key")
@@ -877,6 +864,7 @@ class PgCatalogMixin:
                 "INSERT INTO directory_archive_stats ("
                 + ", ".join(stats_columns) + ") "
                 "SELECT " + ", ".join(stats_columns) + " FROM _dir_stats "
+                "WHERE true "
                 "ON CONFLICT (record_key) DO UPDATE SET " + stats_update
             )
 
@@ -893,13 +881,10 @@ class PgCatalogMixin:
                 "recursive_large_file_count", "recursive_large_file_bytes",
                 "backup_date", "record_key",
             )
-            conn.execute(
-                "CREATE TEMP TABLE _dir_tree ON COMMIT DROP AS "
-                "SELECT " + ", ".join(tree_columns) +
-                " FROM directory_tree_index WITH NO DATA"
-            )
-            with conn.cursor() as cur:
-                copy_rows(cur, "_dir_tree", tree_columns, tree_rows)
+            self._create_stage_table_conn(
+                conn, "_dir_tree", "directory_tree_index",
+                ", ".join(tree_columns))
+            self._copy_rows_conn(conn, "_dir_tree", tree_columns, tree_rows)
             tree_update = ", ".join(
                 f"{column}=EXCLUDED.{column}"
                 for column in tree_columns if column != "record_key")
@@ -907,6 +892,7 @@ class PgCatalogMixin:
                 "INSERT INTO directory_tree_index ("
                 + ", ".join(tree_columns) + ") "
                 "SELECT " + ", ".join(tree_columns) + " FROM _dir_tree "
+                "WHERE true "
                 "ON CONFLICT (record_key) DO UPDATE SET " + tree_update
             )
             return {
@@ -954,11 +940,11 @@ class PgCatalogMixin:
                          "OR f.original_path ILIKE %s ESCAPE '\\')")
             params.extend([pattern, pattern])
         if date_from:
-            where.append("f.catalog_backup_date >= %s::date")
-            params.append(date_from)
+            where.append("f.catalog_backup_date >= %s")
+            params.append(as_day(date_from))
         if date_to:
-            where.append("f.catalog_backup_date < (%s::date + INTERVAL '1 day')")
-            params.append(date_to)
+            where.append("f.catalog_backup_date < %s")
+            params.append(day_bounds(date_to)[1])
         if tape_label:
             where.append("f.tape_label = %s")
             params.append(tape_label)
@@ -1059,7 +1045,7 @@ class PgCatalogMixin:
 
     def list_backup_sessions(self):
         with self._pool.connection() as conn:
-            return _rows(conn.execute("""
+            rows = _rows(conn.execute("""
                 SELECT DATE(f.catalog_backup_date) AS session_date,
                        f.tape_label, COUNT(*) AS file_count,
                        SUM(f.file_size_bytes) AS total_bytes
@@ -1067,13 +1053,18 @@ class PgCatalogMixin:
                 GROUP BY DATE(f.catalog_backup_date), f.tape_label
                 ORDER BY session_date DESC
             """).fetchall())
+        # DATE(...) is an expression: normalise to a ``datetime.date`` (what
+        # PostgreSQL already returns) so callers see one type everywhere.
+        for row in rows:
+            row["session_date"] = as_day(row["session_date"])
+        return rows
 
     def search_by_session(self, session_date, tape_label, limit=None,
                           offset=None, after_id=None):
-        where = """f.catalog_backup_date >= %s::date
-                   AND f.catalog_backup_date < (%s::date + INTERVAL '1 day')
+        where = """f.catalog_backup_date >= %s
+                   AND f.catalog_backup_date < %s
                    AND f.tape_label = %s"""
-        params = [session_date, session_date, tape_label]
+        params = [*day_bounds(session_date), tape_label]
         if after_id is not None:
             where += " AND f.file_id > %s"
             params.append(int(after_id))
@@ -1101,10 +1092,10 @@ class PgCatalogMixin:
             return conn.execute(
                 """SELECT COUNT(*) AS n
                    FROM files_index f
-                   WHERE f.catalog_backup_date >= %s::date
-                     AND f.catalog_backup_date < (%s::date + INTERVAL '1 day')
+                   WHERE f.catalog_backup_date >= %s
+                     AND f.catalog_backup_date < %s
                      AND f.tape_label = %s""",
-                (session_date, session_date, tape_label),
+                (*day_bounds(session_date), tape_label),
             ).fetchone()["n"]
 
     def list_source_hosts(self):
@@ -1221,15 +1212,13 @@ class PgCatalogMixin:
                 "LEFT JOIN archive_containers c ON c.container_id=d.container_id "
                 "LEFT JOIN tape_generations tg ON tg.generation_id="
                 "COALESCE(c.tape_generation_id,d.tape_generation_id) "
-                "LEFT JOIN LATERAL ("
-                "  SELECT aa.artifact_id, aa.artifact_version, "
-                "         aa.local_locator, aa.tape_locator "
+                "LEFT JOIN archive_artifacts a ON a.artifact_id=("
+                "  SELECT aa.artifact_id "
                 "  FROM archive_artifacts aa "
                 "  WHERE aa.container_id=c.container_id "
                 "    AND aa.artifact_kind='tar_sidecar' "
                 "    AND aa.readiness_state='ready' "
-                "  ORDER BY aa.artifact_id DESC LIMIT 1"
-                ") a ON TRUE "
+                "  ORDER BY aa.artifact_id DESC LIMIT 1) "
                 "WHERE " + " AND ".join(where) +
                 " AND t.stored_bundle_path IS NOT NULL",
                 params,

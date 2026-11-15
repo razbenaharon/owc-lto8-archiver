@@ -161,16 +161,7 @@ class PgTapeMixin:
         """
         def operation(conn):
             if require_archiver_lock:
-                owned = conn.execute(
-                    """SELECT EXISTS (
-                           SELECT 1 FROM pg_locks
-                           WHERE locktype='advisory' AND granted
-                             AND pid=pg_backend_pid()
-                             AND classid=%s AND objid=%s AND objsubid=1
-                       ) AS owned""",
-                    (self.ARCHIVER_LOCK_KEY >> 32,
-                     self.ARCHIVER_LOCK_KEY & 0xFFFFFFFF),
-                ).fetchone()["owned"]
+                owned = self._owns_archiver_lock_conn(conn)
                 if not owned:
                     raise RuntimeError(
                         "[DB] Refusing to re-point a session generation "
@@ -443,31 +434,16 @@ class PgTapeMixin:
         return (int(row["used"] or 0) + manifest_bytes
                 + container_bytes + artifact_bytes)
 
-    @staticmethod
-    def _tape_reference_columns_conn(conn):
+    def _tape_reference_columns_conn(self, conn):
         """Every single-column foreign key that points at ``tapes``.
 
         Returns ``(child_table, child_column, parent_column)`` with the two
-        child identifiers already safely quoted by PostgreSQL. Discovering
-        them from the catalog (instead of a hand-kept list) is what keeps
+        child identifiers already safely quoted. Discovering them from the
+        database catalog (instead of a hand-kept list) is what keeps
         rename/delete correct when a later migration adds another table that
-        references a tape. PostgreSQL-only (``pg_constraint``); this is the
-        one place rename/delete depend on it.
+        references a tape.
         """
-        return [
-            (row["child_table"], row["child_column"], row["parent_column"])
-            for row in conn.execute(
-                """SELECT c.conrelid::regclass::text AS child_table,
-                          quote_ident(a.attname) AS child_column,
-                          fa.attname AS parent_column
-                   FROM pg_constraint c
-                   JOIN pg_attribute a
-                     ON a.attrelid=c.conrelid AND a.attnum=c.conkey[1]
-                   JOIN pg_attribute fa
-                     ON fa.attrelid=c.confrelid AND fa.attnum=c.confkey[1]
-                   WHERE c.contype='f' AND c.confrelid='tapes'::regclass
-                     AND array_length(c.conkey, 1)=1
-                   ORDER BY 1, 2""").fetchall()]
+        return self._single_column_references_conn(conn, "tapes")
 
     def delete_tape(self, volume_label):
         """Delete a tape that no session or audit history depends on.

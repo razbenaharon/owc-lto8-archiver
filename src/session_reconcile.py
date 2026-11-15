@@ -49,12 +49,7 @@ from .directory_catalog_validation import archiver_lock_status
 from .local_manifest_archive import active_archive_processes
 from .pipeline_types import ChunkStatus
 
-try:  # keep import-light; the caller already proved psycopg is available
-    import psycopg
-    from psycopg.rows import dict_row
-except ImportError:  # pragma: no cover - mirrors the sibling modules
-    psycopg = None
-    dict_row = None
+from . import db_backend
 
 
 #: Statuses ``remote_sessions_status_check`` permits.
@@ -221,12 +216,10 @@ def classify_session37_format_boundary_category(evidence):
         blocker=f"unrecognized or contradictory status {status!r}")
 
 
-def _connect(conninfo, *, autocommit=False):
-    if psycopg is None:  # pragma: no cover - environment guard
-        raise OperationalError(
-            "[RECONCILE] psycopg is required to inspect session state.")
-    return cast(Any, psycopg).connect(
-        conninfo, autocommit=autocommit, row_factory=cast(Any, dict_row))
+def _connect(conninfo, *, autocommit=False, read_only=False):
+    """One dict-row connection on either backend."""
+    return db_backend.connect(
+        conninfo, autocommit=autocommit, read_only=read_only)
 
 
 def _now(now=None):
@@ -289,8 +282,12 @@ def _classify(session, chunk_states, idle_seconds, now):
     not decide unattended is left to a human.
     """
     by_state = {row["status"]: int(row["chunks"]) for row in chunk_states}
-    updates = [row["last_update"] for row in chunk_states if row["last_update"]]
-    last_activity = max(updates) if updates else session["created_at"]
+    # MAX(updated_at) is an expression: SQLite returns it as text, so it is
+    # normalised here (a no-op for the datetime PostgreSQL returns).
+    updates = [db_backend.as_timestamp(row["last_update"])
+               for row in chunk_states if row["last_update"]]
+    last_activity = (max(updates) if updates
+                     else db_backend.as_timestamp(session["created_at"]))
     idle = (now - last_activity).total_seconds() if last_activity else None
 
     transient = {s: by_state[s] for s in TRANSIENT_CHUNK_STATES if s in by_state}
@@ -364,8 +361,7 @@ def session_forensics(conninfo, *, idle_seconds=DEFAULT_IDLE_SECONDS,
     """Read-only evidence + verdict for every ``active`` remote session."""
     now = _now(now)
     live = liveness_evidence(conninfo, log_dir)
-    with _connect(conninfo) as conn:
-        conn.execute("SET default_transaction_read_only = on")
+    with _connect(conninfo, read_only=True) as conn:
         sessions = [dict(row) for row in conn.execute(
             """SELECT session_id, session_label, remote_host, tape_label,
                       status, scan_complete, scan_error, total_files,

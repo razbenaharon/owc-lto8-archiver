@@ -5,7 +5,7 @@ import os
 from .cli_errors import OperationalError
 from .logsetup import get_logger
 from .pipeline_types import ChunkStatus
-from .pg_bulk import copy_rows
+from .db_backend import as_timestamp, lease_deadline
 from .pg_core import (_coerce_timestamp_kwargs, _now_utc, _row, _rows,
                       _valid_columns)
 
@@ -63,18 +63,10 @@ class PgSessionMixin:
             # Upsert on the timestamped label so a connection-loss retry whose
             # first COMMIT actually landed converges on the committed session
             # instead of creating a duplicate (with a duplicate manifest).
-            row = conn.execute(
-                """INSERT INTO local_sessions
-                   (session_label, source_dir, total_chunks, backup_mode,
-                    created_at, status)
-                   VALUES (%s, %s, %s, %s, %s, 'active')
-                   ON CONFLICT (session_label) DO UPDATE
-                       SET session_label = EXCLUDED.session_label
-                   RETURNING session_id, (xmax = 0) AS inserted""",
-                (session_label, source_dir, len(chunks), backup_mode, now),
-            ).fetchone()
-            session_id = row["session_id"]
-            if not row["inserted"]:
+            session_id, inserted = self._insert_local_session_conn(
+                conn, session_label, source_dir, len(chunks), backup_mode,
+                now)
+            if not inserted:
                 # Session + manifest were committed atomically by the earlier
                 # attempt; re-inserting the manifest would duplicate it.
                 return session_id
@@ -681,16 +673,7 @@ class PgSessionMixin:
 
         def operation(conn):
             if require_archiver_lock:
-                owned = conn.execute(
-                    """SELECT EXISTS (
-                           SELECT 1 FROM pg_locks
-                           WHERE locktype='advisory' AND granted
-                             AND pid=pg_backend_pid()
-                             AND classid=%s AND objid=%s AND objsubid=1
-                       ) AS owned""",
-                    (self.ARCHIVER_LOCK_KEY >> 32,
-                     self.ARCHIVER_LOCK_KEY & 0xFFFFFFFF),
-                ).fetchone()["owned"]
+                owned = self._owns_archiver_lock_conn(conn)
                 if not owned:
                     raise RuntimeError(
                         "[DB] Refusing a membership backfill without the "
@@ -830,13 +813,12 @@ class PgSessionMixin:
         if not existing:
             # COPY, not executemany: multi-million-file snapshots insert in
             # one stream instead of a pipelined statement per row.
-            with conn.cursor() as cur:
-                copy_rows(
-                    cur, "remote_snapshot_files",
-                    ("snapshot_id", "remote_path", "file_size_bytes"),
-                    ((snapshot_id, path, size)
-                     for path, size in by_path.items()),
-                )
+            self._copy_rows_conn(
+                conn, "remote_snapshot_files",
+                ("snapshot_id", "remote_path", "file_size_bytes"),
+                ((snapshot_id, path, size)
+                 for path, size in by_path.items()),
+            )
         conn.execute(
             """INSERT INTO remote_plans
                (snapshot_id, fingerprint, chunk_count, created_at)
@@ -862,14 +844,13 @@ class PgSessionMixin:
                     (snapshot_id,),
                 ).fetchall()
             }
-            with conn.cursor() as cur:
-                copy_rows(
-                    cur, "remote_plan_files",
-                    ("plan_id", "snapshot_file_id", "chunk_index", "ordinal"),
-                    ((plan_id, ids[_canonical_remote_path(row[1])],
-                      int(row[0]), ordinal)
-                     for ordinal, row in enumerate(rows)),
-                )
+            self._copy_rows_conn(
+                conn, "remote_plan_files",
+                ("plan_id", "snapshot_file_id", "chunk_index", "ordinal"),
+                ((plan_id, ids[_canonical_remote_path(row[1])],
+                  int(row[0]), ordinal)
+                 for ordinal, row in enumerate(rows)),
+            )
         conn.execute(
             "UPDATE remote_sessions SET plan_id=%s WHERE session_id=%s",
             (plan_id, session_id),
@@ -1088,10 +1069,12 @@ class PgSessionMixin:
             report["artifact"] = self._export_fetch_state(
                 archive_root, session_id, wanted, rows)
             report["deleted"] = conn.execute(
-                """DELETE FROM remote_file_state s
-                   USING remote_plan_files pf
-                   WHERE s.plan_file_id=pf.plan_file_id
-                     AND s.session_id=%s AND pf.chunk_index = ANY(%s)""",
+                """DELETE FROM remote_file_state
+                   WHERE session_id=%s
+                     AND EXISTS (
+                         SELECT 1 FROM remote_plan_files pf
+                         WHERE pf.plan_file_id=remote_file_state.plan_file_id
+                           AND pf.chunk_index = ANY(%s))""",
                 (session_id, wanted)).rowcount
             return report
 
@@ -1879,13 +1862,13 @@ class PgSessionMixin:
             cur = conn.execute(
                 """UPDATE remote_chunks
                    SET status='fetching', owner_token=%s, attempt_id=%s,
-                       lease_expires_at=%s + make_interval(secs => %s),
+                       lease_expires_at=%s,
                        updated_at=%s
                    WHERE session_id=%s AND chunk_index=%s
                      AND status IN ('pending','fetch_failed','backup_failed')
                      AND (owner_token IS NULL OR lease_expires_at < %s)""",
-                (owner_token, attempt_id, now, float(lease_seconds), now,
-                 session_id, int(chunk_index), now),
+                (owner_token, attempt_id, lease_deadline(now, lease_seconds),
+                 now, session_id, int(chunk_index), now),
             )
             return cur.rowcount == 1
 
@@ -1900,12 +1883,12 @@ class PgSessionMixin:
         def operation(conn):
             cur = conn.execute(
                 """UPDATE remote_chunks
-                   SET lease_expires_at=%s + make_interval(secs => %s),
+                   SET lease_expires_at=%s,
                        updated_at=%s
                    WHERE session_id=%s AND chunk_index=%s AND owner_token=%s
                      AND status <> 'backing'""",
-                (now, float(lease_seconds), now, session_id, int(chunk_index),
-                 owner_token),
+                (lease_deadline(now, lease_seconds), now, session_id,
+                 int(chunk_index), owner_token),
             )
             return cur.rowcount == 1
 
@@ -2250,7 +2233,19 @@ class PgSessionMixin:
         if it were the footprint once produced a wrong conclusion that a
         session's completed work had been destroyed.
         """
-        return self._run_read(
+        def typed(rows):
+            # min()/max() of a timestamp is an expression: an engine without
+            # typed expression results returns text. Normalise (a no-op for
+            # the datetimes PostgreSQL returns).
+            out = []
+            for row in rows:
+                row = dict(row)
+                row["first_run"] = as_timestamp(row["first_run"])
+                row["last_run"] = as_timestamp(row["last_run"])
+                out.append(row)
+            return _rows(out)
+
+        return typed(self._run_read(
             lambda conn: conn.execute(
                 """SELECT r.tape_label,
                           count(DISTINCT r.run_id)      AS runs,
@@ -2265,7 +2260,7 @@ class PgSessionMixin:
                    ORDER BY r.tape_label""",
                 (session_id,),
             ).fetchall(),
-            f"tape footprint for session {session_id}")
+            f"tape footprint for session {session_id}"))
 
     def find_sessions_sharing_plan(self, session_id):
         """Other sessions on the SAME plan or snapshot. Read-only.
@@ -2441,31 +2436,39 @@ class PgSessionMixin:
 
         def operation(conn):
             plan_files = conn.execute("""
-                DELETE FROM remote_plan_files pf
-                USING remote_plans p
-                WHERE p.plan_id=pf.plan_id
-                  AND NOT EXISTS (
-                    SELECT 1 FROM remote_sessions s WHERE s.plan_id=p.plan_id
+                DELETE FROM remote_plan_files
+                WHERE EXISTS (
+                    SELECT 1 FROM remote_plans p
+                    WHERE p.plan_id=remote_plan_files.plan_id
+                      AND NOT EXISTS (
+                        SELECT 1 FROM remote_sessions s
+                        WHERE s.plan_id=p.plan_id
+                      )
                   )
             """)
             plans = conn.execute("""
-                DELETE FROM remote_plans p
+                DELETE FROM remote_plans
                 WHERE NOT EXISTS (
-                    SELECT 1 FROM remote_sessions s WHERE s.plan_id=p.plan_id
+                    SELECT 1 FROM remote_sessions s
+                    WHERE s.plan_id=remote_plans.plan_id
                 )
             """)
             snapshot_files = conn.execute("""
-                DELETE FROM remote_snapshot_files sf
-                USING remote_snapshots sn
-                WHERE sn.snapshot_id=sf.snapshot_id
-                  AND NOT EXISTS (
-                    SELECT 1 FROM remote_plans p WHERE p.snapshot_id=sn.snapshot_id
+                DELETE FROM remote_snapshot_files
+                WHERE EXISTS (
+                    SELECT 1 FROM remote_snapshots sn
+                    WHERE sn.snapshot_id=remote_snapshot_files.snapshot_id
+                      AND NOT EXISTS (
+                        SELECT 1 FROM remote_plans p
+                        WHERE p.snapshot_id=sn.snapshot_id
+                      )
                   )
             """)
             snapshots = conn.execute("""
-                DELETE FROM remote_snapshots sn
+                DELETE FROM remote_snapshots
                 WHERE NOT EXISTS (
-                    SELECT 1 FROM remote_plans p WHERE p.snapshot_id=sn.snapshot_id
+                    SELECT 1 FROM remote_plans p
+                    WHERE p.snapshot_id=remote_snapshots.snapshot_id
                 )
             """)
             return {
@@ -2491,7 +2494,7 @@ class PgSessionMixin:
                 previous = conn.autocommit
                 conn.autocommit = True
                 try:
-                    conn.execute("VACUUM (ANALYZE)")
+                    self._vacuum_analyze_conn(conn)
                 finally:
                     conn.autocommit = previous
         return result

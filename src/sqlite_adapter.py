@@ -677,6 +677,7 @@ class SqliteConnection:
         self.strict_read_then_write = bool(strict_read_then_write)
         self.busy_timeout_ms = int(busy_timeout_ms)
         self.settings = {}
+        self._txn_settings_dirty = False
         self._autocommit = bool(autocommit)
         self._tx_depth = 0
         self._savepoint_seq = 0
@@ -789,6 +790,41 @@ class SqliteConnection:
         counterpart).  Cleared when the transaction ends."""
         self.settings[str(name)] = None if value is None else str(value)
 
+    #: Table that mirrors transaction-scoped settings for schema triggers.
+    #: A trigger cannot call ``lto_setting()`` (an application function is
+    #: "unsafe" in a trigger under ``trusted_schema=OFF``), so guards read
+    #: this table instead.
+    TXN_SETTINGS_TABLE = "lto_txn_settings"
+
+    def set_txn_setting(self, name, value):
+        """Like :meth:`set_setting`, and also visible to schema triggers.
+
+        The row lives in ``lto_txn_settings`` only inside the current write
+        transaction: it is deleted in the same transaction just before COMMIT
+        and vanishes with a ROLLBACK, so it is never durable and never seen by
+        another connection.  Requires an open transaction.
+        """
+        self._check_open()
+        if self.read_only:
+            raise ReadOnlyError(
+                "[SQLITE] set_txn_setting() on a read-only connection")
+        if not self._raw.in_transaction:
+            raise ProgrammingError(
+                "[SQLITE] set_txn_setting() needs an open transaction; the "
+                "setting is transaction-scoped")
+        if not self._has_write_lock:
+            self._upgrade_to_write()
+        self.set_setting(name, value)
+        try:
+            self._raw.execute(
+                f"INSERT OR REPLACE INTO {self.TXN_SETTINGS_TABLE} "
+                "(name, value) VALUES (?, ?)",
+                (str(name), None if value is None else str(value)))
+        except sqlite3.Error as exc:
+            self._after_statement_error()
+            raise map_error(exc) from exc
+        self._txn_settings_dirty = True
+
     def _check_open(self):
         if self._closed:
             raise InterfaceError("[SQLITE] The connection is closed")
@@ -841,6 +877,7 @@ class SqliteConnection:
         except BaseException:
             if not self._raw.in_transaction:
                 self.settings.clear()
+                self._txn_settings_dirty = False
             self._release_write_lock()
             raise
 
@@ -849,6 +886,10 @@ class SqliteConnection:
         try:
             if self._raw.in_transaction:
                 try:
+                    if commit and self._txn_settings_dirty:
+                        # Transaction-scoped settings must never be durable.
+                        self._raw.execute(
+                            f"DELETE FROM {self.TXN_SETTINGS_TABLE}")
                     self._raw.execute("COMMIT" if commit else "ROLLBACK")
                 except sqlite3.Error as exc:
                     if self._raw.in_transaction:
@@ -860,6 +901,7 @@ class SqliteConnection:
         finally:
             self._tx_depth = 0
             self.settings.clear()
+            self._txn_settings_dirty = False
             self._release_write_lock()
 
     def _after_statement_error(self):
@@ -869,6 +911,7 @@ class SqliteConnection:
                 self._has_write_lock or self._tx_depth):
             self._tx_depth = 0
             self.settings.clear()
+            self._txn_settings_dirty = False
             self._release_write_lock()
 
     def commit(self):
@@ -1063,6 +1106,7 @@ class SqliteConnection:
         finally:
             self._tx_depth = 0
             self.settings.clear()
+            self._txn_settings_dirty = False
             self._release_write_lock()
             self._closed = True
             try:

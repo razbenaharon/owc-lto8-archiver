@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover
     zstd = None
 
 from .archive_artifacts import ArtifactConflict, publish_no_clobber
+from . import db_backend
 from .cli_errors import OperationalError
 from .pg_bulk import copy_rows, require_psycopg
 from .pg_core import PgConnectionCore
@@ -114,6 +115,10 @@ def active_archive_processes():
 
 
 def _connect(conninfo, *, autocommit=False):
+    # Export / validate / prune maintenance is PostgreSQL-only in v1.0. The
+    # file-based search used by restore (search_manifests,
+    # find_manifest_record) needs no database and works on every backend.
+    db_backend.require_postgresql(conninfo, "small_file_manifest_maintenance")
     require_psycopg()
     return cast(Any, psycopg.connect(
         conninfo, autocommit=autocommit,
@@ -632,6 +637,8 @@ def _build_catalog_aggregates(conn, export_id):
 def execute_export(conninfo, archive_root, hot_backup_path, *,
                    threshold_bytes=SMALL_FILE_THRESHOLD_BYTES):
     """Snapshot eligible rows and write immutable local manifest segments."""
+    # Refuse a SQLite catalog before validating (or creating) anything.
+    db_backend.require_postgresql(conninfo, "small_file_manifest_maintenance")
     if not hot_backup_path or not os.path.isfile(hot_backup_path):
         raise OperationalError("[MANIFEST] A verified hot backup path is required.")
     root = os.path.abspath(archive_root)
@@ -1214,9 +1221,14 @@ def export_status(conninfo):
 
 
 def pruned_manifest_paths(conninfo):
-    """Absolute segment paths whose PostgreSQL export reached pruned."""
-    with _connect(conninfo, autocommit=True) as conn:
-        if not _table_exists(conn, "local_manifest_exports"):
+    """Absolute segment paths whose export reached pruned.
+
+    Read-only and backend-neutral: a SQLite catalog has the tables but never
+    an export, so this is simply empty there.
+    """
+    with db_backend.connect(conninfo, autocommit=True,
+                            read_only=True) as conn:
+        if not db_backend.table_exists(conn, "local_manifest_exports"):
             return []
         rows = conn.execute(
             """SELECT e.archive_root, s.manifest_relpath

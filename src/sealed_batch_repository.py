@@ -228,6 +228,9 @@ class SealedBatchRepository:
     """PostgreSQL repository for sealed tape-write batches."""
 
     def __init__(self, conninfo):
+        # Sealed batches are PostgreSQL-only in v1.0: refuse before any work.
+        from . import db_backend
+        db_backend.require_postgresql(conninfo, "sealed_batches")
         self.conninfo = conninfo
 
     # -- connection / transaction helpers --------------------------------

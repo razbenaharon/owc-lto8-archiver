@@ -13,6 +13,9 @@ from .constants import (BACKUP_LOG_DIR, CONFIG_FILE, LOCAL_STAGING_RESERVE_BYTES
                         PROJECT_ROOT)
 from .paths import _clean_config_path, _clean_remote_path, _config_list
 
+#: Default SQLite catalog file, relative to the project root (gitignored).
+DEFAULT_SQLITE_FILENAME = 'lto_archive.sqlite3'
+
 
 class ConfigError(OperationalError):
     """config.ini holds a value the archiver refuses to guess at.
@@ -96,6 +99,8 @@ CONFIG_SCHEMA = {
         'backup_log_dir': _str(),
     },
     'DATABASE': {
+        'backend': _choice('sqlite', 'postgresql'),
+        'sqlite_path': _str(),
         'host': _str(),
         'port': _int(1, 65535),
         'dbname': _str(),
@@ -478,12 +483,12 @@ class ConfigManager:
             'restore_dir': os.path.join(PROJECT_ROOT, 'restored'),
             'backup_log_dir': BACKUP_LOG_DIR,
         }
+        # New installs get the zero-setup SQLite catalog. An EXISTING
+        # config.ini without a `backend` key keeps PostgreSQL (see
+        # db_backend below), so nothing changes for a running system.
         self.config['DATABASE'] = {
-            'host': 'localhost',
-            'port': '5432',
-            'dbname': 'lto_archive',
-            'user': 'lto',
-            'sslmode': 'prefer',
+            'backend': 'sqlite',
+            'sqlite_path': DEFAULT_SQLITE_FILENAME,
         }
         self.config['HARDWARE'] = {
             'lto_drive':     r'D:\\',
@@ -686,7 +691,29 @@ class ConfigManager:
     def pg_sslmode(self):
         return self.config.get('DATABASE', 'sslmode', fallback='prefer').strip()
     @property
+    def db_backend(self):
+        """Catalog backend: ``'sqlite'`` or ``'postgresql'``.
+
+        A config with no ``backend`` key is an install that predates the
+        SQLite backend, so it stays on PostgreSQL. Only an explicit
+        ``backend = sqlite`` (which the generated default config and
+        config.example.ini carry) selects SQLite.
+        """
+        return self._get_choice('DATABASE', 'backend', 'postgresql')
+    @property
+    def sqlite_path(self):
+        """Absolute path of the SQLite catalog file (project root by default)."""
+        raw = _clean_config_path(self.config.get(
+            'DATABASE', 'sqlite_path', fallback=DEFAULT_SQLITE_FILENAME))
+        if not raw:
+            raw = DEFAULT_SQLITE_FILENAME
+        if not os.path.isabs(raw):
+            raw = os.path.join(PROJECT_ROOT, raw)
+        return os.path.abspath(raw)
+    @property
     def db_dsn(self):
+        if self.db_backend == 'sqlite':
+            return 'sqlite:///' + self.sqlite_path.replace('\\', '/')
         user = quote(self.pg_user, safe='')
         password = quote(self.pg_password, safe='')
         auth = f"{user}:{password}@" if password else f"{user}@"
@@ -696,6 +723,8 @@ class ConfigManager:
         )
     @property
     def db_display_ref(self):
+        if self.db_backend == 'sqlite':
+            return 'sqlite:///' + self.sqlite_path.replace('\\', '/')
         user = quote(self.pg_user, safe='')
         auth = f"{user}:***@" if self.pg_password else f"{user}@"
         return (

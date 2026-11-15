@@ -39,12 +39,19 @@ from src.inspector_repository import InspectorRepository
 from src.local_manifest_archive import (
     dry_run_export, execute_export, prune_export, validate_export)
 from src.schema_audit import audit_schema_provenance
+from db_backends import (create_test_db, each_backend, postgresql_only,
+                         sqlite_only)
 from pg_test_guard import (SKIP_REASON, create_test_database,
                            drop_test_database, pg_available)
 
 
-def _connect(*args, **kwargs) -> Any:
-    return cast(Any, psycopg.connect(*args, **kwargs))
+def _connect(conninfo, *args, **kwargs) -> Any:
+    """A raw connection on whichever backend ``conninfo`` names."""
+    if str(conninfo).startswith("sqlite:"):
+        from src import db_backend
+        return db_backend.connect(
+            conninfo, autocommit=kwargs.get("autocommit", False))
+    return cast(Any, psycopg.connect(conninfo, *args, **kwargs))
 
 
 def _pg_available():
@@ -54,14 +61,15 @@ def _pg_available():
     return pg_available()
 
 
-@unittest.skipUnless(_pg_available(), SKIP_REASON)
+@each_backend
 class PgIntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         from src.pg_db import PgDatabaseManager
 
-        cls.dbname, cls.conninfo = create_test_database("lto_test")
-        cls.db = PgDatabaseManager(cls.conninfo)
+        cls.tdb = create_test_db(getattr(cls, 'BACKEND', None) or 'postgresql', "lto_test")
+        cls.dbname, cls.conninfo = cls.tdb.name, cls.tdb.conninfo
+        cls.db = cls.tdb.manager(migrations="startup")
         cls.directory_schema_was_auto_installed = cls.db.directory_catalog_schema_installed()
         cls.db.apply_directory_catalog_schema()
 
@@ -71,18 +79,15 @@ class PgIntegrationTests(unittest.TestCase):
             cls.db.close()
         except Exception:
             pass
-        drop_test_database(cls.dbname)
+        cls.tdb.drop()
 
     # -- helpers -------------------------------------------------------------
 
     def _query(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True,
-                      row_factory=cast(Any, dict_row)) as conn:
-            return conn.execute(sql, params).fetchall()
+        return self.tdb.run(sql, params)
 
     def _exec(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True) as conn:
-            conn.execute(sql, params)
+        self.tdb.exec(sql, params)
 
     @staticmethod
     def _loose(original_path, tape, size=10, host="srv02"):
@@ -96,9 +101,12 @@ class PgIntegrationTests(unittest.TestCase):
             "stored_path": original_path,
         }
 
+    @postgresql_only("SQLite installs the complete schema at creation")
     def test_directory_catalog_schema_is_not_auto_applied_on_startup(self):
         self.assertFalse(self.directory_schema_was_auto_installed)
 
+    @postgresql_only(
+        "schema provenance audit reads pg_catalog (src/schema_audit.py)")
     def test_schema_provenance_audit_reports_installed_vs_repository_ddl(self):
         from src.constants import PROJECT_ROOT
 
@@ -119,6 +127,8 @@ class PgIntegrationTests(unittest.TestCase):
                       report["capabilities"]["remote_plan_files"]["can_support"])
         self.assertEqual(report["historical_dry_run"]["writes_performed"], 0)
 
+    @postgresql_only(
+        "schema provenance audit reads pg_catalog (src/schema_audit.py)")
     def test_schema_provenance_dry_run_flags_transient_root_and_null_chunk(self):
         self.db.register_tape("TAUD")
         records = [{
@@ -369,9 +379,7 @@ class PgIntegrationTests(unittest.TestCase):
     # -- §2.3 typed, foreign-keyed archive_runs.session refs -----------------
 
     def test_archive_runs_columns_are_typed(self):
-        cols = {r["column_name"] for r in self._query(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_name = 'archive_runs'")}
+        cols = set(self.tdb.columns("archive_runs"))
         self.assertIn("local_session_id", cols)
         self.assertIn("remote_session_id", cols)
         # The legacy polymorphic column must be gone after migration 004.
@@ -406,6 +414,8 @@ class PgIntegrationTests(unittest.TestCase):
         self.assertIsNone(remote_run["local_session_id"])
         self.assertIsNone(remote_run["remote_session_id"])
 
+    @postgresql_only(
+        "small-file manifest export/validate/prune is PostgreSQL-only in v1.0")
     def test_local_manifest_eligibility_query_accepts_only_terminal_local_work(self):
         self.db.register_tape("TMAN")
         session_id = self.db.create_local_session(
@@ -427,6 +437,8 @@ class PgIntegrationTests(unittest.TestCase):
         after = dry_run_export(self.conninfo)
         self.assertEqual(after["eligible_rows"], before_eligible + 1)
 
+    @postgresql_only(
+        "small-file manifest export/validate/prune is PostgreSQL-only in v1.0")
     def test_zz_local_manifest_export_validate_prune_preserves_operations(self):
         eligible_before = dry_run_export(self.conninfo)["eligible_rows"]
         self.assertGreaterEqual(eligible_before, 1)
@@ -502,7 +514,7 @@ class PgIntegrationTests(unittest.TestCase):
 
     def test_archive_runs_fk_rejects_unknown_local_session(self):
         self.db.register_tape("TXFK")
-        with self.assertRaises(errors.ForeignKeyViolation):
+        with self.assertRaises(self.tdb.errors.ForeignKeyViolation):
             self._exec(
                 "INSERT INTO archive_runs "
                 "(run_label, tape_label, session_kind, local_session_id, started_at) "
@@ -514,7 +526,7 @@ class PgIntegrationTests(unittest.TestCase):
         good_local = self.db.create_local_session(
             "LCK", "/s", [[{"name": "t", "size_bytes": 1}]], "pack")
         # A 'remote' run must not carry a local session reference.
-        with self.assertRaises(errors.CheckViolation):
+        with self.assertRaises(self.tdb.errors.CheckViolation):
             self._exec(
                 "INSERT INTO archive_runs "
                 "(run_label, tape_label, session_kind, local_session_id, started_at) "
@@ -801,14 +813,15 @@ class PgSchemaAuditMigrationTests(unittest.TestCase):
     def setUp(self):
         from src.pg_db import PgDatabaseManager
 
-        self.dbname, self.conninfo = create_test_database("lto_audit")
-        self.db = PgDatabaseManager(self.conninfo)
+        self.tdb = create_test_db(getattr(self, 'BACKEND', None) or 'postgresql', "lto_audit")
+        self.dbname, self.conninfo = self.tdb.name, self.tdb.conninfo
+        self.db = self.tdb.manager(migrations="startup")
 
     def tearDown(self):
         try:
             self.db.close()
         finally:
-            drop_test_database(self.dbname)
+            self.tdb.drop()
 
     def _audit(self):
         with _connect(self.conninfo, autocommit=True,
@@ -860,8 +873,7 @@ class PgSchemaAuditMigrationTests(unittest.TestCase):
             "UNAVAILABLE")
 
     def _exec(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True) as conn:
-            conn.execute(sql, params)
+        self.tdb.exec(sql, params)
 
 
 @unittest.skipUnless(_pg_available(), SKIP_REASON)
@@ -869,8 +881,9 @@ class PgSchemaAuditFrontierDefectTests(unittest.TestCase):
     def setUp(self):
         from src.pg_db import PgDatabaseManager
 
-        self.dbname, self.conninfo = create_test_database("lto_frontier_audit")
-        self.db = PgDatabaseManager(self.conninfo)
+        self.tdb = create_test_db(getattr(self, 'BACKEND', None) or 'postgresql', "lto_frontier_audit")
+        self.dbname, self.conninfo = self.tdb.name, self.tdb.conninfo
+        self.db = self.tdb.manager(migrations="startup")
         self.db.apply_directory_catalog_schema()
         self.db.apply_incremental_scan_schema()
 
@@ -878,7 +891,7 @@ class PgSchemaAuditFrontierDefectTests(unittest.TestCase):
         try:
             self.db.close()
         finally:
-            drop_test_database(self.dbname)
+            self.tdb.drop()
 
     def test_membership_null_and_missing_segment_consumption_are_failures(self):
         self.db.register_tape("TFRONT")
@@ -899,8 +912,7 @@ class PgSchemaAuditFrontierDefectTests(unittest.TestCase):
         self.assertEqual(report["historical_dry_run"]["writes_performed"], 0)
 
     def _exec(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True) as conn:
-            conn.execute(sql, params)
+        self.tdb.exec(sql, params)
 
 
 @unittest.skipUnless(_pg_available(), SKIP_REASON)
@@ -908,10 +920,11 @@ class PgArchiveRunsMigrationTests(unittest.TestCase):
     """Exercise the production upgrade path of migration 004 on legacy data."""
 
     def setUp(self):
-        self.dbname, self.conninfo = create_test_database("lto_mig")
+        self.tdb = create_test_db(getattr(self, 'BACKEND', None) or 'postgresql', "lto_mig")
+        self.dbname, self.conninfo = self.tdb.name, self.tdb.conninfo
 
     def tearDown(self):
-        drop_test_database(self.dbname)
+        self.tdb.drop()
 
     @staticmethod
     def _migration_sql():
@@ -974,7 +987,7 @@ class PgArchiveRunsMigrationTests(unittest.TestCase):
             self.assertIsNone(rows["remote"]["remote_session_id"])
 
         # The foreign key is now enforced for future writes.
-        with self.assertRaises(errors.ForeignKeyViolation):
+        with self.assertRaises(self.tdb.errors.ForeignKeyViolation):
             self._exec_on(
                 self.conninfo,
                 "INSERT INTO archive_runs (run_label, tape_label, session_kind, "
@@ -1004,7 +1017,7 @@ class PgArchiveRunsMigrationTests(unittest.TestCase):
             return conn.execute(sql, params).fetchall()
 
 
-@unittest.skipUnless(_pg_available(), SKIP_REASON)
+@each_backend
 class IncrementalScanMigrationTests(unittest.TestCase):
     """Plan 1 / Task 2.1 — migration 014 against a real PostgreSQL.
 
@@ -1016,8 +1029,9 @@ class IncrementalScanMigrationTests(unittest.TestCase):
     def setUp(self):
         from src.pg_db import PgDatabaseManager
 
-        self.dbname, self.conninfo = create_test_database("lto_scan")
-        self.db = PgDatabaseManager(self.conninfo)
+        self.tdb = create_test_db(getattr(self, 'BACKEND', None) or 'postgresql', "lto_scan")
+        self.dbname, self.conninfo = self.tdb.name, self.tdb.conninfo
+        self.db = self.tdb.manager(migrations="startup")
         self.addCleanup(self._drop)
 
     def _drop(self):
@@ -1025,17 +1039,14 @@ class IncrementalScanMigrationTests(unittest.TestCase):
             self.db.close()
         except Exception:
             pass
-        drop_test_database(self.dbname)
+        self.tdb.drop()
 
     # -- helpers -----------------------------------------------------------
     def _query(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True,
-                      row_factory=cast(Any, dict_row)) as conn:
-            return conn.execute(sql, params).fetchall()
+        return self.tdb.run(sql, params)
 
     def _exec(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True) as conn:
-            conn.execute(sql, params)
+        self.tdb.exec(sql, params)
 
     def _session(self, label="S1", tape="Tape_MIG"):
         """A minimal tape + session + plan the frontier can hang off."""
@@ -1046,11 +1057,13 @@ class IncrementalScanMigrationTests(unittest.TestCase):
         return session_id
 
     # -- state transitions -------------------------------------------------
+    @postgresql_only("exercises the explicit PostgreSQL migration 014 files")
     def test_the_schema_is_not_auto_applied_at_startup(self):
         """014 is explicit: a fresh manager must NOT have installed it."""
         self.assertFalse(self.db.incremental_scan_schema_installed())
         self.assertFalse(self.db.incremental_scan_schema_finalized())
 
+    @postgresql_only("exercises the explicit PostgreSQL migration 014 files")
     def test_the_base_half_is_idempotent(self):
         self.db.apply_incremental_scan_schema()
         self.assertTrue(self.db.incremental_scan_schema_installed())
@@ -1081,6 +1094,7 @@ class IncrementalScanMigrationTests(unittest.TestCase):
         self.db.apply_incremental_scan_schema(finalize=True)
         self.assertTrue(self.db.incremental_scan_schema_finalized())
 
+    @postgresql_only("exercises the explicit PostgreSQL migration 014 files")
     def test_finalize_refuses_on_duplicate_plan_ordinals(self):
         """The refusal that protects a chunk which may already be on tape."""
         session_id = self._session()
@@ -1103,6 +1117,7 @@ class IncrementalScanMigrationTests(unittest.TestCase):
         self.assertEqual(ordinals, [0, 0])
         self.assertFalse(self.db.incremental_scan_schema_finalized())
 
+    @postgresql_only("exercises the explicit PostgreSQL migration 014 files")
     def test_the_preflight_reports_duplicates_without_changing_anything(self):
         session_id = self._session()
         self.db.append_remote_streaming_chunk(
@@ -1589,6 +1604,7 @@ class IncrementalScanMigrationTests(unittest.TestCase):
                        DO UPDATE SET status=EXCLUDED.status""",
                 (session_id, plan_file_id, status))
 
+    @postgresql_only("exercises the explicit PostgreSQL migration 014 files")
     def test_the_rollback_refuses_to_drop_a_populated_frontier(self):
         session_id, _ = self._frontier_session()
         self.assertTrue(self.db.session_has_frontier_state(session_id))
@@ -1602,6 +1618,7 @@ class IncrementalScanMigrationTests(unittest.TestCase):
                 conn.execute(rollback.read_text(encoding="utf-8"))
         self.assertIn("REFUSING to roll back", str(caught.exception))
 
+    @postgresql_only("exercises the explicit PostgreSQL migration 014 files")
     def test_the_rollback_drops_an_empty_frontier_cleanly(self):
         """With nothing published, the rollback is allowed to remove it."""
         self._session()
@@ -1620,7 +1637,7 @@ class IncrementalScanMigrationTests(unittest.TestCase):
         self.assertIn("membership_state", columns)
 
 
-@unittest.skipUnless(_pg_available(), SKIP_REASON)
+@each_backend
 class TapeRenameGenerationTests(unittest.TestCase):
     """A relabel is the SAME cartridge, so its generation history follows it.
 
@@ -1634,8 +1651,9 @@ class TapeRenameGenerationTests(unittest.TestCase):
     def setUp(self):
         from src.pg_db import PgDatabaseManager
 
-        self.dbname, self.conninfo = create_test_database("lto_ren")
-        self.db = PgDatabaseManager(self.conninfo)
+        self.tdb = create_test_db(getattr(self, 'BACKEND', None) or 'postgresql', "lto_ren")
+        self.dbname, self.conninfo = self.tdb.name, self.tdb.conninfo
+        self.db = self.tdb.manager(migrations="startup")
         self.addCleanup(self._drop)
 
     def _drop(self):
@@ -1643,12 +1661,10 @@ class TapeRenameGenerationTests(unittest.TestCase):
             self.db.close()
         except Exception:
             pass
-        drop_test_database(self.dbname)
+        self.tdb.drop()
 
     def _query(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True,
-                      row_factory=cast(Any, dict_row)) as conn:
-            return conn.execute(sql, params).fetchall()
+        return self.tdb.run(sql, params)
 
     def test_register_tape_creates_the_active_generation_atomically(self):
         self.db.register_tape("GEN1", 12000)
@@ -1747,8 +1763,9 @@ class ShadowLegacyMigrationTests(unittest.TestCase):
     def setUp(self):
         from src.pg_db import PgDatabaseManager
 
-        self.dbname, self.conninfo = create_test_database("lto_shadow")
-        self.db = PgDatabaseManager(self.conninfo)
+        self.tdb = create_test_db(getattr(self, 'BACKEND', None) or 'postgresql', "lto_shadow")
+        self.dbname, self.conninfo = self.tdb.name, self.tdb.conninfo
+        self.db = self.tdb.manager(migrations="startup")
         self.addCleanup(self._drop)
         self.session_id = self._build_legacy_session()
 
@@ -1757,16 +1774,13 @@ class ShadowLegacyMigrationTests(unittest.TestCase):
             self.db.close()
         except Exception:
             pass
-        drop_test_database(self.dbname)
+        self.tdb.drop()
 
     def _query(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True,
-                      row_factory=cast(Any, dict_row)) as conn:
-            return conn.execute(sql, params).fetchall()
+        return self.tdb.run(sql, params)
 
     def _exec(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True) as conn:
-            conn.execute(sql, params)
+        self.tdb.exec(sql, params)
 
     def _build_legacy_session(self):
         """A session shaped like a real interrupted one."""
@@ -1988,7 +2002,7 @@ class ShadowLegacyMigrationTests(unittest.TestCase):
                 (self.session_id,))
 
 
-@unittest.skipUnless(_pg_available(), SKIP_REASON)
+@each_backend
 class RealConcurrencyTests(unittest.TestCase):
     """Claims, transitions and segment consumption under REAL concurrency.
 
@@ -2000,9 +2014,10 @@ class RealConcurrencyTests(unittest.TestCase):
     def setUp(self):
         from src.pg_db import PgDatabaseManager
 
-        self.dbname, self.conninfo = create_test_database("lto_conc")
-        self.db = PgDatabaseManager(self.conninfo)
-        self.other = PgDatabaseManager(self.conninfo)
+        self.tdb = create_test_db(getattr(self, 'BACKEND', None) or 'postgresql', "lto_conc")
+        self.dbname, self.conninfo = self.tdb.name, self.tdb.conninfo
+        self.db = self.tdb.manager(migrations="startup")
+        self.other = self.tdb.manager(migrations="startup")
         self.addCleanup(self._drop)
 
         self.db.register_tape("CONC_T", 12000)
@@ -2021,12 +2036,10 @@ class RealConcurrencyTests(unittest.TestCase):
                 manager.close()
             except Exception:
                 pass
-        drop_test_database(self.dbname)
+        self.tdb.drop()
 
     def _query(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True,
-                      row_factory=cast(Any, dict_row)) as conn:
-            return conn.execute(sql, params).fetchall()
+        return self.tdb.run(sql, params)
 
     # -- chunk claims -----------------------------------------------------
     def test_only_one_of_two_workers_claims_a_chunk(self):
@@ -2051,7 +2064,7 @@ class RealConcurrencyTests(unittest.TestCase):
         lock = threading.Lock()
 
         def attempt(index):
-            manager = PgDatabaseManager(self.conninfo)
+            manager = self.tdb.manager(migrations="startup")
             try:
                 if manager.claim_chunk_for_staging(
                         self.session_id, 1, f"owner-{index}", f"att-{index}"):
@@ -2325,15 +2338,16 @@ class RealConcurrencyTests(unittest.TestCase):
         self.assertIn("unresolved", reason)
 
 
-@unittest.skipUnless(_pg_available(), SKIP_REASON)
+@each_backend
 class ContainerFormatMigrationTests(unittest.TestCase):
     """Plan 2 Phase 0 / migration 015 against disposable PostgreSQL only."""
 
     def setUp(self):
         from src.pg_db import PgDatabaseManager
 
-        self.dbname, self.conninfo = create_test_database("lto_formats")
-        self.db = PgDatabaseManager(self.conninfo)
+        self.tdb = create_test_db(getattr(self, 'BACKEND', None) or 'postgresql', "lto_formats")
+        self.dbname, self.conninfo = self.tdb.name, self.tdb.conninfo
+        self.db = self.tdb.manager(migrations="startup")
         self.staging = tempfile.TemporaryDirectory()
         self.addCleanup(self._drop)
 
@@ -2346,16 +2360,13 @@ class ContainerFormatMigrationTests(unittest.TestCase):
             self.staging.cleanup()
         except Exception:
             pass
-        drop_test_database(self.dbname)
+        self.tdb.drop()
 
     def _query(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True,
-                      row_factory=cast(Any, dict_row)) as conn:
-            return conn.execute(sql, params).fetchall()
+        return self.tdb.run(sql, params)
 
     def _exec(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True) as conn:
-            conn.execute(sql, params)
+        self.tdb.exec(sql, params)
 
     def _ready_014(self, *, finalize=True):
         self.db.apply_incremental_scan_schema(finalize=finalize)
@@ -2525,6 +2536,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
                        decode(repeat(%s,32),'hex'))""",
             (run_id, session_id, key))
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_small_file_run_is_attributable_through_directory_bundles(self):
         """A run whose chunks held only small files leaves no files_index row."""
         session_id = self._exception_session_with_runs()
@@ -2540,6 +2553,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
                        (session_id,))}
         self.assertEqual(formats, {0: "zip", 1: "stored_tar"})
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_run_with_no_output_at_all_is_superseded_not_ambiguous(self):
         """The 2026-07-15 shape: a run whose work was destroyed and redone."""
         session_id = self._exception_session_with_runs()
@@ -2551,6 +2566,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
                WHERE session_id=%s AND chunk_index=1""",
             (session_id,))[0]["packaging_format"], "stored_tar")
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_run_output_naming_a_foreign_session_is_still_refused(self):
         session_id = self._exception_session_with_runs()
         foreign_id = self._session(label="FOREIGN_SESSION")
@@ -2571,6 +2588,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
                 Exception, "without trustworthy remote chunk provenance"):
             self._apply_exception(session_id)
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_run_output_without_chunk_identity_is_still_refused(self):
         session_id = self._exception_session_with_runs()
         self._catalog_chunks(session_id, [0])
@@ -2590,6 +2609,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
                 Exception, "without trustworthy remote chunk provenance"):
             self._apply_exception(session_id)
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_bundle_naming_a_foreign_session_is_still_refused(self):
         session_id = self._exception_session_with_runs()
         foreign_id = self._session(label="FOREIGN_BUNDLE_SESSION")
@@ -2607,6 +2628,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
     # min<>max. The clause now blocks only when such a range REACHES the
     # approved suffix, which would be genuine evidence a suffix chunk started.
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_a_multi_chunk_group_in_the_prefix_is_not_contradictory(self):
         session_id = self._exception_session_with_runs(boundary=3)
         run_id = self._archive_run(session_id)
@@ -2619,6 +2642,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
                WHERE session_id=%s AND chunk_index=3""",
             (session_id,))[0]["packaging_format"], "stored_tar")
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_a_file_range_reaching_the_suffix_still_blocks(self):
         session_id = self._exception_session_with_runs(boundary=3)
         run_id = self._archive_run(session_id)
@@ -2629,6 +2654,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
         with self.assertRaises(Exception):
             self._apply_exception(session_id, boundary=3)
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_015_is_explicit_and_requires_finalized_014(self):
         self.assertFalse(self.db.container_format_schema_installed())
         with self.assertRaisesRegex(Exception, "requires migrations 013 and 014"):
@@ -2643,6 +2670,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
             self.db.apply_container_format_schema()
         self.assertFalse(self.db.container_format_schema_installed())
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_zip_backfill_is_idempotent_immutable_and_preserves_legacy_bundle(self):
         session_id = self._session()
         self._append(session_id, 0)
@@ -2689,6 +2718,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
         self.assertEqual(self._query(
             "SELECT count(*) AS n FROM archive_bundles")[0]["n"], 1)
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_016_persists_stored_tar_partition_cap_and_member_ordinals(self):
         from src.stored_tar_planning import GNU_TAR_RECORD_SIZE
 
@@ -2731,6 +2762,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
             [(0, "small_files", 0), (1, "loose_files", None),
              (2, "small_files", 1)])
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_stored_tar_plan_is_reused_across_restart_and_config_change(self):
         rows = [
             (1, f"/fixture/chunk_001/small_{i}.bin", f"small_{i}.bin", 1)
@@ -2743,7 +2776,7 @@ class ContainerFormatMigrationTests(unittest.TestCase):
             max_size_bytes=512 * 512)
         self.db.close()
         from src.pg_db import PgDatabaseManager
-        self.db = PgDatabaseManager(self.conninfo)
+        self.db = self.tdb.manager(migrations="startup")
         second = self.db.get_or_create_stored_tar_chunk_plan(
             session_id, 1, self.db.get_chunk_files(session_id, 1),
             loose_threshold_bytes=2, max_size_bytes=512 * 512 * 9)
@@ -2751,6 +2784,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
         self.assertEqual(second.members, first.members)
         self.assertEqual(second.containers, first.containers)
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_stored_tar_plan_records_source_missing_without_container(self):
         rows = [
             (1, "/fixture/chunk_001/missing.bin", "missing.bin", 1),
@@ -2773,6 +2808,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
              for m in plan.members],
             [(0, "source_missing", None), (1, "small_files", 0)])
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_stored_tar_plan_bulk_copy_persists_identical_rows_idempotently(self):
         """The COPY-based member persistence writes exactly the plan's rows and
         re-creating the plan neither duplicates nor alters them.
@@ -2831,6 +2868,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
         self.assertEqual(again.members, plan.members)
         self.assertEqual(_stored(), expected)
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_approved_session37_shape_assigns_only_never_started_suffix(self):
         """Session-37's provenance gaps still yield the approved boundary."""
         session_id = self._session(label="MIXED_FORMAT_FIXTURE")
@@ -3029,6 +3068,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
         self.assertTrue(self.db.require_existing_stored_tar_recovery(
             session_id, 49, reader_contract_version=1))
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_session37_boundary_rehearsal_is_read_only(self):
         """Gate 5.5: report the real shape without persisting the boundary."""
         session_id = self._session(label="SESSION37_REHEARSAL_FIXTURE")
@@ -3077,6 +3118,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
         self.assertIsNone(self._query(
             "SELECT to_regclass('remote_packaging_boundaries') AS r")[0]["r"])
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_contradictory_evidence_rolls_back_the_entire_migration(self):
         session_id = self._session(label="CONTRADICTORY_FIXTURE")
         self._append(session_id, 0)
@@ -3110,6 +3153,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
             if self._query("SELECT to_regclass('remote_packaging_boundaries') AS r")[0]["r"]
             else 0, 0)
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_pending_chunk_with_any_claim_evidence_blocks_migration(self):
         self._ready_014()
         cases = (
@@ -3143,6 +3188,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
                 self.assertIsNone(self._query(
                     "SELECT to_regclass('archive_containers') AS r")[0]["r"])
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_non_done_fixed_prefix_still_blocks_exception(self):
         session_id = self._session(label="NON_DONE_PREFIX_FIXTURE")
         self._append(session_id, 0)
@@ -3165,6 +3212,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
         self.assertIsNone(self._query(
             "SELECT to_regclass('archive_containers') AS r")[0]["r"])
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_all_migration007_tables_contribute_measured_chunk_evidence(self):
         session_id = self._session(label="DIRECT_DIRECTORY_EVIDENCE")
         self.db.apply_directory_catalog_schema()
@@ -3196,6 +3245,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
                     "all three migration-007 tables must block the suffix"),
                 staging_evidence=self._staging_evidence([1]))
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_directory_row_proven_for_suffix_still_blocks_exception(self):
         session_id = self._session(label="DIRECTORY_SUFFIX_FIXTURE")
         self.db.apply_directory_catalog_schema()
@@ -3239,6 +3290,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
         self.assertIsNone(self._query(
             "SELECT to_regclass('archive_containers') AS r")[0]["r"])
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_plain_zip_backfill_permanently_closes_exception(self):
         session_id = self._session(label="ZIP_FIRST_FIXTURE")
         self._append(session_id, 0)
@@ -3296,7 +3349,7 @@ class ContainerFormatMigrationTests(unittest.TestCase):
                 "expected_member_count": 2, "expected_logical_bytes": 3,
             })
 
-        with self.assertRaises(errors.CheckViolation):
+        with self.assertRaises(self.tdb.errors.CheckViolation):
             self._exec(
                 """INSERT INTO archive_artifacts
                        (session_id,chunk_index,container_id,artifact_kind,
@@ -3340,6 +3393,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
                            'OTHER_TAPE','other.zip',%s,1,1)""",
                 (session_id, other_generation["generation_id"]))
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_optional_007_is_augmented_but_never_silently_installed(self):
         self._ready_014()
         self.db.apply_container_format_schema()
@@ -3348,6 +3403,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
             self.db.container_format_schema_report()["optional_007_state"],
             "absent")
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_installed_007_receives_nullable_compatibility_columns(self):
         self.db.apply_directory_catalog_schema()
         self._ready_014()
@@ -3363,6 +3420,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
             self.db.container_format_schema_report()["optional_007_state"],
             "installed")
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_partial_007_blocks_and_rolls_back_015(self):
         self._exec("CREATE TABLE directory_archive_stats(dummy INTEGER)")
         self._ready_014()
@@ -3371,6 +3430,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
         self.assertIsNone(self._query(
             "SELECT to_regclass('archive_containers') AS r")[0]["r"])
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_remote_archive_run_identity_and_schema_drift_validation(self):
         session_id = self._session()
         self._append(session_id, 0)
@@ -3385,7 +3446,7 @@ class ContainerFormatMigrationTests(unittest.TestCase):
                     remote_chunk_index,tape_generation_id,started_at)
                VALUES ('stable-run-1','FORMAT_TAPE','remote',%s,0,%s,now())""",
             (session_id, generation["generation_id"]))
-        with self.assertRaises(errors.UniqueViolation):
+        with self.assertRaises(self.tdb.errors.UniqueViolation):
             self._exec(
                 """INSERT INTO archive_runs
                        (run_label,tape_label,session_kind,remote_session_id,
@@ -3404,6 +3465,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "missing or drifted"):
             self.db.validate_container_format_schema()
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_partial_015_is_rejected_instead_of_adopted(self):
         self._ready_014()
         self._exec(
@@ -3416,6 +3479,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
             "SELECT to_regclass('container_format_schema_metadata') AS r"
         )[0]["r"])
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_boundary_approval_and_audit_rows_are_immutable(self):
         session_id = self._session(label="IMMUTABLE_BOUNDARY_FIXTURE")
         self._append(session_id, 0)
@@ -3452,6 +3517,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
                    VALUES (%s,0,0,'fabricated','fabricated','{}','{}',now())""",
                 (other_session,))
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_stale_or_noncanonical_staging_attestation_is_rejected(self):
         from datetime import datetime, timedelta, timezone
 
@@ -3476,6 +3543,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
                 approval_reason="synthetic extra evidence fixture",
                 staging_evidence=extra)
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_ambiguous_catalog_provenance_blocks_exception(self):
         session_id = self._session(label="AMBIGUOUS_PROVENANCE_FIXTURE")
         self._append(session_id, 0)
@@ -3495,6 +3564,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
                 approval_reason="synthetic ambiguous provenance fixture",
                 staging_evidence=self._staging_evidence([1]))
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_definition_fingerprint_detects_disabled_trigger(self):
         session_id = self._session(label="FINGERPRINT_FIXTURE")
         self._append(session_id, 0)
@@ -3546,6 +3617,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
             container["container_id"], owner, part, summary, diagnostics)
         return session_id, plan, container, part, owner, summary
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_017_two_build_owners_cannot_adopt_the_same_part(self):
         rows = [(1, "/fixture/a.bin", "a.bin", 3)]
         session_id = self._stored_tar_planning_session(rows)
@@ -3585,6 +3658,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
         self.assertIsNone(row["validation_summary"])
         self.assertIsNone(row["disposition_counts"])
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_017_validated_part_persists_no_final_or_ready_locator(self):
         _session, _plan, container, part, owner, summary = (
             self._validated_tar_publication_fixture())
@@ -3601,6 +3676,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
               "disposition": "source_missing", "evidence": "lstat_missing"}])
         self.assertEqual(replay["validation_state"], "validated_part")
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_017_pair_becomes_ready_in_one_owner_checked_transaction(self):
         session, _plan, container, _part, owner, _summary = (
             self._validated_tar_publication_fixture())
@@ -3634,6 +3711,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
             **values, "owner_token": "recovery-owner"})
         self.assertEqual(replay["container"]["validation_state"], "ready")
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_017_conflicting_sidecar_rolls_back_the_pair(self):
         session, _plan, container, _part, owner, _summary = (
             self._validated_tar_publication_fixture())
@@ -3664,6 +3743,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
         self.assertEqual(
             artifact["local_locator"], "conflicting/sidecar.jsonl.zst")
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_017_reconciliation_owner_reset_and_ready_block_are_cas_guarded(self):
         session, _plan, container, part, owner, summary = (
             self._validated_tar_publication_fixture())
@@ -3720,6 +3801,8 @@ class ContainerFormatMigrationTests(unittest.TestCase):
             ready_container["container_id"], "ready", None)
         self.assertEqual(replay["validation_state"], "blocked")
 
+    @postgresql_only(
+        "migration 015 / its legacy Stored-TAR boundary exception is PostgreSQL-only")
     def test_phase3_tar_copy_catalog_provenance_and_actual_accounting(self):
         session, _plan, container, _part, owner, _summary = (
             self._validated_tar_publication_fixture(directory_catalog=True))

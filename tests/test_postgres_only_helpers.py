@@ -95,8 +95,8 @@ class PostgresOnlyHelperTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "canonical POSIX"):
                 list(TarCatalogAdapter(db, chunk).records())
 
-    def test_database_manager_direct_sqlite_constructor_is_removed(self):
-        with self.assertRaisesRegex(RuntimeError, "SQLite DatabaseManager has been removed"):
+    def test_legacy_database_manager_constructor_is_removed(self):
+        with self.assertRaisesRegex(RuntimeError, "legacy DatabaseManager class has been removed"):
             DatabaseManager("archive.db")
 
     def test_record_key_includes_source_host(self):

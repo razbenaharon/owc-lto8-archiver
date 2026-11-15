@@ -1,19 +1,5 @@
 """Read-only reports for directory-catalog migration validation."""
-from typing import TYPE_CHECKING, Any, cast
-
-if TYPE_CHECKING:
-    import psycopg
-    from psycopg.rows import dict_row
-else:
-    try:
-        import psycopg
-        from psycopg.rows import dict_row
-    except ImportError:  # pragma: no cover - runtime dependency path
-        psycopg = None
-        dict_row = None
-
-from .pg_bulk import require_psycopg
-from .pg_core import PgConnectionCore
+from . import db_backend
 
 
 DIRECTORY_TABLES = (
@@ -41,18 +27,12 @@ LEGACY_COMPARE_TABLES = (
 
 
 def _connect(conninfo):
-    require_psycopg()
-    return cast(Any, psycopg.connect(
-        conninfo, autocommit=True, row_factory=cast(Any, dict_row)))
+    """One read-only, autocommit, dict-row connection on either backend."""
+    return db_backend.connect(conninfo, autocommit=True, read_only=True)
 
 
 def _table_exists(conn, table_name):
-    return conn.execute(
-        """SELECT 1
-           FROM information_schema.tables
-           WHERE table_schema='public' AND table_name=%s""",
-        (table_name,),
-    ).fetchone() is not None
+    return db_backend.table_exists(conn, table_name)
 
 
 def _count(conn, table_name):
@@ -63,35 +43,17 @@ def _count(conn, table_name):
 
 def describe_database(conninfo):
     with _connect(conninfo) as conn:
-        conn.execute("SET default_transaction_read_only = on")
-        row = conn.execute(
-            """SELECT current_database() AS database,
-                      inet_server_addr()::text AS server_addr,
-                      inet_server_port() AS server_port,
-                      current_user AS current_user"""
-        ).fetchone()
-    return dict(row)
+        return db_backend.describe_database(conn)
 
 
 def archiver_lock_status(conninfo):
-    key = PgConnectionCore.ARCHIVER_LOCK_KEY
-    with _connect(conninfo) as conn:
-        conn.execute("SET default_transaction_read_only = on")
-        row = conn.execute(
-            """SELECT COUNT(*) AS holders
-               FROM pg_locks
-               WHERE locktype='advisory'
-                 AND classid = ((%s::bigint >> 32) & 4294967295)::integer
-                 AND objid = (%s::bigint & 4294967295)::integer
-                 AND granted""",
-            (key, key),
-        ).fetchone()
-    return int(row["holders"])
+    """Number of archiver-lock holders (the one probe for code without a
+    manager; see :func:`src.db_backend.archiver_lock_holders`)."""
+    return db_backend.archiver_lock_holders(conninfo)
 
 
 def row_counts(conninfo, tables):
     with _connect(conninfo) as conn:
-        conn.execute("SET default_transaction_read_only = on")
         return {table: _count(conn, table) for table in tables}
 
 
@@ -140,7 +102,6 @@ def _used_space_estimates(conn):
 def validate_directory_catalog(conninfo):
     warnings = []
     with _connect(conninfo) as conn:
-        conn.execute("SET default_transaction_read_only = on")
         existing = {table for table in DIRECTORY_TABLES
                     if _table_exists(conn, table)}
         missing = [table for table in DIRECTORY_TABLES if table not in existing]

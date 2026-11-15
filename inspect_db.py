@@ -25,6 +25,7 @@ from src.local_manifest_archive import (
     validate_archive_root,
     validate_export,
 )
+from src import db_backend
 from src.db import create_database_manager
 from src.directory_catalog_validation import (
     archiver_lock_status,
@@ -85,10 +86,20 @@ class _DbOverrideConfig:
 
 def _config(args):
     cfg = ConfigManager()
-    return _DbOverrideConfig(cfg, args.db) if args.db else cfg
+    if args.db:
+        # --db names another database on the PostgreSQL server; a SQLite
+        # catalog is one file, chosen by [DATABASE] sqlite_path.
+        db_backend.require_postgresql(cfg, "database_compare")
+        return _DbOverrideConfig(cfg, args.db)
+    return cfg
 
 
 def _conninfo(cfg, dbname=None):
+    """Connection target for the configured backend (a DSN on SQLite)."""
+    if db_backend.is_sqlite(cfg):
+        if dbname:
+            raise db_backend.PostgresOnlyFeature("database_compare")
+        return cfg.db_dsn
     return build_conninfo(
         host=cfg.pg_host,
         port=cfg.pg_port,
@@ -97,6 +108,10 @@ def _conninfo(cfg, dbname=None):
         password=cfg.pg_password,
         sslmode=cfg.pg_sslmode,
     )
+
+
+def _database_label(cfg):
+    return cfg.sqlite_path if db_backend.is_sqlite(cfg) else cfg.pg_dbname
 
 
 def _print_json(payload):
@@ -111,18 +126,31 @@ def _open_db(cfg):
         raise SystemExit(1) from exc
 
 
-def _open_no_init_db(cfg):
-    """Open PostgreSQL without implicit startup DDL."""
+def _manager_class(cfg):
+    if db_backend.is_sqlite(cfg):
+        from src.sqlite_db import SqliteDatabaseManager
+        return SqliteDatabaseManager
     from src.pg_db import PgDatabaseManager
+    return PgDatabaseManager
+
+
+def _open_no_init_db(cfg):
+    """Open the catalog without implicit startup DDL."""
     try:
-        return PgDatabaseManager(_conninfo(cfg), init_schema=False)
+        return _manager_class(cfg)(_conninfo(cfg), init_schema=False)
     except RuntimeError as exc:
         print(f"\n{exc}")
         raise SystemExit(1) from exc
 
 
 def _open_read_only_db(cfg):
-    """Open a manager whose server sessions reject every write."""
+    """Open a manager whose database sessions reject every write."""
+    if db_backend.is_sqlite(cfg):
+        try:
+            return _manager_class(cfg)(_conninfo(cfg), read_only=True)
+        except RuntimeError as exc:
+            print(f"\n{exc}")
+            raise SystemExit(1) from exc
     from src.pg_db import PgDatabaseManager
     conninfo = make_conninfo(
         _conninfo(cfg), options="-c default_transaction_read_only=on")
@@ -159,11 +187,10 @@ def _run_all_session_health(cfg):
     the thing it exists to be. The liveness inputs are host-wide, so a run while
     the archiver is active is reported rather than silently ignored.
     """
-    from src.pg_db import PgDatabaseManager
     from src.session_health import all_session_health
 
     conninfo = _conninfo(cfg)
-    db = PgDatabaseManager(conninfo, init_schema=False)
+    db = _manager_class(cfg)(conninfo, init_schema=False)
     try:
         report = all_session_health(
             db,
@@ -171,7 +198,7 @@ def _run_all_session_health(cfg):
             lock_holders=archiver_lock_status(conninfo))
     finally:
         db.close()
-    report["database"] = cfg.pg_dbname
+    report["database"] = _database_label(cfg)
     _print_json(report)
     return 0
 
@@ -1352,7 +1379,7 @@ def _run_session_frontier_report(cfg, args, parser):
         ]
     finally:
         db.close()
-    _print_json({"database": cfg.pg_dbname, "reports": reports})
+    _print_json({"database": _database_label(cfg), "reports": reports})
     return 0
 
 
@@ -1711,8 +1738,65 @@ def _run_reconcile_sessions(cfg, args):
     return 0
 
 
+#: Command flag -> key in ``src.db_backend.POSTGRESQL_ONLY_FEATURES``. Every
+#: one of these refuses on SQLite before doing anything (one message, exit 1).
+_POSTGRESQL_ONLY_COMMANDS = (
+    ("backup_postgres", "pg_dump_backup"),
+    ("create_migrated_db", "pg_dump_backup"),
+    ("schema_provenance_audit", "schema_audit"),
+    ("compare_db", "database_compare"),
+    ("with_db", "database_compare"),
+    ("bootstrap_frontier", "legacy_backfills"),
+    ("backfill_legacy_chunk_membership", "legacy_backfills"),
+    ("persist_session_transition", "legacy_backfills"),
+    ("session37_boundary_rehearsal", "legacy_backfills"),
+    ("backfill_directory_catalog", "legacy_backfills"),
+    ("stored_tar_exception_session_id", "stored_tar_boundary"),
+    ("manifest_status", "small_file_manifest_maintenance"),
+    ("export_small_file_manifests", "small_file_manifest_maintenance"),
+    ("validate_local_manifest_export", "small_file_manifest_maintenance"),
+    ("prune_exported_small_files", "small_file_manifest_maintenance"),
+)
+
+#: Explicit PostgreSQL migration commands. A SQLite catalog is created with
+#: the complete schema, so these report that instead of running anything.
+_EXPLICIT_MIGRATION_COMMANDS = (
+    "apply_directory_catalog_schema", "apply_incremental_scan_schema",
+    "apply_container_format_schema",
+    "apply_container_format_schema_authority_v2",
+    "apply_stored_tar_plan_schema", "apply_manifest_directory_catalog_schema",
+)
+
+
+def _sqlite_installed_at_creation(cfg, command):
+    """Answer an explicit-migration command on SQLite: nothing to apply."""
+    db = _open_read_only_db(cfg)
+    try:
+        status = db.sqlite_schema_status()
+    finally:
+        db.close()
+    _print_json({
+        "backend": "sqlite",
+        "database": status["database"],
+        "command": "--" + command.replace("_", "-"),
+        "schema": "installed at creation",
+        "schema_version": status["schema_version"],
+        "drift": status["drift"],
+        "applied": [],
+    })
+    return 1 if status["drift"] else 0
+
+
 def _dispatch(parser, args):
     cfg = _config(args)
+
+    if db_backend.is_sqlite(cfg):
+        for flag, feature in _POSTGRESQL_ONLY_COMMANDS:
+            if getattr(args, flag, None):
+                raise db_backend.PostgresOnlyFeature(feature)
+        for flag in _EXPLICIT_MIGRATION_COMMANDS:
+            if getattr(args, flag, None):
+                return _sqlite_installed_at_creation(cfg, flag)
 
     if args.print_db_target:
         payload = {
