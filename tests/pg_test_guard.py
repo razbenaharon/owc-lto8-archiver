@@ -22,7 +22,10 @@ The rules, all fail-closed
    surface loudly, not to quietly step around.
 3. **Refuse anything that looks like production or a normal local install:**
    the default port 5432, a non-loopback host, or a DSN naming a production
-   database.
+   database. Exactly ONE host and ONE port, and nothing that can redirect the
+   connection behind them: ``hostaddr``, ``service``, a connection string
+   smuggled in ``dbname``, any parameter outside a short allow-list, or an
+   ambient ``PGHOSTADDR``/``PGSERVICE``.
 4. **Refuse a server that hosts the production catalog.** If ``lto_archive``
    exists on the target, it *is* the production server, whatever the port says.
    This is the check that cannot be talked around.
@@ -90,8 +93,34 @@ class UnsafeTestDatabase(RuntimeError):
     """
 
 
-def _parse_dsn(dsn):
-    """Extract ``(host, port, dbname)`` from a DSN without connecting."""
+#: The ONLY connection parameters a test DSN may carry. Everything else is
+#: refused, because libpq has many ways to send a connection somewhere other
+#: than ``host``/``port`` say: ``hostaddr`` overrides the address ``host``
+#: resolves to, ``service`` pulls host/port/hostaddr from a service file,
+#: ``passfile``/``ssl*`` reach for files, ``target_session_attrs`` and
+#: ``load_balance_hosts`` only make sense with several hosts. An allow-list
+#: fails closed on parameters a future libpq adds.
+ALLOWED_DSN_KEYS = frozenset({
+    "host", "port", "dbname", "user", "password", "connect_timeout",
+    "application_name", "sslmode", "client_encoding",
+})
+
+#: Parameters that redirect a connection regardless of ``host``/``port``.
+#: Refused on EVERY connection a test opens, not only in the configured DSN.
+ADDRESS_OVERRIDE_KEYS = frozenset({"hostaddr", "service"})
+
+#: Ambient libpq variables that change the ADDRESS of a connection even when
+#: the DSN names a host and a port. ``PGHOSTADDR`` is used whenever the DSN has
+#: no ``hostaddr``; ``PGSERVICE`` selects a service-file entry that can supply
+#: one. (``PGHOST``/``PGPORT`` cannot win: an explicit host and port are
+#: required, and an explicit value beats the environment.)
+ADDRESS_OVERRIDE_ENV = ("PGHOSTADDR", "PGSERVICE")
+
+_PORT = re.compile(r"^[0-9]{1,5}$")
+
+
+def _conninfo_dict(dsn):
+    """Parse ``dsn`` with libpq's own parser, without connecting."""
     try:
         from psycopg.conninfo import conninfo_to_dict
     except ImportError:                       # pragma: no cover
@@ -99,13 +128,49 @@ def _parse_dsn(dsn):
             "psycopg is required to validate the test DSN; refusing to guess "
             "whether the target is safe.")
     try:
-        parsed = conninfo_to_dict(dsn)
+        return dict(conninfo_to_dict(dsn))
     except Exception as exc:
         raise UnsafeTestDatabase(f"{TEST_DSN_ENV} is not a valid DSN: {exc}")
-    host = (parsed.get("host") or "").strip()
-    port = str(parsed.get("port") or "").strip()
-    dbname = (parsed.get("dbname") or "").strip()
-    return host, port, dbname
+
+
+def _parse_dsn(dsn):
+    """Extract ``(host, port, dbname)`` from a DSN without connecting.
+
+    Values are returned EXACTLY as libpq will see them, not stripped. A
+    stripped copy is not what the connection uses, and validating a different
+    string from the one that connects is how a guard gets talked around.
+    """
+    parsed = _conninfo_dict(dsn)
+    return (str(parsed.get("host") or ""), str(parsed.get("port") or ""),
+            str(parsed.get("dbname") or ""))
+
+
+def assert_no_address_override(parsed, origin=TEST_DSN_ENV):
+    """Refuse parameters / environment that redirect a connection.
+
+    ``parsed`` is a conninfo dict. Used for the configured DSN and, by the
+    session-wide ``psycopg.connect`` wrapper, for every connection a test
+    opens: host and port are only meaningful if nothing overrides them.
+    """
+    for key in sorted(ADDRESS_OVERRIDE_KEYS):
+        if parsed.get(key) not in (None, ""):
+            raise UnsafeTestDatabase(
+                f"{origin} carries {key}={parsed[key]!r}. That parameter "
+                "decides where the connection really goes, whatever host and "
+                "port say; it is refused.")
+    dbname = str(parsed.get("dbname") or "")
+    if "=" in dbname or "://" in dbname:
+        raise UnsafeTestDatabase(
+            f"{origin} has a dbname that is itself a connection string "
+            f"({dbname!r}). libpq expands it and it would override the host "
+            "and port that were validated; it is refused.")
+    for var in ADDRESS_OVERRIDE_ENV:
+        if os.environ.get(var):
+            raise UnsafeTestDatabase(
+                f"the environment sets {var}, which redirects a PostgreSQL "
+                f"connection regardless of the host and port in {origin}. "
+                "Unset it before running PostgreSQL tests.")
+    return True
 
 
 def assert_safe_dsn(dsn):
@@ -119,12 +184,27 @@ def assert_safe_dsn(dsn):
             f"{TEST_DSN_ENV} is empty. PostgreSQL tests require an explicit "
             "disposable server; implicit defaults are refused.")
 
+    parsed = _conninfo_dict(dsn)
     host, port, dbname = _parse_dsn(dsn)
+
+    assert_no_address_override(parsed)
+    unknown = sorted(k for k, v in parsed.items()
+                     if k not in ALLOWED_DSN_KEYS and v not in (None, ""))
+    if unknown:
+        raise UnsafeTestDatabase(
+            f"{TEST_DSN_ENV} carries unsupported parameter(s) {unknown}. Only "
+            f"{sorted(ALLOWED_DSN_KEYS)} are accepted: anything else may "
+            "change where or how the connection is made.")
 
     if not host:
         raise UnsafeTestDatabase(
             f"{TEST_DSN_ENV} does not name a host. An implicit host would "
             "resolve to localhost, where the production catalog listens.")
+    if "," in host or "," in port:
+        raise UnsafeTestDatabase(
+            f"{TEST_DSN_ENV} lists several hosts or ports "
+            f"(host={host!r}, port={port!r}). Exactly one server is accepted: "
+            "libpq falls through to the next entry, which nothing validated.")
     if host not in ALLOWED_HOSTS:
         raise UnsafeTestDatabase(
             f"{TEST_DSN_ENV} points at host {host!r}. Only a loopback address "
@@ -134,6 +214,10 @@ def assert_safe_dsn(dsn):
         raise UnsafeTestDatabase(
             f"{TEST_DSN_ENV} does not name a port. The implicit default is "
             "5432, which is the production container on this host.")
+    if not _PORT.match(port) or not 1 <= int(port) <= 65535:
+        raise UnsafeTestDatabase(
+            f"{TEST_DSN_ENV} has port {port!r}, which is not a single plain "
+            "port number.")
     if int(port) in FORBIDDEN_PORTS:
         raise UnsafeTestDatabase(
             f"{TEST_DSN_ENV} uses port {port}, the standard PostgreSQL port. "
@@ -144,7 +228,12 @@ def assert_safe_dsn(dsn):
         raise UnsafeTestDatabase(
             f"{TEST_DSN_ENV} does not name a database. The implicit default is "
             "'lto_archive' — the production catalog.")
-    if dbname in PRODUCTION_DATABASE_NAMES:
+    if not _SAFE_NAME.match(dbname):
+        raise UnsafeTestDatabase(
+            f"{TEST_DSN_ENV} names database {dbname!r}. Only letters, digits "
+            "and underscores are accepted in the maintenance database name.")
+    if (dbname.lower() in PRODUCTION_DATABASE_NAMES
+            or dbname.lower().startswith("lto_archive")):
         raise UnsafeTestDatabase(
             f"{TEST_DSN_ENV} names database {dbname!r}, which is a production "
             "catalog. Point the maintenance connection at 'postgres'.")
@@ -303,6 +392,8 @@ def drop_all_run_databases():
 
 
 __all__ = [
+    "ADDRESS_OVERRIDE_ENV", "ADDRESS_OVERRIDE_KEYS", "ALLOWED_DSN_KEYS",
+    "assert_no_address_override",
     "ALLOWED_HOSTS", "FORBIDDEN_PORTS", "PRODUCTION_DATABASE_NAMES",
     "PRODUCTION_MARKER_DATABASES", "RUN_ID", "RUN_PREFIX", "SKIP_REASON",
     "TEST_DSN_ENV", "UnsafeTestDatabase", "assert_created_by_this_run",
