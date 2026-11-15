@@ -48,7 +48,7 @@ from .archive_artifacts import (
 from .packer import LTOPacker, StagingSpaceError
 from .paths import (_LEGACY_PATH_LIMIT, _dir_tree_size,
                      _disambiguate_local_rel, _exceeds_legacy_path_limit,
-                     _long, _remote_fetch_base_and_rel,
+                     _local_collision_key, _long, _remote_fetch_base_and_rel,
                      remote_store_base_and_rel,
                     _reserved_name_component, _winsafe_extracted_rel)
 from .pipeline_types import (
@@ -1559,7 +1559,7 @@ class RemoteChunkStager:
         records = []
         pending = []        # primary files: extracted at their sanitized path
         collisions = []     # renamed files: fetched individually, then moved
-        claimed = {}        # case-folded local_rel -> remote rel that owns it
+        claimed = {}        # collision key of local_rel -> owning remote rel
         fetching_ids = []
 
         for row in chunk_files:
@@ -1596,14 +1596,14 @@ class RemoteChunkStager:
             # rel is the true remote path (sent verbatim to remote tar); the
             # local copy lands under the name the Windows extractor can write.
             local_rel = _winsafe_extracted_rel(rel)
-            key = local_rel.casefold()
+            key = _local_collision_key(local_rel)
             collided = key in claimed
             if collided:
                 # Two distinct remote names map to the same on-disk path —
                 # rename this one so neither file is silently overwritten.
                 clash_with = claimed[key]
                 local_rel  = _disambiguate_local_rel(local_rel, claimed)
-                key        = local_rel.casefold()
+                key        = _local_collision_key(local_rel)
                 print(f"[REMOTE] Name collision: '{rel}' and '{clash_with}' map "
                       f"to the same Windows path — fetching the former as "
                       f"'{local_rel}'.")
