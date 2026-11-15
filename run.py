@@ -16,6 +16,7 @@ os.chdir(PROJECT_ROOT)
 from src.cli import main, run_remote_archiver_headless
 from src.config import ConfigManager
 from src.db import create_database_manager
+from src.exit_codes import ExitCode
 from src.logsetup import configure_file_logging, get_logger
 from src.pg_backup import create_database_backup
 from src.tape_reset import execute_reset
@@ -114,7 +115,10 @@ if __name__ == "__main__":
                 "catalog is PostgreSQL-only; manage schema with scripts/sql/*.sql "
                 f"instead. Unsupported flag(s): {', '.join(removed)}"
             )
-        main()
+        # The menu returns the exit code of its last failed action (0 when
+        # nothing failed), so a failure the operator saw on screen is also
+        # visible to whatever launched the process.
+        raise SystemExit(int(main() or 0))
     except SystemExit:
         raise
     except RuntimeError as e:
@@ -125,5 +129,10 @@ if __name__ == "__main__":
         if os.environ.get('LTO_DEBUG'):
             raise
         print(f"\n{e}")
+        # A printed error is still a failure: never fall off the end with 0
+        # (a failed --backup-db, or a headless run that could not reach the
+        # database, used to look like success to a scheduled task).
+        raise SystemExit(int(ExitCode.FATAL_CONFIG))
     except KeyboardInterrupt:
         print("\n\n[ABORTED] User stopped the script.")
+        raise SystemExit(int(ExitCode.USER_STOP))

@@ -26,6 +26,7 @@ the mount. What remains is a cached, non-filesystem verification.
 """
 import os
 import subprocess
+import sys
 import threading
 import time
 from typing import TYPE_CHECKING
@@ -463,6 +464,47 @@ def _ensure_lto_drive_ready(tape_drive, prefix="[TAPE]", *, reason=None,
         _release_tape_io_lock()
 
 
+def _stdin_is_interactive():
+    """True only when a human can actually answer a prompt on stdin."""
+    try:
+        return bool(sys.stdin) and sys.stdin.isatty()
+    except Exception:
+        return False
+
+
+def confirm_physical_action(word, consequence_lines):
+    """Ask the operator to TYPE ``word`` before an action with physical or
+    irreversible consequences at the drive. Returns True only on an exact match.
+
+    Fails closed in every other case: Enter, any other text (a stray menu
+    digit, ``y``, the word in the wrong case), a closed stdin, Ctrl+C, and a
+    non-interactive stdin — a detached run fed piped menu digits must never be
+    able to reach the drive mechanics.
+    """
+    print("\n" + "!" * 60)
+    for line in consequence_lines:
+        print(line)
+    print("!" * 60)
+    if not _stdin_is_interactive():
+        print(f"[CANCELLED] Standard input is not interactive, so '{word}' "
+              "cannot be confirmed. Nothing was done.")
+        get_logger().warning(
+            "physical_action_cancelled: word=%s reason=non_interactive_stdin",
+            word)
+        return False
+    try:
+        answer = input(f"Type {word} (exactly, in capitals) to proceed, or "
+                       "press Enter to cancel: ")
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    if answer.strip() != word:
+        print("[CANCELLED] Nothing was done.")
+        get_logger().info("physical_action_cancelled: word=%s", word)
+        return False
+    get_logger().warning("physical_action_confirmed: word=%s", word)
+    return True
+
+
 class TapeManager:
     def __init__(self, db: "PgDatabaseManager", tape_drive: str, ibm_eject_cmd=None):
         self.db            = db
@@ -603,6 +645,18 @@ class TapeManager:
         drive_letter = self._drive_letter()
         exe          = os.path.join(LTFS_DIR, 'LtfsCmdCheck.exe')
         cmd          = [exe, drive_letter]
+        if not confirm_physical_action("REPAIR", (
+                f"[CHECK] LtfsCmdCheck.exe (ltfsck) on drive {drive_letter} "
+                "does not only inspect:",
+                "        it REPAIRS the LTFS filesystem and can rewrite or roll "
+                "back the index on the cartridge.",
+                "        It is a last-resort tool: on a damaged or read-only "
+                "cartridge it can strand a volume",
+                "        that was still recoverable, and it can run for a long "
+                "time. Never run it during an",
+                "        archive run or without a diagnosis "
+                "(docs/incidents/000-no-physical-intervention-policy.md).")):
+            return
         print(f"\n[CHECK] Running: LtfsCmdCheck.exe {drive_letter}")
         self._print_drive_status("[CHECK]")
         print("[CHECK] This may take several minutes...")
@@ -649,5 +703,16 @@ class TapeManager:
             print(f"[ERROR] LtfsCmdDrives.exe not found in: {LTFS_DIR}")
 
     def eject_tape(self):
-        """Run LtfsCmdEject.exe to safely eject the tape."""
+        """Run LtfsCmdEject.exe to safely eject the tape — after a typed
+        confirmation. An eject is physical: nothing in software can undo it."""
+        if not confirm_physical_action("EJECT", (
+                "[EJECT] This PHYSICALLY ejects the cartridge from drive "
+                f"{self._drive_letter()}.",
+                "        An ejected cartridge cannot be reloaded by software: "
+                "somebody must go to the drive",
+                "        and push it back in. Until then every archive run, "
+                "resume and restore is blocked.",
+                "        Do this only when a person is standing at the drive "
+                "and no archive run is active.")):
+            return None
         return eject_tape_drive(self.tape_drive, self.ibm_eject_cmd)

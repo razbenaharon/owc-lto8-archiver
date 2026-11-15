@@ -1948,6 +1948,9 @@ class RemoteOrchestrator:
                 reason=REASON_LTFS_MEDIA_DEGRADED, resumable=False,
                 source="gate", detailed_reason=msg)
 
+        # Remembered so the writer can repeat the PASSIVE half of this check
+        # (IBM LogFile.csv only) before each later chunk of the same group.
+        self._gate_mount_started_at = mount_started_at
         health = ltfs_media_health(since_iso=mount_started_at)
 
         if not health.get("determinate"):
@@ -2444,24 +2447,39 @@ class RemoteOrchestrator:
                  desc.pack_dir)
         try:
             assessment = assess_reboot_state(block_on_unknown=True)
-        except Exception:
-            # The gate itself must never take the pipeline down. Fall back to
-            # the critical Windows markers alone rather than blocking forever.
-            log.exception("pre_tape_write_reboot_check failed; "
-                          "falling back to Windows markers")
-            return list(pending_reboot_reasons(include_soft=False)), None
+        except Exception as exc:
+            # FAIL CLOSED. The gate must not crash the pipeline, but "the
+            # restart state could not be evaluated" is not "no restart is
+            # staged": this path used to consult the Windows markers alone,
+            # silently dropping the SCCM answer — the one control plane that
+            # actually took the 2026-07-15 restart. Keep whatever the Windows
+            # markers do say, and add the unknown as a blocking reason. The
+            # stop is transient and the pack is preserved; the operator
+            # override below still applies.
+            log.exception("pre_tape_write_reboot_check could not evaluate the "
+                          "restart state; blocking this write")
+            try:
+                reasons = list(pending_reboot_reasons(include_soft=False))
+            except Exception:
+                log.exception("Windows restart markers unreadable as well")
+                reasons = []
+            reasons.append(
+                f"The restart state could not be evaluated ({exc}) — "
+                "refusing to start a tape write blind")
+            sccm = {"determinate": False, "error": str(exc)}
+        else:
+            sccm = assessment.sccm
+            # Warning-only indicators are never discarded: they are recorded
+            # here and on the console so a stale rename queue stays visible in
+            # diagnostics without stopping a tape write.
+            if assessment.warnings:
+                summary = assessment.warning_summary()
+                log.info(
+                    "pre_tape_write_reboot_warning: session=%s chunk=%s %s",
+                    session_id, desc.chunk_index + 1, summary)
+                print(f"[WU] {summary}")
+            reasons = assessment.blocking_reasons
 
-        sccm = assessment.sccm
-        # Warning-only indicators are never discarded: they are recorded here
-        # and on the console so a stale rename queue stays visible in
-        # diagnostics without stopping a tape write.
-        if assessment.warnings:
-            summary = assessment.warning_summary()
-            log.info("pre_tape_write_reboot_warning: session=%s chunk=%s %s",
-                     session_id, desc.chunk_index + 1, summary)
-            print(f"[WU] {summary}")
-
-        reasons = assessment.blocking_reasons
         if reasons and not self._block_on_soft_reboot_marker():
             # Explicit operator override of a real, critical pending restart.
             log.warning(
