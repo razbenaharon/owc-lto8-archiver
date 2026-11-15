@@ -975,7 +975,17 @@ class RemoteChunkStager:
                 source_missing_files.extend(loose_missing)
                 if not fetch_ok:
                     raise RuntimeError("large-file fetch failed")
+                # Re-read the rows: only the durable copy carries the
+                # local_rel_path the fetch just recorded.
+                reader = getattr(self.host.db, "get_chunk_files", None)
+                fresh_rows = (
+                    [row for row in reader(session_id, chunk_index)
+                     if row['manifest_id'] is not None
+                     and int(row['manifest_id']) in loose_ids]
+                    if callable(reader) else loose_rows)
+                loose_metadata = []
                 if loose_count:
+                    self._assert_loose_targets_free(fetch_dir, pack_dir)
                     packer = LTOPacker(
                         self.host.cfg.max_zip_size_gb,
                         index_min_file_mb=self.host.cfg.index_min_file_mb,
@@ -983,6 +993,11 @@ class RemoteChunkStager:
                             self.host.cfg.index_packed_small_files),
                         manifest_enabled=False,
                     )
+                    # 'merge', not 'reuse': the pack already holds this
+                    # chunk's TAR/sidecar/manifest artifacts. 'reuse' returned
+                    # an empty list for any non-empty pack, so the large files
+                    # were never copied and were then deleted with the fetch
+                    # dir (audit H12).
                     loose_metadata = packer.run(
                         source=fetch_dir,
                         dest=pack_dir,
@@ -991,13 +1006,24 @@ class RemoteChunkStager:
                         source_name='remote',
                         session_id=session_id,
                         chunk_index=chunk_index,
-                        on_existing='reuse',
+                        on_existing='merge',
                         governor=getattr(self.host, 'governor', None),
                         pack_file_batch_size=self.host.pack_file_batch_size,
                         pack_parallel_workers=1,
                     )
+                # Same gate as the ZIP path (audit H7): every planned large
+                # file is positively missing or in the pack at its size.
+                problems = reconcile_packed_chunk(
+                    loose_rows, loose_missing, loose_count, fresh_rows,
+                    loose_metadata or [], pack_dir=pack_dir)
+                if problems:
+                    raise ChunkReconciliationError(
+                        f"[PACK] Chunk {chunk_index + 1} large files failed "
+                        "reconciliation and were NOT queued for tape: "
+                        + "; ".join(problems[:5]))
+                if loose_count:
                     canonical_count = _apply_canonical_remote_paths(
-                        loose_metadata, loose_rows)
+                        loose_metadata, fresh_rows)
                     if canonical_count != len(loose_metadata):
                         raise RuntimeError(
                             "[DB] Refusing to index temporary loose staging "
@@ -1073,6 +1099,23 @@ class RemoteChunkStager:
                 self.host._cleanup_dir(fetch_dir)
                 self.host._cleanup_dir(pack_dir)
             raise
+
+    @staticmethod
+    def _assert_loose_targets_free(fetch_dir, pack_dir):
+        """Refuse to copy a large file over an object already in the pack.
+
+        Loose files keep their source-relative path inside the pack, next to
+        the chunk's containers and metadata artifacts. A source file whose
+        path equals one of those names must stop the chunk, not replace it."""
+        for root, _dirs, files in os.walk(_long(fetch_dir)):
+            for name in files:
+                rel = os.path.relpath(os.path.join(root, name),
+                                      _long(fetch_dir))
+                target = os.path.join(pack_dir, rel)
+                if os.path.lexists(_long(target)):
+                    raise RuntimeError(
+                        "[PACK] large file would overwrite an existing pack "
+                        f"object: {rel}")
 
     def _reservation_for_chunk(
             self, planned_bytes, planned_files, *, session_id=None,

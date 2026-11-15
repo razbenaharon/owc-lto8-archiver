@@ -552,5 +552,172 @@ class ReconcileFunctionTests(unittest.TestCase):
                         problems)
 
 
+class MixedStoredTarDB(FakeDB):
+    """FakeDB plus the Stored TAR container/artifact repository surface."""
+
+    def __init__(self, rows, chunk_plan):
+        super().__init__(rows, chunk_format="stored_tar")
+        self.chunk_plan = chunk_plan
+        self.container = {
+            "container_id": 7, "session_id": 1, "chunk_index": 0,
+            "container_ordinal": 0, "container_format": "stored_tar",
+            "format_version": "stored-tar-v1",
+            "tar_dialect": "gnu-pax-sparse-v1",
+            "storage_class": "small_files",
+            "container_name": "container_000.tar",
+            "temporary_data_locator": None,
+            "permanent_local_metadata_locator": None,
+            "expected_member_count": 1, "expected_logical_bytes": 3,
+            "observed_member_count": None, "observed_logical_bytes": None,
+            "actual_artifact_bytes": None, "validation_state": "planned",
+            "writer_state": "not_started", "catalog_state": "not_started",
+            "owner_token": None, "validated_part_locator": None,
+            "validation_summary": None,
+        }
+        self.artifacts = []
+
+    def require_existing_stored_tar_recovery(self, _session, _chunk):
+        return True
+
+    def get_or_create_stored_tar_chunk_plan(self, *_args, **_kwargs):
+        return self.chunk_plan
+
+    def get_archive_containers(self, _session, _chunk):
+        return [dict(self.container)]
+
+    def get_archive_artifacts(self, _session, _chunk):
+        return [dict(item) for item in self.artifacts]
+
+    def claim_stored_tar_container_build(self, _id, owner, part_path):
+        self.container.update(owner_token=owner,
+                              validated_part_locator=part_path,
+                              validation_state="building")
+        return True
+
+    def mark_stored_tar_validated_part(self, _id, owner, part_path,
+                                       validation, diagnostics):
+        self.container.update({
+            "owner_token": owner, "validated_part_locator": part_path,
+            "validation_state": "validated_part",
+            "actual_artifact_bytes": validation.archive_size,
+            "observed_member_count": validation.member_count,
+            "observed_logical_bytes": validation.logical_bytes,
+            "validation_summary": {
+                "source_diagnostics": list(diagnostics or ())},
+        })
+        return True
+
+    def publish_stored_tar_pair(self, **values):
+        self.container.update({
+            "temporary_data_locator": values["temporary_data_locator"],
+            "permanent_local_metadata_locator": values["sidecar_locator"],
+            "actual_artifact_bytes": values["tar_size_bytes"],
+            "observed_member_count": values["observed_member_count"],
+            "observed_logical_bytes": values["observed_logical_bytes"],
+            "validation_state": "ready", "owner_token": None,
+        })
+        artifact = {
+            "artifact_id": 9, "session_id": 1, "chunk_index": 0,
+            "container_id": 7, "artifact_kind": "tar_sidecar",
+            "artifact_version": values["sidecar_version"],
+            "local_locator": values["sidecar_locator"],
+            "artifact_size_bytes": values["sidecar_size_bytes"],
+            "readiness_state": "ready",
+        }
+        self.artifacts = [artifact]
+        return {"container": dict(self.container), "artifact": dict(artifact)}
+
+
+class MixedStoredTarChunkTests(_Harness):
+    """H12: a container plus loose large files must carry the large files."""
+
+    LARGE = b"L" * 4096
+
+    def _build_mixed(self, remote_files):
+        from test_stored_tar_producer import GNU_RECORD_SIZE, _write_tar
+        from src.remote_transport import RemoteTarStoreResult
+        self.remote = FakeRemote(remote_files)
+        rows = make_rows({"small.txt": b"abc", "big/large.bin": self.LARGE})
+        small = SimpleNamespace(
+            manifest_id=1, plan_ordinal=0,
+            remote_path=f"{REMOTE_ROOT}/small.txt", file_size_bytes=3,
+            storage_class="small_files", container_ordinal=0)
+        large = SimpleNamespace(
+            manifest_id=2, plan_ordinal=1,
+            remote_path=f"{REMOTE_ROOT}/big/large.bin",
+            file_size_bytes=len(self.LARGE), storage_class="loose",
+            container_ordinal=None)
+        container_plan = SimpleNamespace(
+            session_id=1, chunk_index=0, container_ordinal=0,
+            container_name="container_000.tar", expected_member_count=1,
+            expected_logical_bytes=3, estimated_archive_bytes=GNU_RECORD_SIZE,
+            max_size_bytes=GNU_RECORD_SIZE,
+            container_format=ContainerFormat.STORED_TAR,
+            format_version="stored-tar-v1", tar_dialect="gnu-pax-sparse-v1",
+            storage_class="small_files")
+        chunk_plan = SimpleNamespace(
+            containers=(container_plan,), members=(small, large),
+            small_members=(small,), loose_members=(large,),
+            source_missing_members=())
+        self.db = MixedStoredTarDB(rows, chunk_plan)
+        self.host = make_host(self.staging, self.db)
+        self.host.staging_padding = 1.0
+        self.fetch_dir = os.path.join(self.staging, "_fetch_s0001_000")
+        self.pack_dir = os.path.join(self.staging, "_pack_s0001_000")
+
+        def store(_user, _host, _base, paths, part, **_kwargs):
+            self.assertEqual(paths, ["small.txt"])
+            _write_tar(part, [("small.txt", b"abc")])
+            return RemoteTarStoreResult(
+                True, part, os.path.getsize(part), 0, "")
+
+        for patcher in (
+                mock.patch("src.remote_staging._remote_tar_fetch",
+                           side_effect=self.remote.fetch),
+                mock.patch("src.remote_staging._remote_source_status_probe",
+                           side_effect=self.remote.probe),
+                mock.patch("src.remote_staging._remote_tar_store",
+                           side_effect=store)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_large_file_is_carried_into_the_pack_and_declared(self):
+        self._build_mixed({"big/large.bin": self.LARGE})
+        desc = self.stage()
+        self.assertTrue(desc.assert_writer_ready())
+        loose = [item for item in desc.metadata if not item["is_packed"]]
+        self.assertEqual(
+            [(item["canonical_source_path"], item["file_size_bytes"])
+             for item in loose],
+            [(f"{REMOTE_ROOT}/big/large.bin", len(self.LARGE))])
+        staged = os.path.join(self.pack_dir, "big", "large.bin")
+        with open(staged, "rb") as handle:
+            self.assertEqual(handle.read(), self.LARGE)
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.pack_dir, "container_000.tar")))
+        self.assertEqual(desc.loose_file_bytes, len(self.LARGE))
+        self.assertEqual(self.remote.requests, [["big/large.bin"]])
+
+    def test_large_file_that_cannot_be_copied_fails_the_chunk(self):
+        from src.remote_staging import ChunkReconciliationError
+        self._build_mixed({"big/large.bin": self.LARGE})
+        with mock.patch("src.packer._robocopy_file", return_value=False):
+            with self.assertRaises(ChunkReconciliationError):
+                self.stage()
+        self.assertEqual(self.db.chunk_statuses[-1], "fetch_failed")
+
+    def test_large_file_named_like_a_pack_object_is_refused(self):
+        from src.remote_staging import RemoteChunkStager
+        fetch = os.path.join(self.staging, "f")
+        pack = os.path.join(self.staging, "p")
+        os.makedirs(fetch)
+        os.makedirs(pack)
+        for root in (fetch, pack):
+            with open(os.path.join(root, "container_000.tar"), "wb") as handle:
+                handle.write(b"x")
+        with self.assertRaisesRegex(RuntimeError, "would overwrite"):
+            RemoteChunkStager._assert_loose_targets_free(fetch, pack)
+
+
 if __name__ == "__main__":
     unittest.main()
