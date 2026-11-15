@@ -197,6 +197,24 @@ class MenuExitCodes(unittest.TestCase):
             return_value=int(ExitCode.FATAL_CONFIG)))
         self.assertEqual(code, int(ExitCode.FATAL_CONFIG))
 
+    def _restore(self, result):
+        from types import SimpleNamespace
+        retriever_cls = mock.Mock()
+        retriever_cls.return_value.run.return_value = SimpleNamespace(**result)
+        return self._main(
+            ["2", "0"], LTORetriever=retriever_cls,
+            _prepare_robocopy_exclusion=mock.Mock(return_value=False),
+            install_cancel_handler=mock.Mock(), reset_cancel=mock.Mock())
+
+    def test_incomplete_restore_then_exit_is_nonzero(self):
+        # Audit H13: an incomplete restore must not look like success to
+        # whatever launched the program.
+        code = self._restore({"ok": False, "exit_code": 1})
+        self.assertEqual(code, 1)
+
+    def test_complete_restore_then_exit_is_zero(self):
+        self.assertEqual(self._restore({"ok": True, "exit_code": 0}), 0)
+
     def test_plain_exit_is_zero(self):
         self.assertEqual(self._main(["x", "0"]), 0)
 

@@ -469,7 +469,14 @@ def main():
             reset_cancel()
             install_cancel_handler()
             try:
-                retriever.run()
+                restore_result = retriever.run()
+                # An incomplete restore printed its own summary; make the
+                # process exit code say so too (audit H13).
+                if restore_result is not None and not getattr(
+                        restore_result, "ok", True):
+                    failure_code = int(
+                        getattr(restore_result, "exit_code", 0)
+                        or ExitCode.FATAL_CONFIG)
             except RuntimeError as e:
                 # e.g. tape-verify cancelled — return to the menu, don't exit.
                 get_logger().exception("restore run stopped")
