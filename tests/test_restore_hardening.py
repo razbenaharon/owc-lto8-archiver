@@ -372,5 +372,159 @@ class RestoreAccountingTests(_RestoreCase):
         self.assertNotEqual(self.retriever.last_result.exit_code, 0)
 
 
+class AtomicZipExtractionTests(_RestoreCase):
+    """H14: a failed ZIP extraction never leaves a file under the final name,
+    and never stops the remaining files from being restored."""
+
+    GOOD_A = b"A" * 4096
+    BAD = b"corrupt-me-" * 400
+    GOOD_C = b"C" * 4096
+
+    def _bundle(self, name="Bundle_001.zip", compression=zipfile.ZIP_STORED):
+        """A ZIP whose middle member fails its CRC when read."""
+        path = os.path.join(self.tape, name)
+        with zipfile.ZipFile(path, "w", compression) as zf:
+            zf.writestr("D/a.bin", self.GOOD_A)
+            zf.writestr("D/bad.bin", self.BAD)
+            zf.writestr("D/c.bin", self.GOOD_C)
+        with open(path, "rb") as handle:
+            raw = bytearray(handle.read())
+        if compression == zipfile.ZIP_STORED:
+            at = raw.index(self.BAD) + len(self.BAD) // 2
+        else:       # inside the deflate stream of the middle member
+            first = raw.index(b"D/bad.bin") + len(b"D/bad.bin")
+            at = first + 6
+        raw[at] ^= 0xFF
+        with open(path, "wb") as handle:
+            handle.write(bytes(raw))
+        return path
+
+    def _records(self, zip_path, names=("D/a.bin", "D/bad.bin", "D/c.bin")):
+        return [{"tape_label": "T1", "is_packed": True, "bundle_id": 1,
+                 "container_name": zip_path, "stored_path": name,
+                 "file_name": os.path.basename(name),
+                 "original_path": "/vault/" + name} for name in names]
+
+    def _assert_no_partials(self):
+        leftovers = [rel for rel in self._files_under(self.restore)
+                     if ".restore_" in rel or rel.endswith(".part")]
+        self.assertEqual(leftovers, [])
+
+    def _read(self, rel):
+        with open(os.path.join(self.restore, rel), "rb") as handle:
+            return handle.read()
+
+    def test_single_corrupt_member_leaves_nothing_under_the_final_name(self):
+        for compression in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+            with self.subTest(compression=compression):
+                zip_path = self._bundle(f"B{compression}.zip", compression)
+                record = self._records(zip_path, ["D/bad.bin"])[0]
+                with redirect_stdout(io.StringIO()):
+                    ok = self.retriever._restore_packed(record)
+                self.assertFalse(ok)
+                self.assertEqual(self._files_under(self.restore), [])
+                self.assertEqual(self.retriever._result.failures[-1][0],
+                                 "/vault/D/bad.bin")
+
+    def test_bulk_restore_continues_past_a_corrupt_member(self):
+        zip_path = self._bundle()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            result = self.retriever._restore_many(self._records(zip_path))
+        self.assertEqual(self._files_under(self.restore), ["a.bin", "c.bin"])
+        self.assertEqual(self._read("a.bin"), self.GOOD_A)
+        self.assertEqual(self._read("c.bin"), self.GOOD_C)
+        self._assert_no_partials()
+        self.assertFalse(result.ok)
+        self.assertEqual((result.restored_count, result.failed_count), (2, 1))
+        self.assertEqual(result.failures[0][0], "/vault/D/bad.bin")
+        self.assertNotIn("Complete.", out.getvalue())
+
+    def test_directory_restore_continues_past_a_corrupt_member(self):
+        zip_path = self._bundle()
+
+        class _DB:
+            @staticmethod
+            def find_directory_restore_bundles(dir_path, **_kw):
+                return [{"tape_label": "T1", "stored_bundle_path": zip_path,
+                         "base_path": "/vault"}]
+        self.retriever.db = cast(Any, _DB())
+        out = io.StringIO()
+        with redirect_stdout(out):
+            result = self.retriever._restore_directory_complete("/vault/D")
+        self.assertEqual(self._files_under(self.restore),
+                         ["D/a.bin", "D/c.bin"])
+        self.assertEqual(self._read("D/c.bin"), self.GOOD_C)
+        self._assert_no_partials()
+        self.assertFalse(result.ok)
+        self.assertEqual((result.restored_count, result.failed_count), (2, 1))
+        self.assertIn("/vault/D/bad.bin", out.getvalue())
+        self.assertIn("INCOMPLETE", out.getvalue())
+
+    def test_existing_destination_is_never_replaced(self):
+        zip_path = self._bundle()
+        existing = os.path.join(self.restore, "a.bin")
+        with open(existing, "wb") as handle:
+            handle.write(b"already here")
+        with redirect_stdout(io.StringIO()):
+            self.retriever._restore_many(
+                self._records(zip_path, ["D/a.bin"]))
+        self.assertEqual(self._read("a.bin"), b"already here")
+        self.assertEqual(self._read("a_1.bin"), self.GOOD_A)
+
+    def test_publication_race_does_not_clobber_a_file_created_meanwhile(self):
+        zip_path = os.path.join(self.tape, "Race.zip")
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr("x.bin", "from-zip")
+        target = os.path.join(self.restore, "x.bin")
+        with zipfile.ZipFile(zip_path) as zf:
+            real_open = zf.open
+
+            def racing_open(*args, **kwargs):
+                # Another writer claims the final name mid-extraction.
+                with open(target, "wb") as handle:
+                    handle.write(b"winner")
+                return real_open(*args, **kwargs)
+            with mock.patch.object(zf, "open", racing_open):
+                published = self.retriever._extract_zip_entry(
+                    zf, "x.bin", target)
+        self.assertEqual(self._read("x.bin"), b"winner")
+        self.assertNotEqual(os.path.normcase(published),
+                            os.path.normcase(target))
+        with open(published, "rb") as handle:
+            self.assertEqual(handle.read(), b"from-zip")
+        self._assert_no_partials()
+
+    def test_extraction_is_fsynced_before_it_is_published(self):
+        zip_path = os.path.join(self.tape, "Sync.zip")
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr("x.bin", "payload")
+        target = os.path.join(self.restore, "x.bin")
+        events = []
+        real_fsync = os.fsync
+
+        def recording_fsync(fd):
+            real_fsync(fd)
+            events.append(("fsync", os.fstat(fd).st_size,
+                           os.path.exists(target)))
+        with zipfile.ZipFile(zip_path) as zf, mock.patch.object(
+                retriever_mod.os, "fsync", recording_fsync):
+            self.retriever._extract_zip_entry(zf, "x.bin", target)
+        self.assertEqual(events, [("fsync", len("payload"), False)])
+        self.assertEqual(self._read("x.bin"), b"payload")
+
+    def test_cancel_during_extraction_publishes_nothing(self):
+        zip_path = os.path.join(self.tape, "Cancel.zip")
+        with zipfile.ZipFile(zip_path, "w") as zf:
+            zf.writestr("x.bin", "payload")
+        CANCEL.set()
+        self.addCleanup(CANCEL.clear)
+        with zipfile.ZipFile(zip_path) as zf:
+            with self.assertRaises(retriever_mod.RestoreCancelled):
+                self.retriever._extract_zip_entry(
+                    zf, "x.bin", os.path.join(self.restore, "x.bin"))
+        self.assertEqual(self._files_under(self.restore), [])
+
+
 if __name__ == "__main__":
     unittest.main()

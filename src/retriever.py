@@ -881,11 +881,65 @@ class LTORetriever:
                 counter += 1
                 continue
             except OSError as exc:
-                raise RuntimeError(
-                    "[RESTORE] Atomic no-clobber publication is unavailable "
-                    f"for {target!r}") from exc
+                # No hard links here (exFAT/FAT32 or a network share). On
+                # Windows a plain rename is itself atomic and refuses an
+                # existing target, so it is an equally safe fallback.
+                if os.name != "nt":
+                    raise RuntimeError(
+                        "[RESTORE] Atomic no-clobber publication is "
+                        f"unavailable for {target!r}") from exc
+                try:
+                    os.rename(temp_path, target)
+                except FileExistsError:
+                    counter += 1
+                    continue
+                except OSError as rename_exc:
+                    raise RuntimeError(
+                        "[RESTORE] Atomic no-clobber publication is "
+                        f"unavailable for {target!r}") from rename_exc
+                return target
             os.remove(temp_path)
             return target
+
+    def _extract_zip_entry(self, zf, entry, dst):
+        """Extract one ZIP entry so that only verified content gets a name.
+
+        Mirrors the Stored TAR path: the bytes go to a uniquely named temp
+        file in the destination directory, the size is checked against the
+        ZIP's own record and the CRC-32 is checked by ``zipfile`` as the
+        stream reaches its end, the file is flushed and fsynced, and only then
+        is it published under its final name without replacing anything.
+        Any failure removes the temp file and propagates; nothing is ever left
+        under the final name. Returns the published path.
+        """
+        info = zf.getinfo(entry)
+        dst_dir = os.path.dirname(os.path.abspath(dst))
+        os.makedirs(dst_dir, exist_ok=True)
+        temp_path = os.path.join(
+            dst_dir, f".restore_zip_{uuid.uuid4().hex}.part")
+        try:
+            with zf.open(info) as source, open(temp_path, "xb") as output:
+                written = 0
+                while True:
+                    self._check_cancelled()
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:       # EOF: zipfile has verified the CRC
+                        break
+                    output.write(chunk)
+                    written += len(chunk)
+                if written != info.file_size:
+                    raise zipfile.BadZipFile(
+                        f"extracted size {written} != ZIP record "
+                        f"{info.file_size} for {entry!r}")
+                output.flush()
+                os.fsync(output.fileno())
+            self._check_cancelled()
+            return self._publish_temp_no_clobber(temp_path, dst)
+        finally:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
     def _copy_tar_stream(self, source, output, expected_size):
         written = 0
@@ -1105,9 +1159,7 @@ class LTORetriever:
                     return False
                 if warn:
                     print(f"[WARN] {warn}")
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                with zf.open(entry) as zf_src, open(dst, 'wb') as out:
-                    shutil.copyfileobj(zf_src, out)
+                dst = self._extract_zip_entry(zf, entry, dst)
             print(f"[RESTORE] Saved to: {dst}")
             self._note_restored(dst)
             return True
@@ -1171,9 +1223,7 @@ class LTORetriever:
                     try:
                         dst = self._destination_for_record(
                             record, restore_base=restore_base)
-                        os.makedirs(os.path.dirname(dst), exist_ok=True)
-                        with zf.open(entry) as zf_src, open(dst, 'wb') as out:
-                            shutil.copyfileobj(zf_src, out)
+                        dst = self._extract_zip_entry(zf, entry, dst)
                         print(f"[OK] {record['file_name']}")
                         self._note_restored(dst)
                         restored += 1
@@ -1348,11 +1398,16 @@ class LTORetriever:
                     rel = (canonical[len(restore_base):]
                            if restore_base and canonical.startswith(restore_base)
                            else canonical)
-                    dst = self._safe_destination(rel)
-                    os.makedirs(os.path.dirname(os.path.abspath(dst)),
-                                exist_ok=True)
-                    with zf.open(entry) as zsrc, open(dst, "wb") as out:
-                        shutil.copyfileobj(zsrc, out)
+                    # One bad entry must not stop the rest of the directory.
+                    try:
+                        dst = self._extract_zip_entry(
+                            zf, entry, self._safe_destination(rel))
+                    except RestoreCancelled:
+                        raise
+                    except Exception as e:
+                        print(f"[ERROR] {canonical}: {e}")
+                        self._note_failed(canonical, f"extraction failed: {e}")
+                        continue
                     self._note_restored(dst)
                     extracted += 1
                     if extracted % 500 == 0:
