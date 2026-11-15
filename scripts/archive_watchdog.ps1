@@ -87,6 +87,7 @@ $HardStopReasons = @(
     'ambiguous_active_sessions',
     'sealed_batch_feature_unavailable',
     'scan_frontier_unavailable',
+    'archiver_lock_lost',
     # 30 FATAL_CONFIG -- config/auth/code error, no blind retry
     'ssh_authentication_failed',
     'ssh_permission_denied',
