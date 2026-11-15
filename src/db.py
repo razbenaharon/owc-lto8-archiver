@@ -100,7 +100,10 @@ def create_database_manager(cfg):
     from .pg_db import PgDatabaseManager
 
     try:
-        return PgDatabaseManager(cfg.db_dsn)
+        # A database that holds no catalog yet gets the complete schema; an
+        # existing catalog is opened exactly as before (explicit migrations
+        # stay explicit there).
+        return PgDatabaseManager(cfg.db_dsn, complete_fresh_schema=True)
     except Exception as exc:
         if _is_postgres_connection_error(exc):
             raise RuntimeError(_postgres_connection_error_message(cfg)) from exc

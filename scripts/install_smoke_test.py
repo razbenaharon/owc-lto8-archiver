@@ -445,35 +445,33 @@ def _first_run(tree, backend, sqlite_file, pg_conninfo):
     say(f"first run          : exit 0, catalog and schema created ({detail})")
 
 
-def _apply_explicit_postgres_migrations():
-    """Bring the new PostgreSQL database to the fully migrated schema.
+def _check_complete_postgres_schema():
+    """The first run on an EMPTY PostgreSQL database installs everything.
 
-    A first run installs only the start-up schema. The directory catalog and
-    the later migrations (007, 014, 015-019) are explicit on PostgreSQL, and
-    a packed archive run refuses to start without them. They are applied here
-    through the catalog manager, exactly as the test suite does
-    (``tests/db_backends.py``); the operator route is the
-    ``inspect_db.py --apply-*-schema`` commands, which additionally demand a
-    verified ``pg_dump`` backup and are not exercised by this test.
+    Start-up completes the schema (the directory catalog and migrations 014
+    to 019) when - and only when - the database held no catalog before, so a
+    new install can archive straight away. This test applies nothing itself:
+    it only checks what the first run left behind.
     """
-    from db_backends import BackendTestDb
-
     from src.config import ConfigManager
     from src.db import create_database_manager
 
     db = create_database_manager(ConfigManager())
     try:
-        check(not db.directory_catalog_schema_installed(),
-              "the directory catalog schema was already installed by the "
-              "first run; this test's description of PostgreSQL start-up is "
-              "out of date")
-        BackendTestDb.apply_all_migrations(db)
         check(db.directory_catalog_schema_installed(),
-              "the directory catalog schema is still missing")
+              "the first run on an empty PostgreSQL database did not install "
+              "the directory catalog schema")
+        check(db.incremental_scan_schema_finalized(),
+              "the first run did not install the incremental-scan schema")
+        check(db.container_format_schema_authority_v2_report()["ready"],
+              "the first run did not install the container-format schema")
+        check(db.fresh_schema_installed == (),
+              "a second start-up installed schema again: "
+              f"{db.fresh_schema_installed}")
     finally:
         db.close()
-    say("explicit migrations: applied through the catalog manager (the first "
-        "run alone does not install them on PostgreSQL)")
+    say("complete schema    : installed by the first run on the empty "
+        "database (nothing applied by this test)")
 
 
 def _synthetic_files():
@@ -701,35 +699,40 @@ def _round_trip(paths, data):
     return cfg
 
 
-class _NoTapeDrive:
-    """The loaded configuration, minus a tape drive letter."""
+def _set_tape_drive(tree, value):
+    """Rewrite ``[HARDWARE] lto_drive`` in the exported tree's config.ini."""
+    import configparser
 
-    lto_drive = ""
+    target = os.path.join(tree, "config.ini")
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.read(target, encoding="utf-8")
+    parser["HARDWARE"]["lto_drive"] = value
+    with open(target, "w", encoding="utf-8") as handle:
+        parser.write(handle)
 
-    def __init__(self, cfg):
-        self._cfg = cfg
 
-    def __getattr__(self, name):
-        return getattr(self._cfg, name)
-
-
-def _backup(tree, cfg):
-    """Take and verify a SQLite catalog backup.
-
-    The program refuses to put a catalog backup on the drive letter
-    configured as the tape drive. On a real install that is a separate
-    letter; here the stand-in "tape" is a folder on the same disk as
-    everything else. So this checks both sides: the command-line backup must
-    REFUSE (non-zero exit, nothing written), and the same backup code, told
-    that no tape drive is configured, must produce a verified copy.
-    """
-    from src.db_backup import create_database_backup, verify_backup
-
-    target = os.path.join(tree, "db_backups")
-    refused = subprocess.run(
+def _backup_command(tree):
+    return subprocess.run(
         [sys.executable, "run.py", "--backup-db"], cwd=tree,
         stdin=subprocess.DEVNULL, capture_output=True, text=True,
         encoding="utf-8", errors="replace", timeout=600)
+
+
+def _backup(tree):
+    """Take and verify a SQLite catalog backup through the real command.
+
+    The program refuses to put a catalog backup on the drive letter
+    configured as the tape drive. Here the stand-in "tape" is a folder on the
+    same disk as everything else, so the command must first REFUSE (non-zero
+    exit, nothing written). An install with no tape drive configured - a
+    blank ``lto_drive`` - has nothing to protect: there the same command must
+    succeed and leave a verified copy.
+    """
+    from src.config import ConfigManager
+    from src.db_backup import verify_backup
+
+    target = os.path.join(tree, "db_backups")
+    refused = _backup_command(tree)
     check(refused.returncode != 0 and "LTFS drive" in refused.stdout,
           "run.py --backup-db was expected to refuse a backup on the tape "
           f"drive's letter, but exited {refused.returncode}:\n"
@@ -739,17 +742,27 @@ def _backup(tree, cfg):
     say("backup guard       : run.py --backup-db refused to write onto the "
         f"configured tape drive letter (exit {refused.returncode})")
 
-    local_cfg = _NoTapeDrive(cfg)
-    path = create_database_backup(local_cfg)
-    check(os.path.isfile(path), f"the backup file {path} does not exist")
-    check(os.path.normcase(os.path.realpath(os.path.dirname(path)))
-          == os.path.normcase(os.path.realpath(target)),
-          f"the backup was written to {path}, outside the exported tree")
-    result = verify_backup(local_cfg, path)
+    _set_tape_drive(tree, "")
+    done = _backup_command(tree)
+    check(done.returncode == 0,
+          "run.py --backup-db failed with no tape drive configured "
+          f"(exit {done.returncode}):\n"
+          + _tail(done.stdout + "\n" + done.stderr, 30))
+    backups = [name for name in (os.listdir(target)
+                                 if os.path.isdir(target) else [])
+               if name.endswith(".sqlite3")]
+    check(len(backups) == 1,
+          f"expected exactly one backup file in db_backups, found {backups}")
+    path = os.path.join(target, backups[0])
+    check(os.path.basename(path) in done.stdout,
+          "run.py --backup-db did not name the backup it created:\n"
+          + _tail(done.stdout, 15))
+    result = verify_backup(ConfigManager(), path)
     check(result.ok, "the catalog backup failed verification:\n"
           + result.summary())
-    say(f"catalog backup     : {os.path.basename(path)} "
-        f"({os.path.getsize(path)} bytes), integrity verified")
+    say(f"catalog backup     : run.py --backup-db wrote "
+        f"{os.path.basename(path)} ({os.path.getsize(path)} bytes), "
+        "integrity verified")
 
 
 def inner(args):
@@ -791,12 +804,12 @@ def inner(args):
             "path inside the work directory")
         _first_run(tree, args.backend, sqlite_file, pg_conninfo)
         if args.backend == "postgresql":
-            _apply_explicit_postgres_migrations()
+            _check_complete_postgres_schema()
         cfg = _round_trip(paths, data)
         check(cfg.db_backend == args.backend,
               f"the program used the {cfg.db_backend} backend")
         if args.backend == "sqlite":
-            _backup(tree, cfg)
+            _backup(tree)
         else:
             check(not os.path.exists(sqlite_file),
                   "a SQLite catalog file appeared during a PostgreSQL run")

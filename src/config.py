@@ -732,6 +732,18 @@ class ConfigManager:
         return _clean_config_path(self.config.get(
             'HARDWARE', 'lto_drive', fallback=r'D:\\'))
     @property
+    def lto_drive_configured(self):
+        """False when ``[HARDWARE] lto_drive`` is blank or absent.
+
+        ``lto_drive`` itself cannot say so: a blank value normalises to
+        ``.`` (the current directory) and an absent key falls back to a
+        default letter. Code that protects the tape drive from other writes
+        asks this first - with no drive configured there is nothing to
+        protect, and refusing would only block the operator.
+        """
+        raw = self.config.get('HARDWARE', 'lto_drive', fallback='') or ''
+        return bool(raw.strip().strip('"\'').strip())
+    @property
     def ibm_eject_cmd(self):
         return _clean_config_path(self.config.get(
             'HARDWARE', 'ibm_eject_cmd',

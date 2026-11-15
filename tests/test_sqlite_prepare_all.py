@@ -56,6 +56,11 @@ POSTGRESQL_ONLY_FUNCTIONS = {
         "_init_schema", "_ensure_runtime_constraints",
         "apply_directory_catalog_schema", "apply_incremental_scan_schema",
         "apply_on",
+        # completing an EMPTY PostgreSQL database at start-up; reached only
+        # through PgDatabaseManager(complete_fresh_schema=True), which the
+        # SQLite core never passes (SQLite installs everything at creation)
+        "_init_schema_completing_a_fresh_database", "_fresh_install_state",
+        "_complete_fresh_schema",
         # hooks overridden by SqliteConnectionCore
         "_set_local_setting_conn", "_index_exists_conn", "_view_exists_conn",
         "_constraint_exists_conn", "_create_stage_table_conn",
