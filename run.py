@@ -10,6 +10,13 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+if __name__ == "__main__" and "--version" in sys.argv[1:]:
+    # Answered before anything else is imported: no config.ini is read or
+    # created, no database is opened and no database driver is needed.
+    from src import __version__
+    print(f"owc-lto8-archiver {__version__}")
+    raise SystemExit(0)
+
 from src.constants import PROJECT_ROOT
 os.chdir(PROJECT_ROOT)
 

@@ -1,0 +1,8 @@
+# OWC LTO-8 archiver — dependencies for the PostgreSQL catalog backend
+# ([DATABASE] backend = postgresql): the core set plus the psycopg 3 driver.
+#
+#     python -m pip install -r requirements-postgres.txt
+#
+# The PostgreSQL server itself is separate (see docker-compose.yml).
+-r requirements-core.txt
+psycopg[binary,pool]>=3.2
