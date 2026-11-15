@@ -23,6 +23,9 @@ _ROBOCOPY_ERROR_RE = re.compile(r'ERROR \d+ \(0x[0-9A-Fa-f]{8}\)')
 # FAILED counter at 0.
 _RETRY_LOOKAHEAD_LINES = 3
 
+# Popen creation flags for the tape-write child only (0 off Windows).
+_TAPE_WRITE_CREATIONFLAGS = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+
 
 def _unrecovered_error_lines(output):
     """ERROR lines robocopy did not follow with a retry (stripped)."""
@@ -289,6 +292,14 @@ def _run_robocopy_tuned(cmd, priority=None, affinity=None, on_start=None,
         encoding='utf-8',
         errors='replace',
         bufsize=1,   # line-buffered so the sink sees each line as it is emitted
+        # Isolate the tape write from console control events. Windows delivers
+        # a console Ctrl+C (and scripts/graceful_stop.py's CTRL_C_EVENT) to
+        # EVERY process attached to the console, so without this the robocopy
+        # child was killed mid-write (exit 0xC000013A) no matter what the
+        # Python cancel handler decided. A child started in its own process
+        # group has Ctrl+C disabled, so a stop request is honoured only by this
+        # process — at the next chunk boundary.
+        creationflags=_TAPE_WRITE_CREATIONFLAGS,
     )
     # Protected: a cooperative Ctrl+C must let the active tape write finish and
     # commit rather than cut it and leave the chunk ambiguously 'backing'. Only a
