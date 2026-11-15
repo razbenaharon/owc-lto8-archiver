@@ -6,19 +6,28 @@ real pipeline pieces run against a real SQLite catalog file:
     synthetic source files
       -> LTOAnalyzer allocation plan -> local session + chunk manifest (catalog)
       -> LTOPacker (small files into a ZIP bundle, large files loose)
-      -> LTOBackup (the real robocopy, temp dir -> temp dir) + catalog commit
+      -> LTOBackup (copy to the temp "tape", the real result classifier) and
+         its catalog commit
       -> catalog search
       -> LTORetriever restore
       -> every restored file is byte-identical to its source.
 
-Only the two hardware questions are answered by a patch: "is the LTO drive
-ready" and "which cartridge is mounted".
+What is replaced, and only this:
+
+* the two hardware questions - "is the LTO drive ready" and "which cartridge
+  is mounted";
+* the ``robocopy.exe`` child process. An in-process copier does the same
+  copy and reports in robocopy's own summary format, so the production
+  classifier still decides whether the write succeeded. No robocopy process
+  is started: on the archive host a stray one would look like a live tape
+  write to the operational guards.
 """
 import hashlib
 import os
 import shutil
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from db_backends import SQLITE, create_test_db
@@ -29,6 +38,47 @@ from src.retriever import LTORetriever
 from src.runtime import CANCEL
 
 TAPE_LABEL = "E2E_SQLITE_T1"
+
+
+def _robocopy_stand_in(cmd, priority=None, affinity=None, on_start=None,
+                       raw_sink=None):
+    """``robocopy <src> <dst> /E ...`` in process, with robocopy's report."""
+    source, target = str(cmd[1]), str(cmd[2])
+    files = dirs = copied_bytes = 0
+    for current, _subdirs, names in os.walk(source):
+        relative = os.path.relpath(current, source)
+        destination = os.path.normpath(os.path.join(target, relative))
+        os.makedirs(destination, exist_ok=True)
+        dirs += 1
+        for name in names:
+            shutil.copy2(os.path.join(current, name),
+                         os.path.join(destination, name))
+            files += 1
+            copied_bytes += os.path.getsize(os.path.join(current, name))
+    report = "\n".join((
+        "", "               Total    Copied   Skipped  Mismatch    FAILED    "
+        "Extras",
+        f"    Dirs : {dirs:9d} {dirs:9d}         0         0         0"
+        "         0",
+        f"   Files : {files:9d} {files:9d}         0         0         0"
+        "         0",
+        f"   Bytes : {copied_bytes:9d} {copied_bytes:9d}         0         0"
+        "         0         0",
+        "   Times :   0:00:01   0:00:01                       0:00:00   "
+        "0:00:00",
+        "   Speed :            1000000 Bytes/sec.", ""))
+    if raw_sink is not None:
+        raw_sink.write(report)
+    return SimpleNamespace(stdout=report, stderr="",
+                           returncode=1 if files else 0)
+
+
+def _copy_file_stand_in(src, dst, display_name=None):
+    """``robocopy`` for one file: it lands at dirname(dst)/basename(src)."""
+    target_dir = os.path.dirname(os.path.abspath(dst))
+    os.makedirs(target_dir, exist_ok=True)
+    shutil.copy2(src, os.path.join(target_dir, os.path.basename(src)))
+    return True
 
 
 def _digest(path):
@@ -124,7 +174,9 @@ class SqliteArchiveRestoreRoundTrip(unittest.TestCase):
                 source_name="local", session_id=session_id,
                 chunk_index=chunk_index)
             with mock.patch("src.backup._ensure_lto_drive_ready",
-                            return_value=True):
+                            return_value=True), \
+                    mock.patch("src.backup._run_robocopy_tuned",
+                               _robocopy_stand_in):
                 _NoEjectBackup(
                     self.db, "", log_dir=self.logs, index_min_file_mb=0,
                     index_packed_small_files=True,
@@ -172,7 +224,9 @@ class SqliteArchiveRestoreRoundTrip(unittest.TestCase):
             staging_dir=os.path.join(self.tmp, "restore_staging"),
             restore_dir=self.restore)
         with mock.patch("src.retriever.get_volume_label",
-                        return_value=TAPE_LABEL):
+                        return_value=TAPE_LABEL), \
+                mock.patch("src.retriever._robocopy_file",
+                           _copy_file_stand_in):
             outcome = retriever._restore_many(records)
         self.assertEqual(outcome.failed_count, 0, outcome.failures)
         self.assertEqual(outcome.restored_count, len(self.files))
