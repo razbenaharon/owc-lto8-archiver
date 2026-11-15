@@ -508,13 +508,19 @@ def _ssh_run(remote_user, remote_host, command, capture=True, password='',
     sshpass when available, or OpenSSH askpass. PuTTY's ``-pw`` fallback is
     intentionally not supported because it exposes the password in process
     arguments.
+
+    Every form carries the SSH keepalive options, so a dead or half-open
+    connection ends the command with exit 255 after about a minute instead of
+    blocking for ever; ``timeout`` (exit 124) bounds a peer that still answers
+    keepalives but never finishes. Both outcomes are ordinary failures the
+    caller can retry.
     """
     password = password or ''
     if password:
         if _has_command('sshpass'):
             ssh_cmd = [
                 'sshpass', '-e',
-                'ssh',
+                'ssh', *_SSH_STREAM_KEEPALIVE_OPTS,
                 '-o', 'BatchMode=no',
                 '-o', 'PubkeyAuthentication=no',
                 '-o', f'StrictHostKeyChecking={SSH_HOSTKEY_POLICY}',
@@ -545,7 +551,7 @@ def _ssh_run(remote_user, remote_host, command, capture=True, password='',
                     ssh_cmd, 124, '', f"SSH command timed out after {timeout}s")
         if _has_command('ssh'):
             ssh_cmd = [
-                'ssh',
+                'ssh', *_SSH_STREAM_KEEPALIVE_OPTS,
                 '-o', 'BatchMode=no',
                 '-o', 'PubkeyAuthentication=no',
                 '-o', 'NumberOfPasswordPrompts=1',
@@ -590,7 +596,7 @@ def _ssh_run(remote_user, remote_host, command, capture=True, password='',
         )
 
     ssh_cmd = [
-        'ssh',
+        'ssh', *_SSH_STREAM_KEEPALIVE_OPTS,
         '-o', 'BatchMode=yes',
         '-o', f'StrictHostKeyChecking={SSH_HOSTKEY_POLICY}',
         f'{remote_user}@{remote_host}',

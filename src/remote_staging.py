@@ -32,6 +32,7 @@ import time
 import uuid
 import zipfile
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -90,6 +91,70 @@ def _fetch_watchdog_action(*, cur, last_growth_at, now, total_bytes,
     if stall_timeout and (now - last_growth_at) >= stall_timeout:
         return 'stall'
     return None
+
+
+class _FetchPauseState:
+    """Marks the stretches in which the fetch is waiting on purpose.
+
+    The ResourceGovernor can hold the producer between tar streams for as long
+    as RAM or the tape needs. Staging does not grow meanwhile, which is
+    exactly what a wedged stream looks like to the stall watchdog; without
+    this marker a back-pressure pause longer than ``fetch_stall_timeout``
+    aborted a healthy fetch and stopped the run (audit M10b)."""
+
+    def __init__(self, clock=time.time):
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._depth = 0
+        self._resumed_at = None
+
+    @contextmanager
+    def paused(self):
+        with self._lock:
+            self._depth += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._depth -= 1
+                self._resumed_at = self._clock()
+
+    def snapshot(self):
+        """``(paused_now, last_resume_time_or_None)``."""
+        with self._lock:
+            return self._depth > 0, self._resumed_at
+
+
+class _FetchProgressClock:
+    """What the watchdog may conclude from successive staging sizes.
+
+    * ``observe`` returns the bytes fetched *by this attempt*: whatever was
+      already in the fetch dir when it started (a resume after a crash) is the
+      baseline and is not counted against the remaining plan. Counting it made
+      a resume that already held two thirds of the chunk look like a 3x
+      overrun (audit M10c; see incident 008).
+    * Any change in the staged size is life, not only a new maximum. A Stored
+      TAR chunk drops back to zero each time a container is published, and the
+      next container then looked stalled until it outgrew the previous one
+      (audit M10a).
+    * A deliberate pause is not a stall; the stall clock restarts when it ends.
+    """
+
+    def __init__(self, started_at, baseline_bytes=0):
+        self.baseline_bytes = max(0, int(baseline_bytes or 0))
+        self.last_growth_at = started_at
+        self._last_raw = None
+
+    def observe(self, raw_bytes, now, paused=False, resumed_at=None):
+        raw_bytes = int(raw_bytes)
+        if self._last_raw is None or raw_bytes != self._last_raw:
+            self.last_growth_at = now
+        self._last_raw = raw_bytes
+        if paused:
+            self.last_growth_at = now
+        elif resumed_at is not None and resumed_at > self.last_growth_at:
+            self.last_growth_at = min(now, resumed_at)
+        return max(0, raw_bytes - self.baseline_bytes)
 
 
 @dataclass(frozen=True)
@@ -543,6 +608,15 @@ class RemoteChunkStager:
     def __init__(self, host):
         #: The RemoteOrchestrator façade that owns session state and config.
         self.host = host
+        #: Deliberate governor waits, visible to the staging watchdog.
+        self._fetch_pause = _FetchPauseState()
+
+    def _governor_fetch_continue(self):
+        """Governor checkpoint between fetch steps, announced as a pause."""
+        governor = getattr(self.host, 'governor', None)
+        if governor:
+            with self._fetch_pause.paused():
+                governor.wait_or_pause("fetch", "continue")
 
     def _start_stored_tar_attempt(self, owner, session_id, chunk_index):
         """Persist process identity so a restart can prove this owner dead."""
@@ -1917,8 +1991,7 @@ class RemoteChunkStager:
                 (row, remote_base, rel, local_rel, local_path))
 
         for start in range(0, len(fetching_ids), self.host.metadata_batch_size):
-            if governor := getattr(self.host, 'governor', None):
-                governor.wait_or_pause("fetch", "continue")
+            self._governor_fetch_continue()
             batch_ids = fetching_ids[start:start + self.host.metadata_batch_size]
             self.host.db.update_manifest_rows_fetching(
                 batch_ids, session_id=session_id)
@@ -1936,8 +2009,11 @@ class RemoteChunkStager:
 
             fetch_stop  = threading.Event()
             fetch_abort = threading.Event()
-            self.host._start_fetch_monitor(fetch_stop, fetch_abort, fetch_dir,
-                                      todo_bytes)
+            # todo_bytes covers only what is still to fetch, so the watchdog
+            # must not count what an interrupted run already left here.
+            self.host._start_fetch_monitor(
+                fetch_stop, fetch_abort, fetch_dir, todo_bytes,
+                baseline_bytes=_dir_tree_size(fetch_dir))
 
             pending_by_base = defaultdict(list)
             for row, remote_base, rel, local_rel, local_path in pending:
@@ -1961,8 +2037,7 @@ class RemoteChunkStager:
                     for remote_base, base_batch in work_items:
                         if CANCEL.is_set():
                             return False, source_missing_files, fetched_file_count
-                        if governor := getattr(self.host, 'governor', None):
-                            governor.wait_or_pause("fetch", "continue")
+                        self._governor_fetch_continue()
                         ok, err = self.host._fetch_one_batch(
                             remote_base, base_batch, fetch_dir, fetch_abort)
                         if not ok:
@@ -2082,8 +2157,7 @@ class RemoteChunkStager:
             return False, source_missing_files, fetched_file_count
 
         for start in range(0, len(fetched_updates), self.host.metadata_batch_size):
-            if governor := getattr(self.host, 'governor', None):
-                governor.wait_or_pause("fetch", "continue")
+            self._governor_fetch_continue()
             self.host.db.update_manifest_rows_fetched(
                 fetched_updates[start:start + self.host.metadata_batch_size],
                 session_id=session_id)
@@ -2301,8 +2375,7 @@ class RemoteChunkStager:
             for item in work_items:
                 if CANCEL.is_set() or fetch_abort.is_set():
                     break
-                if governor:
-                    governor.wait_or_pause("fetch", "continue")
+                self._governor_fetch_continue()
                 futures.append(pool.submit(_worker, item))
             for fut in futures:
                 fut.result()
@@ -2330,8 +2403,7 @@ class RemoteChunkStager:
             for row, remote_base, rel, _local_rel, local_path in collisions:
                 if CANCEL.is_set():
                     return False
-                if governor := getattr(self.host, 'governor', None):
-                    governor.wait_or_pause("fetch", "continue")
+                self._governor_fetch_continue()
                 tmp = os.path.join(collide_root, str(row['manifest_id']))
                 shutil.rmtree(_long(tmp), ignore_errors=True)
                 os.makedirs(_long(tmp), exist_ok=True)
@@ -2411,7 +2483,8 @@ class RemoteChunkStager:
 
     def _start_fetch_monitor(
             self, stop_evt, abort_evt, fetch_dir, total_bytes,
-            tar_part_paths=None, tar_part_paths_lock=None, label="FETCH"):
+            tar_part_paths=None, tar_part_paths_lock=None, label="FETCH",
+            baseline_bytes=0):
         """Live remote->PC throughput, plus a staging watchdog.
 
         Progress is the fetch dir's logical growth. The watchdog fires
@@ -2421,9 +2494,13 @@ class RemoteChunkStager:
         chunk exceeds its planned bytes by fetch_overrun_abort_factor. Any
         overrun past the warn threshold is reported loudly (the plan's sizes
         come from the scan, so a growing or sparse-expanded remote file shows
-        up here first)."""
+        up here first).
+
+        ``baseline_bytes`` is what the fetch dir already held when this
+        attempt began; ``total_bytes`` is compared with growth beyond it."""
         abort_factor = getattr(self.host, "fetch_abort_factor", 2.0)
         stall_timeout = getattr(self.host, "fetch_stall_timeout", 600)
+        pause_state = self._fetch_pause
 
         def _alarm(msg):
             print(f"\n[FETCH][ALERT] {msg}")
@@ -2441,14 +2518,13 @@ class RemoteChunkStager:
             # hit exactly this — a ~2.5h fetch/stage hang on 2026-07-15 — so the
             # watchdog is the safety net that turns an infinite hang into a
             # bounded, resumable retry.
-            max_seen = 0
-            last_growth_at = time.time()
+            progress = _FetchProgressClock(time.time(), baseline_bytes)
             previous_snapshot = None
             part_last_growth = {}
             while not stop_evt.wait(interval):
                 walk_start = time.time()
                 if tar_part_paths is None:
-                    cur = _dir_tree_size(fetch_dir)
+                    raw = _dir_tree_size(fetch_dir)
                     snapshot = None
                 else:
                     lock = tar_part_paths_lock or threading.Lock()
@@ -2456,8 +2532,19 @@ class RemoteChunkStager:
                         parts = list(tar_part_paths)
                     snapshot = _staging_progress_snapshot(
                         parts, (fetch_dir,))
-                    cur = int(snapshot["total_bytes"])
+                    raw = int(snapshot["total_bytes"])
                 now   = time.time()
+                paused, resumed_at = pause_state.snapshot()
+                cur = progress.observe(raw, now, paused=paused,
+                                       resumed_at=resumed_at)
+                last_growth_at = progress.last_growth_at
+                # A deliberate pause restarts every per-part stall clock too.
+                pause_mark = now if paused else resumed_at
+                if pause_mark is not None:
+                    pause_mark = min(now, pause_mark)
+                    for path, seen_at in list(part_last_growth.items()):
+                        if seen_at < pause_mark:
+                            part_last_growth[path] = pause_mark
                 # Rewalking a chunk with many small files is itself expensive;
                 # keep the scan overhead under ~10% of the monitor's cycle.
                 interval = min(30, max(2, (now - walk_start) * 10))
@@ -2473,9 +2560,6 @@ class RemoteChunkStager:
                 )
                 prev_bytes = cur
                 prev_time  = now
-                if cur > max_seen:
-                    max_seen = cur
-                    last_growth_at = now
 
                 if (total_bytes and not overrun_warned
                         and cur > total_bytes * _FETCH_OVERRUN_WARN_FACTOR):
@@ -2573,7 +2657,8 @@ class RemoteChunkStager:
         if os.path.exists(_long(path)):
             governor = getattr(self.host, 'governor', None)
             if governor:
-                governor.wait_until(governor.can_cleanup, "cleanup")
+                with self._fetch_pause.paused():
+                    governor.wait_until(governor.can_cleanup, "cleanup")
             try:
                 if governor:
                     with governor.mark_cleanup_active():

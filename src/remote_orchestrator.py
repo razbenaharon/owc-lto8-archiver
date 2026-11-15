@@ -1247,6 +1247,10 @@ class RemoteOrchestrator:
                 remote_password=self.remote_password,
                 skipped_tracker=self.skipped_tracker,
                 ui=self.ui,
+                # [PERFORMANCE] ssh_command_timeout_seconds: a hung listing
+                # fails cleanly (the directory stays 'partial' and is retried)
+                # instead of blocking the scan for ever.
+                timeout=getattr(self, "ssh_timeout", None),
             ),
             ui=self.ui,
             on_budget_exceeded=_on_budget_exceeded,
