@@ -17,6 +17,7 @@ genuinely properties of the source - "this module must never CALL eject",
 Not collected by pytest (no ``test_`` prefix).
 """
 import ast
+import copy
 import inspect
 import os
 import textwrap
@@ -170,12 +171,6 @@ class _Scrub(ast.NodeTransformer):
     visit_Module = visit_ClassDef = _strip_docstring
     visit_FunctionDef = visit_AsyncFunctionDef = _strip_docstring
 
-    def visit_JoinedStr(self, node):
-        if not self.strings:
-            return ast.copy_location(ast.Constant(value=""), node)
-        self.generic_visit(node)
-        return node
-
     def visit_Constant(self, node):
         if not self.strings and isinstance(node.value, str):
             return ast.copy_location(ast.Constant(value=""), node)
@@ -190,12 +185,16 @@ def code_text(target, strings=True):
     neither can satisfy (or trip) an assertion. String literals are kept by
     default because embedded SQL is code in this project; pass
     ``strings=False`` (or use :func:`code_only`) when the assertion is about
-    identifiers and calls, so a log message cannot stand in for a call.
+    identifiers and calls, so a log message cannot stand in for a call. The
+    expressions inside an f-string are code and always survive.
 
     Formatting is normalised by ``ast.unparse`` (single-quoted strings, one
     statement per line), so match on names and short fragments, not layout.
     """
-    tree = _Scrub(strings).visit(tree_of(target))
+    tree = tree_of(target)
+    if tree is target:                 # never mutate a caller's tree
+        tree = copy.deepcopy(tree)
+    tree = _Scrub(strings).visit(tree)
     return ast.unparse(ast.fix_missing_locations(tree))
 
 

@@ -21,7 +21,7 @@ skip: the product moved and this list must be updated with it.
 
 Outcomes
 --------
-``KILLED``    a test failed (pytest exit code 1) - the suite caught the fault.
+``KILLED``    a test ran and failed - the suite caught the fault.
 ``SURVIVED``  every test passed with the fault present.
 ``ERROR``     the anchor was missing/ambiguous, or pytest did not run tests to
               a verdict (collection error, timeout, no tests). Not a kill.
@@ -385,8 +385,12 @@ def _apply(copy_root, mutation):
                 f"anchor found {found} time(s) in {rel} (need exactly 1): "
                 f"{old.strip().splitlines()[0]!r}")
         staged[path] = (text.replace(old, new), crlf)
-    for path, (text, crlf) in staged.items():
-        _write(path, text, crlf)
+    try:
+        for path, (text, crlf) in staged.items():
+            _write(path, text, crlf)
+    except BaseException:
+        _restore(originals)             # never leave a half-applied mutation
+        raise
     return originals
 
 
@@ -409,8 +413,9 @@ def _run_pytest(copy_root, tests, timeout):
     except subprocess.TimeoutExpired:
         return None, "timed out", []
     out = (proc.stdout or "") + (proc.stderr or "")
-    failed = re.findall(r"^(?:FAILED|ERROR|SUBFAIL|SUBFAILED)\S* (\S+)", out,
-                        re.M)
+    # Only a test that RAN and failed counts. A setup/collection ERROR is
+    # infrastructure breaking, not the suite catching the fault.
+    failed = re.findall(r"^(?:FAILED|SUBFAIL|SUBFAILED)\S* (\S+)", out, re.M)
     summary = (out.strip().splitlines() or [""])[-1]
     return proc.returncode, summary, failed
 
@@ -476,9 +481,8 @@ def main(argv=None):
                     copy_root, m["tests"], args.timeout)
             finally:
                 _restore(originals)
-            if code == 1:
+            if code == 1 and failed:
                 outcome = "KILLED"
-                failed = failed or ["(unparsed)::" + summary]
             elif code == 0:
                 outcome = "SURVIVED"
             else:

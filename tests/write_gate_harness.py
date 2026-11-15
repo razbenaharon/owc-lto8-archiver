@@ -308,7 +308,16 @@ class GateWorld:
         self._note("readiness", needs_ownership=True)
         return self.drive_ready
 
+    def _inside_sandbox(self, path):
+        root = os.path.normcase(os.path.abspath(self.tmp))
+        target = os.path.normcase(os.path.abspath(path))
+        return (target + os.sep).startswith(root + os.sep)
+
     def _makedirs(self, path, *args, **kwargs):
+        if not self._inside_sandbox(path):
+            raise AssertionError(
+                f"the product tried to create {path!r} outside the test "
+                "sandbox")
         tape = os.path.normcase(os.path.abspath(self.tape))
         target = os.path.normcase(os.path.abspath(path))
         if ((target + os.sep).startswith(tape + os.sep)
@@ -327,6 +336,9 @@ class GateWorld:
         self._note("copy", needs_ownership=True)
         self.copy_commands.append(list(cmd))
         source, dest = cmd[1], cmd[2]
+        if not (self._inside_sandbox(source) and self._inside_sandbox(dest)):
+            raise AssertionError(
+                f"copy outside the test sandbox: {source!r} -> {dest!r}")
         if self.on_copy is not None:
             self.on_copy(source, dest)
         behaviour = self.copy_plan.pop(0) if self.copy_plan else "ok"
