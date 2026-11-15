@@ -772,8 +772,8 @@ class PgCatalogMixin:
                 for row in conn.execute(
                     """SELECT bundle_id, record_key
                        FROM directory_archive_bundles
-                       WHERE record_key = ANY(%s)""",
-                    ([row["record_key"] for row in bundle_rows],),
+                       WHERE record_key IN (
+                           SELECT record_key FROM _dir_bundles)"""
                 ).fetchall()
             }
 

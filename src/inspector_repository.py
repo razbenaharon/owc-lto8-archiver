@@ -1,19 +1,8 @@
-"""Read-only, bounded PostgreSQL query layer for the database inspector."""
+"""Read-only, bounded query layer for the database inspector (both backends)."""
 import gzip
 import json
 import os
-from typing import Any, TYPE_CHECKING, cast
-
-if TYPE_CHECKING:
-    import psycopg
-    from psycopg.rows import dict_row
-else:
-    try:
-        import psycopg
-        from psycopg.rows import dict_row
-    except ImportError:  # pragma: no cover - optional until PG backend is selected
-        psycopg = None
-        dict_row = None
+from typing import Any
 
 try:
     import zstandard as zstd
@@ -22,6 +11,7 @@ except ImportError:  # pragma: no cover - requirements includes zstandard
 
 from .catalog_query import prefix_pattern, substring_pattern
 from .db import _derived_file_name
+from . import db_backend
 from .db_backend import as_day, day_bounds
 from .directory_catalog_validation import archiver_lock_status
 
@@ -35,16 +25,13 @@ class InspectorRepository:
 
     def __init__(self, db_path):
         self.db_path = db_path
-        if psycopg is None:
-            raise RuntimeError(
-                "[DB] psycopg 3 is required for PostgreSQL inspector access.")
         # autocommit=True keeps each read in its own short transaction. Without
-        # it, psycopg's default deferred transaction would stay open for the
-        # connection's lifetime ("idle in transaction"), pinning xmin and
-        # blocking VACUUM while an inspector tab is left open.
-        self.conn: Any = psycopg.connect(
-            db_path, autocommit=True, row_factory=cast(Any, dict_row))
-        self.conn.execute("SET default_transaction_read_only = on")
+        # it, a deferred transaction would stay open for the connection's
+        # lifetime ("idle in transaction" on PostgreSQL, a pinned WAL snapshot
+        # on SQLite) while an inspector tab is left open. The connection is
+        # read-only at the engine level on both backends.
+        self.conn: Any = db_backend.connect(
+            db_path, autocommit=True, read_only=True)
 
     def _execute(self, sql, params=()) -> Any:
         return self.conn.execute(sql, params)
@@ -59,14 +46,7 @@ class InspectorRepository:
         self.close()
 
     def _require_v3(self):
-        columns = {
-            row["column_name"]
-            for row in self._execute(
-                """SELECT column_name
-                   FROM information_schema.columns
-                   WHERE table_name='files_index'"""
-            )
-        }
+        columns = set(db_backend.column_names(self.conn, "files_index"))
         available = {"directory_id", "catalog_name",
                      "catalog_backup_date"}.issubset(columns)
         if not available:
@@ -137,12 +117,7 @@ class InspectorRepository:
         return [row["source_host"] for row in rows if row["source_host"]]
 
     def _table_exists(self, name):
-        return self._execute(
-            """SELECT 1
-               FROM information_schema.tables
-               WHERE table_schema='public' AND table_name=%s""",
-            (name,),
-        ).fetchone() is not None
+        return db_backend.table_exists(self.conn, name)
 
     def list_sessions(self):
         rows = []

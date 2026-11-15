@@ -228,6 +228,77 @@ def column_exists(conn, table_name, column_name):
     ).fetchone() is not None
 
 
+def column_names(conn, table_name):
+    """Column names of ``table_name`` in declaration order ([] if absent)."""
+    if is_sqlite(conn):
+        return [row["name"] for row in conn.execute(
+            "SELECT name FROM pragma_table_info(%s) ORDER BY cid",
+            (table_name,)).fetchall()]
+    return [row["column_name"] for row in conn.execute(
+        """SELECT column_name FROM information_schema.columns
+           WHERE table_schema='public' AND table_name=%s
+           ORDER BY ordinal_position""", (table_name,)).fetchall()]
+
+
+def describe_database(conn):
+    """Where a connection points: database, server address/port, user."""
+    if is_sqlite(conn):
+        return {"database": conn.path, "server_addr": None,
+                "server_port": None, "current_user": None}
+    return dict(conn.execute(
+        """SELECT current_database() AS database,
+                  inet_server_addr()::text AS server_addr,
+                  inet_server_port() AS server_port,
+                  current_user AS current_user""").fetchone())
+
+
+def database_identity(conn):
+    """``{database, username, bytes}`` for audit reports."""
+    if is_sqlite(conn):
+        try:
+            size = os.path.getsize(conn.path)
+        except OSError:
+            size = None
+        return {"database": conn.path, "username": None, "bytes": size}
+    return dict(conn.execute(
+        """SELECT current_database() AS database,current_user AS username,
+                  pg_database_size(current_database()) AS bytes""").fetchone())
+
+
+def foreign_keys_referencing(conn, parent_table):
+    """Every foreign key pointing at ``parent_table`` as
+    ``{conname, child_table, definition}`` rows, ordered."""
+    if is_sqlite(conn):
+        found = []
+        tables = [row["name"] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY name").fetchall()]
+        for table in tables:
+            groups = {}
+            for row in conn.raw.execute(
+                    f'PRAGMA foreign_key_list("{table}")').fetchall():
+                groups.setdefault(row[0], []).append(row)
+            for key_id, rows in sorted(groups.items()):
+                if rows[0][2] != parent_table:
+                    continue
+                rows = sorted(rows, key=lambda item: item[1])
+                definition = (
+                    "FOREIGN KEY (" + ", ".join(r[3] for r in rows)
+                    + f") REFERENCES {parent_table}("
+                    + ", ".join(str(r[4]) for r in rows) + ")"
+                    + f" ON UPDATE {rows[0][5]} ON DELETE {rows[0][6]}")
+                found.append({"conname": f"{table}_fk_{key_id}",
+                              "child_table": table,
+                              "definition": definition})
+        return found
+    return [dict(row) for row in conn.execute(
+        """SELECT c.conname,c.conrelid::regclass::text AS child_table,
+                  pg_get_constraintdef(c.oid) AS definition
+           FROM pg_constraint c WHERE c.contype='f'
+             AND c.confrelid=%s::regclass
+           ORDER BY child_table,c.conname""", (parent_table,)).fetchall()]
+
+
 def database_name(conn):
     """Human-readable identity of the database a connection is on."""
     if is_sqlite(conn):

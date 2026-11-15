@@ -187,6 +187,20 @@ class BackendTestDb:
         finally:
             conn.close()
 
+    def columns(self, table):
+        """Column names of ``table`` in declaration order."""
+        if self.is_sqlite:
+            conn = self.connect()
+            try:
+                return [row[1] for row in conn.raw.execute(
+                    f'PRAGMA table_info("{table}")').fetchall()]
+            finally:
+                conn.close()
+        return [row["column_name"] for row in self.query(
+            """SELECT column_name FROM information_schema.columns
+               WHERE table_schema='public' AND table_name=%s
+               ORDER BY ordinal_position""", (table,))]
+
     def has_column(self, table, column):
         from src import db_backend
         conn = self.connect()
