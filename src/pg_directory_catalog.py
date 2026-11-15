@@ -294,7 +294,7 @@ class PgDirectoryCatalogMixin:
                     AND a.artifact_kind='plan_manifest'
                     AND a.readiness_state='ready'
                     AND a.local_locator IS NOT NULL
-                    AND lower(right(a.local_locator, 5))<>'.part'
+                    AND lower(substr(a.local_locator, length(a.local_locator) - 4))<>'.part'
                     AND a.artifact_size_bytes IS NOT NULL
                     AND a.published_at IS NOT NULL
                    WHERE c.plan_source='manifest'
@@ -347,7 +347,7 @@ class PgDirectoryCatalogMixin:
                   OR a.artifact_kind IS DISTINCT FROM 'plan_manifest'
                   OR a.readiness_state IS DISTINCT FROM 'ready'
                   OR a.local_locator IS NULL
-                  OR lower(right(a.local_locator, 5))='.part'
+                  OR lower(substr(a.local_locator, length(a.local_locator) - 4))='.part'
                   OR a.artifact_size_bytes IS NULL
                   OR a.published_at IS NULL"""
         ).fetchone()["n"]
