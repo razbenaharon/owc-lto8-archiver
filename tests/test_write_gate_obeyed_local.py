@@ -97,6 +97,7 @@ class _LocalGateCase(unittest.TestCase):
         self.assertEqual(world.count("eject"), 0)
         self.assertEqual(world.count("catalog_commit"), 0)
         self.assertEqual(world.db.local_status_writes, list(statuses))
+        self.assertEqual(world.count("readiness"), 0, world.log)
         self.assertFalse(world.ownership_held)
 
     def assert_refused(self):

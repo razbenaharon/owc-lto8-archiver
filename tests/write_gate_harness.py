@@ -218,6 +218,8 @@ class GateWorld:
 
         self._ownership_depth = 0
         self._inside_copy = False
+        #: The argv handed to every copy call.
+        self.copy_commands = []
         #: Boundary calls that happened while LTFS ownership was NOT held.
         self.unowned = []
 
@@ -323,6 +325,7 @@ class GateWorld:
               raw_sink=None):
         """The fake tape copy. ``cmd`` is the real robocopy argv."""
         self._note("copy", needs_ownership=True)
+        self.copy_commands.append(list(cmd))
         source, dest = cmd[1], cmd[2]
         if self.on_copy is not None:
             self.on_copy(source, dest)

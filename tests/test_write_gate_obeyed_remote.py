@@ -72,6 +72,13 @@ class _RemoteGateCase(unittest.TestCase):
         self.assertFalse(world.ownership_held, "ownership leaked")
         self.assertEqual(world.count("ownership:release_without_acquire"), 0)
         self.assertEqual(world.count("catalog_commit"), 0)
+        # A refused write never even reaches the tape writer: no readiness
+        # probe, and no durable "writer started" record.
+        self.assertEqual(world.count("readiness"), 0, world.log)
+        self.assertEqual(world.db.container_events, [])
+        # ...and a refusal is never counted as a passed verification.
+        self.assertEqual(self.orch._readiness_checks, 0)
+        self.assertEqual(self.orch._cartridge_verifications, 0)
 
 
 # ===========================================================================
@@ -238,6 +245,25 @@ class GateBlocksAreObeyed(_RemoteGateCase):
         block = self.write(desc)
         self.assertIs(block, earlier)
         self.assert_nothing_written(desc)
+
+    # -- the writer's own obedience ----------------------------------------
+    def test_the_writer_stops_on_the_gate_verdict_itself(self):
+        """The audit's first survivor: the gate computed 'block' and the
+        writer ignored it. Every real gate path also RECORDS its stop, and a
+        later recorded-stop check would then rescue a writer that ignored the
+        verdict - so this test hands the writer a verdict that is NOT
+        recorded. The writer must stop on the return value alone."""
+        desc = self.world.stage_chunk(0)
+        verdict = StopResult(
+            exit_code=ExitCode.SAFETY_BLOCK, reason=REASON_LTFS_MEDIA_DEGRADED,
+            resumable=False, source="gate", session_id=SESSION_ID,
+            chunk_index=0)
+        self.orch._pre_write_safety_gate = lambda *_a, **_k: verdict
+        block = self.write(desc)
+        self.assertIs(block, verdict)
+        self.assertIsNone(self.orch._get_recorded_stop())
+        self.assert_nothing_written(desc)
+        self.assertEqual(self.world.count("ownership:release"), 1)
 
     # -- descriptor admission ---------------------------------------------
     def test_a_descriptor_from_another_session_never_reaches_the_tape(self):
@@ -421,6 +447,21 @@ class PermittedWriteOrdering(_RemoteGateCase):
         desc = self.world.stage_chunk(0)
         self.assertIsNone(self.write(desc))
         self.assertEqual(self.world.count("eject"), 0)
+
+    def test_the_copy_is_launched_without_retries(self):
+        """One unrecoverable write latched Tape_02 read-only (incident 010):
+        the copy handed to the drive must never retry into a failing one."""
+        desc = self.world.stage_chunk(0)
+        self.assertIsNone(self.write(desc))
+        (cmd,) = self.world.copy_commands
+        self.assertEqual(os.path.normcase(cmd[1]),
+                         os.path.normcase(desc.pack_dir))
+        self.assertTrue(os.path.normcase(cmd[2]).startswith(
+            os.path.normcase(self.world.tape) + os.sep))
+        self.assertIn("/R:0", cmd)
+        self.assertIn("/W:0", cmd)
+        self.assertEqual([a for a in cmd if a.upper().startswith("/R:")],
+                         ["/R:0"])
 
     def test_a_skip_tape_chunk_touches_no_tape_at_all(self):
         world = self.world
