@@ -77,3 +77,40 @@ class ByteAccounting(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewFollowUp(unittest.TestCase):
+    """Independent review of the classifier (2026-11-16)."""
+
+    def test_negative_return_code_is_not_success(self):
+        # A killed process reports a negative code on POSIX-style runtimes;
+        # a clean-looking summary must not turn that into success.
+        out = _summary(files=(1, 1, 0, 0, 0, 0),
+                       byte_counts=(1, 1, 0, 0, 0, 0))
+        verdict = classify_robocopy_result(
+            -9, _parse_robocopy_summary(out), out,
+            expected_files=1, expected_bytes=1, expected_source_files=1)
+        self.assertFalse(verdict.is_success)
+        self.assertEqual(verdict.category, "nonzero_return_code")
+
+    def _rounded(self, copied):
+        return (
+            "               Total    Copied   Skipped  Mismatch    FAILED    Extras\n"
+            "    Dirs :         1         1         0         0         0         0\n"
+            "   Files :         2         2         0         0         0         0\n"
+            f"   Bytes :   {copied}   {copied}         0         0         0         0\n"
+            "   Times :   0:00:01   0:00:01                       0:00:00   0:00:00\n")
+
+    def test_rounded_byte_summary_far_below_expected_is_not_success(self):
+        out = self._rounded("1.00 m")
+        verdict = _classify(out, expected_files=2, expected_bytes=10_000_000,
+                            expected_source_files=2)
+        self.assertFalse(verdict.is_success)
+        self.assertEqual(verdict.category, "incomplete_bytes")
+
+    def test_rounded_byte_summary_matching_expected_stays_success(self):
+        # "9.53 m" is how robocopy prints 10,000,000 bytes without /BYTES.
+        out = self._rounded("9.53 m")
+        verdict = _classify(out, expected_files=2, expected_bytes=10_000_000,
+                            expected_source_files=2)
+        self.assertTrue(verdict.is_success)
