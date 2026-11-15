@@ -22,6 +22,7 @@ except ImportError:  # pragma: no cover - requirements includes zstandard
 
 from .catalog_query import prefix_pattern, substring_pattern
 from .db import _derived_file_name
+from .db_backend import as_day, day_bounds
 from .directory_catalog_validation import archiver_lock_status
 
 
@@ -535,11 +536,11 @@ class InspectorRepository:
             where.append("f.catalog_name ILIKE %s ESCAPE '\\'")
             params.append(prefix_pattern(filters["name_prefix"]))
         if filters.get("date_from"):
-            where.append("f.catalog_backup_date >= %s::date")
-            params.append(filters["date_from"])
+            where.append("f.catalog_backup_date >= %s")
+            params.append(as_day(filters["date_from"]))
         if filters.get("date_to"):
-            where.append("f.catalog_backup_date < (%s::date + INTERVAL '1 day')")
-            params.append(filters["date_to"])
+            where.append("f.catalog_backup_date < %s")
+            params.append(day_bounds(filters["date_to"])[1])
         if filters.get("source_host"):
             where.append("f.source_host=%s")
             params.append(filters["source_host"])

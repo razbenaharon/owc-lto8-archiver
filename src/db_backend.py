@@ -16,7 +16,9 @@ without it.
 """
 from __future__ import annotations
 
+import json
 import os
+from datetime import date, datetime, timedelta, timezone
 
 from .cli_errors import OperationalError
 
@@ -61,6 +63,60 @@ class PostgresOnlyFeature(OperationalError):
             "[DB] Not available on the SQLite backend: " + description + ". "
             "This feature needs PostgreSQL ([DATABASE] backend = postgresql). "
             "Nothing was changed.")
+
+
+# ---------------------------------------------------------------------------
+# Portable value helpers (identical call on both engines, no backend check)
+# ---------------------------------------------------------------------------
+
+def as_day(value):
+    """A calendar day (``datetime.date``) from a date, datetime or
+    ``YYYY-MM-DD...`` text."""
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value).strip()
+    try:
+        return date.fromisoformat(text[:10])
+    except ValueError as exc:
+        raise ValueError(
+            f"[DB] Not a calendar date (expected YYYY-MM-DD): {value!r}"
+        ) from exc
+
+
+def day_bounds(value):
+    """``(day, next_day)`` for a half-open ``>= day AND < next_day`` filter on
+    a timestamp column.
+
+    Both bounds are sent as DATE parameters. PostgreSQL compares a
+    ``timestamptz`` with a ``date`` exactly as the former ``%s::date`` /
+    ``%s::date + INTERVAL '1 day'`` did (midnight in the session time zone);
+    SQLite compares its canonical UTC timestamp text with ``YYYY-MM-DD``.
+    """
+    day = as_day(value)
+    return day, day + timedelta(days=1)
+
+
+def as_timestamp(value):
+    """An aware UTC ``datetime`` (or None) from a typed column value OR from
+    the text SQLite returns for an expression such as ``MAX(ts)``."""
+    if value is None or isinstance(value, datetime):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        value = bytes(value).decode("utf-8")
+    parsed = datetime.fromisoformat(str(value).strip())
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def as_json(value):
+    """A decoded JSON value from a typed column value OR from the JSON text
+    SQLite returns for an expression or an untyped view column."""
+    if isinstance(value, (str, bytes, bytearray)):
+        return json.loads(value)
+    return value
 
 
 def backend_of(target):

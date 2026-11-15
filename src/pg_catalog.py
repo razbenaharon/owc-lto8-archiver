@@ -12,6 +12,7 @@ from .catalog_query import contains_pattern, prefix_pattern, substring_pattern
 from .catalog_v3 import catalog_directory_chain, catalog_file_name
 from .constants import DB_UPSERT_BATCH_SIZE, LEGACY_DEFAULT_SOURCE_HOST
 from .db import _derived_file_name, _file_record_key, _short_source_host
+from .db_backend import as_day, day_bounds
 from .pg_core import _as_utc, _now_utc, _rows
 from .pipeline_types import FileRecord
 from .runtime import CANCEL
@@ -939,11 +940,11 @@ class PgCatalogMixin:
                          "OR f.original_path ILIKE %s ESCAPE '\\')")
             params.extend([pattern, pattern])
         if date_from:
-            where.append("f.catalog_backup_date >= %s::date")
-            params.append(date_from)
+            where.append("f.catalog_backup_date >= %s")
+            params.append(as_day(date_from))
         if date_to:
-            where.append("f.catalog_backup_date < (%s::date + INTERVAL '1 day')")
-            params.append(date_to)
+            where.append("f.catalog_backup_date < %s")
+            params.append(day_bounds(date_to)[1])
         if tape_label:
             where.append("f.tape_label = %s")
             params.append(tape_label)
@@ -1055,10 +1056,10 @@ class PgCatalogMixin:
 
     def search_by_session(self, session_date, tape_label, limit=None,
                           offset=None, after_id=None):
-        where = """f.catalog_backup_date >= %s::date
-                   AND f.catalog_backup_date < (%s::date + INTERVAL '1 day')
+        where = """f.catalog_backup_date >= %s
+                   AND f.catalog_backup_date < %s
                    AND f.tape_label = %s"""
-        params = [session_date, session_date, tape_label]
+        params = [*day_bounds(session_date), tape_label]
         if after_id is not None:
             where += " AND f.file_id > %s"
             params.append(int(after_id))
@@ -1086,10 +1087,10 @@ class PgCatalogMixin:
             return conn.execute(
                 """SELECT COUNT(*) AS n
                    FROM files_index f
-                   WHERE f.catalog_backup_date >= %s::date
-                     AND f.catalog_backup_date < (%s::date + INTERVAL '1 day')
+                   WHERE f.catalog_backup_date >= %s
+                     AND f.catalog_backup_date < %s
                      AND f.tape_label = %s""",
-                (session_date, session_date, tape_label),
+                (*day_bounds(session_date), tape_label),
             ).fetchone()["n"]
 
     def list_source_hosts(self):
