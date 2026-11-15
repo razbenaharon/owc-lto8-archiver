@@ -12,7 +12,7 @@ from .exit_codes import (ExitCode, StopResult, REASON_BAD_CONFIG,
 from .logsetup import configure_file_logging, get_logger
 from .ltfs import TapeManager
 from .orchestrators import LocalOrchestrator, RemoteOrchestrator
-from .pg_backup import create_database_backup
+from .db_backup import backup_menu_text, backup_noun, create_database_backup
 from .reporting import generate_backup_summary
 from .retriever import LTORetriever
 from .robocopy import _prepare_robocopy_exclusion, _remove_robocopy_exclusion
@@ -438,7 +438,7 @@ def main():
         print("  6. Remote Archive — Fetch from remote host & backup to LTO")
         print("  7. Database Management — Edit / delete tape & file records")
         print("  8. Backup Summary — Ensure backup_logs/SUMMARY.csv report")
-        print("  9. Database Backup — Dump PostgreSQL catalog to db_backups")
+        print("  9. " + backup_menu_text(cfg))
         print("  0. Exit")
         print("-" * 60)
 
@@ -544,7 +544,7 @@ def main():
                 print(str(e))
                 failure_code = int(ExitCode.FATAL_CONFIG)
             else:
-                print(f"[DB BACKUP] PostgreSQL dump created: {path}")
+                print(f"[DB BACKUP] {backup_noun(cfg)} created: {path}")
 
         elif choice == '0':
             print("Goodbye.")

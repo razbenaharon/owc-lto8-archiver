@@ -18,7 +18,7 @@ from src.config import ConfigManager
 from src.db import create_database_manager
 from src.exit_codes import ExitCode
 from src.logsetup import configure_file_logging, get_logger
-from src.pg_backup import create_database_backup
+from src.db_backup import backup_noun, create_database_backup
 from src.tape_reset import execute_reset
 
 
@@ -105,15 +105,16 @@ if __name__ == "__main__":
             cfg = ConfigManager()
             configure_file_logging(cfg.backup_log_dir)
             path = create_database_backup(cfg)
-            print(f"[DB BACKUP] PostgreSQL dump created: {path}")
+            print(f"[DB BACKUP] {backup_noun(cfg)} created: {path}")
             raise SystemExit(0)
 
         removed = sorted(_REMOVED_SQLITE_FLAGS.intersection(sys.argv))
         if removed:
             raise RuntimeError(
-                "SQLite maintenance commands have been removed. The archive "
-                "catalog is PostgreSQL-only; manage schema with scripts/sql/*.sql "
-                f"instead. Unsupported flag(s): {', '.join(removed)}"
+                "These legacy maintenance flags were removed long ago. The "
+                "catalog schema is managed by the application (SQLite) or "
+                "by scripts/sql/*.sql (PostgreSQL). Unsupported flag(s): "
+                f"{', '.join(removed)}"
             )
         # The menu returns the exit code of its last failed action (0 when
         # nothing failed), so a failure the operator saw on screen is also

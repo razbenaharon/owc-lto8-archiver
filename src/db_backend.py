@@ -45,7 +45,15 @@ POSTGRESQL_ONLY_FEATURES = {
     "small_file_manifest_maintenance": (
         "small-file manifest export / validate / prune "
         "(src/local_manifest_archive.py)"),
-    "pg_dump_backup": "pg_dump based backup and restore-verification",
+    "stored_tar_boundary": (
+        "Stored-TAR packaging boundaries and their classification (the "
+        "migration-015 legacy-session exception). New Stored-TAR containers "
+        "exist only behind such a boundary, so SQLite sessions always use "
+        "ZIP packaging"),
+    "pg_dump_backup": (
+        "pg_dump based backup, restore-verification and migrated-database "
+        "creation (inspect_db.py --backup-postgres; on SQLite use "
+        "`python run.py --backup-db`)"),
 }
 
 

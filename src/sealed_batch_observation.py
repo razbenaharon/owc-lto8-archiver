@@ -381,6 +381,14 @@ def maybe_build_observation_worker(cfg, db_dsn):
     """
     if not getattr(cfg, "sealed_tape_write_batches_observation_enabled", False):
         return None
+    from . import db_backend
+    if db_backend.is_sqlite(db_dsn):
+        # Observation is advisory, so it is switched off rather than stopping
+        # the writer - but loudly, with the one PostgreSQL-only refusal.
+        refusal = db_backend.PostgresOnlyFeature("sealed_batches")
+        print(f"\n[FEATURES] {refusal}")
+        get_logger().error("sealed_batch_observation_unavailable: %s", refusal)
+        return None
     try:
         obs_cfg = ObservationConfig.from_cfg(cfg)
         log_path = _validate_log_path(obs_cfg.log_path, cfg)

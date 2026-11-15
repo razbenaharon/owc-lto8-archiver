@@ -128,11 +128,18 @@ class SqliteConnectionCore(PgConnectionCore):
 
     BACKEND = db_backend.BACKEND_SQLITE
 
-    def __init__(self, conninfo, *, init_schema=True, pool=None):
+    def __init__(self, conninfo, *, init_schema=True, pool=None,
+                 read_only=False):
+        """``read_only=True`` opens the file ``mode=ro``: every connection
+        refuses writes, nothing is created and no schema is installed."""
         self._sqlite_path = db_backend.sqlite_path(conninfo)
+        self._read_only = bool(read_only)
+        self._creating_allowed = bool(init_schema) and not self._read_only
         self._file_lock: Optional[sqlite_lock.ArchiverLock] = None
         self._lock_token: Optional[str] = None
-        super().__init__(conninfo, init_schema=init_schema, pool=pool)
+        super().__init__(
+            conninfo, init_schema=init_schema and not self._read_only,
+            pool=pool)
 
     # ------------------------------------------------------------------
     # Connection / retry hooks
@@ -142,14 +149,23 @@ class SqliteConnectionCore(PgConnectionCore):
     def _require_driver():
         sqlite_adapter.require_sqlite_version()
 
+    #: A manager opened with ``init_schema=False`` must never create an empty
+    #: database file as a side effect (set per instance in ``__init__``).
+    _creating_allowed = True
+
     def _open_pool(self, conninfo):
         directory = os.path.dirname(self._sqlite_path)
         if directory and not os.path.isdir(directory):
             raise RuntimeError(
                 "[DB] The folder for the SQLite catalog does not exist: "
                 f"{directory}")
-        return sqlite_adapter.SqlitePool(self._sqlite_path, min_size=1,
-                                         max_size=8)
+        if not os.path.isfile(self._sqlite_path) and (
+                self._read_only or not self._creating_allowed):
+            raise RuntimeError(
+                f"[DB] The SQLite catalog does not exist: {self._sqlite_path}")
+        return sqlite_adapter.SqlitePool(
+            self._sqlite_path, min_size=1, max_size=8,
+            read_only=self._read_only)
 
     @staticmethod
     def _retryable_write_errors():
@@ -715,12 +731,18 @@ class SqliteConnectionCore(PgConnectionCore):
 class SqliteSchemaReports:
     """Schema reports for a catalog whose schema is installed at creation.
 
+    Also refuses the one catalog method that only exists for the PostgreSQL
+    legacy-session exception (``classify_format_boundary``).
+
     PostgreSQL proves each explicit migration by introspecting ``pg_catalog``
     and comparing a plpgsql fingerprint. Here there is one schema, one
     recorded fingerprint, and the reports answer the same questions from
     ``sqlite_master``: are the objects there, and are their definitions the
     ones this application installed.
     """
+
+    def classify_format_boundary(self, session_id):
+        raise db_backend.PostgresOnlyFeature("stored_tar_boundary")
 
     def _sqlite_structure_issues_conn(self, conn, tables=(), columns=None,
                                       indexes=(), triggers=(),
