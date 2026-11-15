@@ -1515,6 +1515,48 @@ class IncrementalScanMigrationTests(unittest.TestCase):
         self.assertTrue(self.db.finish_worker_attempt(attempt_id, "completed"))
         self.assertEqual(self.db.list_live_worker_attempts(session_id), [])
 
+    def test_stored_tar_build_attempt_is_recorded_and_proves_its_owner(self):
+        """Audit M4b: the build attempt must reach the table, not be rejected.
+
+        The stager used an attempt_kind the migration-014 CHECK refuses (and an
+        epoch float for a TIMESTAMPTZ column), swallowed the error, and so no
+        Stored TAR build ever had the owner evidence crash recovery reads.
+        """
+        import os
+        from types import SimpleNamespace
+
+        from src.remote_staging import RemoteChunkStager
+        from src.startup_reconcile import LIVE, _stored_tar_owner_verdict
+
+        session_id, _ = self._frontier_session()
+        stager = RemoteChunkStager(SimpleNamespace(db=self.db))
+        attempt_id = stager._start_stored_tar_attempt(
+            "owner-tar", session_id, 3)
+        self.assertIsNotNone(attempt_id)
+        live = self.db.list_live_worker_attempts(session_id)
+        self.assertEqual(
+            [(a["attempt_id"], a["owner_token"], a["chunk_index"],
+              a["local_pid"]) for a in live],
+            [(attempt_id, "owner-tar", 3, os.getpid())])
+        self.assertIsNotNone(live[0]["local_process_started_at"])
+        # The evidence is usable: this (running) process is seen as the owner.
+        verdict, _reason = _stored_tar_owner_verdict(
+            self.db, session_id, {"owner_token": "owner-tar"})
+        self.assertEqual(verdict, LIVE)
+        stager._finish_stored_tar_attempt(attempt_id)
+        self.assertEqual(self.db.list_live_worker_attempts(session_id), [])
+
+    def test_stored_tar_build_attempt_failure_is_not_swallowed(self):
+        from types import SimpleNamespace
+
+        from src.remote_staging import RemoteChunkStager
+
+        session_id, _ = self._frontier_session()
+        stager = RemoteChunkStager(SimpleNamespace(db=self.db))
+        with self.assertRaisesRegex(RuntimeError, "build attempt"):
+            # No such session: the database rejects the row (foreign key).
+            stager._start_stored_tar_attempt("owner-x", session_id + 9999, 0)
+
     def test_a_sealed_chunk_must_declare_its_expectations(self):
         session_id, _ = self._frontier_session()
         self.db.append_remote_streaming_chunk(

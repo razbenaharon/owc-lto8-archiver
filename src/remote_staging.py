@@ -33,7 +33,7 @@ import uuid
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 from .constants import LOCAL_STAGING_RESERVE_BYTES
 from .db import _apply_canonical_remote_paths
@@ -533,6 +533,10 @@ def _serialize_staged_artifact(item):
     return data
 
 
+#: ``remote_worker_attempts.attempt_kind`` for a Stored TAR container build.
+_STORED_TAR_ATTEMPT_KIND = "pack"
+
+
 class RemoteChunkStager:
     """Fetch + pack one chunk onto local staging. Never touches the tape."""
 
@@ -548,22 +552,33 @@ class RemoteChunkStager:
         started_at = None
         try:
             import psutil
-            started_at = psutil.Process(os.getpid()).create_time()
+            # The column is TIMESTAMPTZ; psutil reports an epoch float.
+            started_at = datetime.fromtimestamp(
+                psutil.Process(os.getpid()).create_time(), tz=timezone.utc)
         except Exception:
             # PID absence after a crash remains useful evidence.  If the PID is
             # later reused, missing creation identity correctly blocks reclaim.
             pass
         try:
+            # attempt_kind must be one the schema accepts (migration 014:
+            # scan/fetch/pack/write). A Stored TAR build is this chunk's pack
+            # stage. The old value 'stored_tar_build' violated the CHECK, the
+            # insert always failed, and the swallowed error left every build
+            # without the owner evidence crash recovery needs (audit M4b).
             return starter(
-                owner_token=owner, attempt_kind="stored_tar_build",
+                owner_token=owner, attempt_kind=_STORED_TAR_ATTEMPT_KIND,
                 session_id=session_id, chunk_index=chunk_index,
                 local_pid=os.getpid(),
                 local_process_started_at=started_at)
-        except Exception:
-            get_logger().warning(
-                "could not record a durable Stored TAR build attempt; a crash "
-                "will require fail-closed owner reconciliation", exc_info=True)
-            return None
+        except Exception as exc:
+            get_logger().error(
+                "could not record a durable Stored TAR build attempt",
+                exc_info=True)
+            raise RuntimeError(
+                "[STAGING] could not record the Stored TAR build attempt for "
+                f"chunk {chunk_index + 1}; refusing to build a container "
+                f"whose owner could not be proven after a crash: {exc}"
+            ) from exc
 
     def _finish_stored_tar_attempt(self, attempt_id):
         if attempt_id is None:
