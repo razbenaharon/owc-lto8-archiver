@@ -12,7 +12,6 @@ from dataclasses import asdict, is_dataclass
 
 from .pipeline_types import (ArtifactReadiness, ContainerFormat,
                              ContainerValidationState, SourceDisposition)
-from .pg_bulk import copy_rows
 from .pg_core import _row, _rows
 from .session_reconcile import classify_session37_format_boundary_category
 from .stored_tar_planning import (build_stored_tar_chunk_plan,
@@ -131,8 +130,7 @@ class PgContainerMixin:
 
     def _container_format_schema_report_conn(self, conn):
         report = {
-            "database": conn.execute(
-                "SELECT current_database() AS db").fetchone()["db"],
+            "database": self._database_name_conn(conn),
             "expected_schema_version": CONTAINER_FORMAT_SCHEMA_VERSION,
             "expected_reader_contract_version":
                 REQUIRED_STORED_TAR_READER_CONTRACT_VERSION,
@@ -518,8 +516,7 @@ class PgContainerMixin:
 
     def _container_format_schema_authority_v2_report_conn(self, conn):
         report = {
-            "database": conn.execute(
-                "SELECT current_database() AS db").fetchone()["db"],
+            "database": self._database_name_conn(conn),
             "expected_migration_checksum":
                 self.container_format_authority_v2_migration_checksum(),
             "installed": False,
@@ -1324,13 +1321,7 @@ class PgContainerMixin:
         }
 
         def lock_read(conn):
-            return bool(conn.execute(
-                """SELECT count(*) AS n FROM pg_locks
-                   WHERE locktype='advisory' AND granted
-                     AND classid=%s AND objid=%s AND objsubid=1""",
-                (self.ARCHIVER_LOCK_KEY >> 32,
-                 self.ARCHIVER_LOCK_KEY & 0xFFFFFFFF),
-            ).fetchone()["n"])
+            return bool(self._archiver_lock_held_conn(conn))
 
         report["archiver_lock_held"] = self._run_read(
             lock_read, "container format migration lock preflight")
@@ -2048,12 +2039,10 @@ class PgContainerMixin:
                     "remote_path", "expected_logical_bytes",
                     "estimated_tar_bytes")
                 col_sql = ", ".join(member_columns)
-                conn.execute(
-                    "CREATE TEMP TABLE _stage_acm ON COMMIT DROP AS "
-                    f"SELECT {col_sql} FROM archive_container_members "
-                    "WITH NO DATA")
-                with conn.cursor() as cur:
-                    copy_rows(cur, "_stage_acm", member_columns, member_rows)
+                self._create_stage_table_conn(
+                    conn, "_stage_acm", "archive_container_members", col_sql)
+                self._copy_rows_conn(
+                    conn, "_stage_acm", member_columns, member_rows)
                 conn.execute(
                     f"INSERT INTO archive_container_members ({col_sql}) "
                     f"SELECT {col_sql} FROM _stage_acm "

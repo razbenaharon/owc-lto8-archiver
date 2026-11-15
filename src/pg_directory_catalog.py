@@ -496,8 +496,7 @@ class PgDirectoryCatalogMixin:
 
     def _manifest_directory_catalog_schema_report_conn(self, conn):
         report = {
-            "database": conn.execute(
-                "SELECT current_database() AS db").fetchone()["db"],
+            "database": self._database_name_conn(conn),
             "expected_schema_version":
                 MANIFEST_DIRECTORY_CATALOG_SCHEMA_VERSION,
             "expected_migration_checksum":

@@ -161,16 +161,7 @@ class PgTapeMixin:
         """
         def operation(conn):
             if require_archiver_lock:
-                owned = conn.execute(
-                    """SELECT EXISTS (
-                           SELECT 1 FROM pg_locks
-                           WHERE locktype='advisory' AND granted
-                             AND pid=pg_backend_pid()
-                             AND classid=%s AND objid=%s AND objsubid=1
-                       ) AS owned""",
-                    (self.ARCHIVER_LOCK_KEY >> 32,
-                     self.ARCHIVER_LOCK_KEY & 0xFFFFFFFF),
-                ).fetchone()["owned"]
+                owned = self._owns_archiver_lock_conn(conn)
                 if not owned:
                     raise RuntimeError(
                         "[DB] Refusing to re-point a session generation "

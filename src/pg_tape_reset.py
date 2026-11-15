@@ -3,6 +3,7 @@ import json
 from .pipeline_types import (ChunkStatus, ChunkTransitionOverride,
                              assert_chunk_transition,
                              is_allowed_chunk_transition)
+from . import db_backend
 from .pg_core import _now_utc, _row
 
 
@@ -138,13 +139,7 @@ class PgTapeResetMixin:
     def _count_label_rows(conn, tape_label):
         counts = {}
         for table, _ in _RESET_TABLES:
-            exists = conn.execute(
-                """SELECT 1 FROM information_schema.columns
-                   WHERE table_schema='public' AND table_name=%s
-                     AND column_name='tape_label'""",
-                (table,),
-            ).fetchone()
-            if exists:
+            if db_backend.column_exists(conn, table, "tape_label"):
                 counts[table] = int(conn.execute(
                     f"SELECT count(*) AS n FROM {table} WHERE tape_label=%s",
                     (tape_label,),

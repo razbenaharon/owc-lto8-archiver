@@ -12,7 +12,6 @@ from .catalog_query import contains_pattern, prefix_pattern, substring_pattern
 from .catalog_v3 import catalog_directory_chain, catalog_file_name
 from .constants import DB_UPSERT_BATCH_SIZE, LEGACY_DEFAULT_SOURCE_HOST
 from .db import _derived_file_name, _file_record_key, _short_source_host
-from .pg_bulk import copy_rows
 from .pg_core import _as_utc, _now_utc, _rows
 from .pipeline_types import FileRecord
 from .runtime import CANCEL
@@ -520,31 +519,22 @@ class PgCatalogMixin:
             f"{column}=EXCLUDED.{column}"
             for column in columns if column != "record_key"
         )
-        conn.execute(
-            "CREATE TEMP TABLE _stage ON COMMIT DROP AS "
-            f"SELECT {col_sql} FROM files_index WITH NO DATA"
-        )
-        with conn.cursor() as cur:
-            copy_rows(cur, "_stage", columns, (
-                [row[column] for column in columns]
-                for row in normalized_by_key.values()
-            ))
+        self._create_stage_table_conn(conn, "_stage", "files_index", col_sql)
+        self._copy_rows_conn(conn, "_stage", columns, (
+            [row[column] for column in columns]
+            for row in normalized_by_key.values()
+        ))
         conflict = (
             f"DO UPDATE SET {update_sql}" if update_existing else "DO NOTHING")
-        # RETURNING (xmax = 0) distinguishes freshly inserted rows (xmax 0) from
-        # updated ones without a second membership scan. With DO NOTHING, only
-        # inserted rows are returned, so anything not returned was a skip.
-        affected = conn.execute(
-            f"""INSERT INTO files_index ({col_sql})
-                SELECT {col_sql} FROM _stage
-                ON CONFLICT (record_key) {conflict}
-                RETURNING (xmax = 0) AS inserted"""
-        ).fetchall()
-        inserted = sum(1 for row in affected if row["inserted"])
+        # The backend hook reports how many rows were freshly inserted and how
+        # many rows the statement touched at all. With DO NOTHING only inserted
+        # rows are touched, so anything not touched was a skip.
+        inserted, affected = self._upsert_from_stage_counts_conn(
+            conn, "files_index", "_stage", col_sql, "record_key", conflict)
         if update_existing:
             return {
                 "inserted": inserted,
-                "updated": len(affected) - inserted,
+                "updated": affected - inserted,
                 "skipped": 0,
             }
         return {
@@ -755,16 +745,13 @@ class PgCatalogMixin:
                     "container_id", "container_format",
                     "tape_generation_id", "actual_artifact_bytes",
                 )
-            conn.execute(
-                "CREATE TEMP TABLE _dir_bundles ON COMMIT DROP AS "
-                "SELECT " + ", ".join(bundle_columns) +
-                " FROM directory_archive_bundles WITH NO DATA"
-            )
-            with conn.cursor() as cur:
-                copy_rows(cur, "_dir_bundles", bundle_columns, (
-                    [row[column] for column in bundle_columns]
-                    for row in bundle_rows
-                ))
+            self._create_stage_table_conn(
+                conn, "_dir_bundles", "directory_archive_bundles",
+                ", ".join(bundle_columns))
+            self._copy_rows_conn(conn, "_dir_bundles", bundle_columns, (
+                [row[column] for column in bundle_columns]
+                for row in bundle_rows
+            ))
             update_sql = ", ".join(
                 f"{column}=EXCLUDED.{column}"
                 for column in bundle_columns if column != "record_key")
@@ -863,13 +850,10 @@ class PgCatalogMixin:
                 "large_file_bytes", "packed_bundle_count", "backup_date",
                 "record_key",
             )
-            conn.execute(
-                "CREATE TEMP TABLE _dir_stats ON COMMIT DROP AS "
-                "SELECT " + ", ".join(stats_columns) +
-                " FROM directory_archive_stats WITH NO DATA"
-            )
-            with conn.cursor() as cur:
-                copy_rows(cur, "_dir_stats", stats_columns, stats_rows)
+            self._create_stage_table_conn(
+                conn, "_dir_stats", "directory_archive_stats",
+                ", ".join(stats_columns))
+            self._copy_rows_conn(conn, "_dir_stats", stats_columns, stats_rows)
             stats_update = ", ".join(
                 f"{column}=EXCLUDED.{column}"
                 for column in stats_columns if column != "record_key")
@@ -893,13 +877,10 @@ class PgCatalogMixin:
                 "recursive_large_file_count", "recursive_large_file_bytes",
                 "backup_date", "record_key",
             )
-            conn.execute(
-                "CREATE TEMP TABLE _dir_tree ON COMMIT DROP AS "
-                "SELECT " + ", ".join(tree_columns) +
-                " FROM directory_tree_index WITH NO DATA"
-            )
-            with conn.cursor() as cur:
-                copy_rows(cur, "_dir_tree", tree_columns, tree_rows)
+            self._create_stage_table_conn(
+                conn, "_dir_tree", "directory_tree_index",
+                ", ".join(tree_columns))
+            self._copy_rows_conn(conn, "_dir_tree", tree_columns, tree_rows)
             tree_update = ", ".join(
                 f"{column}=EXCLUDED.{column}"
                 for column in tree_columns if column != "record_key")
