@@ -5,6 +5,7 @@ from datetime import datetime
 from types import SimpleNamespace
 from typing import Type
 
+from .archiver_lock_guard import assert_archiver_lock_held
 from .backup import LTOBackup, _NoEjectBackup
 from .constants import (DEFAULT_TAPE_CAPACITY_GB, LOCAL_STAGING_RESERVE_BYTES,
                         LOCAL_TAPE_BUDGET_BYTES, ROOT_FILES_GROUP,
@@ -305,6 +306,9 @@ class LocalOrchestrator:
         self._eject_at_session_end()
 
     def _process_chunk(self, session, chunk_index, entries):
+        # Audit H6: prove the single-writer lock is still ours before this
+        # chunk touches the tape. Raises (a hard stop); never re-acquires.
+        assert_archiver_lock_held(self.db)
         tape_label = self._prepare_tape_for_chunk(session, chunk_index, entries)
         if not tape_label:
             return False

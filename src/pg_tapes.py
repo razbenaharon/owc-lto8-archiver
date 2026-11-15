@@ -374,10 +374,15 @@ class PgTapeMixin:
         artifact_bytes = 0
         if has_containers:
             row = conn.execute(
+                # Generation-aware: a container copied to a generation that a
+                # tape reset has since retired is history, not occupied space.
                 """SELECT COALESCE(SUM(actual_artifact_bytes),0) AS used
                    FROM archive_containers
-                   WHERE tape_label=%s AND writer_state='copied'""",
-                (volume_label,),
+                   WHERE tape_label=%s AND writer_state='copied'
+                     AND tape_generation_id IN (
+                         SELECT g.generation_id FROM tape_generations g
+                         WHERE g.volume_label=%s AND g.state='active')""",
+                (volume_label, volume_label),
             ).fetchone()
             container_bytes = int(row["used"] or 0)
             row = conn.execute(
@@ -389,8 +394,11 @@ class PgTapeMixin:
                          WHERE r.remote_session_id=a.session_id
                            AND r.remote_chunk_index=a.chunk_index
                            AND r.tape_label=%s
-                           AND r.tape_generation_id IS NOT NULL)""",
-                (volume_label,),
+                           AND r.tape_generation_id IN (
+                               SELECT g.generation_id FROM tape_generations g
+                               WHERE g.volume_label=%s
+                                 AND g.state='active'))""",
+                (volume_label, volume_label),
             ).fetchone()
             artifact_bytes = int(row["used"] or 0)
         if not self._table_exists_conn(conn, "directory_archive_bundles"):
@@ -435,9 +443,71 @@ class PgTapeMixin:
         return (int(row["used"] or 0) + manifest_bytes
                 + container_bytes + artifact_bytes)
 
+    @staticmethod
+    def _tape_reference_columns_conn(conn):
+        """Every single-column foreign key that points at ``tapes``.
+
+        Returns ``(child_table, child_column, parent_column)`` with the two
+        child identifiers already safely quoted by PostgreSQL. Discovering
+        them from the catalog (instead of a hand-kept list) is what keeps
+        rename/delete correct when a later migration adds another table that
+        references a tape. PostgreSQL-only (``pg_constraint``); this is the
+        one place rename/delete depend on it.
+        """
+        return [
+            (row["child_table"], row["child_column"], row["parent_column"])
+            for row in conn.execute(
+                """SELECT c.conrelid::regclass::text AS child_table,
+                          quote_ident(a.attname) AS child_column,
+                          fa.attname AS parent_column
+                   FROM pg_constraint c
+                   JOIN pg_attribute a
+                     ON a.attrelid=c.conrelid AND a.attnum=c.conkey[1]
+                   JOIN pg_attribute fa
+                     ON fa.attrelid=c.confrelid AND fa.attnum=c.confkey[1]
+                   WHERE c.contype='f' AND c.confrelid='tapes'::regclass
+                     AND array_length(c.conkey, 1)=1
+                   ORDER BY 1, 2""").fetchall()]
+
     def delete_tape(self, volume_label):
+        """Delete a tape that no session or audit history depends on.
+
+        Catalog rows that merely *locate* files on the cartridge are removed
+        with it, and so is its own generation ledger. Anything that is history
+        in its own right - a remote/local session that targeted the tape, a
+        recorded tape reset, a container - is never erased as a side effect
+        (migration 013): the delete is refused with the list of what still
+        references the tape, and nothing is changed.
+        """
         def operation(conn):
+            tape = conn.execute(
+                "SELECT tape_id FROM tapes WHERE volume_label=%s FOR UPDATE",
+                (volume_label,)).fetchone()
+            if tape is None:
+                raise RuntimeError(f"[DB] Tape not found: {volume_label}")
             self._delete_tape_records(conn, volume_label)
+            blockers = []
+            for table, column, parent in self._tape_reference_columns_conn(
+                    conn):
+                if table == "tape_generations":
+                    continue
+                key = (volume_label if parent == "volume_label"
+                       else tape["tape_id"])
+                count = conn.execute(
+                    f"SELECT count(*) AS n FROM {table} WHERE {column}=%s",
+                    (key,)).fetchone()["n"]
+                if count:
+                    blockers.append(f"{table} ({count})")
+            if blockers:
+                raise RuntimeError(
+                    f"[DB] Refusing to delete tape '{volume_label}': it is "
+                    "still referenced by " + ", ".join(blockers) + ". Those "
+                    "rows are archive history and are never removed as a "
+                    "side effect of deleting a tape. Nothing was changed.")
+            if self._table_exists_conn(conn, "tape_generations"):
+                conn.execute(
+                    "DELETE FROM tape_generations WHERE tape_id=%s",
+                    (tape["tape_id"],))
             cur = conn.execute(
                 "DELETE FROM tapes WHERE volume_label=%s", (volume_label,))
             self._require_updated(cur, f"[DB] Tape not found: {volume_label}")
@@ -573,6 +643,16 @@ class PgTapeMixin:
                 "SELECT tape_id FROM tapes WHERE volume_label=%s",
                 (new_label,),
             ).fetchone()["tape_id"]
+            # current_generation must follow the cartridge too. The INSERT
+            # above lands on the column default (1); a tape that has been
+            # reset would otherwise come out of a rename pointing at a retired
+            # generation while its moved generation ledger says otherwise, and
+            # every generation check would then refuse or mis-attribute.
+            if self._column_exists_conn(conn, "tapes", "current_generation"):
+                conn.execute(
+                    "UPDATE tapes SET current_generation=%s WHERE tape_id=%s",
+                    (old["current_generation"], new_tape_id),
+                )
             if self._table_exists_conn(conn, "tape_generations"):
                 conn.execute(
                     """UPDATE tape_generations
@@ -654,6 +734,20 @@ class PgTapeMixin:
                 "UPDATE local_chunks_manifest SET tape_label=%s WHERE tape_label=%s",
                 (new_label, old_label),
             )
+            # Anything else that references the tape (container tables from
+            # migrations 015/018, sealed batches, future tables) follows it as
+            # well. This runs after remote_sessions is repointed because the
+            # container generation guard compares against the session's label.
+            for table, column, parent in self._tape_reference_columns_conn(
+                    conn):
+                if parent == "volume_label":
+                    conn.execute(
+                        f"UPDATE {table} SET {column}=%s WHERE {column}=%s",
+                        (new_label, old_label))
+                else:
+                    conn.execute(
+                        f"UPDATE {table} SET {column}=%s WHERE {column}=%s",
+                        (new_tape_id, old["tape_id"]))
             conn.execute("DELETE FROM tapes WHERE volume_label=%s", (old_label,))
 
         self._transaction(operation, f"rename tape {old_label}")

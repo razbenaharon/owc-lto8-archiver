@@ -25,6 +25,7 @@ every cross-method call routes back through it so an injected hook still wins.
 """
 import time
 
+from .archiver_lock_guard import archiver_lock_stop
 from .backup import LTOBackup, _NoEjectBackup
 from .constants import (tape_budget_bytes, tape_is_full,
                         tape_status_reason_suffix)
@@ -75,6 +76,14 @@ class RemoteChunkWriter:
         for desc in descs:
             validate_staged_chunk_writer_admission(
                 desc, self.host.db, expected_session_id=session_id)
+
+        # Audit H6: prove the single-writer lock is still ours before this
+        # group does anything. DB-only; a loss is a hard stop, never a retry.
+        lock_stop = archiver_lock_stop(
+            self.host.db, session_id=session_id,
+            chunk_index=descs[0].chunk_index)
+        if lock_stop is not None:
+            return self.host._record_stop(lock_stop)
 
         # skip_tape chunks involve no tape at all — handle them outside
         # ownership so an all-skip group never touches LTFS.

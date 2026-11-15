@@ -760,6 +760,7 @@ class WriteChunkRaceTests(unittest.TestCase):
                                    ibm_eject_cmd="")
         statuses = []
         orch.db = SimpleNamespace(
+            verify_archiver_lock=lambda: True,
             get_chunks_with_status=lambda sid, st: [],
             get_chunk_size_summary=lambda sid, ci=None: {ci: (10, 10, 1)},
             get_chunk_packaging_format=lambda sid, ci: ContainerFormat.ZIP,
@@ -896,6 +897,7 @@ class CooperativeCancelWriteTests(unittest.TestCase):
                                    ibm_eject_cmd="")
         statuses = []
         orch.db = SimpleNamespace(
+            verify_archiver_lock=lambda: True,
             get_chunks_with_status=lambda sid, st: [],
             get_chunk_size_summary=lambda sid, ci=None: {ci: (10, 10, 1)},
             get_chunk_packaging_format=lambda sid, ci: ContainerFormat.ZIP,

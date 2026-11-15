@@ -1,9 +1,13 @@
 """Transactional database half of an explicitly authorized tape reset."""
 import json
+from .pipeline_types import (ChunkStatus, ChunkTransitionOverride,
+                             assert_chunk_transition,
+                             is_allowed_chunk_transition)
 from .pg_core import _now_utc, _row
 
 
 _RESET_TABLES = (
+    ("directory_archive_parts", "part_id"),
     ("directory_tree_index", "dir_id"),
     ("directory_archive_bundles", "bundle_id"),
     ("directory_archive_stats", "stat_id"),
@@ -205,7 +209,21 @@ class PgTapeResetMixin:
                        WHERE directory_id IN (
                          SELECT directory_id FROM catalog_directories
                          WHERE tape_label=%s)""", (label,)).rowcount
-            for table in ("directory_tree_index", "files_index",
+            # archive_containers / archive_artifacts rows are deliberately
+            # KEPT: a ready artifact is immutable by migration 018's sealed-
+            # artifact trigger, and the rows stay truthful because they point
+            # at the generation retired below. Used-space accounting counts
+            # only the ACTIVE generation, so they no longer occupy the tape.
+            # KNOWN LIMIT: a Stored-TAR chunk returned to 'pending' here still
+            # owns those copied/committed containers, and the schema has no
+            # second "epoch" for them - re-writing such a chunk fails closed at
+            # staging until that is designed. ZIP chunks have no container
+            # rows and are re-writable as before.
+            # Migration 018 restore routes. They locate data on the erased
+            # generation, and loose parts hold a RESTRICT foreign key into
+            # files_index, so they must go before it.
+            for table in ("directory_archive_parts",
+                          "directory_tree_index", "files_index",
                           "directory_archive_stats",
                           "directory_archive_bundles",
                           "local_manifest_folder_aggregates",
@@ -232,14 +250,34 @@ class PgTapeResetMixin:
             now = _now_utc()
             affected_sessions = set()
             for item in transitions:
-                cur = conn.execute(
-                    """UPDATE remote_chunks
-                       SET status=%s,error_msg=NULL,updated_at=%s
-                       WHERE session_id=%s AND chunk_index=%s AND status=%s""",
-                    (item["after"], now, item["session_id"],
-                     item["chunk_index"], item["before"]),
-                )
-                if cur.rowcount != 1:
+                before = ChunkStatus(item["before"]).value
+                after = ChunkStatus(item["after"]).value
+                if is_allowed_chunk_transition(before, after):
+                    # An ordinary pre-write move (e.g. packing -> pending).
+                    assert_chunk_transition(before, after)
+                    moved = conn.execute(
+                        """UPDATE remote_chunks
+                           SET status=%s,error_msg=NULL,updated_at=%s
+                           WHERE session_id=%s AND chunk_index=%s
+                             AND status=%s""",
+                        (after, now, item["session_id"],
+                         item["chunk_index"], before),
+                    ).rowcount == 1
+                else:
+                    # done/backing -> pending is forbidden everywhere else. The
+                    # cartridge generation was destroyed, so this reset is the
+                    # one named recovery allowed to do it - and every chunk
+                    # gets its own audit row (migration 020 refuses the UPDATE
+                    # without one).
+                    moved = self._override_chunk_transition_conn(
+                        conn, item["session_id"], item["chunk_index"],
+                        expected_from=before, to_status=after,
+                        override=ChunkTransitionOverride.TAPE_RESET,
+                        reason=(f"tape reset {operation_id} of {label} "
+                                f"generation {op['old_generation']}: "
+                                f"{item.get('reason') or 'output erased'}"),
+                        authorized_by=f"tape-reset:{operation_id}")
+                if not moved:
                     raise RuntimeError("[TAPE RESET] Chunk compare-and-set failed")
                 affected_sessions.add(int(item["session_id"]))
             for session_id in sorted(affected_sessions):
