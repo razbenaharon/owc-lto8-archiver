@@ -36,7 +36,7 @@ from src.pg_backup import (
     apply_directory_catalog_schema_to_database,
     create_migrated_database_from_backup,
     create_verified_production_backup,
-    verify_backup_file,
+    verify_backup,
     verify_backup_receipt,
 )
 from src.pg_bulk import build_conninfo, make_conninfo
@@ -1357,10 +1357,14 @@ def _run_session_frontier_report(cfg, args, parser):
 
 
 def _verify_hot_backup(cfg, path):
-    restore_list = verify_backup_file(cfg, path)
+    verification = verify_backup(cfg, path).raise_if_failed()
     return {"backup_path": os.path.abspath(path),
-            "restore_list_path": restore_list,
-            "verified": True}
+            "restore_list_path": verification.artifacts["restore_list_path"],
+            "verified": True,
+            # "verified" is only as strong as this level; the statements say
+            # what was not proven (the dump is not restored anywhere here).
+            "verification_level": verification.level,
+            "not_verified": list(verification.not_verified)}
 
 
 def _run_manifest_export(cfg, args):
