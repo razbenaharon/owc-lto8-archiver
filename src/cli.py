@@ -470,9 +470,9 @@ def main():
             print("1. Format tape        (LtfsCmdFormat.exe — ERASES ALL DATA)")
             print("2. Register tape manually")
             print("3. List available drives")
-            print("4. Check tape         (LtfsCmdCheck.exe — repair filesystem errors)")
+            print("4. Check tape         (LtfsCmdCheck.exe — REPAIRS the filesystem; asks you to type REPAIR)")
             print("5. Tape drives info   (LtfsCmdDrives.exe — list drives & status)")
-            print("6. Eject tape         (LtfsCmdEject.exe — safely eject tape)")
+            print("6. Eject tape         (LtfsCmdEject.exe — PHYSICAL eject; asks you to type EJECT)")
             print("0. Back")
             sub = input("Choose: ").strip()
             if sub == '1':
