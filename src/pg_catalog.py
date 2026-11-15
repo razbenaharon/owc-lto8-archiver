@@ -12,7 +12,7 @@ from .catalog_query import contains_pattern, prefix_pattern, substring_pattern
 from .catalog_v3 import catalog_directory_chain, catalog_file_name
 from .constants import DB_UPSERT_BATCH_SIZE, LEGACY_DEFAULT_SOURCE_HOST
 from .db import _derived_file_name, _file_record_key, _short_source_host
-from .db_backend import as_day, day_bounds
+from .db_backend import as_day, day_bounds, table_exists
 from .pg_core import _as_utc, _now_utc, _rows
 from .pipeline_types import FileRecord
 from .runtime import CANCEL
@@ -1299,15 +1299,16 @@ class PgCatalogMixin:
             sp = str(row["stored_path"]).replace("\\", "/").lstrip("/")
             if sp and op.endswith(sp):
                 candidate = op[:len(op) - len(sp)].rstrip("/")
-                if remote_session_id is not None and self._table_exists_conn(
+                if remote_session_id is not None and table_exists(
                         conn, "remote_scan_scopes"):
                     scopes = conn.execute(
-                        "SELECT root_path FROM remote_scan_scopes "
-                        "WHERE session_id=%s AND root_path IS NOT NULL",
+                        "SELECT source_root FROM remote_scan_scopes "
+                        "WHERE session_id=%s AND source_root IS NOT NULL",
                         (int(remote_session_id),),
                     ).fetchall()
-                    roots = [str(item["root_path"]).replace("\\", "/").rstrip("/")
-                             for item in scopes]
+                    roots = [
+                        str(item["source_root"]).replace("\\", "/").rstrip("/")
+                        for item in scopes]
                     if roots and not any(
                             candidate == root or candidate.startswith(root + "/")
                             for root in roots):

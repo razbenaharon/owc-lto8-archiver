@@ -3,7 +3,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from src.schema_audit import (
-    BASE_TABLES, _code_provenance_facts, audit_schema_provenance)
+    BASE_TABLES, REQUIRED_COLUMNS, _code_provenance_facts,
+    audit_schema_provenance)
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class _Result:
@@ -80,6 +83,30 @@ class SchemaAuditFakeSchemaTests(unittest.TestCase):
             "UNAVAILABLE")
 
 
+class SchemaAuditRepositoryAgreementTests(unittest.TestCase):
+    """The audit's own expectations must describe the schema that exists."""
+
+    def test_required_columns_exist_in_the_migrated_schema(self):
+        import json
+        with open(REPO_ROOT / "tests" / "data" / "pg_schema_expectation.json",
+                  encoding="utf-8") as handle:
+            tables = json.load(handle)["tables"]
+        missing = [
+            f"{table}.{column}"
+            for table, required in REQUIRED_COLUMNS.items()
+            if table in tables
+            for column in required
+            if column not in {item["name"] for item in tables[table]}
+        ]
+        self.assertEqual(missing, [])
+
+    def test_this_repository_satisfies_every_code_provenance_fact(self):
+        facts = _code_provenance_facts(REPO_ROOT)
+        self.assertEqual(facts["reasons"], {})
+        self.assertTrue(facts["persisted_scan_scope_guard"])
+        self.assertTrue(facts["no_remote_path_root_fallback"])
+
+
 class SchemaAuditCodeProvenanceAstTests(unittest.TestCase):
     @staticmethod
     def _root_with_catalog(source):
@@ -154,7 +181,7 @@ class Catalog:
     @staticmethod
     def _derive_bundle_base_path(conn, stored_bundle_path, remote_session_id):
         scopes = conn.execute(
-            "SELECT root_path FROM remote_scan_scopes WHERE session_id=%s",
+            "SELECT source_root FROM remote_scan_scopes WHERE session_id=%s",
             (remote_session_id,),
         ).fetchall()
         return "/candidate"
@@ -162,5 +189,30 @@ class Catalog:
         try:
             facts = _code_provenance_facts(root)
             self.assertFalse(facts["persisted_scan_scope_guard"])
+        finally:
+            temp.cleanup()
+
+    def test_scope_query_on_a_column_the_table_does_not_have_fails(self):
+        """``remote_scan_scopes`` has ``source_root``; the pre-1.0 code read a
+        ``root_path`` column that never existed and the audit accepted it."""
+        temp, root = self._root_with_catalog(
+            '''
+class Catalog:
+    @staticmethod
+    def _derive_bundle_base_path(conn, stored_bundle_path, remote_session_id):
+        candidate = "/candidate"
+        scopes = conn.execute(
+            "SELECT root_path FROM remote_scan_scopes WHERE session_id=%s",
+            (remote_session_id,),
+        ).fetchall()
+        roots = [str(item["root_path"]) for item in scopes]
+        if roots and not any(candidate == root for root in roots):
+            return ""
+        return candidate
+''')
+        try:
+            facts = _code_provenance_facts(root)
+            self.assertFalse(facts["persisted_scan_scope_guard"])
+            self.assertTrue(facts["reasons"]["persisted_scan_scope_guard"])
         finally:
             temp.cleanup()
