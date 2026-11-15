@@ -713,7 +713,7 @@ class ConfigManager:
     @property
     def db_dsn(self):
         if self.db_backend == 'sqlite':
-            return 'sqlite:///' + self.sqlite_path.replace('\', '/')
+            return 'sqlite:///' + self.sqlite_path.replace('\\', '/')
         user = quote(self.pg_user, safe='')
         password = quote(self.pg_password, safe='')
         auth = f"{user}:{password}@" if password else f"{user}@"
@@ -724,7 +724,7 @@ class ConfigManager:
     @property
     def db_display_ref(self):
         if self.db_backend == 'sqlite':
-            return 'sqlite:///' + self.sqlite_path.replace('\', '/')
+            return 'sqlite:///' + self.sqlite_path.replace('\\', '/')
         user = quote(self.pg_user, safe='')
         auth = f"{user}:***@" if self.pg_password else f"{user}@"
         return (
