@@ -1,0 +1,98 @@
+# Builds a DRAFT pre-release. It never publishes anything.
+#
+# Trigger: pushing a `v*` tag, or a manual run started FROM a `v*` tag
+# (Actions -> release -> Run workflow -> "Use workflow from": the tag).
+#
+# What happens, in order:
+#   1. `checks`  - the complete public-repo-guard workflow against the tagged
+#                  commit: privacy gate, the test matrix, the PostgreSQL suites,
+#                  both clean-install smoke tests and the headless GUI tests.
+#   2. `draft-release` - only if every check passed: build the one package
+#                  with scripts/build_release.py and create a GitHub Release
+#                  that is BOTH a draft and a pre-release, with the zip,
+#                  SHA256SUMS.txt and docs/releases/<tag>.md as its text.
+#
+# A draft is invisible to the public and creates no tag. Publishing it is a
+# manual step in the GitHub UI by the repository owner, after reading it.
+# This workflow creates no tag either: `--verify-tag` makes `gh` refuse when
+# the tag does not already exist on the remote.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    uses: ./.github/workflows/public-repo-guard.yml
+    permissions:
+      contents: read
+
+  draft-release:
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The only job, in the only workflow, that may write to the repository:
+    # it needs it to create the draft release and upload its files.
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Require a v* tag
+        if: github.ref_type != 'tag' || !startsWith(github.ref_name, 'v')
+        run: |
+          echo "::error::Run this workflow from a v* tag (it was started from $GITHUB_REF_TYPE '$TAG'). Nothing was built."
+          exit 1
+
+      - uses: actions/checkout@v4
+        with:
+          # The privacy gate and `git archive` read the repository itself.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # Refuses when the tag does not match the version in src/__init__.py,
+      # when the tree is dirty, when the privacy gate fails, or when the zip
+      # contains a local/private file or lacks a required one.
+      - name: Build the release package
+        run: python scripts/build_release.py --expect-tag "$TAG"
+
+      - name: Check the release notes exist
+        run: test -s "docs/releases/$TAG.md"
+
+      - name: Create the DRAFT pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$TAG" \
+            dist/owc-lto8-archiver-*.zip \
+            dist/SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --draft \
+            --prerelease \
+            --title "OWC LTO-8 Archiver $TAG (pre-release)" \
+            --notes-file "docs/releases/$TAG.md"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Draft pre-release created for \`$TAG\`"
+            echo
+            echo "It is a **draft**: not public, not published. Review it under Releases and publish it by hand."
+            echo
+            echo '```'
+            cat dist/SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -9,6 +9,13 @@ from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+if __name__ == "__main__" and "--version" in sys.argv[1:]:
+    # Answered before anything else is imported: no config.ini is read or
+    # created, no database is opened and no database driver is needed.
+    from src import __version__
+    print(f"owc-lto8-archiver {__version__}")
+    raise SystemExit(0)
+
 from src.constants import PROJECT_ROOT
 os.chdir(PROJECT_ROOT)
 
@@ -1522,6 +1529,10 @@ def _run_backfill(db, args):
 def _build_parser():
     parser = argparse.ArgumentParser(
         description="Inspect and safely maintain the PostgreSQL archive catalog.")
+    from src import __version__
+    parser.add_argument("--version", action="version",
+                        version=f"owc-lto8-archiver {__version__}",
+                        help="Print the program version and exit.")
     parser.add_argument("--db", help="Override target database name.")
     parser.add_argument("--tape", help="Limit an operation to one tape label.")
     parser.add_argument("--batch-size", type=int, default=100,
