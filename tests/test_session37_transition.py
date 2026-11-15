@@ -6,6 +6,7 @@ against a differently-shaped session and asserts the boundary moves. A proposal
 that happened to agree with today's production numbers because those numbers
 were written into the source would pass every other test in this file.
 """
+from source_facts import code_text
 import unittest
 
 from src.session_transition import (
@@ -84,7 +85,7 @@ class BaselineTests(unittest.TestCase):
 
         from src import session_transition
 
-        source = inspect.getsource(session_transition)
+        source = code_text(session_transition)
         for literal in ("37", "112", "113", "49", "Tape_02", "Tape_03"):
             self.assertNotIn(literal, source, literal)
 

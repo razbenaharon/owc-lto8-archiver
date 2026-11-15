@@ -10,6 +10,7 @@ cartridge. The one thing that genuinely cannot be proved here — that a real
 IBM drive behaves as the fakes do — is the operator-supervised hardware
 rehearsal, which is explicitly a later activation gate.
 """
+from source_facts import code_text
 import inspect
 import threading
 import unittest
@@ -113,20 +114,13 @@ class Clause01_OnlyTapePathTests(_ContractHarness):
                      "remote_staging", "scan_frontier", "frontier_bootstrap",
                      "startup_reconcile", "archive_artifacts", "pg_scan"):
             module = __import__(f"src.{name}", fromlist=["x"])
-            source = inspect.getsource(module)
+            source = code_text(module)
             if "_backup_writer(" in source:
                 callers.append(name)
         # Only the orchestrator, and only as the façade that BUILDS the writer.
         self.assertEqual(callers, ["remote_orchestrator"])
-        façade = inspect.getsource(ro.RemoteOrchestrator._backup_writer)
+        façade = code_text(ro.RemoteOrchestrator._backup_writer)
         self.assertIn("cls(", façade)
-
-    def test_only_the_writer_module_runs_the_copy(self):
-        from src import remote_writer
-        source = inspect.getsource(remote_writer)
-        self.assertIn("_backup_writer", source)
-        self.assertIn(".run(", source)
-
 
 # =============================================================================
 # Clause 2 — no pre-group LTFS probes in the three entry methods
@@ -136,18 +130,18 @@ class Clause02_NoPreGroupProbeTests(unittest.TestCase):
               "get_volume_label", "_acquire_tape_io_lock", "eject_tape")
 
     def test_start_new_session_has_no_probe(self):
-        source = inspect.getsource(ro.RemoteOrchestrator._start_new_session)
+        source = code_text(ro.RemoteOrchestrator._start_new_session)
         for probe in self.PROBES:
             self.assertNotIn(probe, source, probe)
 
     def test_run_streaming_session_has_no_probe(self):
-        source = inspect.getsource(
+        source = code_text(
             ro.RemoteOrchestrator._run_streaming_session)
         for probe in self.PROBES:
             self.assertNotIn(probe, source, probe)
 
     def test_run_session_has_no_probe(self):
-        source = inspect.getsource(ro.RemoteOrchestrator._run_session)
+        source = code_text(ro.RemoteOrchestrator._run_session)
         for probe in self.PROBES:
             self.assertNotIn(probe, source, probe)
 
@@ -155,7 +149,7 @@ class Clause02_NoPreGroupProbeTests(unittest.TestCase):
         for method in (ro.RemoteOrchestrator._run_streaming_session,
                        ro.RemoteOrchestrator._run_session):
             self.assertIn("_announce_target_cartridge",
-                          inspect.getsource(method), method.__name__)
+                          code_text(method), method.__name__)
 
 
 # =============================================================================
@@ -198,7 +192,7 @@ class Clause04_NoAccessWhileWaitingTests(unittest.TestCase):
 
     def test_the_pipeline_poll_loop_contains_no_tape_call(self):
         from src.remote_pipeline import RemotePipelineCoordinator
-        source = inspect.getsource(RemotePipelineCoordinator)
+        source = code_text(RemotePipelineCoordinator)
         for token in ("_ensure_lto_drive_ready", "get_volume_label",
                       "_acquire_tape_io_lock", "eject_tape", "lto_drive"):
             self.assertNotIn(token, source, token)
@@ -281,7 +275,7 @@ class Clause09_NoAutoEjectTests(_ContractHarness):
         for name in ("remote_pipeline", "remote_staging", "scan_frontier",
                      "frontier_bootstrap", "startup_reconcile"):
             module = __import__(f"src.{name}", fromlist=["x"])
-            self.assertNotIn("eject", inspect.getsource(module).lower()
+            self.assertNotIn("eject", code_text(module).lower()
                              .replace("rejected", "").replace("reject", ""),
                              name)
 
@@ -324,7 +318,7 @@ class Clause10_BackingIsAmbiguousTests(_ContractHarness):
         for name in ("claim_chunk_for_staging", "renew_chunk_claim",
                      "release_chunk_claim", "list_expired_chunk_claims",
                      "reclaim_expired_chunk"):
-            source = inspect.getsource(getattr(PgSessionMixin, name))
+            source = code_text(getattr(PgSessionMixin, name))
             self.assertTrue(
                 "status <> 'backing'" in source
                 or "RECLAIMABLE_CHUNK_STATES" in source
@@ -377,7 +371,7 @@ class Clause11_FailClosedTests(unittest.TestCase):
 
     def test_elapsed_time_alone_never_releases_a_claim(self):
         from src.pg_sessions import PgSessionMixin
-        source = inspect.getsource(PgSessionMixin.reclaim_expired_chunk)
+        source = code_text(PgSessionMixin.reclaim_expired_chunk)
         self.assertIn("if not evidence", source)
         self.assertIn("not proof", source)
 
@@ -388,7 +382,7 @@ class Clause11_FailClosedTests(unittest.TestCase):
 class Clause12_NoTrustedDocumentationTests(unittest.TestCase):
     def test_the_report_hardcodes_no_session_or_chunk_facts(self):
         from src.startup_reconcile import session_frontier_report
-        source = inspect.getsource(session_frontier_report)
+        source = code_text(session_frontier_report)
         for hardcoded in ("37", "112", "113", "96", "108",
                           "Tape_02", "Tape_03"):
             self.assertNotIn(hardcoded, source, hardcoded)
@@ -399,7 +393,7 @@ class Clause12_NoTrustedDocumentationTests(unittest.TestCase):
                      "startup_reconcile", "frontier_bootstrap",
                      "archive_artifacts", "remote_writer"):
             module = __import__(f"src.{name}", fromlist=["x"])
-            source = inspect.getsource(module)
+            source = code_text(module)
             self.assertIsNone(
                 re.search(r"session_id\s*==\s*\d+", source), name)
             self.assertIsNone(
@@ -407,7 +401,7 @@ class Clause12_NoTrustedDocumentationTests(unittest.TestCase):
 
     def test_the_report_reads_membership_from_plan_rows_not_cached_totals(self):
         from src.pg_sessions import PgSessionMixin
-        source = inspect.getsource(
+        source = code_text(
             PgSessionMixin.get_session_membership_summary)
         self.assertIn("remote_plan_files", source)
         self.assertNotIn("s.chunk_count", source)

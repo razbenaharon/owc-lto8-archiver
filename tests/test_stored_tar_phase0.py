@@ -1,4 +1,5 @@
 """Plan 2 Phase 0 contracts. Local-only: no PostgreSQL, SSH, LTFS or tape."""
+from source_facts import code_text
 import configparser
 import inspect
 import os
@@ -64,13 +65,13 @@ class FeatureGateTests(unittest.TestCase):
     def test_migration_015_is_not_a_startup_migration(self):
         self.assertNotIn(
             "015_postgres_container_formats.sql",
-            inspect.getsource(PgConnectionCore._init_schema))
+            code_text(PgConnectionCore._init_schema))
 
     def test_both_chunk_insert_paths_use_the_atomic_assignment_seam(self):
         for method in (
                 PgSessionMixin.append_remote_streaming_chunk,
                 PgSessionMixin._persist_remote_plan):
-            source = inspect.getsource(method)
+            source = code_text(method)
             self.assertIn("assign_new_chunk_format", source)
             self.assertIn("packaging_format, packaging_assigned_at", source)
             self.assertIn("if stored_tar_write_enabled", source)

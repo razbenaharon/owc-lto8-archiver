@@ -1,3 +1,4 @@
+from source_facts import code_text
 import csv
 import inspect
 import os
@@ -66,7 +67,7 @@ class TapeResetUnitTests(unittest.TestCase):
         self.assertFalse(result.resumable)
 
     def test_reset_path_contains_no_eject_command(self):
-        source = inspect.getsource(execute_reset)
+        source = code_text(execute_reset)
         self.assertNotIn("eject_tape", source)
         self.assertNotIn("LtfsCmdEject", source)
 

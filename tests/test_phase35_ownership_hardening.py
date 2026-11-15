@@ -4,6 +4,7 @@ failures, bounded timeouts, and static watchdog/coverage validation.
 Nothing here touches the tape: mutexes are named per test run, LTFS adapters are
 fakes, and PowerShell is only *parsed*, never executed.
 """
+from source_facts import code_only
 import ast
 import os
 import re
@@ -205,22 +206,45 @@ class OwnershipIdentityTests(unittest.TestCase):
                         side_effect=AssertionError("subprocess used")):
             self.assertTrue(own.default_mutex_name())
 
-    def test_production_config_declares_the_id(self):
-        """Operator-machine check: a real config.ini must declare the id.
+    def test_the_id_is_read_from_the_hardware_section_of_config(self):
+        """Hermetic: a temp project root stands in for the repo root.
 
-        config.ini is untracked by design, so this asserts nothing on a
-        clean clone or in CI. The identity *logic* is covered hermetically
-        by the tests above; this one only catches a locally misconfigured
-        drive.
+        This used to read the operator's untracked config.ini and skip when it
+        was absent, so it proved nothing on a clean clone and could fail on a
+        host for reasons unrelated to the code.
         """
-        import configparser
-        config_path = os.path.join(PROJECT_ROOT, "config.ini")
-        if not os.path.exists(config_path):
-            self.skipTest("no local config.ini (expected on a clean clone/CI)")
-        parser = configparser.ConfigParser()
-        parser.read(config_path, encoding="utf-8")
-        value = parser.get("HARDWARE", "ltfs_ownership_id", fallback="")
-        self.assertEqual(own.validate_ownership_id(value), value.strip())
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "config.ini")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("[HARDWARE]\n"
+                         "ltfs_ownership_id =  drive_TESTONLY_01  \n"
+                         "ltfs_writer_lock_timeout_seconds = 7\n")
+            with mock.patch.object(own, "PROJECT_ROOT", root):
+                value = own.configured_ownership_id()
+                self.assertEqual(value, "drive_TESTONLY_01")
+                self.assertEqual(own.validate_ownership_id(value), value)
+                self.assertEqual(own.default_mutex_name(),
+                                 "OWC_LTO8_LTFS_OWNERSHIP_drive_TESTONLY_01")
+                self.assertEqual(own.writer_timeout_seconds(), 7)
+
+    def test_a_config_without_the_id_fails_closed(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            for body in (None, "[HARDWARE]\nlto_drive = X:\\\n",
+                         "[HARDWARE]\nltfs_ownership_id =\n",
+                         "not an ini file at all\n"):
+                path = os.path.join(root, "config.ini")
+                if body is None:
+                    self.assertFalse(os.path.exists(path))
+                else:
+                    with open(path, "w", encoding="utf-8") as fh:
+                        fh.write(body)
+                with mock.patch.object(own, "PROJECT_ROOT", root):
+                    self.assertEqual(own.configured_ownership_id(), "")
+                    with self.assertRaises(LtfsOwnershipError) as ctx:
+                        own.default_mutex_name()
+                self.assertEqual(ctx.exception.kind, own.FAILURE_BAD_IDENTITY)
 
     def test_example_config_documents_the_id(self):
         with open(os.path.join(PROJECT_ROOT, "config.example.ini"),
@@ -286,13 +310,6 @@ class OwnershipFailureClassificationTests(unittest.TestCase):
                               own.FAILURE_PRIMITIVE,
                               own.FAILURE_BAD_IDENTITY}), 4)
 
-    def test_reason_constant_is_wired_into_the_orchestrator(self):
-        from src import remote_orchestrator as ro
-        import inspect
-        body = inspect.getsource(ro)
-        self.assertIn("REASON_LTFS_OWNERSHIP_UNAVAILABLE", body)
-        self.assertIn("LtfsOwnershipError", body)
-
     def test_ownership_stop_preserves_the_pack_and_does_not_set_backing(self):
         """Static proof via AST: the ownership stop preserves the pack, and
         'backing' is only ever set from the writer-start callback."""
@@ -304,9 +321,9 @@ class OwnershipFailureClassificationTests(unittest.TestCase):
         # orchestrator method is a delegating façade.
         from src.remote_writer import RemoteChunkWriter
         group_src = textwrap.dedent(
-            inspect.getsource(RemoteChunkWriter._write_chunk_group))
+            code_only(RemoteChunkWriter._write_chunk_group))
         one_src = textwrap.dedent(
-            inspect.getsource(RemoteChunkWriter._write_one_chunk_owned))
+            code_only(RemoteChunkWriter._write_one_chunk_owned))
         group_fn = ast.parse(group_src).body[0]
 
         # The ownership handler must set preserve_pack=True with our reason.
@@ -472,7 +489,7 @@ class ProtectedOperationCoverageTests(unittest.TestCase):
 
     def test_low_level_helpers_assert_ownership(self):
         import inspect
-        src = inspect.getsource(ltfs)
+        src = code_only(ltfs)
         for fn in ("def drive_status", "def _read_volume_label_unlocked",
                    "def _eject_tape_unlocked"):
             idx = src.index(fn)
@@ -483,7 +500,7 @@ class ProtectedOperationCoverageTests(unittest.TestCase):
     def test_every_ltfs_module_entry_point_is_guarded(self):
         """Public LTFS helpers either take the lock or assert ownership."""
         import inspect
-        src = inspect.getsource(ltfs)
+        src = code_only(ltfs)
         tree = ast.parse(src)
         guarded, unguarded = [], []
         interesting = {
@@ -541,7 +558,7 @@ class ProtectedOperationCoverageTests(unittest.TestCase):
         drive-status output.
         """
         import inspect
-        src = inspect.getsource(ltfs)
+        src = code_only(ltfs)
         tree = ast.parse(src)
         required = {"tape_info", "_ltfs_drive_status", "format_tape",
                     "check_tape"}

@@ -9,6 +9,7 @@ commit.
 Nothing here reaches staging, PostgreSQL, LTFS or SSH: the scanner, the stager,
 the writer and the database are all fakes, and every blocking wait is bounded.
 """
+from source_facts import code_text
 import inspect
 import os
 import re
@@ -400,15 +401,15 @@ class EntryFlowCharacterizationTests(unittest.TestCase):
     def test_cli_entry_points_reach_the_orchestrator_run(self):
         """Both documented entry flows end at ``RemoteOrchestrator.run``."""
         from src import cli
-        interactive = inspect.getsource(cli.run_remote_archiver)
+        interactive = code_text(cli.run_remote_archiver)
         self.assertIn("RemoteOrchestrator", interactive)
         self.assertIn(".run(", interactive)
         # The headless entry does not build a second orchestrator: it reuses
         # the interactive one with non_interactive=True.
-        headless = inspect.getsource(cli.run_remote_archiver_headless)
+        headless = code_text(cli.run_remote_archiver_headless)
         self.assertIn("run_remote_archiver(", headless)
         self.assertIn("non_interactive=True", headless)
-        self.assertIn("run_remote_archiver", inspect.getsource(cli.main))
+        self.assertIn("run_remote_archiver", code_text(cli.main))
 
     def test_incomplete_scan_resume_is_delegated_to_the_streaming_loop(self):
         """``_run_session`` owns only scan-COMPLETE sessions."""
@@ -438,14 +439,14 @@ class EntryFlowCharacterizationTests(unittest.TestCase):
 # =============================================================================
 class NewSessionCharacterizationTests(unittest.TestCase):
     def test_new_session_creates_a_growable_streaming_plan(self):
-        source = inspect.getsource(ro.RemoteOrchestrator._start_new_session)
+        source = code_text(ro.RemoteOrchestrator._start_new_session)
         self.assertIn("create_remote_streaming_session", source)
         # ...and never the fixed-plan constructor.
         self.assertNotIn("create_remote_session_with_plan", source)
 
     def test_streaming_session_creation_marks_the_scan_incomplete(self):
         from src.pg_sessions import PgSessionMixin
-        source = inspect.getsource(
+        source = code_text(
             PgSessionMixin.create_remote_streaming_session)
         self.assertIn("remote_snapshots", source)
         self.assertIn("remote_plans", source)
@@ -606,11 +607,11 @@ class ScannerPlannerCharacterizationTests(unittest.TestCase):
         """The production scanner re-enumerates whole roots; there is no
         persisted position to resume from."""
         from src.scanning import StreamingRemoteScanner
-        source = inspect.getsource(StreamingRemoteScanner._iter_scan_one)
+        source = code_text(StreamingRemoteScanner._iter_scan_one)
         self.assertRegex(source, r"find \{shlex\.quote\(scan_path\)\} -type f")
         self.assertIn(r"-printf '%s %p\\0'", source)
         # iter_scan loops over EVERY configured root, unconditionally.
-        loop = inspect.getsource(StreamingRemoteScanner.iter_scan)
+        loop = code_text(StreamingRemoteScanner.iter_scan)
         self.assertIn("for scan_path in scan_paths", loop)
         self.assertNotIn("resume", loop.lower())
 
@@ -762,7 +763,7 @@ class SurvivingStateCharacterizationTests(unittest.TestCase):
             self.assertIn(table, migration, table)
 
         # ...and startup does not apply it.
-        startup = inspect.getsource(PgConnectionCore._init_schema)
+        startup = code_text(PgConnectionCore._init_schema)
         self.assertNotIn("014", startup)
         self.assertNotIn("incremental_scan", startup)
 
@@ -804,9 +805,9 @@ class SurvivingStateCharacterizationTests(unittest.TestCase):
 
     def test_backing_has_no_automatic_reset(self):
         """'backing' is ambiguous: no code path clears it without a human."""
-        source = inspect.getsource(ro)
+        source = code_text(ro)
         self.assertIn("_detect_prior_backing_chunks", source)
-        detect = inspect.getsource(
+        detect = code_text(
             ro.RemoteOrchestrator._detect_prior_backing_chunks)
         self.assertIn("Refusing to resume blindly", detect)
         self.assertNotIn("update_chunk_status", detect)
@@ -847,7 +848,7 @@ class RemovedDirectoryFirstPathTests(unittest.TestCase):
         from src import scan_frontier
         # StreamingChunkBuilder is what the coordinator seals chunks with...
         self.assertIn("StreamingChunkBuilder",
-                      inspect.getsource(scan_frontier))
+                      code_text(scan_frontier))
         # ...and ChunkPlanner is what it computes footprints with.
         from src.planning import ChunkPlanner, StreamingChunkBuilder
         self.assertIs(StreamingChunkBuilder(1).planner.__class__, ChunkPlanner)
@@ -1093,7 +1094,7 @@ class WriteOnlyResumeTests(unittest.TestCase):
 
         from src import remote_orchestrator
 
-        source = inspect.getsource(
+        source = code_text(
             remote_orchestrator.RemoteOrchestrator._run_streaming_session)
         self.assertIn(
             "None if write_only else FrontierScanCoordinator(", source,

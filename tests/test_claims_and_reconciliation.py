@@ -10,6 +10,7 @@ equally consistent with a worker wedged on an SSH call, so a claim is released
 only when the previous owner is provably gone — and a recycled PID must not be
 mistaken for the original worker.
 """
+from source_facts import code_text
 import inspect
 import os
 import tempfile
@@ -34,7 +35,7 @@ class ClaimSqlSafetyTests(unittest.TestCase):
 
     def _source(self, name):
         from src.pg_sessions import PgSessionMixin
-        return inspect.getsource(getattr(PgSessionMixin, name))
+        return code_text(getattr(PgSessionMixin, name))
 
     def test_backing_is_not_a_reclaimable_state(self):
         from src.pg_sessions import PgSessionMixin
@@ -243,7 +244,7 @@ class RemoteEvidenceTests(unittest.TestCase):
         self.assertEqual(remote_process_evidence(self._evidence()), BLOCKED)
 
     def test_the_probe_is_read_only(self):
-        source = inspect.getsource(remote_token_probe)
+        source = code_text(remote_token_probe)
         self.assertIn("pgrep", source)
         for destructive in ("pkill", "kill ", "rm ", "> ", "tar "):
             self.assertNotIn(destructive, source, destructive)
@@ -416,7 +417,7 @@ class ReconcilerTests(unittest.TestCase):
             self.assertTrue(os.path.exists(writer.part_path))
 
     def test_the_reconciler_never_touches_ltfs(self):
-        source = inspect.getsource(
+        source = code_text(
             __import__("src.startup_reconcile", fromlist=["x"]))
         for token in ("lto_drive", "_acquire_tape_io_lock", "get_volume_label",
                       "_ensure_lto_drive_ready", "LtfsCmd", "robocopy"):

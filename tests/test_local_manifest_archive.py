@@ -1,3 +1,4 @@
+from source_facts import code_text
 import inspect
 import os
 import tempfile
@@ -125,15 +126,15 @@ class PackDirOwnershipTests(unittest.TestCase):
         self.assertNotIn("pack_dir_ownership", sql)
 
     def test_prune_is_snapshot_identity_driven(self):
-        source = inspect.getsource(archive.prune_export)
+        source = code_text(archive.prune_export)
         self.assertIn("source_file_id", source)
         self.assertIn("source_record_key", source)
-        self.assertIn("pg_try_advisory_xact_lock", inspect.getsource(
+        self.assertIn("pg_try_advisory_xact_lock", code_text(
             archive._acquire_prune_lock))
         self.assertNotIn("file_size_bytes <", source)
 
     def test_prune_never_touches_operational_tables(self):
-        source = inspect.getsource(archive.prune_export).lower()
+        source = code_text(archive.prune_export).lower()
         for table in (
             "remote_snapshot_files", "remote_plan_files", "remote_file_state",
             "remote_chunks", "remote_sessions", "local_chunks_manifest",

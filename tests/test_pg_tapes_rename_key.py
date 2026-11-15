@@ -6,6 +6,7 @@ resume/upsert lookups miss them and insert duplicates.
 
 Pure-logic tests only: no live PostgreSQL connection is used.
 """
+from source_facts import code_text
 import inspect
 import unittest
 
@@ -59,12 +60,12 @@ class RenameTapeSourceGuardTests(unittest.TestCase):
     """
 
     def test_rename_tape_selects_remote_provenance_columns(self):
-        source = inspect.getsource(PgTapeMixin.rename_tape)
+        source = code_text(PgTapeMixin.rename_tape)
         self.assertIn("remote_session_id", source)
         self.assertIn("remote_chunk_index", source)
 
     def test_rename_tape_passes_remote_provenance_into_file_record_key(self):
-        source = inspect.getsource(PgTapeMixin.rename_tape)
+        source = code_text(PgTapeMixin.rename_tape)
         self.assertIn("_file_record_key(", source)
         call_start = source.index("_file_record_key(")
         # The remote_session_id/remote_chunk_index kwargs must appear inside

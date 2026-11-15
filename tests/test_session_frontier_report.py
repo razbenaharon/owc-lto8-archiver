@@ -14,6 +14,7 @@ That only works if two things are true, and both are tested here:
   unreadable table, an unknown lock state — each produces "blocked", never a
   guessed boundary.
 """
+from source_facts import code_text
 import inspect
 import os
 import tempfile
@@ -85,7 +86,7 @@ def _report(db, **kwargs):
 # =============================================================================
 class NoHardcodedFactsTests(unittest.TestCase):
     def test_the_report_hardcodes_no_session_or_chunk_number(self):
-        source = inspect.getsource(session_frontier_report)
+        source = code_text(session_frontier_report)
         for hardcoded in ("37", "112", "113", "Tape_02", "Tape_03",
                           "session 37"):
             self.assertNotIn(hardcoded, source, hardcoded)
@@ -245,7 +246,7 @@ class ReadOnlyTests(unittest.TestCase):
                 self.assertNotIn(mutation, name.lower(), name)
 
     def test_it_never_touches_ltfs(self):
-        source = inspect.getsource(session_frontier_report)
+        source = code_text(session_frontier_report)
         for token in ("lto_drive", "get_volume_label", "_acquire_tape_io_lock",
                       "_ensure_lto_drive_ready", "LtfsCmd", "eject"):
             self.assertNotIn(token, source, token)
@@ -254,7 +255,7 @@ class ReadOnlyTests(unittest.TestCase):
         from src.pg_sessions import PgSessionMixin
         for name in ("get_session_membership_summary", "get_chunk_state_counts",
                      "find_sessions_sharing_plan"):
-            source = inspect.getsource(getattr(PgSessionMixin, name))
+            source = code_text(getattr(PgSessionMixin, name))
             self.assertIn("_run_read", source, name)
             for mutation in ("UPDATE ", "INSERT ", "DELETE "):
                 self.assertNotIn(mutation, source, f"{name}: {mutation}")
@@ -262,7 +263,7 @@ class ReadOnlyTests(unittest.TestCase):
     def test_membership_is_read_from_plan_rows_not_cached_totals(self):
         """The cached session totals are what an interrupted run leaves stale."""
         from src.pg_sessions import PgSessionMixin
-        source = inspect.getsource(
+        source = code_text(
             PgSessionMixin.get_session_membership_summary)
         self.assertIn("remote_plan_files", source)
         self.assertIn("remote_snapshot_files", source)
