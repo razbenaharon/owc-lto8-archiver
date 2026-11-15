@@ -581,6 +581,16 @@ class SqliteBackupTests(unittest.TestCase):
         self.assertEqual(result.details["files_index_rows"], 1)
         self.assertIn("PASSED", result.summary())
         self.assertTrue(result.as_dict()["ok"])
+        # The inventory beside it is the tape-reset backup evidence, with the
+        # same contract PostgreSQL's restore list satisfies.
+        from src.tape_reset import verify_backup_inputs
+        restore_list = result.artifacts["restore_list_path"]
+        self.assertTrue(os.path.isfile(restore_list))
+        evidence = verify_backup_inputs(path, restore_list)
+        self.assertEqual(evidence["backup_sha256"], result.sha256)
+        self.assertGreater(evidence["restore_list_entries"], 40)
+        with open(restore_list, encoding="utf-8") as handle:
+            self.assertIn("TABLE files_index ROWS 1", handle.read())
         # The copy holds the data.
         raw = sqlite3.connect(path)
         try:
@@ -659,6 +669,30 @@ class StandaloneConnectionTests(unittest.TestCase):
             self.db._owns_archiver_lock_conn(self.db._lock_conn))
         self.db.release_archiver_lock()
         self.assertEqual(archiver_lock_status(self.tdb.conninfo), 0)
+
+    def test_the_tape_reset_impact_report_is_built_from_a_sqlite_catalog(self):
+        from src import tape_reset
+        self.db.bulk_upsert_files([{
+            "original_path": "/data/x.bin", "file_size_bytes": 5,
+            "tape_label": "RO1", "source_host": "srv02", "is_packed": False,
+            "container_name": None, "stored_path": "/data/x.bin"}])
+        with mock.patch.object(tape_reset, "latest_chunk_write_evidence",
+                               return_value=({}, {})):
+            report = tape_reset.build_impact_report(
+                self.db, operation_id="op-sqlite", tape_label="RO1",
+                identity={"label": "RO1"}, backup={"backup_path": "b"},
+                shadow_database="shadow.sqlite3")
+        self.assertEqual(report["target_label"], "RO1")
+        self.assertEqual(report["tape_row"]["volume_label"], "RO1")
+        self.assertEqual(len(report["tape03_rows"]["files_index"]), 1)
+        self.assertEqual(
+            os.path.normcase(report["database"]["database"]),
+            os.path.normcase(self.tdb.path))
+        children = {item["child_table"] for item in
+                    report["tape_foreign_keys_before_migration"]}
+        self.assertIn("files_index", children)
+        self.assertIn("tape_generations", children)
+        json.dumps(report, default=str)
 
     def test_validation_reports_run_read_only(self):
         from src.directory_catalog_validation import (
@@ -771,6 +805,39 @@ class TwoProcessWriterTests(unittest.TestCase):
         self.assertEqual(holder.returncode, 0)
         self.assertEqual(
             db_backend.archiver_lock_holders(self.tdb.conninfo), 0)
+
+    def test_two_processes_creating_the_same_new_catalog_both_succeed(self):
+        """First run on two consoles at once: one creates the schema, the
+        other waits and adopts it - no half-built catalog, no error."""
+        fresh = os.path.join(os.path.dirname(self.tdb.path), "fresh.sqlite3")
+        dsn = "sqlite:///" + fresh.replace("\\", "/")
+        script = textwrap.dedent("""
+            import sys
+            from src.sqlite_db import SqliteDatabaseManager
+            db = SqliteDatabaseManager(sys.argv[2])
+            status = db.sqlite_schema_status()
+            db.register_tape("CREATED_BY_" + sys.argv[3], 1)
+            db.close()
+            print("OPENED", status["schema_version"], status["drift"],
+                  flush=True)
+        """)
+        children = [self._spawn(script, dsn, name)
+                    for name in ("A", "B", "C")]
+        for child in children:
+            out, err = child.communicate(timeout=180)
+            self.assertEqual(child.returncode, 0, out + err)
+            self.assertIn("OPENED 1 False", out)
+        raw = sqlite3.connect(fresh)
+        try:
+            self.assertEqual(raw.execute(
+                "SELECT count(*) FROM schema_migrations").fetchone()[0], 1)
+            self.assertEqual(raw.execute(
+                "SELECT count(*) FROM tapes").fetchone()[0], 3)
+            self.assertEqual(raw.execute(
+                "SELECT count(*) FROM container_format_schema_metadata"
+            ).fetchone()[0], 1)
+        finally:
+            raw.close()
 
     def test_concurrent_writers_in_two_processes_serialise_cleanly(self):
         """Ordinary catalog writes (no archiver lock) from two processes at

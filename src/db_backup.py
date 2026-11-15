@@ -74,12 +74,38 @@ def _safe_part(value, fallback):
     return text or fallback
 
 
-def verify_sqlite_backup(cfg, backup_path):
+def restore_list_path_for(backup_path):
+    """Inventory file written beside a verified backup."""
+    return Path(backup_path).with_suffix(".restore_list.txt")
+
+
+def _write_restore_list(conn, backup_path, list_path):
+    """Table-by-table inventory of a backup (the counterpart of the
+    ``pg_restore --list`` file PostgreSQL verification leaves behind). It is
+    the second half of the backup evidence the destructive tape reset pins by
+    SHA-256, so the same evidence contract holds on both backends."""
+    tables = [row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' "
+        "AND name NOT LIKE 'sqlite_%' ORDER BY name").fetchall()]
+    lines = ["; SQLite catalog backup inventory",
+             f"; backup: {Path(backup_path).name}",
+             "; one line per table: TABLE <name> ROWS <count>"]
+    for table in tables:
+        count = conn.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0]
+        lines.append(f"TABLE {table} ROWS {count}")
+    temporary = Path(str(list_path) + ".part")
+    temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.replace(temporary, list_path)
+    return len(tables)
+
+
+def verify_sqlite_backup(cfg, backup_path, *, write_restore_list=True):
     """Prove a SQLite catalog backup is a sound database file.
 
     Opens the copy read-only and runs ``integrity_check`` and
-    ``foreign_key_check``. A failed check is reported in the result (``ok``
-    False); only an unsafe path raises.
+    ``foreign_key_check``; a passing backup also gets its table inventory
+    written beside it (``artifacts['restore_list_path']``). A failed check is
+    reported in the result (``ok`` False); only an unsafe path raises.
     """
     from .pg_backup import (BACKUP_LEVEL_NONE, BACKUP_LEVEL_READ_THROUGH,
                             BackupCheck, BackupVerification)
@@ -90,6 +116,7 @@ def verify_sqlite_backup(cfg, backup_path):
         "non_empty", size > 0,
         f"{size:,} bytes" if size > 0 else "backup is missing or empty")]
     details = {}
+    artifacts = {}
     level = BACKUP_LEVEL_NONE
     digest = ""
     if size > 0:
@@ -125,6 +152,14 @@ def verify_sqlite_backup(cfg, backup_path):
                         for row in migrations]
                     details["files_index_rows"] = conn.execute(
                         "SELECT count(*) FROM files_index").fetchone()[0]
+                    if write_restore_list and all(
+                            check.passed for check in checks):
+                        list_path = _local_path(
+                            cfg, restore_list_path_for(backup_path),
+                            expected_kind="file", allow_missing=True)
+                        details["restore_list_entries"] = _write_restore_list(
+                            conn, backup_path, list_path)
+                        artifacts["restore_list_path"] = str(list_path)
                 except sqlite3.Error as exc:
                     checks.append(BackupCheck(
                         "readable_catalog", False, str(exc)))
@@ -136,7 +171,7 @@ def verify_sqlite_backup(cfg, backup_path):
     return BackupVerification(
         backend=db_backend.BACKEND_SQLITE, backup_path=str(backup_path),
         size_bytes=size, sha256=digest, level=level, checks=tuple(checks),
-        not_verified=(NOT_STATE_STATEMENT_SQLITE,), artifacts={},
+        not_verified=(NOT_STATE_STATEMENT_SQLITE,), artifacts=artifacts,
         details=details)
 
 
@@ -188,12 +223,16 @@ def create_sqlite_backup(cfg, output_dir=None, prefix=None, verify=True):
         finally:
             live.close()
         if verify:
-            result = verify_sqlite_backup(cfg, temporary)
+            result = verify_sqlite_backup(cfg, temporary,
+                                          write_restore_list=False)
             if not result.ok:
                 raise RuntimeError(
                     "[DB BACKUP] The new backup failed verification and was "
                     "discarded.\n" + result.summary())
         os.replace(temporary, output_path)
+        if verify:
+            # Inventory beside the final name (the copy was just verified).
+            verify_sqlite_backup(cfg, output_path)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise

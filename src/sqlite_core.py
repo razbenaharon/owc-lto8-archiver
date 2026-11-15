@@ -246,6 +246,22 @@ class SqliteConnectionCore(PgConnectionCore):
         script = Path(path).read_text(encoding="utf-8")
         with conn.transaction():
             raw = conn.raw
+            # Re-check under the write lock: another process opening the same
+            # new catalog at the same moment may have applied this migration
+            # while we waited for it.
+            if raw.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='schema_migrations'").fetchone():
+                done = raw.execute(
+                    "SELECT checksum FROM schema_migrations WHERE version=?",
+                    (version,)).fetchone()
+                if done is not None:
+                    if done[0] != checksum:
+                        raise RuntimeError(
+                            f"[DB] SQLite migration {name} was applied by "
+                            "another process with a different checksum. "
+                            "Refusing to open the catalog.")
+                    return
             try:
                 for statement in _statements(script):
                     raw.execute(statement)
