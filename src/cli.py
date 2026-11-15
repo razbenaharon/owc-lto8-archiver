@@ -19,8 +19,7 @@ from .robocopy import _prepare_robocopy_exclusion, _remove_robocopy_exclusion
 from .remote_transport import _cleanup_askpass_helpers
 from .runtime import _terminate_all_procs, install_cancel_handler, reset_cancel, uninstall_cancel_handler, unpin_current_process
 from .windows_update_guard import (assess_reboot_state, managed_update_policy,
-                                   pause_windows_updates,
-                                   pending_reboot_reasons, print_guard_status,
+                                   pause_windows_updates, print_guard_status,
                                    restore_stale_guard, resume_windows_updates)
 
 if TYPE_CHECKING:

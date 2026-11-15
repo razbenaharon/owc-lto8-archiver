@@ -42,7 +42,6 @@ Reconciliation is fail-safe by construction:
 from datetime import datetime, timezone
 import json
 import os
-from typing import Any, cast
 
 from .cli_errors import OperationalError
 from .directory_catalog_validation import archiver_lock_status

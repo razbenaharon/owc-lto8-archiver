@@ -1789,8 +1789,7 @@ class PgSessionMixin:
         :class:`~src.pipeline_types.ForbiddenTransition` for a transition the
         matrix does not allow — the old state is preserved either way.
         """
-        from .pipeline_types import (ChunkStatus, ForbiddenTransition,
-                                     assert_chunk_transition)
+        from .pipeline_types import ChunkStatus, assert_chunk_transition
 
         target = ChunkStatus(to_status).value
         if expected_from is None:

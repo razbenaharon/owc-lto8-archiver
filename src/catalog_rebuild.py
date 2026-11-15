@@ -23,7 +23,6 @@ import os
 from dataclasses import dataclass, field
 
 from .archive_artifacts import (
-    ArtifactError,
     PLAN_MANIFEST_NAMESPACE,
     SESSION_DESCRIPTOR_NAMESPACE,
     TERMINAL_STATE_NAMESPACE,

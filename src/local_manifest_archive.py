@@ -41,8 +41,6 @@ from .pg_core import PgConnectionCore
 
 
 SMALL_FILE_THRESHOLD_BYTES = 10 * 1024 * 1024
-TERMINAL_REMOTE_CHUNK = "done"
-TERMINAL_LOCAL_CHUNK = "backed_up"
 DEFAULT_PRUNE_BATCH_SIZE = 100_000
 
 

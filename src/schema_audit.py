@@ -18,7 +18,7 @@ import hashlib
 import os
 import re
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Mapping
 
 from .constants import PROJECT_ROOT
 
@@ -203,14 +203,6 @@ ROW_SET_SPECS = {
     "archive_container_members": ("expected_logical_bytes", "estimated_tar_bytes"),
     "archive_artifacts": ("artifact_size_bytes",),
 }
-
-
-def _dict_row(row: Any, columns: Iterable[str] = ()) -> dict[str, Any]:
-    if isinstance(row, Mapping):
-        return dict(row)
-    values = list(row or ())
-    return {name: values[index] for index, name in enumerate(columns)
-            if index < len(values)}
 
 
 def _safe_fetchall(conn: Any, sql: str, params: tuple[Any, ...] = ()):
@@ -1087,8 +1079,3 @@ def render_schema_audit(report: Mapping[str, Any]) -> str:
     lines.append(f"Historical dry-run: repairable={len(historical.get('repairable', []))}, flagged={len(historical.get('flagged', []))}, writes={historical.get('writes_performed', 0)}")
     lines.append("No tape locator was opened; no database write was performed.")
     return "\n".join(lines)
-
-
-# Names useful to callers and tests without prescribing a CLI implementation.
-audit_catalog_boundary = audit_schema_provenance
-render_text = render_schema_audit

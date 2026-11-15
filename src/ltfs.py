@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING
 from . import ltfs_ownership as _ltfs_ownership
 from .constants import DEFAULT_TAPE_CAPACITY_GB, LTFS_DIR
 from .logsetup import get_logger
-from .ltfs_ownership import LtfsOwnershipError, owns_ltfs, require_ownership
+from .ltfs_ownership import require_ownership
 from .runtime import _acquire_tape_io_lock, _release_tape_io_lock
 
 if TYPE_CHECKING:

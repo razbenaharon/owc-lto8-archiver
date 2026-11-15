@@ -18,9 +18,8 @@ The observer holds no lock while computing: it operates on a plain
 :class:`ReadyGroupSnapshot` that the caller copies out of the ReadyQueue, so it
 can later run fully asynchronously from a scheduling snapshot.
 """
-import time
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 

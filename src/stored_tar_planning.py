@@ -4,7 +4,7 @@ Task 2.1 only decides which sealed plan ordinals become TAR members and which
 remain loose.  It deliberately does not create a TAR or inspect source content.
 """
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from .pipeline_types import ContainerFormat
 from .tar_container import STORED_TAR_DIALECT, STORED_TAR_FORMAT_VERSION
