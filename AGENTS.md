@@ -160,6 +160,22 @@ after edits. Pure parsing, config, database, path-normalization, and reporting c
 tape-related changes, reason carefully about hardware side effects and verify with a
 small staged dataset before a full remote archive run.
 
+### Two catalog backends
+
+`[DATABASE] backend` selects `sqlite` (one local file, schema created
+automatically, no server) or `postgresql`. **A config with no `backend` key
+stays on PostgreSQL**; only new installs default to SQLite. The method-group
+mixins are shared and must never branch on the backend: put engine differences
+behind a hook in `src/pg_core.py` and override it in `src/sqlite_core.py`.
+SQL is written in PostgreSQL syntax and must stay valid on both engines
+(`tests/test_sqlite_prepare_all.py` checks every literal statement). The list
+of PostgreSQL-only features is `src/db_backend.POSTGRESQL_ONLY_FEATURES`.
+Details: [docs/sqlite_backend.md](docs/sqlite_backend.md).
+
+`python -m pytest -q` runs every behavioural catalog suite on SQLite with no
+server (`tests/db_backends.py`); the same suites run on PostgreSQL when a test
+server is configured:
+
 ### PostgreSQL tests need an explicit disposable server
 
 `python -m pytest -q` on its own is safe and complete except for the PostgreSQL

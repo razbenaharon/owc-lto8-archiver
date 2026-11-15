@@ -33,7 +33,7 @@ not a live status endpoint.
 | Safety or permitted recovery action | `AGENTS.md`, then policy 000; use the safer rule if wording differs |
 | What the current code does | Current source and tests |
 | Per-file inventory of packed small files | The JSONL.zst manifests under the `[LOCAL_MANIFEST_ARCHIVE]` root |
-| Session/chunk state | The local PostgreSQL catalog |
+| Session/chunk state | The catalog database: PostgreSQL, or the local SQLite file when `[DATABASE] backend = sqlite` |
 | Tape/media health | IBM LTFS `LogFile.csv`, scoped to the current mount |
 | Mounted LTFS sync mode | The live mount declaration, event 61259; never `ltfs.conf.local` alone |
 | Active configuration | The production host's untracked `config.ini` and `.env`; never infer it from `config.example.ini` or a synced clone |
@@ -61,6 +61,7 @@ drive to establish status.
 | Understand the system, module boundaries, data flow, schemas | [`architecture.md`](architecture.md) |
 | Live archive operation, stop, or recovery | [`operations.md`](operations.md), then the newest open incidents |
 | Run or extend the tests; validate a change | [`testing-and-validation.md`](testing-and-validation.md) |
+| Catalog backend choice, the SQLite backend, what is PostgreSQL-only | [`sqlite_backend.md`](sqlite_backend.md) |
 | Current tape/session/campaign state | [`tape-and-archive-state.md`](tape-and-archive-state.md) |
 | Legacy export & PostgreSQL pruning (deferred Plan 4) | [`archive-modernization-plans/04_LEGACY_EXPORT_AND_POSTGRESQL_PRUNING.md`](archive-modernization-plans/04_LEGACY_EXPORT_AND_POSTGRESQL_PRUNING.md) |
 | Small-file manifest export/prune | [`local_small_file_manifest_runbook.md`](local_small_file_manifest_runbook.md) |
