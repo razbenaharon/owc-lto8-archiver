@@ -526,5 +526,23 @@ class AtomicZipExtractionTests(_RestoreCase):
         self.assertEqual(self._files_under(self.restore), [])
 
 
+class ReviewFollowUpTests(_RestoreCase):
+    def test_catalog_error_in_directory_restore_is_a_failure(self):
+        # review F1
+        class _DB:
+            @staticmethod
+            def find_directory_restore_bundles(dir_path, **_kw):
+                raise RuntimeError("[DB] directory catalog is not installed")
+        self.retriever.db = cast(Any, _DB())
+        out = io.StringIO()
+        with redirect_stdout(out), mock.patch(
+                "builtins.input", side_effect=["6", "/vault/D"]):
+            result = self.retriever.run()
+        self.assertFalse(result.ok)
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertEqual(result.failed_count, 1)
+        self.assertIn("directory catalog is not installed", out.getvalue())
+        self.assertIn("INCOMPLETE", out.getvalue())
+
 if __name__ == "__main__":
     unittest.main()

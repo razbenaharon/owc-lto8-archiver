@@ -1278,8 +1278,14 @@ class LTORetriever:
         try:
             bundles = self.db.find_directory_restore_bundles(needle)
         except RuntimeError as e:
+            # The catalog could not answer, so nothing was restored. That is
+            # a failed restore, not an empty one.
             print(str(e))
-            return
+            mark = self._result._mark()
+            self._note_failed(needle, f"directory catalog lookup failed: {e}")
+            outcome = self._result._since(mark)
+            self._print_summary(outcome)
+            return outcome
         if not bundles:
             print("[RETRIEVER] No directory-catalog bundle found for that path. "
                   "(Bundle-complete restore needs the 007 directory catalog; "
