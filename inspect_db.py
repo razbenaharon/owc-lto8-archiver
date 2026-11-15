@@ -1,4 +1,4 @@
-"""Root runner for PostgreSQL inspector and catalog maintenance commands."""
+"""Root runner for the catalog inspector and maintenance commands."""
 import argparse
 import json
 import os
@@ -1521,7 +1521,8 @@ def _run_backfill(db, args):
 
 def _build_parser():
     parser = argparse.ArgumentParser(
-        description="Inspect and safely maintain the PostgreSQL archive catalog.")
+        description="Inspect and safely maintain the archive catalog "
+                    "(SQLite or PostgreSQL).")
     parser.add_argument("--db", help="Override target database name.")
     parser.add_argument("--tape", help="Limit an operation to one tape label.")
     parser.add_argument("--batch-size", type=int, default=100,

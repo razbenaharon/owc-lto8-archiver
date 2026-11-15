@@ -2,27 +2,11 @@
 import hashlib
 
 
-class DatabaseManager:
-    """Placeholder for the pre-PostgreSQL manager class, removed long ago.
-
-    The catalog backend is chosen by ``[DATABASE] backend``. Always use
-    ``create_database_manager(cfg)`` so connection handling and error messages
-    stay consistent.
-    """
-
-    def __new__(cls, *args, **kwargs):
-        raise RuntimeError(
-            "[DB] The legacy DatabaseManager class has been removed. Set "
-            "[DATABASE] backend (sqlite or postgresql) and call "
-            "create_database_manager(cfg)."
-        )
-
-
 def _fmt_ts(value, width=19):
     """Render a timestamp for fixed-width display.
 
-    PostgreSQL returns datetime/date objects where the legacy SQLite catalog
-    returned ISO strings; both forms (and None) must display safely.
+    A value may arrive as a datetime/date object or as an ISO string; both
+    forms (and None) must display safely.
     """
     if value is None:
         return ''
@@ -132,6 +116,9 @@ def _is_postgres_connection_error(exc):
     return isinstance(exc, (PoolTimeout, psycopg.OperationalError))
 
 
+_LOCAL_POSTGRES_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})
+
+
 def _postgres_connection_error_message(cfg):
     host = getattr(cfg, "pg_host", "localhost")
     port = getattr(cfg, "pg_port", "5432")
@@ -140,16 +127,31 @@ def _postgres_connection_error_message(cfg):
     lines = [
         f"[DB] Could not connect to PostgreSQL at {host}:{port} "
         f"(database '{dbname}', user '{user}').",
-        "[DB] Start the local database with: docker compose up -d db",
-        "[DB] Then check it with: docker ps --filter name=lto_pg",
-        "[DB] If the container just started, wait until it is healthy; "
-        "PostgreSQL may be replaying WAL after an unclean shutdown.",
-        "[DB] Recovery details are visible with: docker logs --tail 80 lto_pg",
     ]
+    if str(host).strip().lower() in _LOCAL_POSTGRES_HOSTS:
+        # The bundled docker-compose.yml database. For a server on another
+        # machine these hints would only mislead.
+        lines += [
+            "[DB] Start the local database with: docker compose up -d db",
+            "[DB] Then check it with: docker ps --filter name=lto_pg",
+            "[DB] If the container just started, wait until it is healthy; "
+            "PostgreSQL may be replaying WAL after an unclean shutdown.",
+            "[DB] Recovery details are visible with: "
+            "docker logs --tail 80 lto_pg",
+        ]
+    else:
+        lines.append(
+            "[DB] Check that the server is running and reachable from this "
+            "machine, and that [DATABASE] host/port/dbname/user in "
+            "config.ini are right.")
     if not getattr(cfg, "pg_password", ""):
         lines.append(
             "[DB] No PostgreSQL password is configured. Copy .env.example to "
             ".env or set PGPASSWORD; the local Docker default is "
             "'change_me_local'."
         )
+    lines.append(
+        "[DB] The catalog backend is [DATABASE] backend in config.ini "
+        "(postgresql here). 'sqlite' needs no server, but it is a separate, "
+        "new catalog: nothing is copied from PostgreSQL.")
     return "\n".join(lines)

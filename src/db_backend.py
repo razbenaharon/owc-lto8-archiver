@@ -36,8 +36,8 @@ POSTGRESQL_ONLY_FEATURES = {
         "(directory-catalog backfill, session-37 transition, frontier "
         "bootstrap, membership backfill, plan-1 rehearsal)"),
     "database_compare": (
-        "database comparison and migrated-database validation "
-        "(inspect_db.py --compare-db, --validate-migrated-db)"),
+        "another database on the same PostgreSQL server "
+        "(inspect_db.py --db, --compare-db / --with-db)"),
     "schema_audit": "schema provenance audit (src/schema_audit.py)",
     "sealed_batches": (
         "sealed tape-write batches and their observation mode "
