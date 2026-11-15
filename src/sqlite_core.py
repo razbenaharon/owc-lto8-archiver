@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import socket
 import sqlite3
 from pathlib import Path
@@ -80,13 +81,40 @@ def _statements(script):
             "[DB] SQLite schema script ends with an incomplete statement")
 
 
+_CREATE_OBJECT = re.compile(
+    r"^\s*CREATE\s+(?:TABLE|VIEW)\s+(\w+)", re.IGNORECASE | re.MULTILINE)
+_catalog_names_cache = None
+
+
+def catalog_object_names():
+    """Names of every table and view the migration files create."""
+    global _catalog_names_cache
+    if _catalog_names_cache is None:
+        names = set()
+        for _version, _name, path in migration_files():
+            names.update(_CREATE_OBJECT.findall(
+                Path(path).read_text(encoding="utf-8")))
+        _catalog_names_cache = frozenset(names)
+    return _catalog_names_cache
+
+
 def schema_fingerprint(raw):
-    """SHA-256 over every schema object definition, in a stable order."""
+    """SHA-256 over the definition of every catalog object, in stable order.
+
+    Covers the tables and views the migration files create and everything
+    attached to them (indexes, triggers) - so a dropped, altered or ADDED
+    trigger on a catalog table is drift. A table of some other name that an
+    operator happens to keep in the same file is not part of the catalog and
+    is ignored, as it is by the PostgreSQL fingerprints.
+    """
+    owned = catalog_object_names()
     digest = hashlib.sha256()
     rows = raw.execute(
         "SELECT type, name, tbl_name, sql FROM sqlite_master "
         "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name").fetchall()
     for row in rows:
+        if row[2] not in owned:
+            continue
         for value in row:
             text = "" if value is None else " ".join(str(value).split())
             encoded = text.encode("utf-8")

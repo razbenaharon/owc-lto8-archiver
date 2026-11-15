@@ -84,13 +84,10 @@ class PgIntegrationTests(unittest.TestCase):
     # -- helpers -------------------------------------------------------------
 
     def _query(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True,
-                      row_factory=cast(Any, dict_row)) as conn:
-            return conn.execute(sql, params).fetchall()
+        return self.tdb.run(sql, params)
 
     def _exec(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True) as conn:
-            conn.execute(sql, params)
+        self.tdb.exec(sql, params)
 
     @staticmethod
     def _loose(original_path, tape, size=10, host="srv02"):
@@ -876,8 +873,7 @@ class PgSchemaAuditMigrationTests(unittest.TestCase):
             "UNAVAILABLE")
 
     def _exec(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True) as conn:
-            conn.execute(sql, params)
+        self.tdb.exec(sql, params)
 
 
 @unittest.skipUnless(_pg_available(), SKIP_REASON)
@@ -916,8 +912,7 @@ class PgSchemaAuditFrontierDefectTests(unittest.TestCase):
         self.assertEqual(report["historical_dry_run"]["writes_performed"], 0)
 
     def _exec(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True) as conn:
-            conn.execute(sql, params)
+        self.tdb.exec(sql, params)
 
 
 @unittest.skipUnless(_pg_available(), SKIP_REASON)
@@ -1048,13 +1043,10 @@ class IncrementalScanMigrationTests(unittest.TestCase):
 
     # -- helpers -----------------------------------------------------------
     def _query(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True,
-                      row_factory=cast(Any, dict_row)) as conn:
-            return conn.execute(sql, params).fetchall()
+        return self.tdb.run(sql, params)
 
     def _exec(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True) as conn:
-            conn.execute(sql, params)
+        self.tdb.exec(sql, params)
 
     def _session(self, label="S1", tape="Tape_MIG"):
         """A minimal tape + session + plan the frontier can hang off."""
@@ -1672,9 +1664,7 @@ class TapeRenameGenerationTests(unittest.TestCase):
         self.tdb.drop()
 
     def _query(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True,
-                      row_factory=cast(Any, dict_row)) as conn:
-            return conn.execute(sql, params).fetchall()
+        return self.tdb.run(sql, params)
 
     def test_register_tape_creates_the_active_generation_atomically(self):
         self.db.register_tape("GEN1", 12000)
@@ -1787,13 +1777,10 @@ class ShadowLegacyMigrationTests(unittest.TestCase):
         self.tdb.drop()
 
     def _query(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True,
-                      row_factory=cast(Any, dict_row)) as conn:
-            return conn.execute(sql, params).fetchall()
+        return self.tdb.run(sql, params)
 
     def _exec(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True) as conn:
-            conn.execute(sql, params)
+        self.tdb.exec(sql, params)
 
     def _build_legacy_session(self):
         """A session shaped like a real interrupted one."""
@@ -2052,9 +2039,7 @@ class RealConcurrencyTests(unittest.TestCase):
         self.tdb.drop()
 
     def _query(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True,
-                      row_factory=cast(Any, dict_row)) as conn:
-            return conn.execute(sql, params).fetchall()
+        return self.tdb.run(sql, params)
 
     # -- chunk claims -----------------------------------------------------
     def test_only_one_of_two_workers_claims_a_chunk(self):
@@ -2378,13 +2363,10 @@ class ContainerFormatMigrationTests(unittest.TestCase):
         self.tdb.drop()
 
     def _query(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True,
-                      row_factory=cast(Any, dict_row)) as conn:
-            return conn.execute(sql, params).fetchall()
+        return self.tdb.run(sql, params)
 
     def _exec(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True) as conn:
-            conn.execute(sql, params)
+        self.tdb.exec(sql, params)
 
     def _ready_014(self, *, finalize=True):
         self.db.apply_incremental_scan_schema(finalize=finalize)

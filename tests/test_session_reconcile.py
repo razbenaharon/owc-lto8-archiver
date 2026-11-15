@@ -26,6 +26,8 @@ else:
 
 import inspect_db
 from src.cli_errors import OperationalError
+from db_backends import (create_test_db, each_backend, postgresql_only,
+                         sqlite_only)
 from pg_test_guard import (SKIP_REASON, create_test_database,
                            drop_test_database, pg_available)
 from src.session_reconcile import (
@@ -223,8 +225,13 @@ class CliRefusalTests(unittest.TestCase):
         self.assertNotIsInstance(caught.exception, OperationalError)
 
 
-def _connect(*args, **kwargs) -> Any:
-    return cast(Any, psycopg).connect(*args, **kwargs)
+def _connect(conninfo, *args, **kwargs) -> Any:
+    """A raw connection on whichever backend ``conninfo`` names."""
+    if str(conninfo).startswith("sqlite:"):
+        from src import db_backend
+        return db_backend.connect(
+            conninfo, autocommit=kwargs.get("autocommit", False))
+    return cast(Any, psycopg).connect(conninfo, *args, **kwargs)
 
 
 def _pg_available():
@@ -234,7 +241,7 @@ def _pg_available():
     return pg_available()
 
 
-@unittest.skipUnless(_pg_available(), SKIP_REASON)
+@each_backend
 class ReconcileIntegrationTests(unittest.TestCase):
     """End-to-end against a throwaway database — never the live catalog."""
 
@@ -242,8 +249,9 @@ class ReconcileIntegrationTests(unittest.TestCase):
     def setUpClass(cls):
         from src.pg_db import PgDatabaseManager
 
-        cls.dbname, cls.conninfo = create_test_database("lto_reconcile")
-        cls.db = PgDatabaseManager(cls.conninfo)
+        cls.tdb = create_test_db(getattr(cls, 'BACKEND', None) or 'postgresql', "lto_reconcile")
+        cls.dbname, cls.conninfo = cls.tdb.name, cls.tdb.conninfo
+        cls.db = cls.tdb.manager(migrations="startup")
         cls.db.apply_directory_catalog_schema()
         cls.db.register_tape("Tape_T")
 
@@ -253,7 +261,7 @@ class ReconcileIntegrationTests(unittest.TestCase):
             cls.db.close()
         except Exception:
             pass
-        drop_test_database(cls.dbname)
+        cls.tdb.drop()
 
     def setUp(self):
         self._exec("DELETE FROM remote_chunks")
@@ -272,8 +280,7 @@ class ReconcileIntegrationTests(unittest.TestCase):
             self.addCleanup(quiet.stop)
 
     def _exec(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True) as conn:
-            conn.execute(sql, params)
+        self.tdb.exec(sql, params)
 
     def _scalar(self, sql, params=()):
         with _connect(self.conninfo, autocommit=True) as conn:
@@ -451,7 +458,7 @@ LEGACY_REMOTE_SESSION_SQL = """
     FROM remote_sessions s ORDER BY s.session_id"""
 
 
-@unittest.skipUnless(_pg_available(), SKIP_REASON)
+@each_backend
 class SessionQueryEquivalenceTests(unittest.TestCase):
     """The optimized Sessions query must agree with the one it replaced."""
 
@@ -459,8 +466,9 @@ class SessionQueryEquivalenceTests(unittest.TestCase):
     def setUpClass(cls):
         from src.pg_db import PgDatabaseManager
 
-        cls.dbname, cls.conninfo = create_test_database("lto_sessq")
-        cls.db = PgDatabaseManager(cls.conninfo)
+        cls.tdb = create_test_db(getattr(cls, 'BACKEND', None) or 'postgresql', "lto_sessq")
+        cls.dbname, cls.conninfo = cls.tdb.name, cls.tdb.conninfo
+        cls.db = cls.tdb.manager(migrations="startup")
         cls.db.apply_directory_catalog_schema()
         cls.db.register_tape("Tape_Q")
         cls._build_fixture()
@@ -471,7 +479,7 @@ class SessionQueryEquivalenceTests(unittest.TestCase):
             cls.db.close()
         except Exception:
             pass
-        drop_test_database(cls.dbname)
+        cls.tdb.drop()
 
     @classmethod
     def _build_fixture(cls):

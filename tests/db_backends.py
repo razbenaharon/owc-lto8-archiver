@@ -28,6 +28,7 @@ class guarded by ``pg_test_guard`` and says so in its docstring, or is marked
 with :func:`postgresql_only` / :func:`sqlite_only` inside a decorated class.
 """
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -105,6 +106,7 @@ class BackendTestDb:
         self.backend = backend
         self._managers = []
         self._tmpdir = None
+        self._chunk_format_columns = False
         if backend == SQLITE:
             self._tmpdir = tempfile.mkdtemp(prefix="lto_sqlite_test_")
             clean = "".join(ch if ch.isalnum() else "_" for ch in str(tag))
@@ -159,6 +161,44 @@ class BackendTestDb:
         return db
 
     # -- raw SQL ---------------------------------------------------------
+    _CHUNK_INSERT = re.compile(
+        r"INSERT\s+INTO\s+remote_chunks\s*\(", re.IGNORECASE)
+
+    def adapt(self, sql):
+        """Make a fixture's raw ``INSERT INTO remote_chunks ... VALUES``
+        valid on whatever schema is installed.
+
+        Fixtures written for the pre-015 schema omit the packaging columns
+        (PostgreSQL then backfills them when the test applies migration 015).
+        Where the columns already exist - always on SQLite - the insert must
+        name them, exactly as production code does.
+        """
+        match = self._CHUNK_INSERT.search(sql)
+        if not match or "packaging_format" in sql:
+            return sql
+        if not self._chunk_format_columns:
+            if not self.has_column("remote_chunks", "packaging_format"):
+                return sql
+            self._chunk_format_columns = True
+        close = _closing_paren(sql, match.end() - 1)
+        values = re.compile(r"\s*VALUES\s*", re.IGNORECASE).match(
+            sql, close + 1)
+        if not values:
+            return sql                      # INSERT ... SELECT: left alone
+        out = (sql[:close] + ",packaging_format,packaging_assigned_at"
+               + sql[close:values.end()])
+        position = values.end()
+        while position < len(sql) and sql[position] == "(":
+            end = _closing_paren(sql, position)
+            out += sql[position:end] + ",'zip',now())"
+            position = end + 1
+            gap = re.compile(r"\s*,\s*").match(sql, position)
+            if not gap:
+                break
+            out += gap.group(0)
+            position = gap.end()
+        return out + sql[position:]
+
     def connect(self, *, autocommit=True):
         """A dict-row connection (PostgreSQL SQL dialect on both backends)."""
         from src import db_backend
@@ -167,14 +207,14 @@ class BackendTestDb:
     def query(self, sql, params=()):
         conn = self.connect()
         try:
-            return conn.execute(sql, params).fetchall()
+            return conn.execute(self.adapt(sql), params).fetchall()
         finally:
             conn.close()
 
     def exec(self, sql, params=()):
         conn = self.connect()
         try:
-            conn.execute(sql, params)
+            conn.execute(self.adapt(sql), params)
         finally:
             conn.close()
 
@@ -182,7 +222,7 @@ class BackendTestDb:
         """Execute one statement; rows when it returns any, else ``[]``."""
         conn = self.connect()
         try:
-            cur = conn.execute(sql, params)
+            cur = conn.execute(self.adapt(sql), params)
             return cur.fetchall() if cur.description else []
         finally:
             conn.close()
@@ -200,6 +240,19 @@ class BackendTestDb:
             """SELECT column_name FROM information_schema.columns
                WHERE table_schema='public' AND table_name=%s
                ORDER BY ordinal_position""", (table,))]
+
+    def check_constraints(self, table):
+        """Text of every CHECK constraint on ``table``."""
+        if self.is_sqlite:
+            sql = self.scalar(
+                "SELECT sql FROM sqlite_master WHERE type='table' "
+                "AND name=%s", (table,)) or ""
+            return [line.strip() for line in sql.splitlines()
+                    if " CHECK " in line]
+        return [row["def"] for row in self.query(
+            """SELECT pg_get_constraintdef(c.oid) AS def
+               FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid
+               WHERE t.relname=%s AND c.contype='c'""", (table,))]
 
     def has_column(self, table, column):
         from src import db_backend
@@ -244,6 +297,24 @@ class BackendTestDb:
                 self._tmpdir = None
         else:
             pg_test_guard.drop_test_database(self.name)
+
+
+def _closing_paren(text, start):
+    """Index of the parenthesis closing the one at ``text[start]``."""
+    depth, quoted = 0, False
+    for index in range(start, len(text)):
+        char = text[index]
+        if char == "'":
+            quoted = not quoted
+        if quoted:
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    raise ValueError("unbalanced parentheses in fixture SQL")
 
 
 def create_test_db(backend, tag="db"):

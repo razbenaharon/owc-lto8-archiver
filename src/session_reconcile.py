@@ -282,8 +282,12 @@ def _classify(session, chunk_states, idle_seconds, now):
     not decide unattended is left to a human.
     """
     by_state = {row["status"]: int(row["chunks"]) for row in chunk_states}
-    updates = [row["last_update"] for row in chunk_states if row["last_update"]]
-    last_activity = max(updates) if updates else session["created_at"]
+    # MAX(updated_at) is an expression: SQLite returns it as text, so it is
+    # normalised here (a no-op for the datetime PostgreSQL returns).
+    updates = [db_backend.as_timestamp(row["last_update"])
+               for row in chunk_states if row["last_update"]]
+    last_activity = (max(updates) if updates
+                     else db_backend.as_timestamp(session["created_at"]))
     idle = (now - last_activity).total_seconds() if last_activity else None
 
     transient = {s: by_state[s] for s in TRANSIENT_CHUNK_STATES if s in by_state}

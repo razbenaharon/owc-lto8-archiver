@@ -8,6 +8,8 @@ audit query against disposable PostgreSQL in both directions.
 """
 import unittest
 
+from db_backends import (create_test_db, each_backend, postgresql_only,
+                         sqlite_only)
 from pg_test_guard import SKIP_REASON
 from test_directory_catalog_pg import _DirectoryCatalogFixture, _pg_available
 
@@ -15,7 +17,7 @@ from src.session_transition import (ACTIVATABLE_BOOTSTRAP_STATES,
                                     build_transition_proposal)
 
 
-@unittest.skipUnless(_pg_available(), SKIP_REASON)
+@each_backend
 class BootstrapStateVocabularyTests(_DirectoryCatalogFixture,
                                     unittest.TestCase):
     def _set_bootstrap(self, state):
@@ -47,13 +49,9 @@ class BootstrapStateVocabularyTests(_DirectoryCatalogFixture,
                 self.assertEqual(len(self._bootstrap_blockers()), 1)
 
     def test_every_accepted_state_is_one_the_schema_can_hold(self):
-        definition = self._query(
-            """SELECT pg_get_constraintdef(c.oid) AS def
-               FROM pg_constraint c
-               WHERE c.conrelid='remote_frontier_bootstraps'::regclass
-                 AND c.contype='c'
-                 AND pg_get_constraintdef(c.oid) LIKE '%%state%%'""")
-        text = " ".join(row["def"] for row in definition)
+        text = " ".join(
+            definition for definition in self.tdb.check_constraints(
+                "remote_frontier_bootstraps") if "state" in definition)
         for state in ACTIVATABLE_BOOTSTRAP_STATES:
             self.assertIn(f"'{state}'", text)
 

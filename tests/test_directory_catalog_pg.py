@@ -16,12 +16,19 @@ except ImportError:                          # pragma: no cover - guard handles 
     psycopg = None
     dict_row = None
 
+from db_backends import (create_test_db, each_backend, postgresql_only,
+                         sqlite_only)
 from pg_test_guard import (SKIP_REASON, create_test_database,
                            drop_test_database, pg_available)
 
 
-def _connect(*args, **kwargs) -> Any:
-    return cast(Any, psycopg.connect(*args, **kwargs))
+def _connect(conninfo, *args, **kwargs) -> Any:
+    """A raw connection on whichever backend ``conninfo`` names."""
+    if str(conninfo).startswith("sqlite:"):
+        from src import db_backend
+        return db_backend.connect(
+            conninfo, autocommit=kwargs.get("autocommit", False))
+    return cast(Any, psycopg).connect(conninfo, *args, **kwargs)
 
 
 def _pg_available():
@@ -40,8 +47,9 @@ class _DirectoryCatalogFixture:
     def setUp(self):
         from src.pg_db import PgDatabaseManager
 
-        self.dbname, self.conninfo = create_test_database("lto_dircat")
-        self.db = PgDatabaseManager(self.conninfo)
+        self.tdb = create_test_db(getattr(self, 'BACKEND', None) or 'postgresql', "lto_dircat")
+        self.dbname, self.conninfo = self.tdb.name, self.tdb.conninfo
+        self.db = self.tdb.manager(migrations="startup")
         self.addCleanup(self._drop)
 
         self.db.apply_directory_catalog_schema()
@@ -58,16 +66,13 @@ class _DirectoryCatalogFixture:
             self.db.close()
         except Exception:
             pass
-        drop_test_database(self.dbname)
+        self.tdb.drop()
 
     def _exec(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True) as conn:
-            conn.execute(sql, params)
+        self.tdb.exec(sql, params)
 
     def _query(self, sql, params=()):
-        with _connect(self.conninfo, autocommit=True,
-                      row_factory=cast(Any, dict_row)) as conn:
-            return conn.execute(sql, params).fetchall()
+        return self.tdb.run(sql, params)
 
     def _seed_session(self):
         self._exec("INSERT INTO tapes (volume_label,status) VALUES "
@@ -241,7 +246,7 @@ class _DirectoryCatalogFixture:
         return row["status"] if row else None
 
 
-@unittest.skipUnless(_pg_available(), SKIP_REASON)
+@each_backend
 class DirectoryCatalogPgTests(_DirectoryCatalogFixture, unittest.TestCase):
     """One directory, many parts, and the completeness that follows."""
 
@@ -404,7 +409,7 @@ if __name__ == "__main__":                   # pragma: no cover
     unittest.main()
 
 
-@unittest.skipUnless(_pg_available(), SKIP_REASON)
+@each_backend
 class LegacyAdapterTests(_DirectoryCatalogFixture, unittest.TestCase):
     """Task 2.3: legacy evidence folds in without altering legacy tables."""
 
@@ -428,8 +433,8 @@ class LegacyAdapterTests(_DirectoryCatalogFixture, unittest.TestCase):
                     file_count,byte_count,small_file_count,small_file_bytes,
                     large_file_count,large_file_bytes,backup_date,record_key)
                VALUES ('h','/r/data','T_A',%s,NULL,'legacy.zip',5,500,5,500,
-                       0,0,now(),decode(repeat('ab',32),'hex'))""",
-            (self.session_id,))
+                       0,0,now(),%s)""",
+            (self.session_id, bytes.fromhex("ab" * 32)))
         report = self.db.ingest_legacy_directory_parts(self.session_id)
         self.assertEqual(report["coarse_bundle_candidates"], 1)
         self.assertEqual(report["container_parts"], 0)
@@ -466,7 +471,7 @@ class LegacyAdapterTests(_DirectoryCatalogFixture, unittest.TestCase):
         self.assertEqual(before, after)
 
 
-@unittest.skipUnless(_pg_available(), SKIP_REASON)
+@each_backend
 class RestoreRoutingTests(_DirectoryCatalogFixture, unittest.TestCase):
     """Task 4.1: a directory expands into exact parts, without touching tape."""
 
@@ -553,7 +558,7 @@ class RestoreRoutingTests(_DirectoryCatalogFixture, unittest.TestCase):
             self.assertNotIn(token, source, token)
 
 
-@unittest.skipUnless(_pg_available(), SKIP_REASON)
+@each_backend
 class TransitionPersistenceTests(_DirectoryCatalogFixture, unittest.TestCase):
     """Task 3.1 execute mode: the boundary is persisted, or refused."""
 
@@ -649,7 +654,7 @@ class TransitionPersistenceTests(_DirectoryCatalogFixture, unittest.TestCase):
                 (self.session_id,))
 
 
-@unittest.skipUnless(_pg_available(), SKIP_REASON)
+@each_backend
 class BackfillLegacyChunkMembershipTests(_DirectoryCatalogFixture,
                                          unittest.TestCase):
     """Sealing a pre-frontier chunk must DERIVE its expectation, never guess.
@@ -759,7 +764,7 @@ class BackfillLegacyChunkMembershipTests(_DirectoryCatalogFixture,
         self.assertIsNone(self._state(index)["membership_state"])
 
 
-@unittest.skipUnless(_pg_available(), SKIP_REASON)
+@each_backend
 class RepointSessionTapeGenerationTests(_DirectoryCatalogFixture,
                                         unittest.TestCase):
     """Re-pointing a stale target generation must PROVE it is safe.
