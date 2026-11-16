@@ -41,7 +41,8 @@ POSTGRESQL_ONLY_FEATURES = {
     "schema_audit": "schema provenance audit (src/schema_audit.py)",
     "sealed_batches": (
         "sealed tape-write batches and their observation mode "
-        "([PERFORMANCE] tape_write_batch_mode)"),
+        "([FEATURES] sealed_tape_write_batches_enabled, "
+        "[FEATURES] sealed_tape_write_batches_observation_enabled)"),
     "small_file_manifest_maintenance": (
         "small-file manifest export / validate / prune "
         "(src/local_manifest_archive.py)"),
