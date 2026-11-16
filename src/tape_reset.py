@@ -528,6 +528,12 @@ def prepare_impact_report(cfg, *, tape_label, output_path, backup_path,
         raise RuntimeError(
             f"[TAPE RESET] Refusing to overwrite an existing file: {output}")
     if db_backend.is_sqlite(cfg):
+        if (os.path.normcase(os.path.abspath(os.fspath(backup_path)))
+                == os.path.normcase(os.path.abspath(cfg.sqlite_path))):
+            raise RuntimeError(
+                "[TAPE RESET] --backup-file is the live catalog itself, "
+                "which the reset changes. Create a backup first "
+                "(python run.py --backup-db).")
         verification = verify_backup(cfg, backup_path)
         required_level = BACKUP_LEVEL_READ_THROUGH
     else:

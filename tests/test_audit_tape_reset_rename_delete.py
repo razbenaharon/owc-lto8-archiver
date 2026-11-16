@@ -499,6 +499,15 @@ class PrepareImpactReportTests(_ResetFixture, unittest.TestCase):
         self.assertFalse(self.out.exists())
         self.assertEqual(self.identity_reads, 0)
 
+    @sqlite_only("a PostgreSQL catalog is not a file")
+    def test_the_live_catalog_is_not_accepted_as_its_own_backup(self):
+        with self.assertRaisesRegex(RuntimeError, "live catalog itself"):
+            self._prepare(backup_path=self.tdb.path)
+        self.assertFalse(self.out.exists())
+        self.assertEqual(self.identity_reads, 0)
+        self.assertFalse(os.path.exists(
+            os.path.splitext(self.tdb.path)[0] + ".restore_list.txt"))
+
     @postgresql_only("a SQLite backup is itself the restorable database")
     def test_postgresql_needs_a_named_scratch_server(self):
         with self.assertRaisesRegex(RuntimeError, "--scratch-host"):
