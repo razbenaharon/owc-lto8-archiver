@@ -226,7 +226,7 @@ class LTOBackup:
                 "write. Create and verify a PostgreSQL backup, restore it to a "
                 "separate migrated database, then apply "
                 "scripts/sql/007_postgres_directory_catalog.sql. See "
-                "docs/directory_catalog_migration_runbook.md."
+                "docs/installation.md (Schema on PostgreSQL)."
             )
 
         exclude_file_paths = exclude_file_paths or []

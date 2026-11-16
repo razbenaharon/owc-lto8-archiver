@@ -4,7 +4,7 @@ Plan 1, Task 1.2. Moved out of ``RemoteOrchestrator`` unchanged, so that the
 one place a tape write can start is a single, small, readable module.
 
 The invariants this module exists to protect (see
-``docs/incidents/000-no-physical-intervention-policy.md``):
+``docs/history/incidents/000-no-physical-intervention-policy.md``):
 
 * **One ownership period per group, not per chunk.** Ownership and the safety
   gate run once; between chunks there is deliberately no readiness probe, no

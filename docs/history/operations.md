@@ -1,8 +1,22 @@
-# Operations runbook
+# Operations runbook (original deployment, August 2026)
+
+> **Dated record, not current guidance.** This runbook was written for one
+> installation and its state in August 2026. Use the
+> [user guide](../user-guide.md), [safety rules](../safety.md) and
+> [troubleshooting](../troubleshooting.md) instead. Known errors in it,
+> left as written:
+>
+> - `python inspect_db.py --session-forensics --session <N>` is rejected.
+>   The working command is `python inspect_db.py --session-forensics`
+>   (optionally `--idle-seconds <N>`); it reports every active session.
+> - `python inspect_db.py --reboot-sentinel-status` never existed. The
+>   read-only equivalent is in the user guide, under *Before every tape run*.
+> - Drive letter `Z:`, tape labels, session numbers and the "current
+>   blockers" section describe that site only.
 
 How to operate, stop, and recover a live archive run without ever creating a
 state that needs somebody standing at the drive. The prime directive
-([CLAUDE.md](../CLAUDE.md), [incident 000](incidents/000-no-physical-intervention-policy.md))
+([CLAUDE.md](../../CLAUDE.md), [incident 000](incidents/000-no-physical-intervention-policy.md))
 outranks throughput: *if this fails at the worst possible moment, can it be
 recovered without somebody at the drive?* If no — stop.
 
@@ -171,7 +185,7 @@ code change -> full offline tests -> isolated PostgreSQL tests
 ```
 
 Offline suite and the disposable-PostgreSQL recipe (one canonical copy, port
-15432): [testing-and-validation.md](testing-and-validation.md). Never point
+15432): [testing-and-validation.md](../testing-and-validation.md). Never point
 tests at the production database.
 
 ## Current blockers

@@ -41,7 +41,7 @@ TAPE_BUDGET_LABEL = f"{LOCAL_TAPE_BUDGET_BYTES / 1000**4:.1f} TB"
 DEFAULT_TAPE_CAPACITY_GB = 12288
 # tapes.status values (migration 011). 'full' = retired from writing, whatever
 # the reason — genuinely out of space, or unwritable like Tape_02 after its PWE
-# bit latched (docs/incidents/010-20260724-ltfs-write-perm-readonly.md).
+# bit latched (docs/history/incidents/010-20260724-ltfs-write-perm-readonly.md).
 TAPE_STATUS_ACTIVE = 'active'
 TAPE_STATUS_FULL = 'full'
 TAPE_STATUSES = (TAPE_STATUS_ACTIVE, TAPE_STATUS_FULL)

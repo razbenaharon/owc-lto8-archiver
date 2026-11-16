@@ -1781,7 +1781,7 @@ class RemoteOrchestrator:
                f"restart can lose every chunk written since the mount.")
         print(f"\n[TAPE] {msg}")
         print("[TAPE] Fix the mount's sync_type and reload the cartridge, then "
-              "re-run. See docs/performance_insights_and_recommendations.md.")
+              "re-run. See docs/safety.md.")
         get_logger().error("ltfs_sync_mode_blocked: declared=%s at=%s",
                            declared, status["declared_at"])
         send_best_effort(self.notifier, f"[PIPELINE] {msg}")
@@ -1966,7 +1966,7 @@ class RemoteOrchestrator:
         msg = (f"LTFS reports drive/medium {kind}. Refusing to start a tape "
                f"write: {detail}. Writing into a failing drive is what froze "
                "Tape_02 permanently. Investigate before resuming — see "
-               "docs/incidents/010-20260724-ltfs-write-perm-readonly.md.")
+               "docs/history/incidents/010-20260724-ltfs-write-perm-readonly.md.")
         print(f"\n[TAPE] {msg}")
         for ev in worst[:5]:
             print(f"[TAPE]   {ev['at']}  [{ev['id']}]  {ev['message'][:140]}")

@@ -1068,7 +1068,7 @@ class PgConnectionCore:
                 "database. Apply scripts/sql/007_postgres_directory_catalog.sql "
                 "explicitly to the migrated PostgreSQL database after creating "
                 "and verifying a production backup. See "
-                "docs/directory_catalog_migration_runbook.md."
+                "docs/installation.md (Schema on PostgreSQL)."
             )
 
     def _ensure_runtime_constraints(self):

@@ -1,11 +1,11 @@
-"""Every rule in docs/incidents/, asserted against the Plan 1 code.
+"""Every rule in docs/history/incidents/, asserted against the Plan 1 code.
 
 This file exists because a refactor is exactly when hard-won safety rules get
 lost — they live in prose, the code moves, and nothing notices. Each test below
 names the incident it protects, so a future change that breaks one is told which
 outage it is re-enabling.
 
-The rules come from ``docs/incidents/000-no-physical-intervention-policy.md``
+The rules come from ``docs/history/incidents/000-no-physical-intervention-policy.md``
 and the numbered incidents. They are asserted BEHAVIOURALLY where possible (run
 the code, watch what it does to a fake drive) and structurally only where
 behaviour cannot be reached without a real device.
