@@ -655,7 +655,7 @@ class TapeManager:
                 "        that was still recoverable, and it can run for a long "
                 "time. Never run it during an",
                 "        archive run or without a diagnosis "
-                "(docs/incidents/000-no-physical-intervention-policy.md).")):
+                "(docs/safety.md).")):
             return
         print(f"\n[CHECK] Running: LtfsCmdCheck.exe {drive_letter}")
         self._print_drive_status("[CHECK]")

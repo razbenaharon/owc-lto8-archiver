@@ -384,7 +384,7 @@ class TapeWriteGovernorLifecycleTests(unittest.TestCase):
             # `wait_or_pause("tape", "start")` whenever the machine has less
             # than governor_tape_min_free_ram_gb (3.0 GB) available — which is
             # routine on this 15.6 GB host, where psutil counts reclaimable
-            # file cache as used (see docs/incidents/001). The wait is
+            # file cache as used (see docs/history/incidents/001). The wait is
             # unbounded by design in production; a test must not depend on it.
             with mock.patch("src.backup._ensure_lto_drive_ready",
                             return_value=True), \

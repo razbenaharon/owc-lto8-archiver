@@ -736,7 +736,7 @@ class WriteChunkRaceTests(unittest.TestCase):
         `LtfsCmdEject` is mechanical and there is no software "load" for a tape
         out of the slot, so a run finishing overnight stranded the drive until
         somebody travelled to the lab — the exact outcome
-        docs/incidents/000-no-physical-intervention-policy.md forbids. It also
+        docs/history/incidents/000-no-physical-intervention-policy.md forbids. It also
         would have blocked the follow-up session for the roots plan 37 never
         scanned. The default is now "leave the cartridge loaded".
         """
@@ -1256,7 +1256,8 @@ class ProtectedProcessCancelTests(unittest.TestCase):
 class DocsAssertionTests(unittest.TestCase):
     def test_doc_does_not_call_unmount_unsupported_or_claim_verified_sync(self):
         path = os.path.join(os.path.dirname(os.path.dirname(__file__)),
-                            "docs", "performance_insights_and_recommendations.md")
+                            "docs", "history",
+                            "performance_insights_and_recommendations.md")
         text = open(path, encoding="utf-8").read().lower()
         self.assertNotIn("unmount is unsupported", text)
         self.assertNotIn("index-sync verified", text)

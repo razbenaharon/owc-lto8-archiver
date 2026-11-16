@@ -1,87 +1,45 @@
 # Documentation map
 
-This is the entry point for engineers and LLMs working on the repository.
-Use it to choose the smallest authoritative document set for the task instead
-of reading every historical note.
+| You want to | Read |
+| --- | --- |
+| Know what this is and try it | [../README.md](../README.md) |
+| Install it, or upgrade an existing PostgreSQL installation | [installation.md](installation.md) |
+| Look up a `config.ini` key | [configuration.md](configuration.md) |
+| Archive, restore, maintain tapes, back up the catalog, stop a run | [user-guide.md](user-guide.md) |
+| Know the rules that protect the tape | [safety.md](safety.md) |
+| Understand an error message or an exit code | [troubleshooting.md](troubleshooting.md) |
+| Choose between SQLite and PostgreSQL; see what is PostgreSQL-only | [database-backends.md](database-backends.md) |
+| Understand modules, locks, the chunk state machine, the safety gates | [architecture.md](architecture.md) |
+| Run the tests; see what is and is not verified; plan a hardware pilot | [testing-and-validation.md](testing-and-validation.md) |
+| See what changed | [../CHANGELOG.md](../CHANGELOG.md), [releases/v1.0.0-rc.1.md](releases/v1.0.0-rc.1.md) |
+| Contribute | [../CONTRIBUTING.md](../CONTRIBUTING.md), [../AGENTS.md](../AGENTS.md) |
+| See the manifest and receipt formats | [../examples/README.md](../examples/README.md) |
+| Check licences | [../LICENSE](../LICENSE), [../THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md) |
+| Read how the rules were learned | [history/README.md](history/README.md) |
 
-## Read first
+## Which source wins
 
-0. [`PROJECT_STATUS.md`](PROJECT_STATUS.md) — what is done, open, and blocked,
-   with an evidence label on every line.
-1. [`AGENTS.md`](../AGENTS.md) — current repository rules, architecture,
-   validation commands, and non-negotiable tape-safety constraints.
-2. [`incidents/README.md`](incidents/README.md) — incident index and links to
-   open operational risks.
-3. [`incidents/000-no-physical-intervention-policy.md`](incidents/000-no-physical-intervention-policy.md)
-   — the operator's standing safety policy.
-4. [`tape-and-archive-state.md`](tape-and-archive-state.md) — the current
-   dated snapshot of tape, drive, session, and campaign state.
-
-For live operations, also read the newest incidents marked **OPEN**. As of
-2026-08-20 those are
-[`014-20260819-campaign-write-servo-halt.md`](incidents/014-20260819-campaign-write-servo-halt.md)
-and
-[`015-20260820-campaign-drive-instability.md`](incidents/015-20260820-campaign-drive-instability.md).
-
-## Source-of-truth hierarchy
-
-Use the first applicable source in this table. A dated document is a snapshot,
-not a live status endpoint.
+When two sources disagree:
 
 | Question | Authoritative source |
 | --- | --- |
-| Safety or permitted recovery action | `AGENTS.md`, then policy 000; use the safer rule if wording differs |
-| What the current code does | Current source and tests |
-| Per-file inventory of packed small files | The JSONL.zst manifests under the `[LOCAL_MANIFEST_ARCHIVE]` root |
-| Session/chunk state | The catalog database: PostgreSQL, or the local SQLite file when `[DATABASE] backend = sqlite` |
-| Tape/media health | IBM LTFS `LogFile.csv`, scoped to the current mount |
-| Mounted LTFS sync mode | The live mount declaration, event 61259; never `ltfs.conf.local` alone |
-| Active configuration | The production host's untracked `config.ini` and `.env`; never infer it from `config.example.ini` or a synced clone |
-| Last documented production state | [`tape-and-archive-state.md`](tape-and-archive-state.md), then the newest open incident |
-| Performance statistics | `backup_logs/SUMMARY.csv`; do not parse `archiver.log` for reports |
-| Historical cause and evidence | The corresponding incident document |
+| What the program does | The code and its tests |
+| Which commands and flags exist | The parsers in `run.py` and `inspect_db.py`. `python inspect_db.py --help` lists the inspector's; `run.py` has no top-level help, so use [user-guide.md](user-guide.md), which a test checks against the real parsers |
+| Which settings exist | `CONFIG_SCHEMA` in `src/config.py`; [configuration.md](configuration.md) is tested against it |
+| What is safe at the tape | [safety.md](safety.md). If a rule and a convenience conflict, the rule wins |
+| Session and chunk state | The catalog database, not a document |
+| The LTFS sync mode in force | The mount itself (LTFS event 61259), not `ltfs.conf.local` |
+| Drive and medium health | The IBM LTFS log for the current mount |
+| What happened at the original deployment | [history/](history/README.md): dated records, not instructions |
 
-When sources conflict, prefer live evidence over a dated snapshot, current code
-over a design document, and a later explicit correction over an older
-recommendation. Never relax a tape-safety rule merely to reconcile a conflict.
+## Keeping the documentation true
 
-## Environment identity
-
-The repository may be synchronized to more than one Windows computer. Before
-reporting "current status", record `$env:COMPUTERNAME`. A check on a computer
-other than the production archive host describes only that clone; if
-production cannot be queried, say so explicitly and label the result
-"last documented state as of YYYY-MM-DD". Do not browse or walk the LTFS
-drive to establish status.
-
-## Task routing
-
-| Task | Read |
-| --- | --- |
-| Understand the system, module boundaries, data flow, schemas | [`architecture.md`](architecture.md) |
-| Live archive operation, stop, or recovery | [`operations.md`](operations.md), then the newest open incidents |
-| Run or extend the tests; validate a change | [`testing-and-validation.md`](testing-and-validation.md) |
-| Catalog backend choice, the SQLite backend, what is PostgreSQL-only | [`sqlite_backend.md`](sqlite_backend.md) |
-| Current tape/session/campaign state | [`tape-and-archive-state.md`](tape-and-archive-state.md) |
-| Legacy export & PostgreSQL pruning (deferred Plan 4) | [`archive-modernization-plans/04_LEGACY_EXPORT_AND_POSTGRESQL_PRUNING.md`](archive-modernization-plans/04_LEGACY_EXPORT_AND_POSTGRESQL_PRUNING.md) |
-| Small-file manifest export/prune | [`local_small_file_manifest_runbook.md`](local_small_file_manifest_runbook.md) |
-| Drive cleaning / ITDT diagnostics | [`drive_cleaning_and_itdt_runbook.md`](drive_cleaning_and_itdt_runbook.md) |
-| Performance work | [`performance_insights_and_recommendations.md`](performance_insights_and_recommendations.md) |
-| Transfer/chunk sizing | [`tape_transfer_size_analysis.md`](tape_transfer_size_analysis.md) |
-
-Retired historical documents (completed plan handoffs, one-off migration
-runbooks, superseded design notes, benchmarks) live **outside the public
-tree** in the operator's private records; their still-operative content was
-folded into the documents above.
-
-## Documentation maintenance rules
-
-- Every operational state statement must name the host and include an
-  `as observed` date/time.
-- Mark historical settings and measurements as historical; do not call them
-  "current" without live verification.
-- Put corrections at the top summary as well as beside the historical detail.
-- Update `incidents/README.md` when an incident opens, closes, or changes the
-  production recovery plan.
-- Add a new incident rather than rewriting evidence from an old one. Cross-link
-  the correction from both entries.
+- A command or flag written in `README.md`, `CONTRIBUTING.md`, `AGENTS.md`
+  or `docs/*.md` must be accepted by the program. `tests/test_docs_commands.py` fails
+  otherwise. Run a new command before documenting it.
+- A relative link must resolve. The same test checks every Markdown file.
+- A new `config.ini` key needs a row in [configuration.md](configuration.md).
+- Do not write counts that change (tests, lines, files) without a date.
+- Do not add site-specific state (host names, tape labels, session numbers)
+  to the guides. A dated record belongs under [history/](history/README.md).
+- Use placeholders: `source-host.example`, user `archive`, `D:\staging`.
