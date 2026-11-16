@@ -172,6 +172,10 @@ def _parse_robocopy_bytes(tokens, idx):
         except ValueError:
             return 0, idx
     try:
+        return int(val), idx            # exact /BYTES integer, any size
+    except ValueError:
+        pass
+    try:
         return int(float(val)), idx
     except ValueError:
         return 0, idx

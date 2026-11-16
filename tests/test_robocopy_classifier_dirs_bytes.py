@@ -114,3 +114,13 @@ class ReviewFollowUp(unittest.TestCase):
         verdict = _classify(out, expected_files=2, expected_bytes=10_000_000,
                             expected_source_files=2)
         self.assertTrue(verdict.is_success)
+
+    def test_exact_byte_counts_keep_full_integer_precision(self):
+        # Going through float loses the last digit above 2**53.
+        big = 9007199254740993
+        out = _summary(files=(1, 1, 0, 0, 0, 0),
+                       byte_counts=(big, big, 0, 0, 0, 0))
+        self.assertEqual(_parse_robocopy_summary(out)["bytes_copied"], big)
+        verdict = _classify(out, expected_files=1, expected_bytes=big,
+                            expected_source_files=1)
+        self.assertTrue(verdict.is_success)
