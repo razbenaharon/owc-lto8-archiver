@@ -55,11 +55,40 @@ def _sha256_file(path):
     return digest.hexdigest()
 
 
-def _read_only_uri(path):
+def _read_only_uri(path, immutable=False):
     quoted = urllib.parse.quote(os.path.abspath(path).replace("\\", "/"),
                                 safe="/:")
     return ("file://" + ("" if quoted.startswith("/") else "/") + quoted
-            + "?mode=ro")
+            + "?mode=ro" + ("&immutable=1" if immutable else ""))
+
+
+def _sidecar_paths(path):
+    """The write-ahead log and shared-memory files SQLite keeps beside a
+    database in WAL mode."""
+    return [Path(str(path) + suffix) for suffix in ("-wal", "-shm")]
+
+
+def _has_pending_wal(path):
+    """True unless ``path`` provably has no write-ahead log holding data."""
+    try:
+        return os.path.getsize(str(path) + "-wal") > 0
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def _backup_uri(path):
+    """Read-only URI for checking a finished backup file.
+
+    A backup keeps the catalog's WAL header, and a plain read-only open of
+    such a file creates ``-wal`` / ``-shm`` files beside it that a read-only
+    connection cannot remove - they used to stay in the backup folder.
+    ``immutable=1`` reads the file as it is and creates nothing. It would
+    also ignore a write-ahead log, so a file that arrives with one is still
+    opened the plain way and read through its log.
+    """
+    return _read_only_uri(path, immutable=not _has_pending_wal(path))
 
 
 def _local_path(cfg, path, *, expected_kind, allow_missing):
@@ -124,7 +153,7 @@ def verify_sqlite_backup(cfg, backup_path, *, write_restore_list=True):
     if size > 0:
         digest = _sha256_file(backup_path)
         try:
-            conn = sqlite3.connect(_read_only_uri(backup_path), uri=True)
+            conn = sqlite3.connect(_backup_uri(backup_path), uri=True)
         except sqlite3.Error as exc:
             checks.append(BackupCheck("opens_as_sqlite", False, str(exc)))
         else:
@@ -219,6 +248,9 @@ def create_sqlite_backup(cfg, output_dir=None, prefix=None, verify=True):
             copy = sqlite3.connect(str(temporary))
             try:
                 live.backup(copy)
+                # Nothing may be left in a write-ahead log: the backup is
+                # the one file, complete on its own.
+                copy.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
             finally:
                 copy.close()
         except sqlite3.Error as exc:
@@ -250,7 +282,8 @@ def create_sqlite_backup(cfg, output_dir=None, prefix=None, verify=True):
                     "[DB BACKUP] The published backup failed verification; "
                     "do not rely on it.\n" + final.summary())
     except BaseException:
-        temporary.unlink(missing_ok=True)
+        for leftover in [temporary] + _sidecar_paths(temporary):
+            leftover.unlink(missing_ok=True)
         raise
     return str(output_path)
 

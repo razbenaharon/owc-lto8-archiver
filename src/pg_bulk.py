@@ -20,8 +20,10 @@ else:
 def require_psycopg():
     if psycopg is None or ConnectionPool is None:
         raise RuntimeError(
-            "[PG] psycopg 3 is not installed. Run "
-            "`python -m pip install -r requirements.txt`."
+            "[PG] psycopg 3 (the PostgreSQL driver) is not installed. Run "
+            "`python -m pip install -r requirements-postgres.txt`. "
+            "A SQLite catalog ([DATABASE] backend = sqlite) needs no "
+            "server and no driver."
         )
 
 

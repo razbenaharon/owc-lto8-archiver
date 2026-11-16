@@ -1171,8 +1171,8 @@ class RemoteOrchestrator:
         #
         # This exists because writing an already-planned chunk needs no
         # discovery whatsoever, while the resumed scanner currently cannot run
-        # on a pre-frontier session at all (see the ordinal-collision blocker
-        # in docs/SESSION_37_CONTINUATION_RUNBOOK.md). Making the two
+        # on a pre-frontier session at all (its ordinals would collide with
+        # the ones the older planner already used). Making the two
         # independent means a bounded write group no longer depends on
         # traversal being healthy.
         write_only = bool(getattr(self.cfg, 'write_only_resume', False))
@@ -1939,8 +1939,11 @@ class RemoteOrchestrator:
         if not health.get("determinate"):
             err = health.get("error") or "LTFS event log could not be read"
             msg = (f"Cannot verify LTFS drive/medium health ({err}). Refusing to "
-                   "start a tape write: an unreadable drive log is exactly how "
-                   "the 2026-07-24 cartridge freeze went unnoticed for four days.")
+                   "start a tape write: an unreadable drive log is how a "
+                   "failing drive went unnoticed for four days before it "
+                   "made a cartridge permanently read-only on a real "
+                   "deployment (see "
+                   "docs/history/incidents/010-20260724-ltfs-write-perm-readonly.md).")
             print(f"\n[TAPE] {msg}")
             get_logger().error("ltfs_media_health_unverifiable: %s", err)
             send_best_effort(self.notifier, f"[PIPELINE] {msg}")
@@ -1964,8 +1967,9 @@ class RemoteOrchestrator:
                   f"[{first['id']}] {first['meaning']}; latest {last['at']} "
                   f"[{last['id']}] {last['meaning']}")
         msg = (f"LTFS reports drive/medium {kind}. Refusing to start a tape "
-               f"write: {detail}. Writing into a failing drive is what froze "
-               "Tape_02 permanently. Investigate before resuming — see "
+               f"write: {detail}. Writing into a failing drive has made a "
+               "cartridge permanently read-only on a real deployment. "
+               "Investigate before resuming — see "
                "docs/history/incidents/010-20260724-ltfs-write-perm-readonly.md.")
         print(f"\n[TAPE] {msg}")
         for ev in worst[:5]:

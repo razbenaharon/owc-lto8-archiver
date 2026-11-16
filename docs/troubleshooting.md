@@ -107,7 +107,8 @@ Fix each line named. Exit code 30.
 | `[DB] The SQLite catalog schema does not match ...` / `[DB] SQLite migration ... was changed after ...` | The schema file or the database was modified outside the program | Restore the original `scripts/sql/sqlite/*.sql`; if the database itself was altered, restore a catalog backup |
 | `[DB] This SQLite catalog was written by a NEWER version ...` | An older program on a newer catalog | Use the newer program |
 | `[DB] Not available on the SQLite backend: .... This feature needs PostgreSQL ([DATABASE] backend = postgresql). Nothing was changed.` | A PostgreSQL-only feature on SQLite. Exit code 1 | [The list](database-backends.md#postgresql-only-features) |
-| `Container-format schema missing or drifted: ... fingerprint drift` from `--validate-container-format-schema` | Expected on a complete schema (migrations 016/017 extend the same tables) | Use the other `--validate-*` commands |
+| `--validate-container-format-schema checks migration 015 on its own and cannot pass on this database` | Expected on a complete schema (migrations 016/017 extend the same tables); exit code 1 | Run `python inspect_db.py --validate-container-format-schema-authority-v2` |
+| `Container-format schema missing or drifted: ...` from `--validate-container-format-schema` | The schema differs from migration 015 (016/017 not installed, or another issue is listed) | Read the listed issues; restore from a backup or re-apply the migration |
 
 ## Lock
 

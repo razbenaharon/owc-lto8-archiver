@@ -172,9 +172,11 @@ python inspect_db.py --validate-container-format-schema-authority-v2
 ```
 
 `--validate-container-format-schema` checks migration 015 **as it was before
-016/017**. On a complete schema it stops with
-`Container-format schema missing or drifted: ... fingerprint drift`. That
-message is expected there and is not a fault of the catalog.
+016/017**. On a complete schema it cannot pass: it prints one line saying so,
+points to `--validate-container-format-schema-authority-v2` and exits with
+code 1. That is expected there and is not a fault of the catalog. The same
+command reports `Container-format schema missing or drifted: ...` for a
+real difference.
 
 What was verified for this version: the automatic installation on an empty
 database, the preflights and the three checks above, on a disposable

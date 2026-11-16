@@ -244,9 +244,10 @@ Full instructions: [docs/user-guide.md](docs/user-guide.md).
   schema on first start.
 - **Re-formatting a labelled cartridge is not available from the menu.** It
   is refused there in favour of the `tape-reset` subcommand of `run.py`, which
-  requires an `--impact-report` file. No command produces that file in this
-  version; only the Python function `src.tape_reset.prepare_impact_file`
-  does. See [the user guide](docs/user-guide.md#tape-maintenance-option-3).
+  requires an `--impact-report` file. That file is written by the read-only
+  `python run.py tape-reset --tape <LABEL> --prepare-impact-report <FILE> --backup-file <BACKUP>`.
+  The reset has not been run on hardware.
+  See [the user guide](docs/user-guide.md#tape-maintenance-option-3).
 - **Stored TAR chunks cannot be rewritten after a tape reset.** ZIP chunks
   can.
 - **A reset interrupted during the format itself needs a person at the

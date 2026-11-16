@@ -52,8 +52,9 @@ def _start_windows_update_guard(cfg: ConfigManager):
             print(f"  - {signal.message} [{signal.code}]")
         print("[WU] Pausing updates cannot cancel an already-staged restart. "
               "A restart during a tape write corrupts the LTFS index and "
-              "loses every chunk written so far — this cost ~126 GB of "
-              "Tape_02 on 2026-07-15.")
+              "loses every chunk written so far — a forced restart during "
+              "a tape write has caused data loss on a real deployment; see "
+              "docs/history/incidents/005-20260715-sccm-forced-restart-data-loss.md.")
         if cfg.windows_update_block_on_pending_reboot:
             print("[WU] Reboot this host first, then start the run. To "
                   "override, set [WINDOWS_UPDATE] block_on_pending_reboot "

@@ -290,6 +290,267 @@ class ResetResumeTests(_ResetFixture, unittest.TestCase):
 
 
 @each_backend
+class PrepareImpactReportTests(_ResetFixture, unittest.TestCase):
+    """``run.py tape-reset --prepare-impact-report``: the read-only step that
+    writes the report the destructive reset requires.
+
+    Nothing called it before, so the documented reset could not be started
+    from the command line. Hardware calls are patched; the catalog is real.
+    """
+
+    IDENTITY = {"label": "T_A", "drive": "X:\\", "drive_serial": "SER",
+                "device": "tape0", "ltfs_generation": 7, "vcr": 70}
+    POST = {"label": "T_A", "drive": "X:\\", "drive_serial": "SER",
+            "device": "tape0", "ltfs_generation": 1, "vcr": 2}
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = Path(tempfile.mkdtemp(prefix="lto_prepare_"))
+        self.addCleanup(self._rmtree)
+        self.identity = dict(self.IDENTITY)
+        self.identity_reads = 0
+        self.formats = 0
+        self.cfg = SimpleNamespace(
+            db_backend=self.BACKEND, db_dsn=self.conninfo,
+            sqlite_path=self.tdb.path, lto_drive="",
+            lto_drive_configured=False)
+        latest = {(self.session_id, index): {
+            "tape_label": "T_A", "status": "completed",
+            "finished_at": "2026-01-01T00:00:00"} for index in range(3)}
+
+        def read_identity(drive):
+            self.identity_reads += 1
+            return dict(self.identity)
+
+        def fake_format(drive, label, operation_id):
+            self.formats += 1
+            self.identity = dict(self.POST)
+            return {"mounted_identity": dict(self.POST), "ejected": False}
+
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        for name, value in (
+                ("AUDIT_ROOT", self.tmp / "audits"),
+                ("mounted_identity", read_identity),
+                ("latest_chunk_write_evidence", lambda *a, **k: (latest, {})),
+                ("_forbidden_processes", lambda pid=None: []),
+                ("_format_and_positive_evidence", fake_format),
+                ("smallest_write_test",
+                 lambda drive, operation_id: {"bytes_written": 1}),
+                ("_acquire_tape_io_lock", lambda *a, **k: None),
+                ("_release_tape_io_lock", lambda *a, **k: None)):
+            stack.enter_context(mock.patch.object(tape_reset, name, value))
+        self.scratch = None
+        self.pg_verification_level = "restored"
+        if self.BACKEND == "sqlite":
+            from src import db_backup
+            self.backup = db_backup.create_database_backup(
+                self.cfg, output_dir=str(self.tmp / "backups"))
+        else:
+            # The pg_dump / pg_restore toolchain is not what is under test:
+            # the verification result is supplied, the catalog work is real.
+            self.backup = str(self.tmp / "catalog.dump")
+            Path(self.backup).write_bytes(b"dump")
+            restore_list = self.tmp / "catalog.restore_list.txt"
+            restore_list.write_text("1; TABLE DATA tapes\n", encoding="utf-8")
+            self.scratch = SimpleNamespace(pg_host="127.0.0.1")
+            self.verify_calls = []
+
+            def fake_verify(cfg, backup_path, **options):
+                from src.pg_backup import BackupCheck, BackupVerification
+                self.verify_calls.append(options)
+                return BackupVerification(
+                    backend="postgresql", backup_path=str(backup_path),
+                    size_bytes=4, sha256="0" * 64,
+                    level=self.pg_verification_level,
+                    checks=(BackupCheck("scratch_restore", True, "ok"),),
+                    artifacts={"restore_list_path": str(restore_list)},
+                    details={"scratch_restore": {
+                        "scratch_database": "ltoverify_fixture"}})
+
+            stack.enter_context(mock.patch(
+                "src.db_backup.verify_backup", fake_verify))
+        self.out = self.tmp / "impact.json"
+
+    def _rmtree(self):
+        for root, _dirs, files in os.walk(self.tmp):
+            for name in files:
+                os.chmod(os.path.join(root, name), stat.S_IWRITE)
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _prepare(self, **overrides):
+        options = dict(tape_label="T_A", output_path=str(self.out),
+                       backup_path=self.backup, scratch_server=self.scratch)
+        options.update(overrides)
+        return tape_reset.prepare_impact_report(self.cfg, **options)
+
+    def _reset(self, impact_path, delete_catalog=True, confirmed=True):
+        return tape_reset.execute_reset(
+            self.db, SimpleNamespace(lto_drive="X:\\"), tape_label="T_A",
+            impact_path=impact_path, delete_catalog=delete_catalog,
+            confirmed=confirmed)
+
+    def _catalog_state(self):
+        tables = ("tapes", "remote_sessions", "remote_chunks", "files_index",
+                  "archive_runs", "archive_containers",
+                  "directory_archive_parts", "tape_reset_operations",
+                  "tape_generations")
+        state = {table: self._count(table, "1=1") for table in tables}
+        state["chunk_statuses"] = [
+            (row["chunk_index"], row["status"]) for row in self._query(
+                "SELECT chunk_index,status FROM remote_chunks "
+                "ORDER BY session_id,chunk_index")]
+        return state
+
+    def test_prepare_writes_the_report_and_changes_nothing(self):
+        before = self._catalog_state()
+        result = self._prepare()
+        self.assertEqual(self._catalog_state(), before)
+        self.assertEqual(before["tape_reset_operations"], 0)
+        self.assertEqual(self.formats, 0)
+        self.assertEqual(self.identity_reads, 1)
+
+        path = Path(result["impact_report"])
+        self.assertEqual(path, self.out.resolve())
+        self.assertFalse(os.access(path, os.W_OK), "the report is write-once")
+        report = tape_reset.read_json(path)
+        self.assertEqual(result["impact_report_sha256"],
+                         tape_reset.sha256_file(path))
+        self.assertEqual(report["target_label"], "T_A")
+        self.assertEqual(report["operation_id"], result["operation_id"])
+        self.assertEqual(report["mounted_identity"], self.IDENTITY)
+        self.assertTrue(report["backup"]["shadow_verified"])
+        self.assertTrue(report["backup"]["shadow_verification"]["ok"])
+        self.assertEqual(report["backup"]["backup_sha256"],
+                         tape_reset.sha256_file(self.backup))
+        self.assertEqual(result["chunks_returning_to_pending"], 3)
+        self.assertEqual(report["planned_chunk_transitions"],
+                         self.transitions)
+        self.assertIn("--impact-report", result["next_command"])
+        self.assertIn("--delete-catalog --yes", result["next_command"])
+        # A preparation creates no audit directory: only the report.
+        self.assertFalse((self.tmp / "audits").exists())
+        if self.BACKEND == "sqlite":
+            self.assertEqual(
+                report["backup"]["shadow_verification"]["level"],
+                "read_through")
+            self.assertEqual(report["shadow_database"],
+                             report["backup"]["backup_path"])
+        else:
+            self.assertEqual(self.verify_calls,
+                             [{"deep_target": self.scratch}])
+            self.assertEqual(report["shadow_database"], "ltoverify_fixture")
+
+    def test_the_prepared_report_authorises_the_unchanged_reset(self):
+        result = self._prepare()
+        final = self._reset(result["impact_report"])
+        self.assertEqual(final["state"], "verified")
+        self.assertEqual(final["operation_id"], result["operation_id"])
+        self.assertEqual(self.formats, 1)
+        self.assertEqual(self._count("files_index"), 0)
+
+    def test_the_reset_still_refuses_without_its_two_confirmations(self):
+        result = self._prepare()
+        for delete_catalog, confirmed in ((True, False), (False, True),
+                                          (False, False)):
+            with self.subTest(delete=delete_catalog, yes=confirmed):
+                with self.assertRaisesRegex(RuntimeError, "mandatory"):
+                    self._reset(result["impact_report"],
+                                delete_catalog=delete_catalog,
+                                confirmed=confirmed)
+        self.assertEqual(self.formats, 0)
+
+    def test_a_report_for_another_catalog_state_is_still_refused(self):
+        result = self._prepare()
+        self._part(self.child_id, 2)        # the catalog changed afterwards
+        with self.assertRaisesRegex(RuntimeError, "scope differs"):
+            self._reset(result["impact_report"])
+        self.assertEqual(self.formats, 0)
+
+    def test_an_existing_file_is_never_overwritten(self):
+        self.out.write_text("mine", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "Refusing to overwrite"):
+            self._prepare()
+        self.assertEqual(self.out.read_text(encoding="utf-8"), "mine")
+        self.assertEqual(self.identity_reads, 0)
+
+    def test_another_cartridge_in_the_drive_is_refused(self):
+        self.identity["label"] = "T_B"
+        with self.assertRaisesRegex(RuntimeError, "Mounted label"):
+            self._prepare()
+        self.assertFalse(self.out.exists())
+
+    def test_an_unknown_tape_is_refused(self):
+        self.identity["label"] = "NOPE"
+        with self.assertRaisesRegex(RuntimeError, "Tape not found"):
+            self._prepare(tape_label="NOPE")
+        self.assertFalse(self.out.exists())
+
+    def test_an_unproven_backup_writes_no_report(self):
+        if self.BACKEND == "sqlite":
+            with open(self.backup, "r+b") as handle:
+                handle.seek(os.path.getsize(self.backup) // 2)
+                handle.write(b"\xff" * 4096)
+        else:
+            self.pg_verification_level = "read_through"   # never restored
+        with self.assertRaisesRegex(RuntimeError, "not proven restorable"):
+            self._prepare()
+        self.assertFalse(self.out.exists())
+        self.assertEqual(self.identity_reads, 0)
+
+    @sqlite_only("a PostgreSQL catalog is not a file")
+    def test_the_live_catalog_is_not_accepted_as_its_own_backup(self):
+        with self.assertRaisesRegex(RuntimeError, "live catalog itself"):
+            self._prepare(backup_path=self.tdb.path)
+        self.assertFalse(self.out.exists())
+        self.assertEqual(self.identity_reads, 0)
+        self.assertFalse(os.path.exists(
+            os.path.splitext(self.tdb.path)[0] + ".restore_list.txt"))
+
+    @sqlite_only("a write-ahead log is a SQLite file")
+    def test_a_backup_that_depends_on_a_write_ahead_log_is_refused(self):
+        """The reset pins the backup by the hash of ONE file. A copy whose
+        latest data sits in a ``-wal`` beside it is not covered by that."""
+        import shutil
+        import sqlite3
+        copied = str(self.tmp / "copied.sqlite3")
+        shutil.copy(self.backup, copied)
+        writer = sqlite3.connect(copied)
+        reader = sqlite3.connect(copied)     # keeps the log from closing out
+        try:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("UPDATE tapes SET status='full'")
+            writer.commit()
+            reader.execute("SELECT count(*) FROM tapes").fetchone()
+            self.assertGreater(os.path.getsize(copied + "-wal"), 0)
+            with self.assertRaisesRegex(RuntimeError, "write-ahead log"):
+                self._prepare(backup_path=copied)
+        finally:
+            writer.close()
+            reader.close()
+        self.assertFalse(self.out.exists())
+        self.assertEqual(self.identity_reads, 0)
+
+    @postgresql_only("a SQLite backup is itself the restorable database")
+    def test_postgresql_needs_a_named_scratch_server(self):
+        with self.assertRaisesRegex(RuntimeError, "--scratch-host"):
+            self._prepare(scratch_server=None)
+        self.assertEqual(self.verify_calls, [])
+        self.assertFalse(self.out.exists())
+
+    def test_the_catalog_connection_refuses_writes(self):
+        db = tape_reset.open_read_only_catalog(self.cfg)
+        try:
+            with self.assertRaises(self.tdb.errors.ReadOnly):
+                with db._pool.connection() as conn:
+                    conn.execute("UPDATE tapes SET status='full'")
+        finally:
+            db.close()
+        self.assertEqual(self._count("tapes", "status='full'"), 0)
+
+
+@each_backend
 class RenameWithContainersTests(_ResetFixture, unittest.TestCase):
     def test_a_rename_carries_containers_and_restore_routes(self):
         """Used to fail: the new tables still referenced the old label."""

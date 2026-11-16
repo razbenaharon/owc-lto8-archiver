@@ -520,14 +520,50 @@ def _inspect_container_format_staging(
     return evidence
 
 
+#: The one issue migration 015's own report raises when the tables it
+#: fingerprinted have changed (``src/pg_containers.py``).
+CONTAINER_FORMAT_V1_FINGERPRINT_DRIFT = (
+    "container format catalog-definition fingerprint drift")
+
+
 def _run_container_format_schema_report(cfg, *, validate=False):
-    """Read-only migration-015 report/validation."""
+    """Read-only migration-015 report/validation.
+
+    Migration 015 fingerprints every column of the container tables, and its
+    authority row is immutable. Migrations 016/017 add columns to those same
+    tables, so on a database that has them the 015 fingerprint can never
+    match again - by design; migration 019 added the v2 authority that covers
+    015+016+017. Validation therefore answers that one case (015 installed,
+    016/017 installed, the fingerprint the ONLY issue) with a pointer to the
+    v2 validation instead of a bare "drift". It still fails: this check
+    cannot vouch for such a schema, and a real drift there is exactly what
+    the v2 validation detects. Any other issue, or the same issue without
+    016/017, is reported as the drift it is.
+    """
     db = _open_read_only_db(cfg)
     try:
-        report = (db.validate_container_format_schema() if validate
-                  else db.container_format_schema_report())
+        report = db.container_format_schema_report()
+        superseded = bool(
+            validate and not report["ready"]
+            and report.get("installation_state") == "installed"
+            and list(report.get("issues") or [])
+            == [CONTAINER_FORMAT_V1_FINGERPRINT_DRIFT]
+            and db.stored_tar_plan_schema_report().get(
+                "installation_state") == "installed")
     finally:
         db.close()
+    if validate and not report["ready"]:
+        if superseded:
+            raise OperationalError(
+                "[DB] --validate-container-format-schema checks migration "
+                "015 on its own and cannot pass on this database: migrations "
+                "016/017 are installed and extend the same tables, so the "
+                "015 fingerprint no longer applies (by design, not a fault). "
+                "Validate this schema with `python inspect_db.py "
+                "--validate-container-format-schema-authority-v2`.")
+        raise OperationalError(
+            "[DB] Container-format schema missing or drifted: "
+            + "; ".join(report["issues"]))
     _print_json(report)
     return 0
 

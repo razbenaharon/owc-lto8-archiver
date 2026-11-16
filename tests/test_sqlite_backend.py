@@ -696,6 +696,73 @@ class SqliteBackupTests(unittest.TestCase):
         finally:
             raw.close()
 
+    def test_a_backup_is_one_self_contained_file_with_no_sidecars(self):
+        """Verifying the copy used to leave ``*.part-shm`` / ``*.part-wal``
+        (and the same pair beside the published name) in the backup folder."""
+        from src import db_backup
+        self.db.acquire_archiver_lock()            # the catalog is in use
+        path = db_backup.create_database_backup(self.cfg, output_dir=self.out)
+        self.assertTrue(db_backup.verify_backup(self.cfg, path).ok)
+        self.assertEqual(
+            sorted(os.listdir(self.out)),
+            sorted([os.path.basename(path),
+                    os.path.basename(
+                        str(db_backup.restore_list_path_for(path)))]))
+        # The one file, alone in another folder, is the whole catalog.
+        alone = tempfile.mkdtemp(prefix="lto_sqlite_backup_alone_")
+        self.addCleanup(shutil.rmtree, alone, ignore_errors=True)
+        moved = shutil.copy(path, alone)
+        raw = sqlite3.connect(moved)
+        try:
+            self.assertEqual(
+                raw.execute("PRAGMA integrity_check").fetchall(), [("ok",)])
+            self.assertEqual(raw.execute(
+                "SELECT volume_label FROM tapes").fetchall(), [("BK1",)])
+            self.assertEqual(raw.execute(
+                "SELECT count(*) FROM files_index").fetchone()[0], 1)
+        finally:
+            raw.close()
+        # It restores as a catalog the application opens, read-only included.
+        from src.sqlite_db import SqliteDatabaseManager
+        restored = SqliteDatabaseManager(moved, read_only=True)
+        try:
+            self.assertFalse(restored.sqlite_schema_status()["drift"])
+        finally:
+            restored.close()
+
+    def test_a_failed_backup_leaves_no_working_files(self):
+        from src import db_backup
+        failed = mock.Mock(ok=False)
+        failed.summary.return_value = "FAILED"
+        with mock.patch.object(db_backup, "verify_sqlite_backup",
+                               return_value=failed):
+            with self.assertRaisesRegex(RuntimeError, "failed verification"):
+                db_backup.create_database_backup(
+                    self.cfg, output_dir=self.out)
+        self.assertEqual(os.listdir(self.out), [])
+
+    def test_a_backup_with_a_pending_wal_is_verified_through_it(self):
+        """A copy that arrives with its own write-ahead log is still read
+        through that log, never as the stale main file alone."""
+        from src import db_backup
+        self.db.close()
+        copied = os.path.join(self.out, "copied.sqlite3")
+        shutil.copy(self.tdb.path, copied)
+        writer = sqlite3.connect(copied)
+        other = sqlite3.connect(copied)       # keeps the WAL from closing out
+        try:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("DELETE FROM files_index")
+            writer.commit()
+            other.execute("SELECT count(*) FROM tapes").fetchone()
+            self.assertGreater(os.path.getsize(copied + "-wal"), 0)
+            result = db_backup.verify_backup(self.cfg, copied)
+        finally:
+            writer.close()
+            other.close()
+        self.assertTrue(result.ok, result.summary())
+        self.assertEqual(result.details["files_index_rows"], 0)
+
     def test_a_damaged_backup_fails_verification(self):
         from src import db_backup
         path = db_backup.create_database_backup(self.cfg, output_dir=self.out)

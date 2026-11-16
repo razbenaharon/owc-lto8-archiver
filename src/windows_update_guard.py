@@ -1346,8 +1346,11 @@ def pause_windows_updates(pause_days):
         print("[WU] Running without Administrator privileges — cannot pause "
               "Windows Update. A forced update restart during a tape write "
               "will corrupt the LTFS index and lose the chunks written so "
-              "far (this happened on 2026-07-15, ~126 GB). Re-run as "
-              "Administrator, or pause updates manually in Settings.")
+              "far (a forced restart during a tape write has caused data "
+              "loss on a real deployment; see "
+              "docs/history/incidents/005-20260715-sccm-forced-restart-data-loss.md). "
+              "Re-run as Administrator, or pause updates manually in "
+              "Settings.")
         return False
 
     days = max(1, min(int(pause_days), _MAX_PAUSE_DAYS))
