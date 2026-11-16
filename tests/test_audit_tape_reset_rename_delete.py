@@ -482,9 +482,10 @@ class PrepareImpactReportTests(_ResetFixture, unittest.TestCase):
         self._exec(
             """INSERT INTO remote_chunks (session_id,chunk_index,status,
                    updated_at,membership_state,expected_file_count,
-                   expected_bytes,packaging_format,packaging_assigned_at)
+                   expected_bytes,packaging_format,packaging_assigned_at,
+                   plan_source)
                VALUES (%s,3,'done',now(),'sealed',1,100,'stored_tar',
-                       now())""", (self.session_id,))
+                       now(),'legacy_db')""", (self.session_id,))
         if self.BACKEND != "sqlite":
             self._exec("ALTER TABLE remote_chunks ENABLE TRIGGER USER")
         self.latest[(self.session_id, 3)] = {
