@@ -594,7 +594,7 @@ class TapeManager:
                       "generation-aware `run.py tape-reset` command.")
                 return
 
-        label = input("New Volume Label (e.g. Scalpelab_Tape_X): ").strip()
+        label = input("New Volume Label (e.g. Archive_Tape_01): ").strip()
         if not label:
             print("[ABORTED] No label provided.")
             return

@@ -65,6 +65,8 @@ PRIVATE_IDENTITY_PATTERNS = [
     (re.compile(r"10970" + r"08774"), "drive serial"),
     (re.compile(r"Tech" + r"nion", re.I), "organization name"),
     (re.compile(r"/st" + r"rg/"), "real remote data path"),
+    (re.compile(r"Scalpe" + r"l[ _-]?lab|Scalpe" + r"lab", re.I),
+     "lab name"),
 ]
 
 TEXT_EXTENSIONS = {".py", ".md", ".txt", ".ini", ".sql", ".yml", ".yaml",

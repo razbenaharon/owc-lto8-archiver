@@ -33,7 +33,7 @@ POSTGRESQL_ONLY_FEATURES = {
         "--create-migrated-db, --apply-directory-catalog-schema)"),
     "legacy_backfills": (
         "legacy data backfill / transition / rehearsal commands "
-        "(directory-catalog backfill, session-37 transition, frontier "
+        "(directory-catalog backfill, legacy-session transition, frontier "
         "bootstrap, membership backfill, plan-1 rehearsal)"),
     "database_compare": (
         "another database on the same PostgreSQL server "
