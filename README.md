@@ -257,7 +257,9 @@ Full instructions: [docs/user-guide.md](docs/user-guide.md).
 - **One drive.** There is no drive pool.
 - **No content hashes for fetched files.** A source file replaced by another
   of the same size between scan and fetch is not detected.
-- **The CI workflows have not yet been run on GitHub.**
+- **The release workflow has not yet been run on GitHub.** The check workflow
+  (privacy gate, tests on Python 3.11 / 3.13 / 3.14, PostgreSQL suites, GUI,
+  clean installs) has passed there.
 
 ## Documentation
 
