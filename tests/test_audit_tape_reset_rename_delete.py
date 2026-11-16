@@ -508,6 +508,30 @@ class PrepareImpactReportTests(_ResetFixture, unittest.TestCase):
         self.assertFalse(os.path.exists(
             os.path.splitext(self.tdb.path)[0] + ".restore_list.txt"))
 
+    @sqlite_only("a write-ahead log is a SQLite file")
+    def test_a_backup_that_depends_on_a_write_ahead_log_is_refused(self):
+        """The reset pins the backup by the hash of ONE file. A copy whose
+        latest data sits in a ``-wal`` beside it is not covered by that."""
+        import shutil
+        import sqlite3
+        copied = str(self.tmp / "copied.sqlite3")
+        shutil.copy(self.backup, copied)
+        writer = sqlite3.connect(copied)
+        reader = sqlite3.connect(copied)     # keeps the log from closing out
+        try:
+            writer.execute("PRAGMA wal_autocheckpoint=0")
+            writer.execute("UPDATE tapes SET status='full'")
+            writer.commit()
+            reader.execute("SELECT count(*) FROM tapes").fetchone()
+            self.assertGreater(os.path.getsize(copied + "-wal"), 0)
+            with self.assertRaisesRegex(RuntimeError, "write-ahead log"):
+                self._prepare(backup_path=copied)
+        finally:
+            writer.close()
+            reader.close()
+        self.assertFalse(self.out.exists())
+        self.assertEqual(self.identity_reads, 0)
+
     @postgresql_only("a SQLite backup is itself the restorable database")
     def test_postgresql_needs_a_named_scratch_server(self):
         with self.assertRaisesRegex(RuntimeError, "--scratch-host"):

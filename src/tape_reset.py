@@ -534,6 +534,14 @@ def prepare_impact_report(cfg, *, tape_label, output_path, backup_path,
                 "[TAPE RESET] --backup-file is the live catalog itself, "
                 "which the reset changes. Create a backup first "
                 "(python run.py --backup-db).")
+        from .db_backup import _has_pending_wal
+        if _has_pending_wal(backup_path):
+            # The reset pins the backup by the hash of this one file; data
+            # that lives only in a log beside it would not be covered.
+            raise RuntimeError(
+                "[TAPE RESET] --backup-file has a write-ahead log beside "
+                "it, so it is not one self-contained file. Use a backup "
+                "made by `python run.py --backup-db`.")
         verification = verify_backup(cfg, backup_path)
         required_level = BACKUP_LEVEL_READ_THROUGH
     else:
