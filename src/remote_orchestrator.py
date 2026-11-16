@@ -1171,8 +1171,8 @@ class RemoteOrchestrator:
         #
         # This exists because writing an already-planned chunk needs no
         # discovery whatsoever, while the resumed scanner currently cannot run
-        # on a pre-frontier session at all (see the ordinal-collision blocker
-        # in docs/SESSION_37_CONTINUATION_RUNBOOK.md). Making the two
+        # on a pre-frontier session at all (its ordinals would collide with
+        # the ones the older planner already used). Making the two
         # independent means a bounded write group no longer depends on
         # traversal being healthy.
         write_only = bool(getattr(self.cfg, 'write_only_resume', False))
@@ -1942,8 +1942,8 @@ class RemoteOrchestrator:
                    "start a tape write: an unreadable drive log is how a "
                    "failing drive went unnoticed for four days before it "
                    "made a cartridge permanently read-only on a real "
-                   "deployment (docs/history/incidents/"
-                   "010-20260724-ltfs-write-perm-readonly.md).")
+                   "deployment (see "
+                   "docs/history/incidents/010-20260724-ltfs-write-perm-readonly.md).")
             print(f"\n[TAPE] {msg}")
             get_logger().error("ltfs_media_health_unverifiable: %s", err)
             send_best_effort(self.notifier, f"[PIPELINE] {msg}")

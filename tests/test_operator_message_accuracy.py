@@ -58,6 +58,36 @@ class DbBackendCitesRealSettings(unittest.TestCase):
                          CONFIG_SCHEMA["PERFORMANCE"])
 
 
+class DocumentsNamedInCodeExist(unittest.TestCase):
+    """A comment or message that sends the reader to ``docs/x.md`` must point
+    at a file that is there. (``scripts/sql`` is left out: applied migrations
+    are never edited.)"""
+
+    def _sources(self):
+        import glob
+        files = [os.path.join(REPO_ROOT, "run.py"),
+                 os.path.join(REPO_ROOT, "inspect_db.py")]
+        for pattern in (("src", "*.py"), ("scripts", "*.py"),
+                        ("scripts", "*.ps1")):
+            files += glob.glob(os.path.join(REPO_ROOT, *pattern))
+        return sorted(files)
+
+    def test_every_docs_path_in_code_resolves(self):
+        missing = set()
+        seen = 0
+        for path in self._sources():
+            with open(path, encoding="utf-8", errors="replace") as handle:
+                text = handle.read()
+            for cited in re.findall(r"docs/[A-Za-z0-9_./-]+\.md", text):
+                seen += 1
+                if not os.path.isfile(
+                        os.path.join(REPO_ROOT, *cited.split("/"))):
+                    missing.add(
+                        f"{os.path.basename(path)} -> {cited}")
+        self.assertGreater(seen, 3)
+        self.assertEqual(sorted(missing), [])
+
+
 class MissingPsycopgMessage(unittest.TestCase):
     def _message(self):
         with mock.patch.object(pg_bulk, "psycopg", None):

@@ -54,8 +54,7 @@ def _start_windows_update_guard(cfg: ConfigManager):
               "A restart during a tape write corrupts the LTFS index and "
               "loses every chunk written so far — a forced restart during "
               "a tape write has caused data loss on a real deployment; see "
-              "docs/history/incidents/"
-              "005-20260715-sccm-forced-restart-data-loss.md.")
+              "docs/history/incidents/005-20260715-sccm-forced-restart-data-loss.md.")
         if cfg.windows_update_block_on_pending_reboot:
             print("[WU] Reboot this host first, then start the run. To "
                   "override, set [WINDOWS_UPDATE] block_on_pending_reboot "
