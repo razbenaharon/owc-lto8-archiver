@@ -25,6 +25,9 @@ directories only.
   `<database>.archiver.lock`, released by the system when the process ends.
 - SQLite catalog backup with integrity and foreign-key checks
   (`python run.py --backup-db`, menu option 9).
+- `python run.py tape-reset --tape <LABEL> --prepare-impact-report <FILE>
+  --backup-file <BACKUP>`: the read-only step that writes the impact report
+  a tape reset requires. Nothing produced that file before.
 - A new, empty PostgreSQL database gets the complete schema on first start.
 - `--version` for `run.py` and `inspect_db.py`; one version source
   (`src/__init__.py`).
