@@ -453,8 +453,13 @@ def _impact_core(report):
 
 
 def prepare_impact_file(db, cfg, *, operation_id, tape_label, backup,
-                        shadow_database, shadow_verification):
-    """Read-only preparation helper. Caller does not need a migrated schema."""
+                        shadow_database, shadow_verification,
+                        output_path=None):
+    """Read-only preparation helper. Caller does not need a migrated schema.
+
+    ``output_path`` chooses where the report is written (default: the
+    operation's audit directory). The file is created exactly once.
+    """
     _acquire_tape_io_lock("prepare destructive tape-reset impact")
     try:
         identity = mounted_identity(cfg.lto_drive)
@@ -469,9 +474,115 @@ def prepare_impact_file(db, cfg, *, operation_id, tape_label, backup,
     report = build_impact_report(
         db, operation_id=operation_id, tape_label=tape_label,
         identity=identity, backup=backup, shadow_database=shadow_database)
-    path = audit_dir(operation_id) / "impact.json"
+    path = (Path(output_path) if output_path
+            else audit_dir(operation_id) / "impact.json")
     written, digest = write_immutable_json(path, report)
     return written, digest, report
+
+
+def open_read_only_catalog(cfg):
+    """Open the catalog so that the database engine refuses every write.
+
+    Used by the report preparation: it never runs start-up schema changes
+    and cannot alter a row.
+    """
+    if db_backend.is_sqlite(cfg):
+        from .sqlite_db import SqliteDatabaseManager
+        return SqliteDatabaseManager(cfg.db_dsn, read_only=True)
+    from psycopg.conninfo import make_conninfo
+    from .pg_db import PgDatabaseManager
+    return PgDatabaseManager(
+        make_conninfo(cfg.db_dsn,
+                      options="-c default_transaction_read_only=on"),
+        init_schema=False)
+
+
+def prepare_impact_report(cfg, *, tape_label, output_path, backup_path,
+                          scratch_server=None):
+    """Write the impact report ``execute_reset`` requires. Changes nothing.
+
+    This is the command-line entry to :func:`prepare_impact_file`
+    (``run.py tape-reset --prepare-impact-report``). It reads the catalog
+    through a read-only connection, reads the IBM LTFS log and the label of
+    the mounted cartridge (the identity the destructive step later insists
+    on; no file on the cartridge is opened), and writes one new file. It
+    never formats, ejects, loads or writes to a cartridge and never writes to
+    the catalog.
+
+    The report may only say the backup was proven restorable when that was
+    proven here:
+
+    * SQLite - the backup is itself a database file; it is opened and read
+      through completely (``integrity_check``, ``foreign_key_check``).
+    * PostgreSQL - the dump is restored into a new scratch database on the
+      server the operator names (``scratch_server``), inspected, and the
+      scratch database is dropped again.
+    """
+    from .db_backup import verify_backup
+    from .pg_backup import (BACKUP_LEVEL_READ_THROUGH, BACKUP_LEVEL_RESTORED,
+                            validate_backup_local_path)
+
+    output = validate_backup_local_path(
+        cfg, output_path, expected_kind="file", allow_missing=True)
+    if output.exists():
+        raise RuntimeError(
+            f"[TAPE RESET] Refusing to overwrite an existing file: {output}")
+    if db_backend.is_sqlite(cfg):
+        verification = verify_backup(cfg, backup_path)
+        required_level = BACKUP_LEVEL_READ_THROUGH
+    else:
+        if scratch_server is None:
+            raise RuntimeError(
+                "[TAPE RESET] On PostgreSQL the backup must be proven "
+                "restorable first: name a scratch server with "
+                "--scratch-host, --scratch-port and --scratch-user. The "
+                "dump is restored there into a new scratch database, "
+                "checked, and that database is dropped again.")
+        verification = verify_backup(
+            cfg, backup_path, deep_target=scratch_server)
+        required_level = BACKUP_LEVEL_RESTORED
+    if not verification.ok or verification.level != required_level:
+        raise RuntimeError(
+            "[TAPE RESET] The catalog backup was not proven restorable; no "
+            "impact report was written.\n" + verification.summary())
+    restore_list = verification.artifacts.get("restore_list_path")
+    if not restore_list:
+        raise RuntimeError(
+            "[TAPE RESET] Backup verification produced no restore list")
+    backup = verify_backup_inputs(verification.backup_path, restore_list)
+    if db_backend.is_sqlite(cfg):
+        shadow_database = backup["backup_path"]
+    else:
+        shadow_database = str((verification.details.get("scratch_restore")
+                               or {}).get("scratch_database") or "")
+        if not shadow_database:
+            raise RuntimeError(
+                "[TAPE RESET] Scratch restore left no database name")
+
+    db = open_read_only_catalog(cfg)
+    try:
+        written, digest, report = prepare_impact_file(
+            db, cfg, operation_id=new_operation_id(), tape_label=tape_label,
+            backup=backup, shadow_database=shadow_database,
+            shadow_verification=verification.as_dict(), output_path=output)
+    finally:
+        db.close()
+    return {
+        "impact_report": written,
+        "impact_report_sha256": digest,
+        "operation_id": report["operation_id"],
+        "target_label": report["target_label"],
+        "backup_path": backup["backup_path"],
+        "backup_verification_level": verification.level,
+        "sessions": len(report["sessions"]),
+        "chunks_returning_to_pending": len(
+            report["planned_chunk_transitions"]),
+        "catalog_rows_to_delete": report["tape03_counts"],
+        "changed": "nothing: the catalog and the cartridge were only read",
+        "next_command": (
+            f"python run.py tape-reset --tape {tape_label} "
+            f"--impact-report {written} --delete-catalog --yes"),
+    }
 
 
 def execute_reset(db, cfg, *, tape_label, impact_path, delete_catalog,

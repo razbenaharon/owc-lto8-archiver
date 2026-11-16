@@ -14,7 +14,7 @@ import os
 import runpy
 import sys
 import unittest
-from contextlib import ExitStack, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 from unittest import mock
 
@@ -70,6 +70,8 @@ class RunPyExitCodes(unittest.TestCase):
                 side_effect=AssertionError("unexpected headless run")),
             "src.tape_reset.execute_reset": mock.Mock(
                 side_effect=AssertionError("unexpected tape reset")),
+            "src.tape_reset.prepare_impact_report": mock.Mock(
+                side_effect=AssertionError("unexpected impact report")),
         }
         defaults.update(replacements)
         cwd = os.getcwd()
@@ -83,6 +85,7 @@ class RunPyExitCodes(unittest.TestCase):
             stack.enter_context(mock.patch.dict(os.environ))
             os.environ.pop("LTO_DEBUG", None)
             stack.enter_context(redirect_stdout(io.StringIO()))
+            stack.enter_context(redirect_stderr(io.StringIO()))
             try:
                 runpy.run_path(RUN_PY, run_name="__main__")
             except SystemExit as exc:
@@ -146,6 +149,133 @@ class RunPyExitCodes(unittest.TestCase):
             **{"src.tape_reset.execute_reset": mock.Mock(
                 side_effect=RuntimeError("reset refused"))})
         self.assertEqual(code, int(ExitCode.FATAL_CONFIG))
+
+
+class TapeResetCommandLine(unittest.TestCase):
+    """``run.py tape-reset`` has a read-only mode and a destructive mode, and
+    the command line never lets one be mistaken for the other."""
+
+    _run = RunPyExitCodes._run
+
+    def _mocks(self):
+        prepare = mock.Mock(return_value={"impact_report": "out.json"})
+        execute = mock.Mock(return_value={"state": "verified"})
+        opened = mock.Mock(return_value=_FakeDB())
+        return prepare, execute, opened, {
+            "src.tape_reset.prepare_impact_report": prepare,
+            "src.tape_reset.execute_reset": execute,
+            "src.db.create_database_manager": opened}
+
+    def test_prepare_only_prepares(self):
+        prepare, execute, opened, patches = self._mocks()
+        code = self._run(
+            ["tape-reset", "--tape", "T", "--prepare-impact-report",
+             "out.json", "--backup-file", "b.sqlite3"], **patches)
+        self.assertEqual(code, 0)
+        execute.assert_not_called()
+        opened.assert_not_called()          # no read-write catalog manager
+        prepare.assert_called_once()
+        self.assertEqual(prepare.call_args.kwargs, {
+            "tape_label": "T", "output_path": "out.json",
+            "backup_path": "b.sqlite3", "scratch_server": None})
+
+    def test_prepare_passes_the_named_scratch_server(self):
+        prepare, execute, _opened, patches = self._mocks()
+        code = self._run(
+            ["tape-reset", "--tape", "T", "--prepare-impact-report",
+             "out.json", "--backup-file", "b.dump", "--scratch-host",
+             "127.0.0.1", "--scratch-port", "15432", "--scratch-user", "u"],
+            **patches)
+        self.assertEqual(code, 0)
+        execute.assert_not_called()
+        scratch = prepare.call_args.kwargs["scratch_server"]
+        self.assertEqual(
+            (scratch.pg_host, scratch.pg_port, scratch.pg_user,
+             scratch.pg_password),
+            ("127.0.0.1", "15432", "u", None))
+
+    def test_a_half_named_scratch_server_is_refused(self):
+        prepare, execute, _opened, patches = self._mocks()
+        code = self._run(
+            ["tape-reset", "--tape", "T", "--prepare-impact-report",
+             "out.json", "--backup-file", "b.dump", "--scratch-host", "h"],
+            **patches)
+        self.assertEqual(code, int(ExitCode.FATAL_CONFIG))
+        prepare.assert_not_called()
+        execute.assert_not_called()
+
+    def test_prepare_cannot_be_combined_with_the_destructive_flags(self):
+        for extra in (["--yes"], ["--delete-catalog"],
+                      ["--impact-report", "r.json"],
+                      ["--resume-operation", "op"],
+                      ["--delete-catalog", "--yes"]):
+            with self.subTest(extra=extra):
+                prepare, execute, opened, patches = self._mocks()
+                code = self._run(
+                    ["tape-reset", "--tape", "T", "--prepare-impact-report",
+                     "out.json", "--backup-file", "b"] + extra, **patches)
+                self.assertEqual(code, 2)
+                prepare.assert_not_called()
+                execute.assert_not_called()
+                opened.assert_not_called()
+
+    def test_prepare_requires_a_backup_file(self):
+        prepare, execute, _opened, patches = self._mocks()
+        code = self._run(
+            ["tape-reset", "--tape", "T", "--prepare-impact-report",
+             "out.json"], **patches)
+        self.assertEqual(code, 2)
+        prepare.assert_not_called()
+        execute.assert_not_called()
+
+    def test_one_of_the_two_modes_is_required(self):
+        prepare, execute, _opened, patches = self._mocks()
+        code = self._run(["tape-reset", "--tape", "T", "--delete-catalog",
+                          "--yes"], **patches)
+        self.assertEqual(code, 2)
+        prepare.assert_not_called()
+        execute.assert_not_called()
+
+    def test_preparation_flags_are_refused_on_the_destructive_mode(self):
+        prepare, execute, _opened, patches = self._mocks()
+        code = self._run(
+            ["tape-reset", "--tape", "T", "--impact-report", "r.json",
+             "--delete-catalog", "--yes", "--backup-file", "b"], **patches)
+        self.assertEqual(code, 2)
+        prepare.assert_not_called()
+        execute.assert_not_called()
+
+    def test_the_destructive_mode_is_called_exactly_as_before(self):
+        prepare, execute, opened, patches = self._mocks()
+        code = self._run(
+            ["tape-reset", "--tape", "T", "--impact-report", "r.json",
+             "--delete-catalog", "--yes"], **patches)
+        self.assertEqual(code, 0)
+        prepare.assert_not_called()
+        opened.assert_called_once()
+        self.assertEqual(execute.call_args.kwargs, {
+            "tape_label": "T", "impact_path": "r.json",
+            "delete_catalog": True, "confirmed": True,
+            "resume_operation": None})
+
+    def test_the_confirmations_still_reach_the_reset_unaltered(self):
+        """Without --delete-catalog / --yes the reset itself refuses, as it
+        always did: the command line adds no confirmation of its own."""
+        _prepare, execute, _opened, patches = self._mocks()
+        self._run(["tape-reset", "--tape", "T", "--impact-report", "r.json"],
+                  **patches)
+        self.assertEqual(execute.call_args.kwargs["delete_catalog"], False)
+        self.assertEqual(execute.call_args.kwargs["confirmed"], False)
+
+    def test_a_refused_preparation_exits_nonzero(self):
+        _prepare, execute, _opened, patches = self._mocks()
+        patches["src.tape_reset.prepare_impact_report"] = mock.Mock(
+            side_effect=RuntimeError("[TAPE RESET] Mounted label mismatch"))
+        code = self._run(
+            ["tape-reset", "--tape", "T", "--prepare-impact-report",
+             "out.json", "--backup-file", "b"], **patches)
+        self.assertEqual(code, int(ExitCode.FATAL_CONFIG))
+        execute.assert_not_called()
 
 
 class MenuExitCodes(unittest.TestCase):

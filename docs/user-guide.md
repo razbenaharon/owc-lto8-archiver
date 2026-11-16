@@ -238,17 +238,42 @@ console. Anything else, including Enter, a piped answer or a closed standard
 input, cancels and does nothing.
 
 **Re-formatting a cartridge that already has a label** is refused from this
-menu and directed to the destructive reset command:
+menu and directed to the destructive reset command, which takes two steps.
+
+Step 1 writes the impact report. It changes nothing:
+
+```powershell
+python run.py --backup-db
+python run.py tape-reset --tape <LABEL> --prepare-impact-report <FILE> --backup-file <BACKUP>
+```
+
+It reads the catalog through a read-only connection, the IBM LTFS log and
+the label of the mounted cartridge (the reset later insists on that same
+cartridge; no file on it is opened), verifies the backup, and writes
+`<FILE>`, which must not exist yet. It never formats, ejects or writes to a
+cartridge and never writes to the catalog. The printed summary lists what a
+reset would delete and how many chunks would return to `pending`. On
+PostgreSQL the backup is a dump (`python inspect_db.py --backup-postgres`)
+and must be proven restorable: name a scratch server and the dump is
+restored there into a new database, checked, and that database is dropped:
+
+```powershell
+python run.py tape-reset --tape <LABEL> --prepare-impact-report <FILE> --backup-file <DUMP> --scratch-host <HOST> --scratch-port <PORT> --scratch-user <USER>
+```
+
+The password comes from `PGPASSWORD` or the PostgreSQL password file;
+`--scratch-docker-container <NAME>` uses the `pg_restore` of a container.
+
+Step 2 is the reset itself:
 
 ```powershell
 python run.py tape-reset --tape <LABEL> --impact-report <FILE> --delete-catalog --yes
 ```
 
 All four are mandatory. It formats the mounted cartridge, removes its
-catalog records and returns its chunks to `pending`; it never ejects. The
-impact report is a file written by `src.tape_reset.prepare_impact_file`,
-which needs a verified catalog backup. **No menu option or command calls that
-function in this version**, so a reset currently needs a few lines of Python.
+catalog records and returns its chunks to `pending`; it never ejects. It
+refuses if the catalog, the backup or the mounted cartridge differ from what
+the report recorded; prepare a new report then.
 Treat it as an expert operation that has not been run on hardware. If a
 reset fails, the error file in `tape_reset_audits\` holds the command that
 resumes it (`--resume-operation`). A reset interrupted during the format
