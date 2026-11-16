@@ -719,10 +719,12 @@ def execute_reset(db, cfg, *, tape_label, impact_path, delete_catalog,
                     "[TAPE RESET] Observed deletion scope differs from impact "
                     "report")
 
-        if op is None:
-            # A new operation only: one already under way is finished as
+        if not post_format:
+            # Nothing has been erased yet, so refusing still loses nothing.
+            # Once the cartridge is formatted the operation is finished as
             # approved rather than stopped half-way.
             refuse_unrewritable_chunks(db, impact["planned_chunk_transitions"])
+        if op is None:
             op = db.create_tape_reset_intent(
                 operation_id=operation_id, tape_label=tape_label,
                 expected_drive=identity["drive"],

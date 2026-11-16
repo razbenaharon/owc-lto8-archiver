@@ -318,7 +318,18 @@ def _db_management_menu(db):
             if db.tape_exists(new_label):
                 print(f"[ERROR] Label '{new_label}' already exists.")
                 continue
-            db.rename_tape(old_label, new_label)
+            try:
+                db.rename_tape(old_label, new_label)
+            except Exception as exc:
+                # The rename is one transaction; a refusal (for example the
+                # database's loose-file restore routes) leaves nothing half
+                # renamed. Report it instead of ending the menu.
+                print(f"[ERROR] Rename refused; nothing was changed. {exc}")
+                get_logger().warning("tape rename %s -> %s refused: %s",
+                                     old_label, new_label, exc)
+                continue
+            print(f"[OK] '{old_label}' renamed to '{new_label}' in the "
+                  "catalog.")
 
         elif sub == '4':
             tapes = _print_tapes_table(db)

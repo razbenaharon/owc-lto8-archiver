@@ -527,6 +527,31 @@ class PrepareImpactReportTests(_ResetFixture, unittest.TestCase):
         self.assertEqual(self.formats, 0)
         self.assertEqual(self._catalog_state(), before)
 
+    def test_a_resumed_reset_that_never_formatted_is_refused_too(self):
+        # An operation recorded before this check, stopped before the
+        # format, must not reach the formatter when it is resumed.
+        self._make_container_stored_tar()
+
+        def failed_format(drive, label, operation_id):
+            raise RuntimeError("format interrupted")
+
+        with mock.patch.object(tape_reset, "refuse_unrewritable_chunks",
+                               lambda *a, **k: None):
+            result = self._prepare()
+            with mock.patch.object(tape_reset,
+                                   "_format_and_positive_evidence",
+                                   failed_format):
+                with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                    self._reset(result["impact_report"])
+        self.assertEqual(self._count("tape_reset_operations", "1=1"), 1)
+        with self.assertRaisesRegex(RuntimeError, "Stored-TAR"):
+            tape_reset.execute_reset(
+                self.db, SimpleNamespace(lto_drive="X:\\"),
+                tape_label="T_A", impact_path=result["impact_report"],
+                delete_catalog=True, confirmed=True,
+                resume_operation=result["operation_id"])
+        self.assertEqual(self.formats, 0)
+
     def test_an_existing_file_is_never_overwritten(self):
         self.out.write_text("mine", encoding="utf-8")
         with self.assertRaisesRegex(RuntimeError, "Refusing to overwrite"):
