@@ -72,6 +72,10 @@ storage_map/coverage_baseline.json
 storage_map/scratch_coverage.json
 storage_map/scratchpad_serve.log
 
+# Release packages built by scripts/build_release.py — attached to a GitHub
+# release, never committed
+dist/
+
 # Generated snapshots — regenerable, and they embed real inventory
 docs/storage_map_*.html
 deliverables/

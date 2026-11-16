@@ -33,14 +33,14 @@ try:
 except ImportError:  # pragma: no cover
     zstd = None
 
+from .archive_artifacts import ArtifactConflict, publish_no_clobber
+from . import db_backend
 from .cli_errors import OperationalError
 from .pg_bulk import copy_rows, require_psycopg
 from .pg_core import PgConnectionCore
 
 
 SMALL_FILE_THRESHOLD_BYTES = 10 * 1024 * 1024
-TERMINAL_REMOTE_CHUNK = "done"
-TERMINAL_LOCAL_CHUNK = "backed_up"
 DEFAULT_PRUNE_BATCH_SIZE = 100_000
 
 
@@ -113,6 +113,10 @@ def active_archive_processes():
 
 
 def _connect(conninfo, *, autocommit=False):
+    # Export / validate / prune maintenance is PostgreSQL-only in v1.0. The
+    # file-based search used by restore (search_manifests,
+    # find_manifest_record) needs no database and works on every backend.
+    db_backend.require_postgresql(conninfo, "small_file_manifest_maintenance")
     require_psycopg()
     return cast(Any, psycopg.connect(
         conninfo, autocommit=autocommit,
@@ -426,20 +430,42 @@ def _session_directory(row):
     return f"session_legacy_run_{row['archive_run_id']}"
 
 
-def _segment_relpath(row):
+def _segment_relpath(row, export_id=None):
+    """Root-relative segment path for one (tape, session, bundle) group.
+
+    ``export_id`` makes the name unique per export. Without it two exports
+    that both hold rows of the same bundle (the second picking up rows the
+    first had to skip) mapped to ONE file name, and the later export replaced
+    the earlier export's segment - whose rows were already pruned from the
+    catalog, so the only copy of that inventory was gone. Segments written
+    before this change keep their un-suffixed names; readers locate segments
+    by the ledger's recorded path or by ``*.jsonl.zst``, never by this shape.
+    """
     tape = _safe_component(row["tape_label"])
     session = _safe_component(_session_directory(row))
-    name = (f"bundle_{row['bundle_id']}.jsonl.zst"
-            if row["bundle_id"] is not None else "unbundled.jsonl.zst")
-    return os.path.join(tape, session, name)
+    stem = (f"bundle_{row['bundle_id']}"
+            if row["bundle_id"] is not None else "unbundled")
+    if export_id is not None:
+        stem += f".export_{int(export_id)}"
+    return os.path.join(tape, session, stem + ".jsonl.zst")
+
+
+def _refuse_existing_segment(final_path):
+    raise OperationalError(
+        "[MANIFEST] Refusing to overwrite an existing manifest segment: "
+        f"{final_path}. Segments are immutable - an earlier export's rows may "
+        "exist nowhere else. Nothing was replaced.")
 
 
 def _write_segment(root, relpath, rows):
+    """Write one immutable segment: temp file, fsync, exclusive publish."""
     if zstd is None:
         raise OperationalError("[MANIFEST] zstandard is required.")
     final_path = os.path.abspath(os.path.join(root, relpath))
     if os.path.commonpath([root, final_path]) != root:
         raise OperationalError("[MANIFEST] Refusing path outside archive root.")
+    if os.path.lexists(final_path):
+        _refuse_existing_segment(final_path)
     os.makedirs(os.path.dirname(final_path), exist_ok=True)
     fd, temp_path = tempfile.mkstemp(
         prefix=".manifest_", suffix=".tmp", dir=os.path.dirname(final_path))
@@ -447,7 +473,8 @@ def _write_segment(root, relpath, rows):
     count = total_bytes = covered_rows = covered_bytes = 0
     try:
         with open(temp_path, "wb") as raw:
-            with zstd.ZstdCompressor(level=6).stream_writer(raw) as writer:
+            with zstd.ZstdCompressor(level=6).stream_writer(
+                    raw, closefd=False) as writer:
                 for row in rows:
                     payload = dict(row)
                     writer.write((json.dumps(
@@ -459,7 +486,16 @@ def _write_segment(root, relpath, rows):
                     if row.get("covered_by_directory_catalog", False):
                         covered_rows += 1
                         covered_bytes += size
-        os.replace(temp_path, final_path)
+            # The contents must be on disk before the name exists. (Windows
+            # cannot fsync the directory entry; see archive_artifacts.)
+            raw.flush()
+            os.fsync(raw.fileno())
+        try:
+            # Exclusive create: atomically fails if the name was taken since
+            # the check above. Never os.replace - that is how a manifest dies.
+            publish_no_clobber(temp_path, final_path)
+        except ArtifactConflict:
+            _refuse_existing_segment(final_path)
     except Exception:
         try:
             os.remove(temp_path)
@@ -599,6 +635,8 @@ def _build_catalog_aggregates(conn, export_id):
 def execute_export(conninfo, archive_root, hot_backup_path, *,
                    threshold_bytes=SMALL_FILE_THRESHOLD_BYTES):
     """Snapshot eligible rows and write immutable local manifest segments."""
+    # Refuse a SQLite catalog before validating (or creating) anything.
+    db_backend.require_postgresql(conninfo, "small_file_manifest_maintenance")
     if not hot_backup_path or not os.path.isfile(hot_backup_path):
         raise OperationalError("[MANIFEST] A verified hot backup path is required.")
     root = os.path.abspath(archive_root)
@@ -682,7 +720,8 @@ def execute_export(conninfo, archive_root, hot_backup_path, *,
                                 COALESCE(er.remote_session_id,-1),
                                 f.archive_run_id, COALESCE(f.bundle_id,-1),
                                 f.file_id""", (export_id,))
-                for rel, group in itertools.groupby(cur, key=_segment_relpath):
+                for rel, group in itertools.groupby(
+                        cur, key=lambda row: _segment_relpath(row, export_id)):
                     segments.append(_write_segment(
                         root, rel, (dict(row) for row in group)))
             with conn.transaction():
@@ -1180,9 +1219,14 @@ def export_status(conninfo):
 
 
 def pruned_manifest_paths(conninfo):
-    """Absolute segment paths whose PostgreSQL export reached pruned."""
-    with _connect(conninfo, autocommit=True) as conn:
-        if not _table_exists(conn, "local_manifest_exports"):
+    """Absolute segment paths whose export reached pruned.
+
+    Read-only and backend-neutral: a SQLite catalog has the tables but never
+    an export, so this is simply empty there.
+    """
+    with db_backend.connect(conninfo, autocommit=True,
+                            read_only=True) as conn:
+        if not db_backend.table_exists(conn, "local_manifest_exports"):
             return []
         rows = conn.execute(
             """SELECT e.archive_root, s.manifest_relpath

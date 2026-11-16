@@ -1,154 +1,192 @@
-# Current system
+# Architecture
 
-Consolidated architecture reference for the OWC LTO-8 archiver. It describes
-what the code does today; for live production state see
-[tape-and-archive-state.md](tape-and-archive-state.md), and for how to operate
-a run see [operations.md](operations.md).
+An overview of how the program is put together. For operation see
+[user-guide.md](user-guide.md); for the rules the design serves see
+[safety.md](safety.md).
 
-## What the system is
-
-A Windows-focused Python utility that archives lab-server data to LTO-8/LTFS
-tape. It fetches data from remote hosts over SSH, packs many small files into
-containers (ZIP bundles or stored-TAR), writes them to an LTFS-mounted tape via
-`robocopy`, and indexes the result in a PostgreSQL catalog.
-
-## The canonical archive flow — LOCAL-FIRST
+## The flow: local first
 
 ```text
-remote source (SSH/tar fetch)
-  -> local staging on the internal NVMe
-  -> validation (stored-TAR parse to trailer + sidecar, or ZIP pack)
+source (local folder, or remote host over SSH/tar)
+  -> local staging
+  -> pack + validate (ZIP bundles, or Stored TAR parsed to its trailer)
   -> finite write group: robocopy to the LTFS tape
-  -> verify via copy-tool classification (never read-back from tape)
-  -> commit to catalog
+  -> classify the copy result (the tape is never read back)
+  -> commit to the catalog
 ```
 
-There is **no code path that streams source data directly to tape**. The tape
-writer's only input is validated local staging (`src/remote_writer.py`;
-`ReadyQueue`). This ordering is what makes every failure recoverable without a
-person at the drive: a fetch or validation failure costs local disk, never
-tape state.
+There is no code path that streams source data directly to tape. The tape
+writer's only input is validated local staging. That ordering is what makes a
+fetch or packing failure cost local disk and never tape state.
 
-## Project structure & module organization
+## Module map
 
-- `run.py` — root runner for the main CLI (chdir to the project root, then
-  `src.cli.main()`).
-- `inspect_db.py` — root runner for the GUI database inspector.
-- `src/` — internal package, split into modules with strictly downward
-  dependencies: `constants`/`pipeline_types` → `logsetup` → `runtime` →
-  `paths` → `reporting`/`config`/`db` → `robocopy`/`remote_transport` →
-  `ltfs` → `packer` → `scanning`/`planning` → `archive_artifacts` →
-  `backup`/`retriever` → `scan_frontier`/`remote_staging`/`remote_writer` →
-  `remote_pipeline` → `local_orchestrator`/`remote_orchestrator` →
-  `orchestrators` (re-export facade) → `cli`; `src/db_inspector_qt.py` holds
-  the GUI. The PostgreSQL layer is split the same way: `pg_bulk` → `pg_core` →
-  `pg_catalog`/`pg_scan`/`pg_sessions`/`pg_tapes` → `pg_db` (facade assembling
-  `PgDatabaseManager` from the mixins). Import the facades (`orchestrators`,
-  `pg_db`) from application code; in tests, `mock.patch` targets must name the
-  module a symbol is *used* in (e.g. `src.scanning._ssh_run`).
-- `config.ini` — local paths, tape drive settings, remote archive settings,
-  performance tuning. `.env` stores secrets; keep it untracked
-  (`.env.example` is the template). Data files (`config.ini`, `.env`,
-  `backup_logs/`) stay in the project root; `src/constants.py` anchors paths
-  to `PROJECT_ROOT`.
-- `backup_logs/` — the single `SUMMARY.csv` statistics file plus the rotating
-  diagnostic trace `archiver.log`. No per-run log files, no per-file
-  manifests; the CSV is file-name-free by construction.
-- `scripts/sql/` — PostgreSQL schema/index/constraint migrations applied on
-  startup by `PgDatabaseManager._init_schema`; `docker-compose.yml` runs the
-  local database. Catalog rows are runtime data, not source.
+`run.py` and `inspect_db.py` in the project root are thin runners: they change
+to the project folder and call into the `src` package. Data files
+(`config.ini`, `.env`, the SQLite catalog, `backup_logs/`, `db_backups/`) stay
+in the project root and are ignored by git.
 
-## The remote pipeline, after Plan 1
+Dependencies point downward in this list:
 
-`remote_orchestrator.py` used to be one 3,657-line class. It is now a
-**façade** over four modules, each owning one invariant:
-
-| module | owns | never does |
+| Layer | Modules | Role |
 | --- | --- | --- |
-| `scan_frontier.py` | the sole production scanner; discovery; sealing chunks | touch the tape |
-| `remote_staging.py` | SSH/tar fetch, retry classification, the staging watchdog, packing | touch the tape |
-| `remote_writer.py` | **the finite write group — the sole tape-writing entry path** | eject; retry into a failing drive; clear `backing` |
-| `remote_pipeline.py` | the single scheduling loop for BOTH session kinds | decide anything about the tape |
+| Entry | `cli`, `ui` | Main menu, sub-menus, the headless remote-archive entry |
+| Orchestration | `local_orchestrator`, `remote_orchestrator`, `orchestrators` (re-export facade) | One archive session: plan, resume, pre-write gates |
+| Remote pipeline | `scan_frontier`, `remote_staging`, `remote_writer`, `remote_pipeline`, `ready_queue`, `resource_governor` | Scan, fetch + pack, write, and the loop that schedules them |
+| Write and restore | `backup`, `retriever`, `packer`, `packer_parallel`, `tar_container`, `stored_tar_planning` | Copy to tape and record it; search and restore; containers |
+| Artifacts | `archive_artifacts`, `plan_manifest`, `terminal_manifest`, `scan_state_manifest`, `local_manifest_archive`, `manifest_first` | Versioned local files that hold per-file detail |
+| Tape | `ltfs`, `ltfs_ownership`, `robocopy`, `tape_write_log`, `tape_reset` | LTFS tools, the drive ownership mutex, the copy and its classifier |
+| Host | `windows_update_guard`, `runtime`, `status_file`, `exit_codes`, `telegram_notify` (retired) | Restart guard, cancel handling, status file, exit codes |
+| Catalog | `db` (factory), `db_backend`, `pg_db` / `sqlite_db` (managers), `pg_core` / `sqlite_core` (engine hooks), `pg_catalog`, `pg_sessions`, `pg_tapes`, `pg_scan`, `pg_containers`, `pg_directory_catalog`, `pg_tape_reset` (shared method groups), `sqlite_adapter`, `sqlite_dialect`, `sqlite_lock`, `pg_bulk` | Everything that talks to the database |
+| Catalog tools | `db_backup`, `pg_backup`, `session_reconcile`, `session_health`, `schema_audit`, `directory_catalog_validation`, `inspector_repository`, `db_inspector_qt` | Backups, reports, maintenance, the GUI |
+| Base | `config`, `constants`, `paths`, `pipeline_types`, `logsetup`, `reporting`, `cli_errors` | Configuration schema, shared types, logging |
 
-`remote_writer.py` is the only place a remote pipeline copy enters the tape.
-Cartridge selection, announcement, and pre-run checks also exist in
-`remote_orchestrator.py`, so a review of all cartridge access must include
-both modules.
+Application code imports the facades (`orchestrators`, and
+`db.create_database_manager`). In tests, a `mock.patch` target names the
+module a symbol is used in.
 
-Three rules the code enforces rather than documents:
+### The remote pipeline
 
-- **No LTFS access outside a finite write group.** Not at startup, not while
-  waiting, not between group members, not at completion. Both loops announce
-  the target cartridge up front (verified once per group, under ownership).
-- **The remote pipeline never ejects**, even with
-  `[HARDWARE] eject_after_session = true` (that setting applies only to the
-  attended local orchestrator).
-- **`backing` has no automatic retry.** `CHUNK_TRANSITIONS` allows only
-  `backing → done`; an unreadable chunk status *stops the run* instead of
-  being treated as clear.
+`remote_orchestrator.py` is a facade over four modules, each owning one
+invariant:
 
-## Source-of-truth boundaries
+| Module | Owns | Never does |
+| --- | --- | --- |
+| `scan_frontier.py` | The only scanner: discovery, sealing chunks | touch the tape |
+| `remote_staging.py` | SSH/tar fetch, retry classification, staging watchdog, packing, planned = fetched = packed reconciliation | touch the tape |
+| `remote_writer.py` | The finite write group: the only path by which a remote copy reaches the tape | eject; retry into a failing drive; clear `backing` |
+| `remote_pipeline.py` | The single scheduling loop | decide anything about the tape |
 
-Each store answers exactly one kind of question; none duplicates another:
+Cartridge selection and the pre-run checks live in `remote_orchestrator.py`,
+so a review of all cartridge access must include it and `remote_writer.py`.
 
-| store | is authoritative for |
+## The two-backend seam
+
+`[DATABASE] backend` selects SQLite or PostgreSQL.
+`db.create_database_manager(cfg)` returns `SqliteDatabaseManager` or
+`PgDatabaseManager`. Both are assembled from the **same** method-group
+classes; those classes never test which backend they run on.
+
+- Engine differences are hooks in `pg_core.PgConnectionCore`, overridden in
+  `sqlite_core.SqliteConnectionCore`.
+- SQL is written once in PostgreSQL syntax. `sqlite_dialect` applies a closed
+  list of lexical rewrites; anything left over raises.
+- Code that opens its own short-lived connection (inspector, reconcile, tape
+  reset, reports) goes through `db_backend.connect()`.
+- PostgreSQL-only features are one list, `db_backend.POSTGRESQL_ONLY_FEATURES`,
+  and one refusal, `PostgresOnlyFeature`.
+- Importing the package never imports psycopg, so a SQLite-only install works
+  without it.
+
+Details and the guard-by-guard mapping:
+[database-backends.md](database-backends.md).
+
+### Schema
+
+PostgreSQL: ordered files in `scripts/sql/`. Start-up applies the additive
+ones (001-006, 008-011, 013, 020). 007, 014-019 are installed automatically
+only on a database that was completely empty; on an existing catalog they are
+explicit commands. 012 (sealed batches) is always manual. See
+[installation.md](installation.md#schema-on-postgresql).
+
+SQLite: `scripts/sql/sqlite/001_schema.sql` is the fully migrated schema,
+applied in one transaction and recorded with its checksum. The catalog
+refuses to open if that file, or the definitions it created, changed.
+
+## Locks
+
+Three locks, each for a different thing:
+
+| Lock | Protects | Mechanism |
+| --- | --- | --- |
+| Archiver lock | One archive run at a time per catalog | PostgreSQL: session advisory lock. SQLite: operating-system lock on `<database>.archiver.lock` plus an owner row. Verified before every write group and by the move to `backing`; never re-acquired silently. Lost lock = stop (`archiver_lock_lost`) |
+| LTFS ownership | One process touching the tape drive | Named Windows mutex `Global\OWC_LTO8_LTFS_OWNERSHIP_<ltfs_ownership_id>`, keyed on the physical drive, not the drive letter. Unset or malformed identity = no tape access |
+| Tape I/O lock | Tape operations inside one process | In-process reentrant lock (`_acquire_tape_io_lock`) |
+
+Processes outside the program (Explorer, antivirus, another copy job) are not
+covered by any lock.
+
+## Chunk state machine
+
+A remote session is a list of chunks. Chunk status lives in the catalog.
+Allowed moves (`CHUNK_TRANSITIONS` in `src/pipeline_types.py`):
+
+```text
+pending       -> fetching | fetch_failed | backing | backup_failed | done
+fetching      -> packing | fetch_failed | pending | done
+packing       -> backing | backup_failed | fetch_failed | pending | fetching | done
+backing       -> done
+done          -> (final)
+fetch_failed  -> pending | fetching
+backup_failed -> pending | fetching | packing
+```
+
+- A chunk is set to `backing` **before the first touch of the tape**. From
+  there it can only become `done`. If a run dies in between, the chunk stays
+  `backing`: whether it is on tape cannot be known from the catalog, so the
+  next run stops (`ambiguous_backing_chunk`) instead of rewriting it.
+- The same rule is enforced twice: in the status setter, and in the database
+  by a row trigger (PostgreSQL migration 020; same-named trigger on SQLite).
+- Leaving `backing` or `done` needs a **named override**, recorded with who
+  authorised it and why in `remote_chunk_transition_overrides`:
+  `tape_reset` (the cartridge generation was destroyed by an authorised
+  reset) or `operator_reconciled` (a person compared the cartridge with the
+  catalog). There is no blanket bypass.
+
+## Safety gates before a tape write
+
+Evaluated before each write group; any gate that fails, or cannot be
+evaluated, blocks the write and stops the run with a named reason:
+
+| Gate | Stop reason |
 | --- | --- |
-| JSONL.zst manifests under the `[LOCAL_MANIFEST_ARCHIVE]` root | Per-file inventory of packed small files (after a validated + pruned export) |
-| PostgreSQL | Operational state + coarse aggregates: sessions, chunks, bundles, containers, folder aggregates, tape accounting |
-| Receipts + sidecars | Campaign container evidence (SHA-256s, member counts, logical bytes, plan-manifest locators) |
-| Tapes | Payload only — never metadata anyone must read back to interpret the archive |
+| Archiver lock still held | `archiver_lock_lost` |
+| LTFS ownership acquired | `ltfs_ownership_unavailable` |
+| Mount is real and its sync mode is `time@5` (LTFS event 61259) | `ltfs_mount_unverifiable`, `ltfs_sync_mode_not_time5` |
+| No fatal or degrading drive/medium event in the IBM LTFS log since the mount; re-checked from the log before each chunk of the group | `ltfs_media_degraded` |
+| No pending Windows or SCCM restart | `sccm_reboot_pending`, `windows_reboot_pending` |
+| Mounted cartridge and tape generation match the session; tape not marked full; chunk fits the budget | `unexpected_tape_or_db_state` |
+| No chunk of the session left in `backing` | `ambiguous_backing_chunk` |
+| Planned, fetched and packed file sets agree | chunk is not handed to the writer |
 
-## Artifact schemas and the publication protocol
+The local (menu 1) path runs the same sync-mode, health and restart gates.
+During the group, the first hard write error stops the run; there is no
+retry. The copy result is decided by a classifier over the raw `robocopy`
+log, never by the return code and never by reading the tape.
 
-Three versioned local artifact schemas carry the per-file detail that would
-otherwise cost one PostgreSQL row per file:
+Exit codes and stop reasons: `src/exit_codes.py`,
+[troubleshooting.md](troubleshooting.md#exit-codes).
 
-- **`plan-manifest-v1`** — the sealed plan of a chunk: canonical path,
-  expected size, stable plan ordinal, chunk/container identity, storage class
-  (`container` or `loose`), container format, routing precision.
-- **`tar-sidecar-v1`** — the validated parse of a stored-TAR container:
-  `record_type='member'` rows for actual TAR members and
-  `record_type='source_exception'` rows for absent planned ordinals; together
-  they account for every plan ordinal exactly once.
-- **`terminal-state-v1`** — the terminal manifest of a chunk: exactly one
-  disposition per plan ordinal, written when the chunk reaches its final
-  state.
+## Where each fact lives
 
-All three publish through the same protocol: write to a uniquely-named
-**`.part`** file → flush and **fsync** → **reparse** the completed file and
-validate it against the sealed plan → **atomic publish** (`os.replace`, never
-clobbering an existing final name). A crash leaves an orphan `.part`, never a
-truncated artifact a reader would parse as complete; a ready catalog locator
-is never allowed to name a `.part` (enforced in code, in `pg_scan`, and by a
-schema CHECK). No content hashes exist in these artifacts — hashing would mean
-reading every source byte over SSH, so the residual same-size-replacement risk
-is documented rather than papered over.
-
-## Database migrations (scripts/sql/, 001–019)
-
-| # | Adds |
+| Store | Authoritative for |
 | --- | --- |
-| 001 | Base PostgreSQL schema (files index, directories, tapes, bundles) |
-| 002 | Indexes for the base schema |
-| 003 | Constraints for the base schema |
-| 004 | `archive_runs` / session linkage |
-| 005 | Unique session labels |
-| 006 | Remote streaming sessions and chunks |
-| 007 | Directory catalog tables |
-| 008 | Remote provenance columns |
-| 009 | Remote session foreign keys |
-| 010 | `[LOCAL_MANIFEST_ARCHIVE]` small-file manifest export tracking |
-| 011 | Durable tape status (`tapes.status='full'` retirement) |
-| 012 | Sealed tape write batches (+ rollback script) |
-| 013 | Tape reset safety guards |
-| 014 | Incremental scan / persistent frontier (+ finalize and rollback scripts) |
-| 015 | Container formats (ZIP vs stored-TAR axis) |
-| 016 | Stored-TAR plans |
-| 017 | Stored-TAR publication state (sidecar/TAR locator readiness) |
-| 018 | Manifest-first directory catalog |
-| 019 | Container-format schema authority v2 |
+| Catalog database | Sessions, chunks, bundles and containers, large-file rows, folder totals, tape accounting |
+| `jsonl.zst` manifests under `[LOCAL_MANIFEST_ARCHIVE] root` | Per-file inventory of packed small files; scan segments |
+| Receipts and sidecars beside containers | Container evidence: sizes, SHA-256, member counts |
+| Tape | Payload only. Nothing needed to interpret the archive lives only on tape |
 
-Migrations are applied automatically on startup; migration 014 is applied and
-finalized on the authoritative catalog, and the persistent frontier scanner is
-the sole production scanner (no legacy scan mode, no fallback — an unusable
-migration-014 schema stops the run rather than downgrading).
+Formats of the public artifacts, with synthetic samples:
+[examples/](../examples/README.md).
+
+## Local artifacts and how they are published
+
+Three versioned schemas carry per-file detail without one catalog row per
+file: `plan-manifest-v1` (the sealed plan of a chunk), `tar-sidecar-v1` (the
+validated parse of a Stored TAR container) and `terminal-state-v1` (one
+final disposition per planned file).
+
+All three are published the same way: write to a uniquely named `.part` file,
+flush and fsync, re-read and validate the finished file against the sealed
+plan, then publish atomically without ever overwriting an existing final
+name. A crash leaves an orphan `.part`, never a truncated artifact that a
+reader would take as complete. A catalog locator may never name a `.part`
+(checked in code and by a schema constraint).
+
+These artifacts carry no content hashes of source files: hashing would mean
+reading every source byte a second time over SSH.
+
+## History
+
+The design decisions above were made in response to real failures. The dated
+records are in [history/](history/README.md).

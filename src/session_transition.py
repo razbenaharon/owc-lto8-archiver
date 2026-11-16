@@ -27,6 +27,16 @@ ACTIVE_CHUNK_STATES = ("fetching", "packing", "backing", "writing")
 #: States that are ambiguous about what reached the tape.
 AMBIGUOUS_CHUNK_STATES = ("backing",)
 
+#: ``remote_frontier_bootstraps.state`` values under which a boundary may be
+#: drawn. The vocabulary is the schema's CHECK constraint (migration 014):
+#: ``planned | running | completed | failed | abandoned``; the audit adds
+#: ``absent`` when no row exists. ``completed`` is a finished bootstrap and
+#: ``running`` is the durable "migrated, coverage still provisional" state a
+#: conservative bootstrap leaves behind (it is a row state, not process
+#: liveness - that is what the owner-token and lease blockers measure).
+#: Anything else - including a value this module does not know - blocks.
+ACTIVATABLE_BOOTSTRAP_STATES = ("completed", "running")
+
 
 class TransitionBlocked(RuntimeError):
     """The boundary cannot be activated; the reason is the message."""
@@ -116,7 +126,7 @@ def build_transition_proposal(db, session_id):
         blockers.append(
             "chunk indexes are absent or non-contiguous, so 'the next index' "
             "is not well defined")
-    if audit["bootstrap_state"] not in ("complete", "running"):
+    if audit["bootstrap_state"] not in ACTIVATABLE_BOOTSTRAP_STATES:
         blockers.append(
             f"the frontier bootstrap is {audit['bootstrap_state']!r}; an "
             "incomplete bootstrap cannot prove what is already covered")

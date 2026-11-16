@@ -8,6 +8,7 @@ operation on ``PgConnectionCore``.
 """
 from collections import defaultdict
 
+from .db_backend import as_json
 from .pg_core import _now_utc, _rows
 
 
@@ -127,14 +128,6 @@ class PgDirectoryCatalogMixin:
         "tape_write_batch_chunks",
         "tape_write_active_chunk",
     )
-
-    @staticmethod
-    def _view_exists_conn(conn, view_name):
-        return conn.execute(
-            """SELECT 1 FROM information_schema.views
-               WHERE table_schema='public' AND table_name=%s""",
-            (view_name,),
-        ).fetchone() is not None
 
     @staticmethod
     def _named_objects_conn(conn, catalog, name_column):
@@ -302,7 +295,7 @@ class PgDirectoryCatalogMixin:
                     AND a.artifact_kind='plan_manifest'
                     AND a.readiness_state='ready'
                     AND a.local_locator IS NOT NULL
-                    AND lower(right(a.local_locator, 5))<>'.part'
+                    AND lower(substr(a.local_locator, length(a.local_locator) - 4))<>'.part'
                     AND a.artifact_size_bytes IS NOT NULL
                     AND a.published_at IS NOT NULL
                    WHERE c.plan_source='manifest'
@@ -355,7 +348,7 @@ class PgDirectoryCatalogMixin:
                   OR a.artifact_kind IS DISTINCT FROM 'plan_manifest'
                   OR a.readiness_state IS DISTINCT FROM 'ready'
                   OR a.local_locator IS NULL
-                  OR lower(right(a.local_locator, 5))='.part'
+                  OR lower(substr(a.local_locator, length(a.local_locator) - 4))='.part'
                   OR a.artifact_size_bytes IS NULL
                   OR a.published_at IS NULL"""
         ).fetchone()["n"]
@@ -496,8 +489,7 @@ class PgDirectoryCatalogMixin:
 
     def _manifest_directory_catalog_schema_report_conn(self, conn):
         report = {
-            "database": conn.execute(
-                "SELECT current_database() AS db").fetchone()["db"],
+            "database": self._database_name_conn(conn),
             "expected_schema_version":
                 MANIFEST_DIRECTORY_CATALOG_SCHEMA_VERSION,
             "expected_migration_checksum":
@@ -718,13 +710,9 @@ class PgDirectoryCatalogMixin:
         self._require_manifest_directory_catalog_schema()
 
         def operation(conn):
-            row = conn.execute(
-                """SELECT lto_transition_chunk_plan_source(
-                           %s, %s, %s, %s, %s, %s) AS transition_id""",
-                (session_id, chunk_index, plan_manifest_artifact_id,
-                 *identities),
-            ).fetchone()
-            return int(row["transition_id"])
+            return int(self._sql_transition_chunk_plan_source_conn(
+                conn, session_id, chunk_index, plan_manifest_artifact_id,
+                *identities))
 
         return self._transaction(
             operation,
@@ -1373,10 +1361,21 @@ class PgDirectoryCatalogMixin:
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
 
         def operation(conn):
-            return _rows(conn.execute(
+            rows = _rows(conn.execute(
                 "SELECT * FROM directory_catalog_status_v" + where
                 + " ORDER BY source_host, canonical_path, session_id",
                 tuple(params),
             ).fetchall())
+            # The view computes these columns, so an engine without typed
+            # expression results hands back JSON text / 0-1; normalise them
+            # (a no-op for the values PostgreSQL returns).
+            for row in rows:
+                for column in ("child_directories", "coverage_generations",
+                               "restore_route"):
+                    if row.get(column) is not None:
+                        row[column] = as_json(row[column])
+                if row.get("coverage_is_final") is not None:
+                    row["coverage_is_final"] = bool(row["coverage_is_final"])
+            return rows
 
         return self._run_read(operation, "read directory catalog status")

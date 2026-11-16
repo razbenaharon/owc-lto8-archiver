@@ -17,6 +17,7 @@ retained, recorded unresolved, and nothing is replanned automatically.
 Everything is a fake source and an in-memory frontier database. No SSH, no
 PostgreSQL, no LTFS.
 """
+from source_facts import code_text
 import copy
 import os
 import tempfile
@@ -260,7 +261,7 @@ class ShadowRehearsalTests(_Bootstrap):
         db, _source, _result = self._run({"/vault/a/old.bin": 10})
         self.assertFalse(hasattr(db, "sealed_chunks"))
         import inspect
-        source = inspect.getsource(FrontierBootstrap)
+        source = code_text(FrontierBootstrap)
         for forbidden in ("append_remote_streaming_chunk", "seal_remote_chunk",
                           "consume_segment_range"):
             self.assertNotIn(forbidden, source, forbidden)

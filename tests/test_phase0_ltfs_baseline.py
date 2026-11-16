@@ -8,6 +8,7 @@ unintended change to a neighbouring behaviour shows up as an unexpected failure.
 Every test is mock-only and uses a temporary directory as its fake drive. The
 autouse guard in conftest.py fails closed if any of them reaches the real mount.
 """
+from source_facts import code_only
 import configparser
 import os
 import queue
@@ -133,7 +134,7 @@ class ReadinessProbeTests(unittest.TestCase):
                 return ".".join(reversed(parts))
             return None
 
-        tree = ast.parse(inspect.getsource(ltfs))
+        tree = ast.parse(code_only(ltfs))
         targets = {"_verify_readiness_uncached",
                    "_ensure_lto_drive_ready_unlocked",
                    "_ensure_lto_drive_ready"}
@@ -508,7 +509,7 @@ class RobocopyCommandBaselineTests(unittest.TestCase):
             return None
 
         found = set()
-        for node in ast.walk(ast.parse(inspect.getsource(backup_mod))):
+        for node in ast.walk(ast.parse(code_only(backup_mod))):
             if isinstance(node, ast.Call):
                 name = dotted(node.func)
                 if name in banned:
@@ -613,9 +614,9 @@ class ReadinessInvalidationWiringTests(unittest.TestCase):
         from src import backup as backup_mod
         from src import remote_orchestrator as ro_mod
         self.assertIn("note_tape_io_error(",
-                      inspect.getsource(backup_mod))
+                      code_only(backup_mod))
         self.assertIn("note_device_state_change(",
-                      inspect.getsource(ro_mod))
+                      code_only(ro_mod))
 
     def test_successful_write_keeps_cached_readiness(self):
         """Invalidation must be failure-scoped, not fired on every write."""
@@ -671,19 +672,17 @@ class TapeLockBaselineTests(unittest.TestCase):
 # =============================================================================
 class PipelineDepthBaselineTests(unittest.TestCase):
     def _config(self):
-        """The operator's config when there is one, else the tracked example.
+        """The TRACKED example config - never the operator's config.ini.
 
-        config.ini is untracked, so reading only that made these baselines
-        unverifiable on a clean clone and in CI - they passed solely because an
-        earlier test had left a generated config.ini in the repo root. The
-        example config carries the same documented baseline, so falling back to
-        it keeps the assertions meaningful everywhere while still catching drift
-        on a machine that has a real config.
+        These baselines describe what the repository ships. Reading the
+        untracked repo-root config.ini (as this helper used to, when one
+        existed) made them depend on a file outside version control: a
+        legitimate change to a host's own tuning broke the suite, and the same
+        commit passed or failed depending on the machine.
         """
         parser = configparser.ConfigParser()
-        local = os.path.join(PROJECT_ROOT, "config.ini")
         example = os.path.join(PROJECT_ROOT, "config.example.ini")
-        parser.read(local if os.path.exists(local) else example, encoding="utf-8")
+        self.assertEqual(parser.read(example, encoding="utf-8"), [example])
         return parser
 
     def test_prefetch_depth_is_one_today(self):

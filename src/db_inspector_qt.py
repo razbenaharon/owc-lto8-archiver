@@ -1,8 +1,6 @@
-"""PySide6 lazy PostgreSQL archive inspector."""
+"""PySide6 lazy archive-catalog inspector (SQLite or PostgreSQL)."""
 import os
-import subprocess
 import sys
-from typing import Any, Dict
 
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -13,7 +11,6 @@ from PySide6.QtCore import (
     QAbstractTableModel,
     QModelIndex,
     QObject,
-    QRunnable,
     QThreadPool,
     Qt,
     Signal,
@@ -47,7 +44,7 @@ from PySide6.QtWidgets import (
 )
 
 from .constants import (TAPE_STATUS_ACTIVE, TAPE_STATUS_FULL, tape_is_full,
-                        tape_status_reason_suffix)
+                        tape_status_reason_suffix, tape_usage)
 from .db import _fmt_ts
 from .inspector_repository import InspectorRepository
 
@@ -66,56 +63,106 @@ def _fmt_bytes(value):
     return f"{n:.1f} PiB"
 
 
-class WorkerSignals(QObject):
-    finished = Signal(object, object)
-    failed = Signal(object, str)
+def confirm_typed(parent, title, message, expected):
+    """Destructive-action gate: the operator must type ``expected`` exactly.
+
+    A Yes/No box is one stray click or Enter away from "Yes" (audit M8). Typing
+    the name of the thing being destroyed is not something done by accident.
+    Returns True only for an exact match; anything else changes nothing.
+    """
+    expected = str(expected)
+    text, ok = QInputDialog.getText(
+        parent, title, f"{message}\n\nType  {expected}  to confirm:")
+    if not ok:
+        return False
+    if str(text).strip() != expected:
+        QMessageBox.warning(
+            parent, title,
+            "The confirmation text did not match. Nothing was changed.")
+        return False
+    return True
 
 
-class RepositoryWorker(QRunnable):
-    def __init__(self, db_path, token, function):
-        super().__init__()
-        self.db_path = db_path
-        self.token = token
-        self.function = function
-        self.signals = WorkerSignals()
-
-    @Slot()
-    def run(self):
-        try:
-            with InspectorRepository(self.db_path) as repo:
-                result = self.function(repo)
-        except Exception as exc:
-            self.signals.failed.emit(self.token, str(exc))
-            return
-        self.signals.finished.emit(self.token, result)
+def _database_error_text(what, exc):
+    return (f"{what} failed - the database may be unreachable.\n\n{exc}")
 
 
-class _DbTaskSignals(QObject):
-    finished = Signal(object)
-    failed = Signal(str)
+def _in_repository(db_path, function):
+    """Bind ``function(repo)`` to a fresh read-only repository connection.
+
+    ``InspectorRepository`` is looked up when the job runs, so the connection
+    is opened on the worker thread, never on the GUI thread.
+    """
+    def job():
+        with InspectorRepository(db_path) as repo:
+            return function(repo)
+    return job
 
 
-class DbWriteTask(QRunnable):
-    """Run a blocking PgDatabaseManager write off the UI thread.
+class TaskRunner(QObject):
+    """Run blocking database calls on the thread pool; reply on the GUI thread.
 
-    Heavy maintenance ops (rename_tape rebuilds every record_key of a tape;
-    cleanup runs VACUUM) used to freeze the event loop for minutes at catalog
-    scale. The manager is connection-pool backed, so it is thread-safe here.
+    Lifetime model (audit H15). Each worker used to own a private signal
+    ``QObject`` hanging off an auto-deleted ``QRunnable``. Once ``run()``
+    returned nothing kept that object alive, so it was routinely destroyed
+    while its queued reply was still in the event queue: the reply was dropped
+    (write buttons stayed disabled, tables never refreshed) and, often enough,
+    the interpreter crashed tearing a ``QObject`` down from a pool thread.
+
+    Here there is exactly one signal, it belongs to this object, and this
+    object lives on the GUI thread for as long as its owner widget does. A job
+    is a plain callable; the runner holds a strong reference to it and to its
+    callbacks from ``submit`` until the reply has been delivered. The reply is
+    always a queued connection, so callbacks only ever run on the GUI thread.
     """
 
-    def __init__(self, fn):
-        super().__init__()
-        self.fn = fn
-        self.signals = _DbTaskSignals()
+    _reply = Signal(int, bool, object)
 
-    @Slot()
-    def run(self):
-        try:
-            result = self.fn()
-        except Exception as exc:
-            self.signals.failed.emit(str(exc))
+    def __init__(self, parent=None, pool=None):
+        super().__init__(parent)
+        self._pool = pool or QThreadPool.globalInstance()
+        self._jobs = {}
+        self._next_id = 0
+        self._reply.connect(self._deliver, Qt.ConnectionType.QueuedConnection)
+
+    def pending(self):
+        """Number of submitted jobs whose reply has not been delivered yet."""
+        return len(self._jobs)
+
+    def submit(self, fn, on_ok=None, on_fail=None):
+        """Run ``fn()`` off the GUI thread.
+
+        Exactly one of ``on_ok(result)`` / ``on_fail(message)`` is then called
+        on the GUI thread.
+        """
+        self._next_id += 1
+        job_id = self._next_id
+
+        def job():
+            try:
+                ok, payload = True, fn()
+            except Exception as exc:
+                ok, payload = False, str(exc) or exc.__class__.__name__
+            try:
+                self._reply.emit(job_id, ok, payload)
+            except RuntimeError:
+                # The owning window was closed and destroyed while the job
+                # ran; there is nobody left to tell.
+                pass
+
+        self._jobs[job_id] = (job, on_ok, on_fail)
+        self._pool.start(job)
+        return job_id
+
+    @Slot(int, bool, object)
+    def _deliver(self, job_id, ok, payload):
+        entry = self._jobs.pop(job_id, None)
+        if entry is None:
             return
-        self.signals.finished.emit(result)
+        _job, on_ok, on_fail = entry
+        callback = on_ok if ok else on_fail
+        if callback is not None:
+            callback(payload)
 
 
 class TreeNode:
@@ -148,7 +195,7 @@ class ArchiveTreeModel(QAbstractItemModel):
         super().__init__(parent)
         self.db_path = db_path
         self.root = TreeNode("root", "root")
-        self.pool = QThreadPool.globalInstance()
+        self.tasks = TaskRunner(self)
         self._token = 0
         self._load_tapes()
 
@@ -252,10 +299,10 @@ class ArchiveTreeModel(QAbstractItemModel):
                 row["recursive_file_count"] = totals.get("recursive_file_count", 0)
             return page
 
-        worker = RepositoryWorker(self.db_path, token, load)
-        worker.signals.finished.connect(self._on_loaded)
-        worker.signals.failed.connect(self._on_failed)
-        self.pool.start(worker)
+        self.tasks.submit(
+            _in_repository(self.db_path, load),
+            on_ok=lambda result: self._on_loaded(token, result),
+            on_fail=lambda message: self._on_failed(token, message))
 
     def node_from_index(self, index):
         return index.internalPointer() if index.isValid() else self.root
@@ -265,7 +312,6 @@ class ArchiveTreeModel(QAbstractItemModel):
             return QModelIndex()
         return self.createIndex(node.row(), 0, node)
 
-    @Slot(object, object)
     def _on_loaded(self, token, result):
         _token_id, node = token
         node.loading = False
@@ -286,7 +332,6 @@ class ArchiveTreeModel(QAbstractItemModel):
         node.cursor = result["next_cursor"]
         node.has_more = bool(result["has_more"])
 
-    @Slot(object, str)
     def _on_failed(self, token, message):
         _token_id, node = token
         node.loading = False
@@ -414,7 +459,7 @@ class BrowseWidget(QWidget):
         super().__init__(parent)
         self.db = db
         self.db_path = db_path
-        self.pool = QThreadPool.globalInstance()
+        self.tasks = TaskRunner(self)
         self.generation = 0
         self.current_directory_id = None
         self.current_sort = "name"
@@ -493,37 +538,54 @@ class BrowseWidget(QWidget):
             self._update_buttons()
             return
         self.current_directory_id = node.directory_id
-        self.cursor_stack = [None]
-        self.page_index = 0
+        self._reset_paging()
         self.load_page(None)
 
     def _sort_changed(self, value):
         self.current_sort = value
-        self.cursor_stack = [None]
-        self.page_index = 0
+        self._reset_paging()
         self.load_page(None)
 
-    def load_page(self, cursor):
+    def _reset_paging(self):
+        """A new listing starts: nothing of the old one may stay actionable."""
+        self.cursor_stack = [None]
+        self.page_index = 0
+        self.has_more = False
+        self.table_model.set_rows([])
+        self._update_buttons()
+
+    def load_page(self, cursor, page_index=None):
+        """Load one page. ``page_index`` is the page being *requested*; the
+        widget only moves to it once the rows have actually arrived, so a
+        failed load leaves the pagination state exactly as it was."""
         if self.current_directory_id is None:
             return
+        target = self.page_index if page_index is None else page_index
         self.generation += 1
         generation = self.generation
         directory_id = self.current_directory_id
         sort = self.current_sort
         self.status.setText("Loading...")
 
-        worker = RepositoryWorker(
-            self.db_path, generation,
-            lambda repo: repo.list_directory_files(
-                directory_id, sort=sort, cursor=cursor, limit=PAGE_SIZE))
-        worker.signals.finished.connect(self._on_files_loaded)
-        worker.signals.failed.connect(lambda _token, msg: self._show_error(msg))
-        self.pool.start(worker)
+        self.tasks.submit(
+            _in_repository(self.db_path, lambda repo: repo.list_directory_files(
+                directory_id, sort=sort, cursor=cursor, limit=PAGE_SIZE)),
+            on_ok=lambda result: self._on_files_loaded(
+                generation, result, target),
+            on_fail=lambda message: self._on_page_failed(generation, message))
 
-    @Slot(object, object)
-    def _on_files_loaded(self, generation, result):
+    def _on_page_failed(self, generation, message):
         if generation != self.generation:
             return
+        self.status.setText(
+            f"Load failed - still on page {self.page_index + 1}.")
+        self._update_buttons()
+        self._show_error(message)
+
+    def _on_files_loaded(self, generation, result, page_index):
+        if generation != self.generation:
+            return
+        self.page_index = page_index
         self.table_model.set_rows(result["rows"])
         self.has_more = bool(result["has_more"])
         if self.has_more:
@@ -546,14 +608,14 @@ class BrowseWidget(QWidget):
     def previous_page(self):
         if self.page_index <= 0:
             return
-        self.page_index -= 1
-        self.load_page(self.cursor_stack[self.page_index])
+        target = self.page_index - 1
+        self.load_page(self.cursor_stack[target], target)
 
     def next_page(self):
-        if not self.has_more:
+        if not self.has_more or len(self.cursor_stack) <= self.page_index + 1:
             return
-        self.page_index += 1
-        self.load_page(self.cursor_stack[self.page_index])
+        target = self.page_index + 1
+        self.load_page(self.cursor_stack[target], target)
 
     def reload_page(self):
         if self.current_directory_id is not None:
@@ -576,14 +638,18 @@ class BrowseWidget(QWidget):
         ids = self.selected_file_ids()
         if not ids:
             return
-        if QMessageBox.question(
+        if not confirm_typed(
                 self, "Delete File Records",
-                f"Delete {len(ids)} file record(s)? This cannot be undone."
-        ) != QMessageBox.StandardButton.Yes:
+                f"Delete {len(ids)} file record(s)? This cannot be undone.",
+                "DELETE"):
             return
         # One transaction (also reconciles tapes.used_space) instead of one
         # commit per record.
-        self.db.delete_files(ids)
+        try:
+            self.db.delete_files(ids)
+        except Exception as exc:
+            self._show_error(_database_error_text("Delete", exc))
+            return
         self.reload_page()
 
     def _context_menu(self, pos):
@@ -601,7 +667,7 @@ class SearchWidget(QWidget):
         super().__init__(parent)
         self.db = db
         self.db_path = db_path
-        self.pool = QThreadPool.globalInstance()
+        self.tasks = TaskRunner(self)
         self.generation = 0
         self.cursor_stack = [None]
         self.page_index = 0
@@ -670,9 +736,14 @@ class SearchWidget(QWidget):
     def new_search(self):
         self.cursor_stack = [None]
         self.page_index = 0
+        self.has_more = False
+        self.table_model.set_rows([])
+        self._update_buttons()
         self.load_page(None)
 
-    def load_page(self, cursor):
+    def load_page(self, cursor, page_index=None):
+        """See ``BrowseWidget.load_page``: the page index moves on success."""
+        target = self.page_index if page_index is None else page_index
         query = self.query.text().strip()
         if not query:
             self.table_model.set_rows([])
@@ -689,18 +760,24 @@ class SearchWidget(QWidget):
         if source_host and source_host != "All":
             scope["source_host"] = source_host
         self.status.setText("Searching...")
-        worker = RepositoryWorker(
-            self.db_path, generation,
-            lambda repo: repo.search_catalog_fts(
-                query, scope=scope, cursor=cursor, limit=PAGE_SIZE))
-        worker.signals.finished.connect(self._on_loaded)
-        worker.signals.failed.connect(lambda _token, msg: self._show_error(msg))
-        self.pool.start(worker)
+        self.tasks.submit(
+            _in_repository(self.db_path, lambda repo: repo.search_catalog_fts(
+                query, scope=scope, cursor=cursor, limit=PAGE_SIZE)),
+            on_ok=lambda result: self._on_loaded(generation, result, target),
+            on_fail=lambda message: self._on_page_failed(generation, message))
 
-    @Slot(object, object)
-    def _on_loaded(self, generation, result):
+    def _on_page_failed(self, generation, message):
         if generation != self.generation:
             return
+        self.status.setText(
+            f"Search failed - still on page {self.page_index + 1}.")
+        self._update_buttons()
+        self._show_error(message)
+
+    def _on_loaded(self, generation, result, page_index):
+        if generation != self.generation:
+            return
+        self.page_index = page_index
         self.table_model.set_rows(result["rows"])
         self.has_more = bool(result["has_more"])
         if self.has_more:
@@ -722,13 +799,13 @@ class SearchWidget(QWidget):
 
     def previous_page(self):
         if self.page_index > 0:
-            self.page_index -= 1
-            self.load_page(self.cursor_stack[self.page_index])
+            target = self.page_index - 1
+            self.load_page(self.cursor_stack[target], target)
 
     def next_page(self):
-        if self.has_more:
-            self.page_index += 1
-            self.load_page(self.cursor_stack[self.page_index])
+        if self.has_more and len(self.cursor_stack) > self.page_index + 1:
+            target = self.page_index + 1
+            self.load_page(self.cursor_stack[target], target)
 
     def selected_file_ids(self):
         return self.table_model.file_ids(self.table.selectionModel().selectedRows())
@@ -744,12 +821,16 @@ class SearchWidget(QWidget):
         ids = self.selected_file_ids()
         if not ids:
             return
-        if QMessageBox.question(
+        if not confirm_typed(
                 self, "Delete File Records",
-                f"Delete {len(ids)} file record(s)? This cannot be undone."
-        ) != QMessageBox.StandardButton.Yes:
+                f"Delete {len(ids)} file record(s)? This cannot be undone.",
+                "DELETE"):
             return
-        self.db.delete_files(ids)
+        try:
+            self.db.delete_files(ids)
+        except Exception as exc:
+            self._show_error(_database_error_text("Delete", exc))
+            return
         self.load_page(self.cursor_stack[self.page_index])
 
     def _show_error(self, message):
@@ -761,7 +842,7 @@ class DirectoryCatalogWidget(QWidget):
         super().__init__(parent)
         self.db = db
         self.db_path = db_path
-        self.pool = QThreadPool.globalInstance()
+        self.tasks = TaskRunner(self)
         self.generation = 0
 
         layout = QVBoxLayout(self)
@@ -814,13 +895,11 @@ class DirectoryCatalogWidget(QWidget):
         self.generation += 1
         generation = self.generation
         self.status.setText(f"{label}...")
-        worker = RepositoryWorker(self.db_path, generation, fn)
-        worker.signals.finished.connect(
-            lambda token, result: self._loaded(token, result, columns))
-        worker.signals.failed.connect(lambda _token, msg: self._show_error(msg))
-        self.pool.start(worker)
+        self.tasks.submit(
+            _in_repository(self.db_path, fn),
+            on_ok=lambda result: self._loaded(generation, result, columns),
+            on_fail=self._show_error)
 
-    @Slot(object, object)
     def _loaded(self, generation, result, columns):
         if generation != self.generation:
             return
@@ -926,8 +1005,9 @@ class ManageWidget(QWidget):
         super().__init__(parent)
         self.db = db
         self.db_path = db_path
-        self.pool = QThreadPool.globalInstance()
+        self.tasks = TaskRunner(self)
         self._sessions_token = 0
+        self._write_in_flight = False
         self._cleanup_summary = {}
         layout = QVBoxLayout(self)
         tabs = QTabWidget(self)
@@ -957,7 +1037,7 @@ class ManageWidget(QWidget):
         self.tapes_table = QTableWidget(0, 8)
         self.tapes_table.setHorizontalHeaderLabels([
             "ID", "Volume Label", "Initialized", "Capacity GB",
-            "Used", "Files", "Used %", "Status"])
+            "Used", "Files", "Used % of plan budget", "Status"])
         self.tapes_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.tapes_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         layout.addWidget(self.tapes_table, 1)
@@ -976,8 +1056,12 @@ class ManageWidget(QWidget):
         controls = QHBoxLayout()
         self.delete_session_btn = QPushButton("Delete Selected Session")
         self.cleanup_btn = QPushButton("Clean Unused Session Data")
-        self.preflight_btn = QPushButton("Open Catalog Preflight")
-        for button in (self.delete_session_btn, self.cleanup_btn, self.preflight_btn):
+        # "Open Catalog Preflight" used to sit here. It launched
+        # `run.py --catalog-v3-preflight`, a SQLite-era flag run.py now
+        # rejects, so the button could only ever open a console showing an
+        # error. Removed (audit M8) rather than re-pointed: schema work is
+        # done with `inspect_db.py` flags, deliberately not from a button.
+        for button in (self.delete_session_btn, self.cleanup_btn):
             controls.addWidget(button)
         controls.addStretch(1)
         layout.addLayout(controls)
@@ -990,13 +1074,19 @@ class ManageWidget(QWidget):
         layout.addWidget(self.sessions_table, 1)
         self.delete_session_btn.clicked.connect(self.delete_session)
         self.cleanup_btn.clicked.connect(self.cleanup_sessions)
-        self.preflight_btn.clicked.connect(self.open_preflight_console)
         return page
 
     def refresh(self):
+        """Reload both tabs. Returns False (after telling the operator) when
+        the database cannot be read, instead of failing silently in a slot."""
         self._loaded = True
-        self.refresh_tapes()
+        try:
+            self.refresh_tapes()
+        except Exception as exc:
+            self._show_error(_database_error_text("Refreshing tapes", exc))
+            return False
         self.refresh_sessions()
+        return True
 
     def _write_buttons(self):
         return (self.rename_btn, self.capacity_btn, self.recalc_btn,
@@ -1004,11 +1094,20 @@ class ManageWidget(QWidget):
                 self.refresh_btn, self.delete_session_btn, self.cleanup_btn)
 
     def _run_db_task(self, fn, on_done=None):
-        """Run a DB write in the thread pool with the write buttons disabled."""
+        """Run a DB write in the thread pool with the write buttons disabled.
+
+        One write at a time: a second request while one is in flight is
+        refused (returns False) rather than queued behind it, so a stray
+        double activation cannot run the same destructive action twice.
+        """
+        if self._write_in_flight:
+            return False
+        self._write_in_flight = True
         for button in self._write_buttons():
             button.setEnabled(False)
 
         def _restore_buttons():
+            self._write_in_flight = False
             for button in self._write_buttons():
                 button.setEnabled(True)
 
@@ -1021,10 +1120,8 @@ class ManageWidget(QWidget):
             _restore_buttons()
             self._show_error(message)
 
-        task = DbWriteTask(fn)
-        task.signals.finished.connect(_ok)
-        task.signals.failed.connect(_fail)
-        self.pool.start(task)
+        self.tasks.submit(fn, on_ok=_ok, on_fail=_fail)
+        return True
 
     def selected_tape(self):
         row = self.tapes_table.currentRow()
@@ -1042,12 +1139,13 @@ class ManageWidget(QWidget):
             used = tape["used_space"] or 0
             cap = tape["total_capacity"] or 0
             full = tape_is_full(tape.get("status"))
-            pct = (used / (cap * 1024 ** 3) * 100) if cap else 0
+            # Percent of the planning budget — shared with the text menu.
+            usage = tape_usage(cap, used)
             values = [
                 tape["tape_id"], label, _fmt_ts(tape["date_formatted"]),
                 cap or "", _fmt_bytes(used),
                 self.db.count_tape_file_records(label),
-                "FULL" if full else f"{pct:.1f}%",
+                "FULL" if full else usage.percent_text,
                 ("FULL" + tape_status_reason_suffix(tape)) if full
                 else TAPE_STATUS_ACTIVE]
             for col, value in enumerate(values):
@@ -1059,10 +1157,12 @@ class ManageWidget(QWidget):
         if not label:
             return
         if tape_is_full(getattr(self, "_tape_status", {}).get(label)):
-            if QMessageBox.question(
+            # Putting a retired cartridge back into the write rotation is how
+            # a write lands on read-only media; make it deliberate.
+            if not confirm_typed(
                     self, "Re-activate Tape",
-                    f"{label} is marked FULL. Re-activate it for writing?"
-            ) != QMessageBox.StandardButton.Yes:
+                    f"{label} is marked FULL. Re-activate it for writing?",
+                    label):
                 return
             self._run_db_task(
                 lambda: self.db.set_tape_status(label, TAPE_STATUS_ACTIVE),
@@ -1114,19 +1214,25 @@ class ManageWidget(QWidget):
         label = self.selected_tape()
         if not label:
             return
-        count = self.db.count_tape_file_records(label)
-        if QMessageBox.question(
+        try:
+            count = self.db.count_tape_file_records(label)
+        except Exception as exc:
+            self._show_error(_database_error_text("Counting records", exc))
+            return
+        if confirm_typed(
                 self, "Wipe File Records",
-                f"Delete {count:,} file record(s) for {label}?") == QMessageBox.StandardButton.Yes:
+                f"Delete {count:,} file record(s) for {label}? "
+                "This cannot be undone.", label):
             self._run_db_task(
                 lambda: self.db.delete_files_for_tape(label),
                 on_done=lambda _result: self.refresh())
 
     def delete_tape(self):
         label = self.selected_tape()
-        if label and QMessageBox.question(
+        if label and confirm_typed(
                 self, "Delete Tape",
-                f"Delete tape {label} and all file records?") == QMessageBox.StandardButton.Yes:
+                f"Delete tape {label} and all its file records? "
+                "This cannot be undone.", label):
             self._run_db_task(
                 lambda: self.db.delete_tape(label),
                 on_done=lambda _result: self.refresh())
@@ -1136,19 +1242,14 @@ class ManageWidget(QWidget):
         token = self._sessions_token
         self.sessions_table.setRowCount(0)
         self.cleanup_btn.setEnabled(False)
-        worker = RepositoryWorker(
-            self.db_path,
-            token,
-            lambda repo: {
+        self.tasks.submit(
+            _in_repository(self.db_path, lambda repo: {
                 "rows": repo.list_sessions(),
                 "summary": repo.unreferenced_remote_data_summary(),
-            },
-        )
-        worker.signals.finished.connect(self._on_sessions_loaded)
-        worker.signals.failed.connect(lambda _token, msg: self._show_error(msg))
-        self.pool.start(worker)
+            }),
+            on_ok=lambda result: self._on_sessions_loaded(token, result),
+            on_fail=self._show_error)
 
-    @Slot(object, object)
     def _on_sessions_loaded(self, token, result):
         if token != self._sessions_token:
             return
@@ -1170,6 +1271,11 @@ class ManageWidget(QWidget):
             bool(summary.get("plans") or summary.get("snapshots"))
             and not summary.get("active_sessions"))
 
+    def selected_session_status(self):
+        row = self.sessions_table.currentRow()
+        item = self.sessions_table.item(row, 3) if row >= 0 else None
+        return item.text().strip().lower() if item is not None else ""
+
     def selected_session(self):
         row = self.sessions_table.currentRow()
         if row < 0:
@@ -1184,19 +1290,41 @@ class ManageWidget(QWidget):
         kind, session_id = self.selected_session()
         if not kind:
             return
-        if QMessageBox.question(
-                self, "Delete Session",
-                f"Delete {kind} session {session_id}?") != QMessageBox.StandardButton.Yes:
+        # Three layers, cheapest first (audit M8): the row on screen, then a
+        # fresh read-only pre-flight (status + archiver lock) on the worker
+        # thread, then PgDatabaseManager.delete_session's own refusal inside
+        # the deleting transaction.
+        if self.selected_session_status() == "active":
+            self._show_error(
+                f"Refusing to delete {kind} session {session_id}: it is "
+                "marked active. Finish it, or prove it stale with "
+                "`inspect_db.py --reconcile-stale-sessions`, first.")
             return
+        if not confirm_typed(
+                self, "Delete Session",
+                f"Delete {kind} session {session_id} and its chunk state? "
+                "This cannot be undone.", session_id):
+            return
+        db_path = self.db_path
+
+        def delete():
+            with InspectorRepository(db_path) as repo:
+                repo.require_session_deletable(kind, session_id)
+            return self.db.delete_session(kind, session_id)
+
         self._run_db_task(
-            lambda: self.db.delete_session(kind, session_id),
-            on_done=lambda _result: self.refresh_sessions())
+            delete, on_done=lambda _result: self.refresh_sessions())
 
     def cleanup_sessions(self):
-        summary = self._cleanup_summary or self.db.get_unreferenced_remote_data_summary()
-        if QMessageBox.question(
+        try:
+            summary = (self._cleanup_summary
+                       or self.db.get_unreferenced_remote_data_summary())
+        except Exception as exc:
+            self._show_error(_database_error_text("Reading the summary", exc))
+            return
+        if not confirm_typed(
                 self, "Clean Unused Session Data",
-                f"Delete unused plans/snapshots?\n\n{summary}") != QMessageBox.StandardButton.Yes:
+                f"Delete unused plans/snapshots?\n\n{summary}", "CLEANUP"):
             return
 
         def done(result):
@@ -1210,16 +1338,6 @@ class ManageWidget(QWidget):
 
     def _show_error(self, message):
         QMessageBox.critical(self, "Database Error", message)
-
-    def open_preflight_console(self):
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        kwargs: Dict[str, Any] = {"cwd": root}
-        if os.name == "nt":
-            kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
-        subprocess.Popen(
-            [sys.executable, os.path.join(root, "run.py"),
-             "--catalog-v3-preflight"],
-            **kwargs)
 
 
 class DBInspectorQtApp(QMainWindow):
@@ -1248,13 +1366,29 @@ class DBInspectorQtApp(QMainWindow):
         refresh = QAction("Refresh", self)
         refresh.triggered.connect(self.refresh_all)
         self.menuBar().addAction(refresh)
-        self.statusBar().showMessage(display_ref or db_path)
+        self._display_ref = display_ref or db_path
+        self.statusBar().showMessage(self._display_ref)
 
     def refresh_all(self):
-        self.search.refresh_tapes()
-        self.directory_catalog.refresh_tapes()
+        """Reload every tab's tape lists; say so when the database is down.
+
+        These reads run on the GUI thread inside a Qt slot, where an
+        exception is printed to a console nobody is watching and otherwise
+        vanishes - the window simply did nothing (audit M8).
+        """
+        try:
+            self.search.refresh_tapes()
+            self.search.refresh_sources()
+            self.directory_catalog.refresh_tapes()
+        except Exception as exc:
+            message = _database_error_text("Refresh", exc)
+            self.statusBar().showMessage("Refresh failed - database error.")
+            QMessageBox.critical(self, "Database Error", message)
+            return False
+        self.statusBar().showMessage(self._display_ref)
         if self.manage._loaded:
-            self.manage.refresh()
+            return self.manage.refresh()
+        return True
 
     def _tab_changed(self, index):
         if self.tabs.widget(index) is self.manage and not self.manage._loaded:
@@ -1266,7 +1400,11 @@ def run_qt_inspector(db, db_path, display_ref=None):
     app.setApplicationName("LTO Archive Inspector")
     window = DBInspectorQtApp(db, db_path, display_ref=display_ref)
     window.show()
-    return app.exec()
+    code = app.exec()
+    # Let in-flight database calls finish before the window (and the runners
+    # their replies are addressed to) is torn down.
+    QThreadPool.globalInstance().waitForDone(10000)
+    return code
 
 
 if __name__ == "__main__":

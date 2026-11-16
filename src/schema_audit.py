@@ -18,7 +18,7 @@ import hashlib
 import os
 import re
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Mapping
 
 from .constants import PROJECT_ROOT
 
@@ -116,7 +116,7 @@ REQUIRED_COLUMNS = {
         "remote_session_id", "chunk_index", "bundle_id", "direct_file_count",
         "recursive_file_count", "direct_bytes", "recursive_bytes", "record_key",
     ),
-    "remote_scan_scopes": ("scan_scope_id", "session_id", "root_path", "coverage_state"),
+    "remote_scan_scopes": ("scan_scope_id", "session_id", "source_root", "coverage_state"),
     "remote_scan_segments": ("scan_segment_id", "scan_directory_id", "locator", "state", "file_count", "byte_count"),
     "remote_chunk_scan_segments": (
         "chunk_segment_id", "session_id", "chunk_index", "scan_segment_id",
@@ -128,8 +128,8 @@ REQUIRED_COLUMNS = {
         "permanent_local_metadata_locator", "tape_label", "tape_path",
         "tape_generation_id", "expected_member_count", "expected_logical_bytes",
         "validation_state", "writer_state", "catalog_state",
-        "stored_tar_max_size_bytes", "estimated_archive_bytes",
-        "validated_part_locator", "validation_summary", "disposition_counts",
+        "estimated_archive_bytes", "validated_part_locator",
+"validation_summary", "disposition_counts",
     ),
     "archive_artifacts": (
         "artifact_id", "session_id", "chunk_index", "container_id",
@@ -203,14 +203,6 @@ ROW_SET_SPECS = {
     "archive_container_members": ("expected_logical_bytes", "estimated_tar_bytes"),
     "archive_artifacts": ("artifact_size_bytes",),
 }
-
-
-def _dict_row(row: Any, columns: Iterable[str] = ()) -> dict[str, Any]:
-    if isinstance(row, Mapping):
-        return dict(row)
-    values = list(row or ())
-    return {name: values[index] for index, name in enumerate(columns)
-            if index < len(values)}
 
 
 def _safe_fetchall(conn: Any, sql: str, params: tuple[Any, ...] = ()):
@@ -668,7 +660,7 @@ def _code_provenance_facts(root: Path) -> dict[str, Any]:
     scope_sql_calls = [
         (call, sql) for call, sql in (execute_sql_calls(derive_for_scope)
                                       if derive_for_scope is not None else [])
-        if "remote_scan_scopes" in sql and "root_path" in sql
+        if "remote_scan_scopes" in sql and "source_root" in sql
     ]
     remote_session_sql = [
         sql for _call, sql in derive_sql if "remote_sessions" in sql
@@ -684,7 +676,7 @@ def _code_provenance_facts(root: Path) -> dict[str, Any]:
         "remote_sessions_sql_literals": len(remote_session_sql),
     }
 
-    # Prove both halves of the scope guard: a scope query selects root_path, and
+    # Prove both halves of the scope guard: a scope query selects source_root, and
     # the fetched result is transformed into a name used by a negative-match
     # test whose body returns the empty root.  This deliberately does not accept
     # a docstring or an unrelated query elsewhere in pg_catalog.py.
@@ -704,7 +696,7 @@ def _code_provenance_facts(root: Path) -> dict[str, Any]:
                     execute_call = candidate
             if execute_call is not None:
                 sql = static_string(execute_call.args[0]) if execute_call.args else None
-                if sql is not None and "remote_scan_scopes" in sql and "root_path" in sql:
+                if sql is not None and "remote_scan_scopes" in sql and "source_root" in sql:
                     scope_result_names.update(names_bound(item.targets[0]))
 
         derived_scope_names = set(scope_result_names)
@@ -757,7 +749,7 @@ def _code_provenance_facts(root: Path) -> dict[str, Any]:
     elif not scope_sql_calls:
         fail_reason(
             "persisted_scan_scope_guard",
-            "_derive_bundle_base_path has no execute() SQL literal selecting root_path from remote_scan_scopes",
+            "_derive_bundle_base_path has no execute() SQL literal selecting source_root from remote_scan_scopes",
         )
     if scope_sql_calls and not scope_result_gates_empty:
         fail_reason(
@@ -999,6 +991,8 @@ def _historical_dry_run(conn: Any, installed: dict[str, Any], counts: dict[str, 
 
 def audit_schema_provenance(conn: Any, *, repository_root: str | os.PathLike[str] = PROJECT_ROOT) -> dict[str, Any]:
     """Return a structured, read-only audit for one selected DB connection."""
+    from . import db_backend
+    db_backend.require_postgresql(conn, "schema_audit")
     root = Path(repository_root)
     installed = _installed_schema(conn)
     repo = _repo_ddl_inventory(root)
@@ -1063,6 +1057,8 @@ def audit_schema_provenance(conn: Any, *, repository_root: str | os.PathLike[str
 
 def audit_manager(manager: Any, *, repository_root: str | os.PathLike[str] = PROJECT_ROOT) -> dict[str, Any]:
     """Run the audit through a manager opened with ``init_schema=False``."""
+    from . import db_backend
+    db_backend.require_postgresql(manager, "schema_audit")
     with manager._pool.connection() as conn:
         return audit_schema_provenance(conn, repository_root=repository_root)
 
@@ -1083,8 +1079,3 @@ def render_schema_audit(report: Mapping[str, Any]) -> str:
     lines.append(f"Historical dry-run: repairable={len(historical.get('repairable', []))}, flagged={len(historical.get('flagged', []))}, writes={historical.get('writes_performed', 0)}")
     lines.append("No tape locator was opened; no database write was performed.")
     return "\n".join(lines)
-
-
-# Names useful to callers and tests without prescribing a CLI implementation.
-audit_catalog_boundary = audit_schema_provenance
-render_text = render_schema_audit

@@ -4,7 +4,7 @@ Plan 1, Task 1.2. Moved out of ``RemoteOrchestrator`` unchanged, so that the
 one place a tape write can start is a single, small, readable module.
 
 The invariants this module exists to protect (see
-``docs/incidents/000-no-physical-intervention-policy.md``):
+``docs/history/incidents/000-no-physical-intervention-policy.md``):
 
 * **One ownership period per group, not per chunk.** Ownership and the safety
   gate run once; between chunks there is deliberately no readiness probe, no
@@ -25,6 +25,7 @@ every cross-method call routes back through it so an injected hook still wins.
 """
 import time
 
+from .archiver_lock_guard import archiver_lock_stop
 from .backup import LTOBackup, _NoEjectBackup
 from .constants import (tape_budget_bytes, tape_is_full,
                         tape_status_reason_suffix)
@@ -75,6 +76,14 @@ class RemoteChunkWriter:
         for desc in descs:
             validate_staged_chunk_writer_admission(
                 desc, self.host.db, expected_session_id=session_id)
+
+        # Audit H6: prove the single-writer lock is still ours before this
+        # group does anything. DB-only; a loss is a hard stop, never a retry.
+        lock_stop = archiver_lock_stop(
+            self.host.db, session_id=session_id,
+            chunk_index=descs[0].chunk_index)
+        if lock_stop is not None:
+            return self.host._record_stop(lock_stop)
 
         # skip_tape chunks involve no tape at all — handle them outside
         # ownership so an all-skip group never touches LTFS.
@@ -140,14 +149,31 @@ class RemoteChunkWriter:
             recorded = self.host._get_recorded_stop()
             if recorded is not None:
                 return recorded
+            self.host._gate_mount_started_at = None
             gate_block = self.host._pre_write_safety_gate(
                 session_id, first, tape_label, stop_pipeline)
             if gate_block is not None:
                 return gate_block
             self.host._readiness_checks += 1
             self.host._cartridge_verifications += 1
+            # The mount start the gate scoped its drive-health evidence to.
+            mount_started_at = getattr(
+                self.host, '_gate_mount_started_at', None)
 
-            for desc in tape_descs:
+            for position, desc in enumerate(tape_descs):
+                # Drive/medium health before EACH later chunk, not only once
+                # per group: a fault logged while chunk N was being written
+                # must stop chunk N+1 (Tape_02 froze after errors nobody
+                # read). This repeats only the PASSIVE half of the gate — it
+                # reads IBM's LogFile.csv and nothing else: no readiness
+                # probe, no label read, no event-log query, no tape access.
+                if position > 0 and mount_started_at:
+                    media_block = self.host._verify_ltfs_media_health(
+                        mount_started_at=mount_started_at)
+                    if media_block is not None:
+                        media_block.session_id = session_id
+                        media_block.chunk_index = desc.chunk_index
+                        return self.host._record_stop(media_block)
                 # Cheap, non-LTFS stop checks between chunks. A staged reboot,
                 # a recorded stop or a cancel must still end the group at a
                 # chunk boundary — but none of these touches the drive.
@@ -212,10 +238,13 @@ class RemoteChunkWriter:
             # before ownership. Launch the external writer without a per-chunk
             # tape-budget recheck here.
             #     ONLY when the writer actually starts (via on_write_start), so
-            #     'backing' means exactly "the tape write has physically begun".
-            #     A failure BEFORE that (drive not ready, bad metadata) never set
-            #     'backing', so it is safely re-fetchable; a failure AT OR AFTER
-            #     it is physically ambiguous and must stay 'backing'.
+            #     'backing' means exactly "the tape write has physically begun"
+            #     — and that includes the very first write-touch, creating the
+            #     destination directory on tape. A failure BEFORE that (drive
+            #     not ready, bad metadata) never set 'backing', so it is safely
+            #     re-drivable; a failure AT OR AFTER it (write-protected media
+            #     on mkdir included) is a hard tape failure and must stay
+            #     'backing'.
             backup_cls = LTOBackup if eject_after else _NoEjectBackup
             governor = getattr(self.host, 'governor', None)
             tape_pending = (
@@ -286,8 +315,12 @@ class RemoteChunkWriter:
                         chunk_index=chunk_index, preserve_pack=True,
                         detailed_reason=f"tape write failed after starting: {e}"),
                         escalate=True)
-                # Failure BEFORE the write started: nothing reached the tape, so
-                # the chunk is safely re-fetchable. 'backing' was never set.
+                # Failure BEFORE the write started: no write-touch of the tape
+                # happened (LTOBackup marks 'backing' before it even creates
+                # the destination directory), so 'backing' was never set and
+                # the chunk is safely re-drivable. The pack is intact local
+                # data and is KEPT on every error — the resume reuses it by
+                # exact inventory instead of re-fetching.
                 if CANCEL.is_set():
                     return self.host._record_stop(StopResult(
                         exit_code=ExitCode.USER_STOP,
@@ -303,7 +336,7 @@ class RemoteChunkWriter:
                     exit_code=ExitCode.TRANSIENT_RESUMABLE,
                     reason=REASON_TAPE_WRITE_FAILED, resumable=True,
                     source="write", session_id=session_id,
-                    chunk_index=chunk_index, preserve_pack=False,
+                    chunk_index=chunk_index, preserve_pack=True,
                     detailed_reason=str(e)))
         except BaseException:
             raise

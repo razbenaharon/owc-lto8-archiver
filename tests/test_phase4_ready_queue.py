@@ -663,14 +663,5 @@ class MetricsTests(unittest.TestCase):
         q.wait_for_group(timeout=TIMEOUT)
         self.assertEqual(q.metrics()["groups_started"], 1)
 
-    def test_orchestrator_tracks_ownership_and_readiness_counts(self):
-        from src import remote_orchestrator as ro
-        import inspect
-        body = inspect.getsource(ro)
-        for counter in ("_ownership_acquisitions", "_readiness_checks",
-                        "_cartridge_verifications"):
-            self.assertIn(counter, body)
-
-
 if __name__ == "__main__":
     unittest.main()

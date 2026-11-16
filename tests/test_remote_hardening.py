@@ -564,8 +564,8 @@ class DirectStoredTarTransportTests(unittest.TestCase):
         self.assertEqual(
             command,
             "LC_ALL=C tar -C '/base with '\"'\"' quote' -b 512 "
-            "--format=pax --sparse --sparse-version=1.0 --no-recursion "
-            "--ignore-failed-read -cf - --null -T -")
+            "--format=pax --sparse --sparse-version=1.0 --hard-dereference "
+            "--no-recursion --ignore-failed-read -cf - --null -T -")
         for filename in ("space name", "tab\tname", "line\nname", "×§×•×‘×¥",
                          r"literal\backslash", "-leading", "$(touch nope);&"):
             self.assertNotIn(filename, command)

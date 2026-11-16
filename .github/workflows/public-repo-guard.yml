@@ -6,6 +6,10 @@
 # letting a database, a real manifest, a log or an infrastructure identity get
 # committed. The test suite runs alongside it so a green check means both
 # "safe to publish" and "not broken".
+#
+# It is also a reusable workflow (`workflow_call`): release.yml runs exactly
+# these jobs against the tagged commit before it builds a draft release, so
+# there is one definition of "checked", not two.
 name: public-repo-guard
 
 on:
@@ -13,12 +17,13 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
 jobs:
-  # The privacy gate reads git history with the standard library only, so it is
+  # The privacy gate reads git with the standard library only, so it is
   # platform-independent and runs once on the cheaper runner.
   guard:
     runs-on: ubuntu-latest
@@ -26,7 +31,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # The gate inspects git history, not just the working tree.
           fetch-depth: 0
 
       - uses: actions/setup-python@v5
@@ -40,38 +44,42 @@ jobs:
   # mutexes, powershell.exe, robocopy exit classification and drive-letter
   # paths. Running it on ubuntu-latest — as this workflow used to — could only
   # ever fail, and did.
+  #
+  # This is the full OFFLINE suite. It needs no database server: every
+  # behavioural catalog suite runs on SQLite (a temporary file per test), and
+  # the PostgreSQL variants skip here and run in the `postgres` job below.
   tests:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         # Endpoints of the supported range only. 3.12 is dropped on purpose:
         # Windows runners bill at 2x, and a version between two passing
-        # endpoints is the least likely to catch anything.
-        python-version: ['3.11', '3.13']
+        # endpoints is the least likely to catch anything. 3.14 is the newest
+        # interpreter the product is run on; allow-prereleases lets the job
+        # resolve it on a runner image that only carries a release candidate.
+        python-version: ['3.11', '3.13', '3.14']
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          allow-prereleases: true
 
-      # Install the declared requirements rather than a hand-picked subset.
-      # The previous list omitted psycopg, so the eighteen pg_test_guard tests
-      # failed on every run instead of exercising the safety guard. Installing
-      # the real file also proves requirements.txt stays resolvable.
+      # The PostgreSQL dependency set = core + psycopg. psycopg is installed
+      # even though no server is used here: the pg_test_guard unit tests need
+      # libpq's DSN parser to exercise the safety guard.
       #
-      # PySide6 is skipped on purpose: it is a ~150 MB desktop toolkit needed
-      # only by the DB Inspector GUI, which has no headless test.
+      # PySide6 (requirements-gui.txt) is left out on purpose: it is a ~150 MB
+      # desktop toolkit needed only by the DB Inspector GUI, which the gui job
+      # below covers once.
       - name: Install dependencies
-        shell: bash
         run: |
           python -m pip install --upgrade pip
-          grep -v '^PySide6' requirements.txt > ci-requirements.txt
-          python -m pip install -r ci-requirements.txt
+          python -m pip install -r requirements-postgres.txt
           python -m pip install pytest
-          rm ci-requirements.txt
 
       # The PostgreSQL suites skip without LTO_TEST_PG_DSN, which is correct
       # here: they need a disposable server and must never be pointed at a real
@@ -93,3 +101,171 @@ jobs:
             echo "::error::the test suite created a config.ini in the repo root"
             exit 1
           fi
+
+  # The same suite with the PostgreSQL variants switched on.
+  #
+  # Why Windows and not an ubuntu `services: postgres` container: the suites
+  # are not platform-independent. The PostgreSQL-marked test modules run
+  # through tests/conftest.py and the application modules, which assume
+  # Windows path and drive-letter semantics, and they sit in the same files
+  # as tests that call powershell.exe and robocopy; the product itself is
+  # Windows-only. So the server comes to the Windows runner instead: a brand
+  # new cluster is initialised from the runner's bundled PostgreSQL binaries
+  # in the runner's temp directory.
+  #
+  # It satisfies tests/pg_test_guard.py by construction: loopback only, port
+  # 15432 (never 5432), and a cluster that has just been created cannot host
+  # an `lto_archive` database. The password is random per run and never
+  # leaves the job. Nothing here touches the runner's own PostgreSQL service.
+  postgres:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      LTO_PG_SEALED_BATCH_IT: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-postgres.txt
+          python -m pip install pytest
+
+      - name: Start a disposable PostgreSQL 17 on 127.0.0.1:15432
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:PGBIN -or -not (Test-Path (Join-Path $env:PGBIN 'initdb.exe'))) {
+            throw "This runner image has no bundled PostgreSQL (PGBIN is '$env:PGBIN')."
+          }
+          $version = & (Join-Path $env:PGBIN 'postgres.exe') --version
+          Write-Host "Bundled server: $version"
+          if ($version -notmatch '\(PostgreSQL\) 17\.') {
+            throw "PostgreSQL 17 is required; this runner image carries: $version"
+          }
+          $secret = [guid]::NewGuid().ToString('N')
+          Write-Host "::add-mask::$secret"
+          $data = Join-Path $env:RUNNER_TEMP 'lto_pg_test_data'
+          $secretFile = Join-Path $env:RUNNER_TEMP 'lto_pg_test_secret.txt'
+          [System.IO.File]::WriteAllText($secretFile, $secret)
+          & (Join-Path $env:PGBIN 'initdb.exe') -D $data -U lto --pwfile=$secretFile --auth=scram-sha-256 --encoding=UTF8 --locale=en_US.UTF-8 --no-instructions
+          if ($LASTEXITCODE -ne 0) { throw "initdb failed ($LASTEXITCODE)" }
+          Remove-Item $secretFile
+          & (Join-Path $env:PGBIN 'pg_ctl.exe') -D $data -l (Join-Path $env:RUNNER_TEMP 'lto_pg_test.log') -o "-p 15432 -c listen_addresses=127.0.0.1" -w start
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content (Join-Path $env:RUNNER_TEMP 'lto_pg_test.log') -ErrorAction SilentlyContinue
+            throw "pg_ctl start failed ($LASTEXITCODE)"
+          }
+          # Keyword form, not a URL: libpq and the guard accept both.
+          "LTO_TEST_PG_DSN=host=127.0.0.1 port=15432 dbname=postgres user=lto password=$secret" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # No -k filter: with the server configured the PostgreSQL variants run
+      # instead of skipping, next to everything else. An unsafe DSN fails at
+      # collection; it never degrades to a skip.
+      - name: Test suite with the PostgreSQL suites enabled
+        run: >-
+          python -m pytest tests/ -q -rs
+          -W error::pytest.PytestUnhandledThreadExceptionWarning
+
+      - name: Assert the PostgreSQL suites really ran
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, sys
+          sys.path.insert(0, "tests")
+          import pg_test_guard
+          if not pg_test_guard.pg_available():
+              sys.exit("the disposable PostgreSQL server was not reachable, "
+                       "so the PostgreSQL suites were skipped")
+          print("PostgreSQL test server reachable and accepted by the guard")
+          PY
+
+      - name: Server log (on failure)
+        if: failure()
+        shell: pwsh
+        run: Get-Content (Join-Path $env:RUNNER_TEMP 'lto_pg_test.log') -Tail 200 -ErrorAction SilentlyContinue
+
+  # A clean install, one job per backend: a new virtualenv, ONE dependency
+  # file, the committed tree only (git archive), a first run, and an
+  # archive -> catalog -> restore round trip on synthetic files with a temp
+  # directory in place of the tape. See scripts/install_smoke_test.py.
+  install-smoke:
+    name: install-smoke (${{ matrix.backend }})
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [sqlite, postgresql]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # Same disposable cluster as the `postgres` job (see the comment there).
+      - name: Start a disposable PostgreSQL 17 on 127.0.0.1:15432
+        if: matrix.backend == 'postgresql'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:PGBIN -or -not (Test-Path (Join-Path $env:PGBIN 'initdb.exe'))) {
+            throw "This runner image has no bundled PostgreSQL (PGBIN is '$env:PGBIN')."
+          }
+          $version = & (Join-Path $env:PGBIN 'postgres.exe') --version
+          Write-Host "Bundled server: $version"
+          if ($version -notmatch '\(PostgreSQL\) 17\.') {
+            throw "PostgreSQL 17 is required; this runner image carries: $version"
+          }
+          $secret = [guid]::NewGuid().ToString('N')
+          Write-Host "::add-mask::$secret"
+          $data = Join-Path $env:RUNNER_TEMP 'lto_pg_test_data'
+          $secretFile = Join-Path $env:RUNNER_TEMP 'lto_pg_test_secret.txt'
+          [System.IO.File]::WriteAllText($secretFile, $secret)
+          & (Join-Path $env:PGBIN 'initdb.exe') -D $data -U lto --pwfile=$secretFile --auth=scram-sha-256 --encoding=UTF8 --locale=en_US.UTF-8 --no-instructions
+          if ($LASTEXITCODE -ne 0) { throw "initdb failed ($LASTEXITCODE)" }
+          Remove-Item $secretFile
+          & (Join-Path $env:PGBIN 'pg_ctl.exe') -D $data -l (Join-Path $env:RUNNER_TEMP 'lto_pg_test.log') -o "-p 15432 -c listen_addresses=127.0.0.1" -w start
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content (Join-Path $env:RUNNER_TEMP 'lto_pg_test.log') -ErrorAction SilentlyContinue
+            throw "pg_ctl start failed ($LASTEXITCODE)"
+          }
+          # Keyword form, not a URL: libpq and the guard accept both.
+          "LTO_TEST_PG_DSN=host=127.0.0.1 port=15432 dbname=postgres user=lto password=$secret" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # The script builds its own virtualenv and installs into it; nothing is
+      # installed into this interpreter. For postgresql it reads the DSN from
+      # LTO_TEST_PG_DSN, so no password appears on a command line.
+      - name: Clean-install smoke test
+        run: python scripts/install_smoke_test.py --backend ${{ matrix.backend }}
+
+  # The DB Inspector GUI, headless. The matrix above skips PySide6, so without
+  # this job the two GUI suites never ran in CI at all. One interpreter is
+  # enough: the toolkit is the variable here, not the Python version.
+  gui:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install dependencies (with PySide6)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pytest
+
+      - name: Headless GUI tests
+        run: >-
+          python -m pytest tests/test_inspector_gui.py
+          tests/test_tape_usage_display.py -q

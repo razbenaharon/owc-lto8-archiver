@@ -163,6 +163,14 @@ _ENTRY_FILE = 'f'
 _ENTRY_DIRECTORY = 'd'
 
 
+#: Upper bound for ONE immediate-child directory listing (or one mutation
+#: probe) when the caller gives none. Deliberately generous: it only has to
+#: turn a hung connection into a clean, retryable listing failure. Matches the
+#: default of ``[PERFORMANCE] ssh_command_timeout_seconds``, which is what a
+#: production run passes in.
+DEFAULT_SCAN_LISTING_TIMEOUT_SECONDS = 3600
+
+
 class DirectoryListing:
     """The result of listing ONE directory's immediate children."""
 
@@ -215,6 +223,12 @@ class DirectoryFrontierScanner(RemoteScanner):
 
     def __init__(self, remote_user, remote_host, remote_password='',
                  timeout=None, skipped_tracker=None, ui=None, metrics=None):
+        # A directory listing must never be unbounded: production built this
+        # scanner without a timeout, so a connection that hung mid-listing
+        # blocked the scan for ever (audit M10). ``None`` therefore means "the
+        # generous default", not "wait indefinitely".
+        if timeout is None or float(timeout) <= 0:
+            timeout = DEFAULT_SCAN_LISTING_TIMEOUT_SECONDS
         super().__init__(
             remote_user, remote_host, remote_password=remote_password,
             timeout=timeout, skipped_tracker=skipped_tracker, ui=ui)

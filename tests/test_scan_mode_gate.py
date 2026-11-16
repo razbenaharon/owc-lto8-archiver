@@ -8,6 +8,7 @@ The properties asserted here keep the fixed production path safe:
 * the orchestrator stops before worker or device work when it is not ready;
 * probing readiness never migrates, backfills or writes anything.
 """
+from source_facts import code_only
 import configparser
 import os
 import tempfile
@@ -185,7 +186,7 @@ class OrchestratorFrontierGateTests(unittest.TestCase):
     def test_the_gate_never_offers_a_legacy_fallback(self):
         """Structural: the refusal path must not mention a downgrade."""
         import inspect
-        source = inspect.getsource(
+        source = code_only(
             ro.RemoteOrchestrator._require_frontier_schema)
         self.assertNotIn("build_legacy_scanner_factory", source)
         self.assertNotIn("MODE_LEGACY", source)
@@ -193,7 +194,7 @@ class OrchestratorFrontierGateTests(unittest.TestCase):
 
     def test_the_run_path_has_no_mode_or_feature_flag_branch(self):
         import inspect
-        source = inspect.getsource(
+        source = code_only(
             ro.RemoteOrchestrator._run_streaming_session)
         self.assertIn("_require_frontier_schema", source)
         self.assertNotIn("decide_scan_mode", source)

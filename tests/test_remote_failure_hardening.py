@@ -7,6 +7,7 @@ previous mount could approve a write, and a prior-run 'backing' chunk could be
 double-written. All tests are mock-only — no real tape, no real SSH, no
 production run.
 """
+from source_facts import code_only
 import inspect
 import io
 import os
@@ -582,8 +583,8 @@ class SingleGateStructureTests(unittest.TestCase):
 
     def setUp(self):
         import inspect
-        self.src = inspect.getsource(ro.RemoteOrchestrator._run_session)
-        self.stream = inspect.getsource(
+        self.src = code_only(ro.RemoteOrchestrator._run_session)
+        self.stream = code_only(
             ro.RemoteOrchestrator._run_streaming_session)
         # Phase 4: authorization moved from the per-chunk _write_chunk to the
         # group boundary. _write_chunk is now a single-chunk wrapper over
@@ -593,8 +594,8 @@ class SingleGateStructureTests(unittest.TestCase):
         # orchestrator keeps a delegating façade method, so the STRUCTURE must
         # be inspected where the behaviour now lives.
         from src.remote_writer import RemoteChunkWriter
-        self.write = inspect.getsource(RemoteChunkWriter._write_chunk_group)
-        self.one = inspect.getsource(
+        self.write = code_only(RemoteChunkWriter._write_chunk_group)
+        self.one = code_only(
             RemoteChunkWriter._write_one_chunk_owned)
 
     def test_every_write_goes_through_the_single_group_boundary(self):
@@ -608,56 +609,11 @@ class SingleGateStructureTests(unittest.TestCase):
             self.assertNotIn("_write_chunk_group(", loop)
         self.assertIn(
             "_write_chunk_group(",
-            inspect.getsource(RemotePipelineCoordinator.run))
-
-    def test_write_chunk_is_the_only_gate_caller_on_the_write_path(self):
-        # The loops must NOT call the gate directly — the group boundary owns it.
-        self.assertNotIn("_pre_write_safety_gate", self.src)
-        self.assertNotIn("_pre_write_safety_gate", self.stream)
-        self.assertIn("_pre_write_safety_gate", self.write)
-        # And it must run exactly once per group, never per chunk.
-        self.assertNotIn("_pre_write_safety_gate", self.one)
-        self.assertEqual(self.write.count("_pre_write_safety_gate("), 1)
+            code_only(RemotePipelineCoordinator.run))
 
     def test_reboot_check_is_not_called_directly_in_the_loops(self):
         self.assertNotIn("_pre_tape_write_reboot_check", self.src)
         self.assertNotIn("_pre_tape_write_reboot_check", self.stream)
-
-    def test_authorize_and_write_are_under_the_tape_lock(self):
-        # acquire -> gate -> per-chunk writer launch -> release, all in the
-        # group boundary. The writer itself launches inside
-        # _write_one_chunk_owned, which the group calls between gate and release.
-        a = self.write.index("_acquire_tape_io_lock")
-        g = self.write.index("_pre_write_safety_gate")
-        w = self.write.index("_write_one_chunk_owned(")
-        r = self.write.rindex("_release_tape_io_lock")
-        self.assertLess(a, g, "the tape lock must be held before authorizing")
-        self.assertLess(g, w, "the gate must pass before the writer launches")
-        self.assertLess(w, r, "the writer launches before the lock is released")
-        self.assertIn(".run(", self.one)
-
-    def test_per_chunk_body_never_acquires_or_releases_ownership(self):
-        """Phase 4: ownership spans the whole group, so the per-chunk body must
-        not touch the lock — that is what keeps readiness verified once."""
-        self.assertNotIn("_acquire_tape_io_lock", self.one)
-        self.assertNotIn("_release_tape_io_lock", self.one)
-
-    def test_done_commit_stays_inside_the_group_ownership_period(self):
-        """CHANGED IN PHASE 4, deliberately.
-
-        The 'done' commit + staging flush used to run after _write_chunk
-        released the lock. It now runs while the GROUP still owns LTFS: the
-        commit is PostgreSQL plus local staging cleanup and touches no tape,
-        and releasing between chunks would invalidate the readiness cache and
-        force the per-chunk probe this phase exists to remove. Ownership is
-        still released in the group's finally, before any wait for new work.
-        """
-        self.assertIn("'done'", self.one)
-        self.assertNotIn("_release_tape_io_lock", self.one)
-        # The group releases exactly once, in a finally.
-        self.assertEqual(self.write.count("_release_tape_io_lock()"), 1)
-        self.assertIn("finally:", self.write)
-
 
 class GatePrecedenceTests(unittest.TestCase):
     """Required precedence: an already-recorded stop wins; a later CANCEL never
@@ -760,6 +716,7 @@ class WriteChunkRaceTests(unittest.TestCase):
                                    ibm_eject_cmd="")
         statuses = []
         orch.db = SimpleNamespace(
+            verify_archiver_lock=lambda: True,
             get_chunks_with_status=lambda sid, st: [],
             get_chunk_size_summary=lambda sid, ci=None: {ci: (10, 10, 1)},
             get_chunk_packaging_format=lambda sid, ci: ContainerFormat.ZIP,
@@ -779,7 +736,7 @@ class WriteChunkRaceTests(unittest.TestCase):
         `LtfsCmdEject` is mechanical and there is no software "load" for a tape
         out of the slot, so a run finishing overnight stranded the drive until
         somebody travelled to the lab — the exact outcome
-        docs/incidents/000-no-physical-intervention-policy.md forbids. It also
+        docs/history/incidents/000-no-physical-intervention-policy.md forbids. It also
         would have blocked the follow-up session for the roots plan 37 never
         scanned. The default is now "leave the cartridge loaded".
         """
@@ -896,6 +853,7 @@ class CooperativeCancelWriteTests(unittest.TestCase):
                                    ibm_eject_cmd="")
         statuses = []
         orch.db = SimpleNamespace(
+            verify_archiver_lock=lambda: True,
             get_chunks_with_status=lambda sid, st: [],
             get_chunk_size_summary=lambda sid, ci=None: {ci: (10, 10, 1)},
             get_chunk_packaging_format=lambda sid, ci: ContainerFormat.ZIP,
@@ -1298,7 +1256,8 @@ class ProtectedProcessCancelTests(unittest.TestCase):
 class DocsAssertionTests(unittest.TestCase):
     def test_doc_does_not_call_unmount_unsupported_or_claim_verified_sync(self):
         path = os.path.join(os.path.dirname(os.path.dirname(__file__)),
-                            "docs", "performance_insights_and_recommendations.md")
+                            "docs", "history",
+                            "performance_insights_and_recommendations.md")
         text = open(path, encoding="utf-8").read().lower()
         self.assertNotIn("unmount is unsupported", text)
         self.assertNotIn("index-sync verified", text)

@@ -23,6 +23,9 @@ _ROBOCOPY_ERROR_RE = re.compile(r'ERROR \d+ \(0x[0-9A-Fa-f]{8}\)')
 # FAILED counter at 0.
 _RETRY_LOOKAHEAD_LINES = 3
 
+# Popen creation flags for the tape-write child only (0 off Windows).
+_TAPE_WRITE_CREATIONFLAGS = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
+
 
 def _unrecovered_error_lines(output):
     """ERROR lines robocopy did not follow with a retry (stripped)."""
@@ -169,6 +172,10 @@ def _parse_robocopy_bytes(tokens, idx):
         except ValueError:
             return 0, idx
     try:
+        return int(val), idx            # exact /BYTES integer, any size
+    except ValueError:
+        pass
+    try:
         return int(float(val)), idx
     except ValueError:
         return 0, idx
@@ -193,6 +200,7 @@ def _parse_robocopy_summary(output):
         'files_mismatch': 0, 'files_failed': 0, 'files_extras': 0,
         'bytes_total': 0, 'bytes_copied': 0, 'speed_mbs': 0.0, 'elapsed': '',
         'summary_found': False, 'summary_malformed': False,
+        'dirs_failed': 0, 'bytes_skipped': 0, 'bytes_exact': False, 'bytes_found': False,
     }
     output = output or ''
     for line in output.splitlines():
@@ -231,9 +239,21 @@ def _parse_robocopy_summary(output):
 
         elif parts[0] == 'Bytes' and len(parts) >= 4 and parts[1] == ':':
             total_b,      i = _parse_robocopy_bytes(parts, 2)  # total
-            bytes_copied, _ = _parse_robocopy_bytes(parts, i)  # copied
+            bytes_copied, i = _parse_robocopy_bytes(parts, i)  # copied
+            bytes_skipped, _ = _parse_robocopy_bytes(parts, i)  # skipped
             result['bytes_total']  = total_b
             result['bytes_copied'] = bytes_copied
+            result['bytes_skipped'] = bytes_skipped
+            # Exact only with /BYTES; "4.52 g" style values are rounded and
+            # must not be compared against an exact expected total.
+            result['bytes_found'] = True
+            result['bytes_exact'] = not any(
+                p.lower() in ('k', 'm', 'g', 't') for p in parts[2:])
+
+        # "Dirs :  4  3  1  0  0  0"  (Total Copied Skipped Mismatch Failed Extras)
+        elif (parts[0] == 'Dirs' and len(parts) >= 8 and parts[1] == ':'
+              and parts[6].lstrip('-').isdigit()):
+            result['dirs_failed'] = int(parts[6])
 
         # "Speed :  59993856 Bytes/Sec."
         elif parts[0] == 'Speed' and len(parts) >= 4 and parts[1] == ':' and 'bytes/sec' in parts[3].lower():
@@ -289,6 +309,14 @@ def _run_robocopy_tuned(cmd, priority=None, affinity=None, on_start=None,
         encoding='utf-8',
         errors='replace',
         bufsize=1,   # line-buffered so the sink sees each line as it is emitted
+        # Isolate the tape write from console control events. Windows delivers
+        # a console Ctrl+C (and scripts/graceful_stop.py's CTRL_C_EVENT) to
+        # EVERY process attached to the console, so without this the robocopy
+        # child was killed mid-write (exit 0xC000013A) no matter what the
+        # Python cancel handler decided. A child started in its own process
+        # group has Ctrl+C disabled, so a stop request is honoured only by this
+        # process — at the next chunk boundary.
+        creationflags=_TAPE_WRITE_CREATIONFLAGS,
     )
     # Protected: a cooperative Ctrl+C must let the active tape write finish and
     # commit rather than cut it and leave the chunk ambiguously 'backing'. Only a
@@ -377,10 +405,12 @@ def classify_robocopy_result(returncode, rc_sum, rc_output,
             'Robocopy did not complete (no return code)', error_lines)
 
     # 2. Robocopy's own hard-failure signals.
-    if returncode >= 8:
+    #    A negative code means the process was killed, never a clean finish.
+    if returncode >= 8 or returncode < 0:
         return RobocopyVerdict(
             False, 'nonzero_return_code',
-            f'Robocopy returned failure code {returncode} (>=8)', error_lines)
+            f'Robocopy returned failure code {returncode} (>=8 or killed)',
+            error_lines)
     if 'RETRY LIMIT EXCEEDED' in output:
         return RobocopyVerdict(
             False, 'retry_limit_exceeded',
@@ -404,6 +434,13 @@ def classify_robocopy_result(returncode, rc_sum, rc_output,
         return RobocopyVerdict(
             False, 'files_failed',
             f'{files_failed} file(s) failed to copy', error_lines)
+    # 4b. A directory robocopy could not create/process: the files beneath it
+    #     may never have been attempted, so FAILED files can still read 0.
+    dirs_failed = int(rc_sum.get('dirs_failed', 0) or 0)
+    if dirs_failed > 0:
+        return RobocopyVerdict(
+            False, 'dirs_failed',
+            f'{dirs_failed} directory(ies) failed', error_lines)
 
     # 5. An ERROR robocopy never retried was not recovered, whatever the
     #    counters say (the tape write runs /R:0, so this is every ERROR there).
@@ -442,6 +479,29 @@ def classify_robocopy_result(returncode, rc_sum, rc_output,
             False, 'incomplete_copy',
             f'robocopy accounted for {accounted} file(s) (copied+skipped) '
             f'but the source holds {expected_source_files}', error_lines)
+
+    # 8. Byte accounting: copied + skipped (already present) bytes must reach
+    #    the expected total. Only with exact /BYTES counters; more than expected
+    #    is fine (the direct path expects only the newly submitted files).
+    #    A summary with no "Bytes :" line at all carries no byte evidence and
+    #    is not trusted when bytes were expected.
+    if expected_bytes and rc_sum.get('bytes_found') is False:
+        return RobocopyVerdict(
+            False, 'missing_byte_summary',
+            f'robocopy summary has no Bytes line though {expected_bytes} '
+            'byte(s) were expected', error_lines)
+    bytes_accounted = bytes_copied + int(rc_sum.get('bytes_skipped', 0) or 0)
+    #    A rounded summary ("4.52 g", no /BYTES) carries three significant
+    #    digits, so it is held to 98% of the expected total rather than waved
+    #    through: a gross shortfall is still a failed copy.
+    bytes_floor = (expected_bytes if rc_sum.get('bytes_exact')
+                   else int(expected_bytes * 0.98)) if expected_bytes else 0
+    if expected_bytes and bytes_accounted < bytes_floor:
+        return RobocopyVerdict(
+            False, 'incomplete_bytes',
+            f'robocopy accounted for {bytes_accounted} byte(s) '
+            f'(copied+skipped) but {expected_bytes} were expected',
+            error_lines)
 
     # Success: complete summary, no failures, work is accounted for. Any ERROR
     # lines here were transient and recovered — the summary is authoritative.

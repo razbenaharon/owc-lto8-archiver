@@ -21,7 +21,10 @@ Authority model (Phase 5B.5, Option B):
 Migration integrity (Phase 5B.5): ``apply_schema`` records a SHA-256 of the 012
 file, fails closed if a different checksum is already recorded for the version,
 and runs exact schema-drift validation — "the tables already exist" is never by
-itself treated as success. Authority: ``docs/PHASE5_SEALED_BATCH_DESIGN.md``.
+itself treated as success. The schema is
+``scripts/sql/012_sealed_tape_write_batches.sql``; installing it and the
+PostgreSQL-only scope are described in ``docs/installation.md`` and
+``docs/database-backends.md``.
 """
 import hashlib
 import json
@@ -228,6 +231,9 @@ class SealedBatchRepository:
     """PostgreSQL repository for sealed tape-write batches."""
 
     def __init__(self, conninfo):
+        # Sealed batches are PostgreSQL-only in v1.0: refuse before any work.
+        from . import db_backend
+        db_backend.require_postgresql(conninfo, "sealed_batches")
         self.conninfo = conninfo
 
     # -- connection / transaction helpers --------------------------------
@@ -255,7 +261,6 @@ class SealedBatchRepository:
         """Apply 012 idempotently, then record/verify its checksum and run exact
         schema-drift validation. Never reports success just because the tables
         exist; a recorded-but-different checksum fails closed."""
-        import psycopg
         ddl = _MIGRATION_FILE.read_text(encoding="utf-8")
         checksum = migration_checksum()
         conn = self._connect()

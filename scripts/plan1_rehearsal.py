@@ -163,6 +163,19 @@ def run_suite(paths, label, verbose=False):
     return record
 
 
+def _isolated_postgres_reachable():
+    """True only when the fail-closed test guard accepts a reachable server.
+
+    An unsafe target (production port, a server hosting the live catalog)
+    raises from the guard rather than counting as "absent".
+    """
+    tests_dir = os.path.join(PROJECT_ROOT, "tests")
+    if tests_dir not in sys.path:
+        sys.path.insert(0, tests_dir)
+    import pg_test_guard
+    return bool(pg_test_guard.pg_available())
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -194,10 +207,13 @@ def main(argv=None):
         print("=" * 78)
         print("PLAN 1 REHEARSAL — stage 2: isolated PostgreSQL")
         print("=" * 78)
-        record = run_suite(["tests/test_pg_integration.py"],
+        # Ask the guard itself, before running: the suite also has SQLite
+        # variants that always pass, so "some tests passed" no longer shows
+        # that any PostgreSQL test ran.
+        postgres_reachable = _isolated_postgres_reachable()
+        record = run_suite(["tests/test_db_integration.py"],
                            "isolated PostgreSQL", verbose=args.verbose)
-        ran_nothing = ("skipped" in record["summary"]
-                       and "passed" not in record["summary"])
+        ran_nothing = not postgres_reachable
         if ran_nothing:
             # A stage that ran nothing must not read as a stage that passed.
             # "pytest exited 0" and "the behaviour was demonstrated" are
@@ -209,9 +225,11 @@ def main(argv=None):
                 else ("----" if ran_nothing else "FAIL"))
         print(f"  [{mark}] isolated PostgreSQL          {record['summary']}")
         if ran_nothing:
-            print("         NOTE: every test skipped — no PostgreSQL server was")
-            print("         reachable. Start it (docker compose up -d db) and")
-            print("         re-run; a skipped stage is NOT evidence.")
+            print("         NOTE: the PostgreSQL tests skipped — no disposable")
+            print("         test server is configured. Set LTO_TEST_PG_DSN (the")
+            print("         exact docker command is in tests/pg_test_guard.py;")
+            print("         never the production port 5432) and re-run; a")
+            print("         skipped stage is NOT evidence.")
 
     offline_ok = all(stage["passed"] for stage in report["stages"])
     missing = [stage["stage"] for stage in report["stages"]

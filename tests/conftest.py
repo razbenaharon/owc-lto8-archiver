@@ -173,6 +173,11 @@ def block_production_drive(monkeypatch):
 # ===========================================================================
 _PSYCOPG_ORIGINAL_CONNECT = None
 
+#: ``psycopg.connect`` keywords that are NOT libpq connection parameters.
+_PSYCOPG_ONLY_KWARGS = frozenset({
+    "autocommit", "prepare_threshold", "row_factory", "cursor_factory",
+    "context"})
+
 
 def _guarded_connect(original):
     from psycopg.conninfo import conninfo_to_dict
@@ -180,14 +185,18 @@ def _guarded_connect(original):
     import pg_test_guard as guard
 
     def wrapper(conninfo="", **kwargs):
+        # Every keyword psycopg does not consume itself is a libpq connection
+        # parameter. Parsing only host/port here let ``hostaddr=`` (or
+        # ``service=``) ride through to the real connect unchecked.
         try:
             parsed = conninfo_to_dict(conninfo, **{
                 k: v for k, v in kwargs.items()
-                if k in ("host", "port", "dbname", "user", "password")})
+                if k not in _PSYCOPG_ONLY_KWARGS and v is not None})
         except Exception:
             parsed = {}
-        target = ((parsed.get("host") or "").strip(),
-                  str(parsed.get("port") or "").strip())
+        # Exactly as libpq will see them: no stripping.
+        target = (str(parsed.get("host") or ""),
+                  str(parsed.get("port") or ""))
 
         dsn = guard.configured_dsn()          # raises on an UNSAFE setting
         if dsn is None:
@@ -206,6 +215,9 @@ def _guarded_connect(original):
                 f"which is not the configured disposable test server "
                 f"({allowed[0]}:{allowed[1]}). Tests must derive every "
                 f"connection from tests/pg_test_guard.py.")
+        # host/port matched; nothing may redirect the connection behind them.
+        guard.assert_no_address_override(
+            parsed, origin="a PostgreSQL connection opened by a test")
         return original(conninfo, **kwargs)
 
     wrapper.__wrapped__ = original

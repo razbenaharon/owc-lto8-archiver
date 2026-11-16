@@ -1,26 +1,12 @@
-"""PostgreSQL database factory and shared catalog identity helpers."""
+"""Database factory (SQLite or PostgreSQL) and shared catalog identity helpers."""
 import hashlib
-
-
-class DatabaseManager:
-    """Removed SQLite manager placeholder.
-
-    The archive catalog is PostgreSQL-only. Use ``create_database_manager(cfg)``
-    so connection handling and error messages stay consistent.
-    """
-
-    def __new__(cls, *args, **kwargs):
-        raise RuntimeError(
-            "[DB] SQLite DatabaseManager has been removed. Configure PostgreSQL "
-            "in [DATABASE] and call create_database_manager(cfg)."
-        )
 
 
 def _fmt_ts(value, width=19):
     """Render a timestamp for fixed-width display.
 
-    PostgreSQL returns datetime/date objects where the legacy SQLite catalog
-    returned ISO strings; both forms (and None) must display safely.
+    A value may arrive as a datetime/date object or as an ISO string; both
+    forms (and None) must display safely.
     """
     if value is None:
         return ''
@@ -99,11 +85,25 @@ def _apply_canonical_remote_paths(metadata, manifest_rows):
 
 
 def create_database_manager(cfg):
-    """Return the PostgreSQL database manager."""
+    """Return the catalog manager for ``[DATABASE] backend``.
+
+    SQLite needs nothing installed: the database file and the complete schema
+    are created automatically the first time it is opened.
+    """
+    from . import db_backend
+
+    if db_backend.is_sqlite(cfg):
+        from .sqlite_db import SqliteDatabaseManager
+
+        return SqliteDatabaseManager(cfg.db_dsn)
+
     from .pg_db import PgDatabaseManager
 
     try:
-        return PgDatabaseManager(cfg.db_dsn)
+        # A database that holds no catalog yet gets the complete schema; an
+        # existing catalog is opened exactly as before (explicit migrations
+        # stay explicit there).
+        return PgDatabaseManager(cfg.db_dsn, complete_fresh_schema=True)
     except Exception as exc:
         if _is_postgres_connection_error(exc):
             raise RuntimeError(_postgres_connection_error_message(cfg)) from exc
@@ -119,6 +119,9 @@ def _is_postgres_connection_error(exc):
     return isinstance(exc, (PoolTimeout, psycopg.OperationalError))
 
 
+_LOCAL_POSTGRES_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})
+
+
 def _postgres_connection_error_message(cfg):
     host = getattr(cfg, "pg_host", "localhost")
     port = getattr(cfg, "pg_port", "5432")
@@ -127,16 +130,31 @@ def _postgres_connection_error_message(cfg):
     lines = [
         f"[DB] Could not connect to PostgreSQL at {host}:{port} "
         f"(database '{dbname}', user '{user}').",
-        "[DB] Start the local database with: docker compose up -d db",
-        "[DB] Then check it with: docker ps --filter name=lto_pg",
-        "[DB] If the container just started, wait until it is healthy; "
-        "PostgreSQL may be replaying WAL after an unclean shutdown.",
-        "[DB] Recovery details are visible with: docker logs --tail 80 lto_pg",
     ]
+    if str(host).strip().lower() in _LOCAL_POSTGRES_HOSTS:
+        # The bundled docker-compose.yml database. For a server on another
+        # machine these hints would only mislead.
+        lines += [
+            "[DB] Start the local database with: docker compose up -d db",
+            "[DB] Then check it with: docker ps --filter name=lto_pg",
+            "[DB] If the container just started, wait until it is healthy; "
+            "PostgreSQL may be replaying WAL after an unclean shutdown.",
+            "[DB] Recovery details are visible with: "
+            "docker logs --tail 80 lto_pg",
+        ]
+    else:
+        lines.append(
+            "[DB] Check that the server is running and reachable from this "
+            "machine, and that [DATABASE] host/port/dbname/user in "
+            "config.ini are right.")
     if not getattr(cfg, "pg_password", ""):
         lines.append(
             "[DB] No PostgreSQL password is configured. Copy .env.example to "
             ".env or set PGPASSWORD; the local Docker default is "
             "'change_me_local'."
         )
+    lines.append(
+        "[DB] The catalog backend is [DATABASE] backend in config.ini "
+        "(postgresql here). 'sqlite' needs no server, but it is a separate, "
+        "new catalog: nothing is copied from PostgreSQL.")
     return "\n".join(lines)

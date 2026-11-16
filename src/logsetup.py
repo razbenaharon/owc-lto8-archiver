@@ -30,6 +30,13 @@ def get_logger():
     """
     logger = logging.getLogger(_LOGGER_NAME)
     logger.propagate = False
+    if not logger.handlers:
+        # A logger with NO handler is not silent: Python falls back to its
+        # last-resort handler, which writes warnings and errors - with the
+        # whole traceback for ``logger.exception`` - to the console. A bad
+        # config.ini is reported before the file log exists, so that is how
+        # a traceback used to appear above the readable message.
+        logger.addHandler(logging.NullHandler())
     return logger
 
 

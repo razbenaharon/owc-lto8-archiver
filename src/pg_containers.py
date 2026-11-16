@@ -12,8 +12,8 @@ from dataclasses import asdict, is_dataclass
 
 from .pipeline_types import (ArtifactReadiness, ContainerFormat,
                              ContainerValidationState, SourceDisposition)
-from .pg_bulk import copy_rows
-from .pg_core import _row, _rows
+from .db_backend import lease_deadline
+from .pg_core import _now_utc, _row, _rows
 from .session_reconcile import classify_session37_format_boundary_category
 from .stored_tar_planning import (build_stored_tar_chunk_plan,
                                   StoredTarChunkPlan,
@@ -131,8 +131,7 @@ class PgContainerMixin:
 
     def _container_format_schema_report_conn(self, conn):
         report = {
-            "database": conn.execute(
-                "SELECT current_database() AS db").fetchone()["db"],
+            "database": self._database_name_conn(conn),
             "expected_schema_version": CONTAINER_FORMAT_SCHEMA_VERSION,
             "expected_reader_contract_version":
                 REQUIRED_STORED_TAR_READER_CONTRACT_VERSION,
@@ -518,8 +517,7 @@ class PgContainerMixin:
 
     def _container_format_schema_authority_v2_report_conn(self, conn):
         report = {
-            "database": conn.execute(
-                "SELECT current_database() AS db").fetchone()["db"],
+            "database": self._database_name_conn(conn),
             "expected_migration_checksum":
                 self.container_format_authority_v2_migration_checksum(),
             "installed": False,
@@ -1324,13 +1322,7 @@ class PgContainerMixin:
         }
 
         def lock_read(conn):
-            return bool(conn.execute(
-                """SELECT count(*) AS n FROM pg_locks
-                   WHERE locktype='advisory' AND granted
-                     AND classid=%s AND objid=%s AND objsubid=1""",
-                (self.ARCHIVER_LOCK_KEY >> 32,
-                 self.ARCHIVER_LOCK_KEY & 0xFFFFFFFF),
-            ).fetchone()["n"])
+            return bool(self._archiver_lock_held_conn(conn))
 
         report["archiver_lock_held"] = self._run_read(
             lock_read, "container format migration lock preflight")
@@ -1363,14 +1355,10 @@ class PgContainerMixin:
             raise RuntimeError(
                 "[DB] Migration 015 is not installed; refusing to create an "
                 "unformatted remote chunk")
-        row = conn.execute(
-            """SELECT lto_assign_new_chunk_format(%s,%s,%s,%s,%s)
-                      AS packaging_format""",
-            (int(session_id), int(chunk_index),
-             stored_tar_write_enabled is True,
-             CONTAINER_FORMAT_SCHEMA_VERSION, reader_contract_version),
-        ).fetchone()
-        return ContainerFormat(row["packaging_format"])
+        return ContainerFormat(self._sql_assign_new_chunk_format_conn(
+            conn, int(session_id), int(chunk_index),
+            stored_tar_write_enabled is True,
+            CONTAINER_FORMAT_SCHEMA_VERSION, reader_contract_version))
 
     def assign_new_chunk_format(
             self, session_id, chunk_index, *, stored_tar_write_enabled=False,
@@ -2048,15 +2036,13 @@ class PgContainerMixin:
                     "remote_path", "expected_logical_bytes",
                     "estimated_tar_bytes")
                 col_sql = ", ".join(member_columns)
-                conn.execute(
-                    "CREATE TEMP TABLE _stage_acm ON COMMIT DROP AS "
-                    f"SELECT {col_sql} FROM archive_container_members "
-                    "WITH NO DATA")
-                with conn.cursor() as cur:
-                    copy_rows(cur, "_stage_acm", member_columns, member_rows)
+                self._create_stage_table_conn(
+                    conn, "_stage_acm", "archive_container_members", col_sql)
+                self._copy_rows_conn(
+                    conn, "_stage_acm", member_columns, member_rows)
                 conn.execute(
                     f"INSERT INTO archive_container_members ({col_sql}) "
-                    f"SELECT {col_sql} FROM _stage_acm "
+                    f"SELECT {col_sql} FROM _stage_acm WHERE true "
                     "ON CONFLICT DO NOTHING")
             return self._read_stored_tar_chunk_plan_conn(
                 conn, session_id, chunk_index)
@@ -2130,13 +2116,14 @@ class PgContainerMixin:
                 """UPDATE archive_containers
                    SET validation_state='building', owner_token=%s,
                        validated_part_locator=%s,
-                       lease_expires_at=now()+(%s * interval '1 second'),
+                       lease_expires_at=%s,
                        validation_started_at=COALESCE(validation_started_at, now()),
                        updated_at=now()
                    WHERE container_id=%s AND validation_state='planned'
                      AND owner_token IS NULL
                    RETURNING *""",
-                (token, part, lease_seconds, int(container_id)),
+                (token, part, lease_deadline(_now_utc(), lease_seconds),
+                 int(container_id)),
             ).fetchone()
             if row is None:
                 raise RuntimeError("Stored TAR build claim lost its owner race")
@@ -2272,14 +2259,15 @@ class PgContainerMixin:
             row = conn.execute(
                 """UPDATE archive_containers
                    SET owner_token=%s,
-                       lease_expires_at=now()+(3600 * interval '1 second'),
+                       lease_expires_at=%s,
                        updated_at=now()
                    WHERE container_id=%s AND owner_token=%s
                      AND validation_state=%s
                      AND writer_state='not_started'
                      AND catalog_state='not_started'
                    RETURNING *""",
-                (new, int(container_id), old, state),
+                (new, lease_deadline(_now_utc(), 3600), int(container_id),
+                 old, state),
             ).fetchone()
             if row is None:
                 raise RuntimeError(

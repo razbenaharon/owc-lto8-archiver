@@ -9,10 +9,13 @@ catalog.
 
 Four rules make these artifacts safe to depend on for recovery:
 
-1. **Publication is atomic.** Records are written to a uniquely-named ``.part``
-   file and only ``os.replace``-d into their final name once the stream is
-   flushed and closed. A crash therefore leaves an orphan ``.part``, never a
-   truncated artifact that a reader would happily parse as complete.
+1. **Publication is atomic and durable.** Records are written to a
+   uniquely-named ``.part`` file, flushed and ``os.fsync``-ed through the
+   still-open write handle, and only then renamed (no-clobber) into their
+   final name. A crash therefore leaves an orphan ``.part``, never a truncated
+   artifact that a reader would happily parse as complete. Windows offers no
+   way to fsync a *directory*, so the rename itself is not separately forced
+   to disk there; the file contents are.
 
 2. **A ready locator is never a ``.part``.** Enforced here, in
    :class:`~src.pg_scan.PgScanMixin` and by the schema's own CHECK — three
@@ -128,6 +131,58 @@ def _require_zstd():
         raise ArtifactError(
             "[SCAN] zstandard is required for .jsonl.zst scan segments. "
             "Run `python -m pip install -r requirements.txt`.")
+
+
+class _SingleFrameReader(io.RawIOBase):
+    """Decompress exactly ONE zstd frame and refuse anything after it.
+
+    Every writer in this module emits a single frame. ``stream_reader`` stops
+    quietly at the end of the first frame, so bytes appended to an artifact -
+    a second frame, a stray copy, garbage - used to be invisible to a reader
+    that then reported the file as valid. Here a frame that ends early, or is
+    followed by even one more byte, is an error.
+    """
+
+    def __init__(self, raw, what):
+        super().__init__()
+        self._raw = raw
+        self._what = str(what)
+        self._frame = zstd.ZstdDecompressor().decompressobj()
+        self._pending = b""
+        self._exhausted = False
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        while not self._pending and not self._exhausted:
+            block = self._raw.read(1024 * 1024)
+            if not block:
+                if not self._frame.eof:
+                    raise ArtifactError(
+                        "artifact is truncated (incomplete zstd frame): "
+                        f"{self._what!r}")
+                self._exhausted = True
+                break
+            if self._frame.eof:
+                raise ArtifactError(
+                    "artifact has trailing data after its zstd frame: "
+                    f"{self._what!r}")
+            self._pending = self._frame.decompress(block)
+            if self._frame.eof and self._frame.unused_data:
+                raise ArtifactError(
+                    "artifact has trailing data after its zstd frame: "
+                    f"{self._what!r}")
+        count = min(len(buffer), len(self._pending))
+        buffer[:count] = self._pending[:count]
+        self._pending = self._pending[count:]
+        return count
+
+
+def _single_frame_text(raw, what):
+    """UTF-8 text view of the one zstd frame an artifact may contain."""
+    return io.TextIOWrapper(
+        io.BufferedReader(_SingleFrameReader(raw, what)), encoding="utf-8")
 
 
 def artifact_root(archive_root):
@@ -475,7 +530,10 @@ class JsonlZstArtifactWriter:
             return self
         os.makedirs(_long(os.path.dirname(self.final_path)), exist_ok=True)
         self._raw = open(_long(self.part_path), "wb")
-        self._compressor = zstd.ZstdCompressor().stream_writer(self._raw)
+        # closefd=False: closing the zstd writer must leave the file handle
+        # open so close() can fsync the finished bytes through it.
+        self._compressor = zstd.ZstdCompressor().stream_writer(
+            self._raw, closefd=False)
         self._text = io.TextIOWrapper(self._compressor, encoding="utf-8")
         self._emit({
             "kind": _HEADER_KIND,
@@ -562,6 +620,9 @@ class JsonlZstArtifactWriter:
                 self._text.flush()
                 self._text.detach()
                 self._compressor.close()
+                # Durability: the bytes must be on disk BEFORE the name is.
+                self._raw.flush()
+                os.fsync(self._raw.fileno())
             finally:
                 self._raw.close()
                 self._text = None
@@ -586,7 +647,9 @@ class JsonlZstArtifactWriter:
                 f"refusing to overwrite an existing scan segment: "
                 f"{self.locator}. Two workers produced the same segment; "
                 "reconcile the frontier rather than letting one win.")
-        os.replace(_long(self.part_path), _long(self.final_path))
+        # No-clobber rename, not os.replace: a writer that lost the race
+        # between the check above and here must fail, not overwrite.
+        publish_no_clobber(self.part_path, self.final_path)
         self.published = True
         get_logger().info(
             "scan_segment_published: locator=%s files=%d bytes=%d "
@@ -621,8 +684,7 @@ def parse_jsonl_zst_artifact(archive_root, locator, *,
     footer = None
     entries = []
     with open(_long(path), "rb") as raw:
-        reader = zstd.ZstdDecompressor().stream_reader(raw)
-        text = io.TextIOWrapper(reader, encoding="utf-8")
+        text = _single_frame_text(raw, locator)
         for line in text:
             line = line.strip()
             if not line:
@@ -768,23 +830,37 @@ def plan3_artifact_locator(namespace, session_label, *, chunk_index=None,
 
 
 def _fsync_path(path):
-    """Best-effort durability for a file and the directory naming it."""
+    """Force an already-written file's contents to disk; True on success.
+
+    Windows implements ``os.fsync`` with ``FlushFileBuffers``, which fails on
+    a handle opened read-only - so the old ``O_RDONLY`` open made this a
+    silent no-op there. The handle is opened read-write instead (``O_BINARY``
+    so nothing is translated; nothing is written through it).
+    """
+    flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
     try:
-        fd = os.open(_long(path), os.O_RDONLY)
+        fd = os.open(_long(path), flags)
     except OSError:
-        return
+        return False
     try:
         os.fsync(fd)
+        return True
     except OSError:                          # pragma: no cover - platform dep.
-        pass
+        return False
     finally:
         os.close(fd)
 
 
 def _fsync_dir(path):
+    """Force a directory entry (the rename) to disk where the OS allows it.
+
+    Windows cannot: ``os.open`` refuses a directory and there is no portable
+    directory flush. The rename is atomic there but its durability is left to
+    NTFS/ReFS metadata journaling; the file CONTENTS are fsynced before the
+    rename on every platform, which is the part a crash could otherwise leave
+    as a correctly named but empty or truncated artifact.
+    """
     if os.name == "nt":
-        # Windows has no directory handle to fsync through os.open; the rename
-        # itself is the atomic barrier there.
         return
     try:                                     # pragma: no cover - POSIX only
         fd = os.open(_long(path), os.O_RDONLY)
@@ -859,7 +935,10 @@ class Plan3ArtifactWriter:
             return self
         os.makedirs(_long(os.path.dirname(self.final_path)), exist_ok=True)
         self._raw = open(_long(self.part_path), "wb")
-        self._compressor = zstd.ZstdCompressor().stream_writer(self._raw)
+        # closefd=False: closing the zstd writer must leave the file handle
+        # open so close() can fsync the finished bytes through it.
+        self._compressor = zstd.ZstdCompressor().stream_writer(
+            self._raw, closefd=False)
         self._text = io.TextIOWrapper(self._compressor, encoding="utf-8")
         self._emit(self.header)
         return self
@@ -934,14 +1013,15 @@ class Plan3ArtifactWriter:
                 })
                 self._text.flush()
                 self._text.detach()
-                # Closing the zstd stream writer also closes the raw file it
-                # wraps, so durability is taken on the path in publish() rather
-                # than on a handle that may already be gone.
+                # The zstd writer was opened with closefd=False, so the raw
+                # handle outlives it and the finished frame is fsynced through
+                # the handle that wrote it. (It used to close the raw file,
+                # which skipped this fsync entirely.)
                 self._compressor.close()
+                self._raw.flush()
+                os.fsync(self._raw.fileno())
             finally:
                 if not self._raw.closed:
-                    self._raw.flush()
-                    os.fsync(self._raw.fileno())
                     self._raw.close()
                 self._text = None
         if not publish:
@@ -1030,15 +1110,20 @@ def _parse_plan3_stream(path, *, expected_version, allow_part=False):
     records = []
     try:
         with open(_long(text_path), "rb") as raw:
-            reader = zstd.ZstdDecompressor().stream_reader(raw)
-            stream = io.TextIOWrapper(reader, encoding="utf-8")
+            stream = _single_frame_text(raw, text_path)
             for line in stream:
                 line = line.strip()
                 if not line:
                     continue
                 record = json.loads(line)
                 kind = record.get("kind")
+                if trailer is not None:
+                    raise ArtifactError(
+                        f"records follow the artifact trailer: {text_path!r}")
                 if kind == _HEADER_KIND:
+                    if header is not None:
+                        raise ArtifactError(
+                            f"artifact has more than one header: {text_path!r}")
                     header = record
                 elif kind == _RECORD_KIND:
                     records.append(record)
@@ -1060,21 +1145,58 @@ def _parse_plan3_stream(path, *, expected_version, allow_part=False):
     return header, records, trailer
 
 
+#: The detail field each artifact kind sums into its trailer ``byte_total``
+#: (``None``: the kind carries no byte total). This mirrors the ``size_field``
+#: each writer passes to :class:`Plan3ArtifactWriter`; a reader needs it to
+#: re-check the declared total against the records it actually read.
+_PLAN3_SIZE_FIELDS = {
+    PLAN_MANIFEST_VERSION: "expected_size",
+    TERMINAL_STATE_VERSION: "observed_archived_size",
+    SESSION_DESCRIPTOR_VERSION: None,
+    SCAN_STATE_SEGMENT_VERSION: None,
+    "abandoned-fetch-state-v1": "file_size_bytes",
+}
+_INFER_SIZE_FIELD = object()
+
+
 def read_plan3_artifact(archive_root, locator, *, expected_version,
-                        validate_artifact=None):
+                        validate_artifact=None,
+                        size_field=_INFER_SIZE_FIELD):
     """Parse a published Plan 3 artifact and re-check its own aggregates.
 
     Every consumer goes through here, so an artifact whose trailer disagrees
-    with its contents is refused at read time as well as at publication time.
+    with its contents is refused at read time as well as at publication time:
+    the declared ``record_count`` and ``byte_total`` must both match what was
+    read, and the file must be exactly one zstd frame ending at its trailer.
+
+    ``size_field`` names the detail field summed into ``byte_total``; by
+    default it is looked up from the artifact version. For a version this
+    module does not know, pass it explicitly - otherwise only the record
+    count is checked.
     """
     path = resolve_locator(os.path.abspath(str(archive_root)), locator)
     header, records, trailer = _parse_plan3_stream(
         path, expected_version=expected_version)
     declared = trailer.get("record_count")
-    if declared is not None and int(declared) != len(records):
+    if declared is None or int(declared) != len(records):
         raise ArtifactError(
             f"artifact aggregate mismatch in {locator!r}: record_count "
             f"declared={declared!r} actual={len(records)}")
+    if size_field is _INFER_SIZE_FIELD:
+        size_field = _PLAN3_SIZE_FIELDS.get(header.get("version"))
+    if size_field:
+        declared_bytes = trailer.get("byte_total")
+        try:
+            actual_bytes = sum(
+                int(record[size_field]) for record in records
+                if record.get(size_field) is not None)
+        except (TypeError, ValueError) as exc:
+            raise ArtifactError(
+                f"artifact {locator!r} has a non-integer {size_field}") from exc
+        if declared_bytes is None or int(declared_bytes) != actual_bytes:
+            raise ArtifactError(
+                f"artifact aggregate mismatch in {locator!r}: byte_total "
+                f"declared={declared_bytes!r} actual={actual_bytes}")
     if validate_artifact is not None:
         validate_artifact(header, records, trailer)
     return header, records, trailer

@@ -55,12 +55,18 @@ SECRET_ALLOWLIST = {"tests/test_operational_hardening.py"}
 # Private infrastructure identities that were scrubbed from the public tree.
 # The literals are built by concatenation so this file never matches its own
 # patterns (and survives mechanical scrub passes).
+#
+# Each pattern matches the whole naming SCHEME, not one literal: a fixture
+# that changes the last digit of a real host name, or keeps the real mount
+# prefix with a made-up tail, still tells a reader how the site names things.
 PRIVATE_IDENTITY_PATTERNS = [
-    (re.compile(r"\bso0[12]\b"), "internal source hostname"),
-    (re.compile(r"LAB-" + r"HPLB-09", re.I), "production host name"),
+    (re.compile(r"\bso0\d\b", re.I), "internal source hostname"),
+    (re.compile(r"LAB-" + r"HPLB", re.I), "production host name"),
     (re.compile(r"10970" + r"08774"), "drive serial"),
     (re.compile(r"Tech" + r"nion", re.I), "organization name"),
-    (re.compile(r"/st" + r"rg/[CDE]/"), "real remote data path"),
+    (re.compile(r"/st" + r"rg/"), "real remote data path"),
+    (re.compile(r"Scalpe" + r"l[ _-]?lab|Scalpe" + r"lab", re.I),
+     "lab name"),
 ]
 
 TEXT_EXTENSIONS = {".py", ".md", ".txt", ".ini", ".sql", ".yml", ".yaml",

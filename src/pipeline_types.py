@@ -304,12 +304,22 @@ class StoredTarValidationSummary:
 #: that may be on tape gets quietly retried.
 CHUNK_TRANSITIONS = {
     ChunkStatus.PENDING: frozenset({
-        ChunkStatus.FETCHING, ChunkStatus.FETCH_FAILED, ChunkStatus.DONE}),
+        ChunkStatus.FETCHING, ChunkStatus.FETCH_FAILED, ChunkStatus.DONE,
+        # A preserved, validated pack can outlive its status: a tape reset
+        # returns the chunk to 'pending' while the pack is still staged. The
+        # writer then starts (or fails to start) straight from 'pending'.
+        ChunkStatus.BACKING, ChunkStatus.BACKUP_FAILED}),
     ChunkStatus.FETCHING: frozenset({
-        ChunkStatus.PACKING, ChunkStatus.FETCH_FAILED, ChunkStatus.PENDING}),
+        ChunkStatus.PACKING, ChunkStatus.FETCH_FAILED, ChunkStatus.PENDING,
+        # Every file of the chunk was source-missing: nothing to pack or write,
+        # so the skip-tape path commits it directly.
+        ChunkStatus.DONE}),
     ChunkStatus.PACKING: frozenset({
         ChunkStatus.BACKING, ChunkStatus.BACKUP_FAILED,
-        ChunkStatus.FETCH_FAILED, ChunkStatus.DONE, ChunkStatus.PENDING}),
+        ChunkStatus.FETCH_FAILED, ChunkStatus.DONE, ChunkStatus.PENDING,
+        # A run that died while packing left no usable pack; the next run
+        # re-fetches the chunk from scratch.
+        ChunkStatus.FETCHING}),
     # Forward to DONE only — that is the write completing and committing.
     # There is NO automatic retry out of 'backing': the chunk may already be on
     # tape, so re-fetching and re-writing it would double-write. Only a human
@@ -327,6 +337,53 @@ CHUNK_TRANSITIONS = {
 
 class ForbiddenTransition(ValueError):
     """A transition that is not in :data:`CHUNK_TRANSITIONS`."""
+
+
+class ChunkTransitionOverride(str, Enum):
+    """Named operator recoveries that may cross :data:`CHUNK_TRANSITIONS`.
+
+    There is no blanket bypass. Each member names ONE recovery, lists exactly
+    which normally-forbidden moves it may make, and every use is recorded in
+    ``remote_chunk_transition_overrides`` (migration 020) with who authorised
+    it and why. The database guard refuses the move without that record.
+    """
+
+    #: The cartridge generation a chunk was written to has been destroyed by an
+    #: explicitly authorised tape reset, so the chunk must be written again.
+    TAPE_RESET = "tape_reset"
+    #: A human reconciled the cartridge against the catalog and established
+    #: that an ambiguous or committed chunk is NOT on tape.
+    OPERATOR_RECONCILED = "operator_reconciled"
+
+
+#: The normally-forbidden ``(from, to)`` moves each named override may make.
+CHUNK_OVERRIDE_TRANSITIONS = {
+    ChunkTransitionOverride.TAPE_RESET: frozenset({
+        (ChunkStatus.DONE, ChunkStatus.PENDING),
+        (ChunkStatus.BACKING, ChunkStatus.PENDING)}),
+    ChunkTransitionOverride.OPERATOR_RECONCILED: frozenset({
+        (ChunkStatus.BACKING, ChunkStatus.PENDING),
+        (ChunkStatus.BACKING, ChunkStatus.BACKUP_FAILED),
+        (ChunkStatus.DONE, ChunkStatus.PENDING)}),
+}
+
+
+def assert_chunk_override_transition(override, from_status, to_status):
+    """Raise unless ``override`` is a known name that permits this move."""
+    try:
+        name = ChunkTransitionOverride(override)
+        pair = (ChunkStatus(from_status), ChunkStatus(to_status))
+    except ValueError:
+        raise ForbiddenTransition(
+            f"unknown chunk transition override {override!r} or status "
+            f"({from_status!r} -> {to_status!r}); the old state is "
+            "preserved") from None
+    if pair not in CHUNK_OVERRIDE_TRANSITIONS[name]:
+        raise ForbiddenTransition(
+            f"override {name.value!r} does not permit chunk transition "
+            f"{pair[0].value!r} -> {pair[1].value!r}; the old state is "
+            "preserved")
+    return name
 
 
 def is_allowed_chunk_transition(from_status, to_status):

@@ -1,19 +1,8 @@
-"""Read-only, bounded PostgreSQL query layer for the database inspector."""
+"""Read-only, bounded query layer for the database inspector (both backends)."""
 import gzip
 import json
 import os
-from typing import Any, TYPE_CHECKING, cast
-
-if TYPE_CHECKING:
-    import psycopg
-    from psycopg.rows import dict_row
-else:
-    try:
-        import psycopg
-        from psycopg.rows import dict_row
-    except ImportError:  # pragma: no cover - optional until PG backend is selected
-        psycopg = None
-        dict_row = None
+from typing import Any
 
 try:
     import zstandard as zstd
@@ -22,6 +11,9 @@ except ImportError:  # pragma: no cover - requirements includes zstandard
 
 from .catalog_query import prefix_pattern, substring_pattern
 from .db import _derived_file_name
+from . import db_backend
+from .db_backend import as_day, day_bounds
+from .directory_catalog_validation import archiver_lock_status
 
 
 DEFAULT_PAGE_SIZE = 250
@@ -33,16 +25,13 @@ class InspectorRepository:
 
     def __init__(self, db_path):
         self.db_path = db_path
-        if psycopg is None:
-            raise RuntimeError(
-                "[DB] psycopg 3 is required for PostgreSQL inspector access.")
         # autocommit=True keeps each read in its own short transaction. Without
-        # it, psycopg's default deferred transaction would stay open for the
-        # connection's lifetime ("idle in transaction"), pinning xmin and
-        # blocking VACUUM while an inspector tab is left open.
-        self.conn: Any = psycopg.connect(
-            db_path, autocommit=True, row_factory=cast(Any, dict_row))
-        self.conn.execute("SET default_transaction_read_only = on")
+        # it, a deferred transaction would stay open for the connection's
+        # lifetime ("idle in transaction" on PostgreSQL, a pinned WAL snapshot
+        # on SQLite) while an inspector tab is left open. The connection is
+        # read-only at the engine level on both backends.
+        self.conn: Any = db_backend.connect(
+            db_path, autocommit=True, read_only=True)
 
     def _execute(self, sql, params=()) -> Any:
         return self.conn.execute(sql, params)
@@ -57,14 +46,7 @@ class InspectorRepository:
         self.close()
 
     def _require_v3(self):
-        columns = {
-            row["column_name"]
-            for row in self._execute(
-                """SELECT column_name
-                   FROM information_schema.columns
-                   WHERE table_name='files_index'"""
-            )
-        }
+        columns = set(db_backend.column_names(self.conn, "files_index"))
         available = {"directory_id", "catalog_name",
                      "catalog_backup_date"}.issubset(columns)
         if not available:
@@ -135,12 +117,7 @@ class InspectorRepository:
         return [row["source_host"] for row in rows if row["source_host"]]
 
     def _table_exists(self, name):
-        return self._execute(
-            """SELECT 1
-               FROM information_schema.tables
-               WHERE table_schema='public' AND table_name=%s""",
-            (name,),
-        ).fetchone() is not None
+        return db_backend.table_exists(self.conn, name)
 
     def list_sessions(self):
         rows = []
@@ -210,6 +187,45 @@ class InspectorRepository:
                            0 AS file_records
                     FROM remote_sessions s ORDER BY s.session_id"""))
         return sorted(rows, key=lambda r: (r["kind"], int(r["session_id"])))
+
+    def session_delete_blockers(self, kind, session_id):
+        """Reasons a session must not be deleted right now; ``[]`` = allowed.
+
+        Read-only pre-flight for the inspector's *Delete Selected Session*
+        (audit M8). ``PgDatabaseManager.delete_session`` repeats the status
+        refusal inside its own transaction; this adds the archiver-lock check
+        and gives the operator every reason at once, before anything is
+        attempted.
+        """
+        kind = (kind or "").strip().lower()
+        if kind not in ("local", "remote"):
+            return [f"unknown session kind: {kind!r}"]
+        table = "local_sessions" if kind == "local" else "remote_sessions"
+        reasons = []
+        row = None
+        if self._table_exists(table):
+            row = self._execute(
+                f"SELECT status FROM {table} WHERE session_id=%s",
+                (int(session_id),)).fetchone()
+        if row is None:
+            reasons.append(f"{kind} session {session_id} does not exist")
+        elif str(row["status"] or "").strip().lower() == "active":
+            reasons.append(
+                f"{kind} session {session_id} is marked active (a row marked "
+                "active is treated as live until proven otherwise)")
+        holders = archiver_lock_status(self.db_path)
+        if holders:
+            reasons.append(
+                f"the archiver lock is held ({holders} holder(s)): an "
+                "archiver is running")
+        return reasons
+
+    def require_session_deletable(self, kind, session_id):
+        reasons = self.session_delete_blockers(kind, session_id)
+        if reasons:
+            raise RuntimeError(
+                f"[DB] Refusing to delete {kind} session {session_id}: "
+                + "; ".join(reasons) + ".")
 
     def list_directory_bundles(self, tape_label=None, cursor=None, limit=None):
         page_size = self._limit(limit)
@@ -495,11 +511,11 @@ class InspectorRepository:
             where.append("f.catalog_name ILIKE %s ESCAPE '\\'")
             params.append(prefix_pattern(filters["name_prefix"]))
         if filters.get("date_from"):
-            where.append("f.catalog_backup_date >= %s::date")
-            params.append(filters["date_from"])
+            where.append("f.catalog_backup_date >= %s")
+            params.append(as_day(filters["date_from"]))
         if filters.get("date_to"):
-            where.append("f.catalog_backup_date < (%s::date + INTERVAL '1 day')")
-            params.append(filters["date_to"])
+            where.append("f.catalog_backup_date < %s")
+            params.append(day_bounds(filters["date_to"])[1])
         if filters.get("source_host"):
             where.append("f.source_host=%s")
             params.append(filters["source_host"])

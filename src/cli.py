@@ -12,15 +12,14 @@ from .exit_codes import (ExitCode, StopResult, REASON_BAD_CONFIG,
 from .logsetup import configure_file_logging, get_logger
 from .ltfs import TapeManager
 from .orchestrators import LocalOrchestrator, RemoteOrchestrator
-from .pg_backup import create_database_backup
+from .db_backup import backup_menu_text, backup_noun, create_database_backup
 from .reporting import generate_backup_summary
 from .retriever import LTORetriever
 from .robocopy import _prepare_robocopy_exclusion, _remove_robocopy_exclusion
 from .remote_transport import _cleanup_askpass_helpers
 from .runtime import _terminate_all_procs, install_cancel_handler, reset_cancel, uninstall_cancel_handler, unpin_current_process
 from .windows_update_guard import (assess_reboot_state, managed_update_policy,
-                                   pause_windows_updates,
-                                   pending_reboot_reasons, print_guard_status,
+                                   pause_windows_updates, print_guard_status,
                                    restore_stale_guard, resume_windows_updates)
 
 if TYPE_CHECKING:
@@ -53,8 +52,9 @@ def _start_windows_update_guard(cfg: ConfigManager):
             print(f"  - {signal.message} [{signal.code}]")
         print("[WU] Pausing updates cannot cancel an already-staged restart. "
               "A restart during a tape write corrupts the LTFS index and "
-              "loses every chunk written so far — this cost ~126 GB of "
-              "Tape_02 on 2026-07-15.")
+              "loses every chunk written so far — a forced restart during "
+              "a tape write has caused data loss on a real deployment; see "
+              "docs/history/incidents/005-20260715-sccm-forced-restart-data-loss.md.")
         if cfg.windows_update_block_on_pending_reboot:
             print("[WU] Reboot this host first, then start the run. To "
                   "override, set [WINDOWS_UPDATE] block_on_pending_reboot "
@@ -71,31 +71,36 @@ def _start_windows_update_guard(cfg: ConfigManager):
 
 
 def run_archiver(cfg: ConfigManager, db: "PgDatabaseManager"):
+    """Menu option 1. Returns an :class:`ExitCode` value (0 when nothing
+    failed) so a failed local run is visible in the process exit code."""
     # Cross-process single-writer guard: the in-process tape I/O lock cannot
     # stop a second `python run.py` instance from interleaving tape writes.
     try:
         db.acquire_archiver_lock()
     except RuntimeError as e:
         print(str(e))
-        return
+        return int(ExitCode.FATAL_CONFIG)
 
     proceed, wu_guard = _start_windows_update_guard(cfg)
     if not proceed:
         db.release_archiver_lock()
-        return
+        return int(ExitCode.TRANSIENT_RESUMABLE)
 
     added_exclusion = _prepare_robocopy_exclusion()
     reset_cancel()
     install_cancel_handler()
     print("[LOCAL] Press Ctrl+C at any time to stop safely "
           "(the session is saved and can be resumed).")
+    code = int(ExitCode.COMPLETED)
     try:
         LocalOrchestrator(cfg, db).run()
     except RuntimeError as e:
         get_logger().exception("local archive run stopped")
         print(str(e))
+        code = int(ExitCode.FATAL_CONFIG)
     except KeyboardInterrupt:
         print("\n[LOCAL] Interrupted. Session state saved — re-run to resume.")
+        code = int(ExitCode.USER_STOP)
     finally:
         # Mirror run_remote_archiver: make sure no robocopy child survives,
         # restore CPU affinity and default Ctrl+C behaviour, then drop the
@@ -110,6 +115,7 @@ def run_archiver(cfg: ConfigManager, db: "PgDatabaseManager"):
         if wu_guard:
             resume_windows_updates()
         db.release_archiver_lock()
+    return code
 
 
 def run_remote_archiver(cfg: ConfigManager, db: "PgDatabaseManager",
@@ -213,6 +219,7 @@ def _print_tapes_table(db):
     if not tapes:
         print("[DB] No tapes registered.")
         return tapes
+    from .constants import tape_usage
     BAR_W = 20
     print(f"\n{'ID':>4}  {'Volume Label':<25}  {'Initialized':<19}  Space")
     print("-" * 80)
@@ -229,13 +236,15 @@ def _print_tapes_table(db):
             # that cannot land.
             space_s = (f"FULL - {used_gb:.1f} GB written"
                        f"{tape_status_reason_suffix(t)}")
-        elif cap_gb:
-            pct     = min(used_gb / cap_gb, 1.0)
-            filled  = round(pct * BAR_W)
-            bar     = '█' * filled + '░' * (BAR_W - filled)
-            space_s = f"[{bar}] {pct*100:.1f}%  {used_gb:.1f}/{cap_gb:.0f} GB"
         else:
-            space_s = f"{used_gb:.1f} GB used  (no capacity set)"
+            # Percent of the planning budget (constants.tape_usage) — the one
+            # figure shared with the GUI and with the planner itself.
+            usage   = tape_usage(cap_gb, used_b)
+            filled  = round(usage.bar_fraction * BAR_W)
+            bar     = '█' * filled + '░' * (BAR_W - filled)
+            space_s = (f"[{bar}] {usage.percent_text}  {used_gb:.1f}/"
+                       f"{usage.budget_bytes / 1000**3:.0f} GB"
+                       f"{'' if cap_gb else '  (no capacity set)'}")
         print(f"{t['tape_id']:>4}  {t['volume_label']:<25}  {date_s:<19}  {space_s}")
     return tapes
 
@@ -309,7 +318,18 @@ def _db_management_menu(db):
             if db.tape_exists(new_label):
                 print(f"[ERROR] Label '{new_label}' already exists.")
                 continue
-            db.rename_tape(old_label, new_label)
+            try:
+                db.rename_tape(old_label, new_label)
+            except Exception as exc:
+                # The rename is one transaction; a refusal (for example the
+                # database's loose-file restore routes) leaves nothing half
+                # renamed. Report it instead of ending the menu.
+                print(f"[ERROR] Rename refused; nothing was changed. {exc}")
+                get_logger().warning("tape rename %s -> %s refused: %s",
+                                     old_label, new_label, exc)
+                continue
+            print(f"[OK] '{old_label}' renamed to '{new_label}' in the "
+                  "catalog.")
 
         elif sub == '4':
             tapes = _print_tapes_table(db)
@@ -408,6 +428,15 @@ def main():
     # result, that result's exit code is preserved rather than replaced by a
     # generic EOF code — the original failure (a network stop, say) wins.
     last_result = None
+    # The most recent FAILED non-remote action (local archive, restore,
+    # database backup). The menu used to print such an error and then exit 0,
+    # so a scheduled or piped run could not tell failure from success.
+    failure_code = 0
+
+    def _exit_code():
+        code = int(getattr(last_result, "exit_code", 0)) if last_result else 0
+        return code or failure_code
+
     while True:
         print("\n" + "=" * 60)
         print("  MAIN MENU")
@@ -420,7 +449,7 @@ def main():
         print("  6. Remote Archive — Fetch from remote host & backup to LTO")
         print("  7. Database Management — Edit / delete tape & file records")
         print("  8. Backup Summary — Ensure backup_logs/SUMMARY.csv report")
-        print("  9. Database Backup — Dump PostgreSQL catalog to db_backups")
+        print("  9. " + backup_menu_text(cfg))
         print("  0. Exit")
         print("-" * 60)
 
@@ -430,7 +459,7 @@ def main():
             # stdin is closed (e.g. a detached run). Exit cleanly with no
             # traceback. If a sub-flow already produced a terminal result,
             # preserve its exit code; otherwise a neutral clean exit.
-            code = int(getattr(last_result, "exit_code", 0)) if last_result else 0
+            code = _exit_code()
             reason = getattr(last_result, "reason", None)
             print("\n[MENU] Standard input closed; exiting cleanly"
                   + (f" (last result: {reason})." if reason else "."))
@@ -441,7 +470,7 @@ def main():
             raise SystemExit(code)
 
         if choice == '1':
-            run_archiver(cfg, db)
+            failure_code = int(run_archiver(cfg, db) or 0) or failure_code
 
         elif choice == '2':
             added_exclusion = _prepare_robocopy_exclusion()
@@ -451,11 +480,19 @@ def main():
             reset_cancel()
             install_cancel_handler()
             try:
-                retriever.run()
+                restore_result = retriever.run()
+                # An incomplete restore printed its own summary; make the
+                # process exit code say so too (audit H13).
+                if restore_result is not None and not getattr(
+                        restore_result, "ok", True):
+                    failure_code = int(
+                        getattr(restore_result, "exit_code", 0)
+                        or ExitCode.FATAL_CONFIG)
             except RuntimeError as e:
                 # e.g. tape-verify cancelled — return to the menu, don't exit.
                 get_logger().exception("restore run stopped")
                 print(str(e))
+                failure_code = int(ExitCode.FATAL_CONFIG)
             except KeyboardInterrupt:
                 print("\n[RESTORE] Interrupted.")
             finally:
@@ -470,9 +507,9 @@ def main():
             print("1. Format tape        (LtfsCmdFormat.exe — ERASES ALL DATA)")
             print("2. Register tape manually")
             print("3. List available drives")
-            print("4. Check tape         (LtfsCmdCheck.exe — repair filesystem errors)")
+            print("4. Check tape         (LtfsCmdCheck.exe — REPAIRS the filesystem; asks you to type REPAIR)")
             print("5. Tape drives info   (LtfsCmdDrives.exe — list drives & status)")
-            print("6. Eject tape         (LtfsCmdEject.exe — safely eject tape)")
+            print("6. Eject tape         (LtfsCmdEject.exe — PHYSICAL eject; asks you to type EJECT)")
             print("0. Back")
             sub = input("Choose: ").strip()
             if sub == '1':
@@ -514,14 +551,17 @@ def main():
             try:
                 path = create_database_backup(cfg)
             except RuntimeError as e:
+                get_logger().exception("database backup failed")
                 print(str(e))
+                failure_code = int(ExitCode.FATAL_CONFIG)
             else:
-                print(f"[DB BACKUP] PostgreSQL dump created: {path}")
+                print(f"[DB BACKUP] {backup_noun(cfg)} created: {path}")
 
         elif choice == '0':
             print("Goodbye.")
             db.close()
-            break
+            # Returned to run.py, which turns it into the process exit code.
+            return _exit_code()
 
         else:
             print("[ERROR] Invalid selection.")

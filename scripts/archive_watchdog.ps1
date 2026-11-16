@@ -71,6 +71,84 @@ function Invoke-Psql {
     return ($out | Out-String).Trim()
 }
 
+# >>> hard-stop policy -- MUST mirror src/exit_codes.py
+# Source of truth: NO_AUTO_RESTART_REASONS, NO_AUTO_RESTART_EXIT_CODES and
+# AUTO_RESTARTABLE_EXIT_CODES in src/exit_codes.py. tests/
+# test_watchdog_hard_stop_sync.py fails when these lists drift, and executes
+# this block on its own (it touches nothing: no process, database or device).
+$HardStopReasons = @(
+    # 20 SAFETY_BLOCK -- a human must inspect before continuing
+    'ambiguous_backing_chunk',
+    'ltfs_sync_mode_not_time5',
+    'ltfs_mount_unverifiable',
+    'ltfs_media_degraded',
+    'unexpected_tape_or_db_state',
+    'ltfs_ownership_unavailable',
+    'ambiguous_active_sessions',
+    'sealed_batch_feature_unavailable',
+    'scan_frontier_unavailable',
+    'archiver_lock_lost',
+    # 30 FATAL_CONFIG -- config/auth/code error, no blind retry
+    'ssh_authentication_failed',
+    'ssh_permission_denied',
+    'ssh_host_key_mismatch',
+    'missing_noninteractive_credential',
+    'bad_config',
+    'no_active_session',
+    'noninteractive_requires_resume',
+    # 40 USER_STOP -- the operator stopped it on purpose
+    'user_requested_stop',
+    # 10, but a tape write failed: never retried into automatically
+    'tape_write_failed'
+)
+$HardStopExitCodes = @(20, 30, 40)
+$RestartableExitCodes = @(10)
+
+function Get-RecordedFailureRefusal {
+    # Decide from the archiver's own last_failure.json record whether an
+    # automatic restart is forbidden. Returns $null when a restart is allowed,
+    # otherwise the reason for refusing. Fails closed: a record without a
+    # usable exit code, or with one this script does not know, refuses.
+    param($Failure)
+    if ($null -eq $Failure) { return 'last_failure.json is empty or unreadable' }
+    $reason = [string]$Failure.reason
+    if ($reason -and ($HardStopReasons -contains $reason)) {
+        return "last recorded failure '$reason' is a hard stop - an operator must authorise resumption"
+    }
+    $code = $null
+    if ($null -ne $Failure.exit_code) {
+        $parsed = 0
+        if ([int]::TryParse([string]$Failure.exit_code, [ref]$parsed)) { $code = $parsed }
+    }
+    if ($null -eq $code) {
+        return "last recorded failure '$reason' carries no usable exit code - refusing to guess that it is restartable"
+    }
+    if ($HardStopExitCodes -contains $code) {
+        return "last recorded failure '$reason' ended with exit code $code (hard stop) - an operator must authorise resumption"
+    }
+    if ($RestartableExitCodes -notcontains $code) {
+        return "last recorded failure '$reason' ended with unknown exit code $code - refusing to guess that it is restartable"
+    }
+    return $null
+}
+
+function Get-TaskResultRefusal {
+    # Honour the exit code of the last scheduled archiver run as well: a
+    # failure that never reached last_failure.json (a config/database error at
+    # startup, for example) is visible only here.
+    param($LastTaskResult)
+    $parsed = [long]0
+    if ($null -eq $LastTaskResult -or
+        -not [long]::TryParse([string]$LastTaskResult, [ref]$parsed)) {
+        return 'the last archiver task result could not be read'
+    }
+    if ($HardStopExitCodes -contains $parsed) {
+        return "the last archiver task run ended with exit code $parsed (hard stop) - an operator must authorise resumption"
+    }
+    return $null
+}
+# <<< hard-stop policy
+
 $refusals = @()
 
 try {
@@ -130,23 +208,29 @@ ORDER BY s.session_id DESC LIMIT 1;
     $drive = (Get-ConfigValue -Section 'HARDWARE' -Key 'lto_drive') -replace '\\\\', '\'
     if (-not $drive) { $refusals += 'could not read [HARDWARE] lto_drive' }
 
-    # A recorded hard tape failure must not be auto-resumed into. This reads the
-    # archiver's own status file -- no device access.
+    # A recorded hard stop must not be auto-resumed into. This reads the
+    # archiver's own status file -- no device access. The decision (reason AND
+    # exit code, fail closed) lives in Get-RecordedFailureRefusal above.
     $failurePath = Join-Path $PSScriptRoot '..\backup_logs\last_failure.json'
     if (Test-Path $failurePath) {
         try {
             $failure = Get-Content $failurePath -Raw | ConvertFrom-Json
-            $hardReasons = @('ambiguous_backing_chunk', 'ltfs_media_degraded',
-                             'ltfs_sync_mode_not_time5', 'tape_write_failed',
-                             'unexpected_tape_or_db_state',
-                             'ltfs_ownership_unavailable')
-            if ($failure.reason -and ($hardReasons -contains $failure.reason)) {
-                $refusals += "last recorded failure '$($failure.reason)' is a hard tape fault - an operator must authorise resumption"
-            }
+            $failureRefusal = Get-RecordedFailureRefusal $failure
+            if ($failureRefusal) { $refusals += $failureRefusal }
         } catch {
             $refusals += 'could not parse backup_logs/last_failure.json'
         }
     }
+
+    # The process exit code of the last scheduled archiver run. Task Scheduler
+    # state only -- no device access. Unreadable => refuse (fail closed).
+    try {
+        $taskInfo = Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction Stop
+        $taskRefusal = Get-TaskResultRefusal $taskInfo.LastTaskResult
+    } catch {
+        $taskRefusal = "could not read the last result of scheduled task '$TaskName'"
+    }
+    if ($taskRefusal) { $refusals += $taskRefusal }
 
     # --- 8. never auto-eject ---------------------------------------------------
     $eject = Get-ConfigValue -Section 'HARDWARE' -Key 'eject_after_session'

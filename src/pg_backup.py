@@ -1,13 +1,35 @@
-"""PostgreSQL catalog backup helpers."""
+"""PostgreSQL catalog backup helpers.
+
+Verification contract (backend-neutral)
+---------------------------------------
+:func:`verify_backup` returns a :class:`BackupVerification`: which checks ran,
+whether each passed, and - in plain words - what was NOT proven. Callers read
+``ok`` / ``level`` / ``checks`` / ``not_verified`` and never need to know that
+the backend is PostgreSQL; a future backend returns the same shape. The
+PostgreSQL-specific work lives in ``_pg_*`` helpers below.
+
+Levels, weakest to strongest:
+
+* ``structure``     - the archive's table of contents is readable.
+* ``read_through``  - additionally every data block was read and decoded
+  (``pg_restore`` to a null sink), which catches truncation and corruption
+  after the table of contents. This is the default.
+* ``restored``      - additionally the dump was restored into a scratch
+  database on a server the operator explicitly named, and every table the
+  archive lists came back. Opt-in only (:func:`deep_verify_backup`).
+"""
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
 import uuid
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
@@ -29,6 +51,84 @@ from .pg_bulk import build_conninfo, require_psycopg
 
 DOCKER_DB_CONTAINER = "lto_pg"
 PG_DUMP_TIMEOUT_SECONDS = 6 * 60 * 60
+
+BACKUP_LEVEL_NONE = "none"
+BACKUP_LEVEL_STRUCTURE = "structure"
+BACKUP_LEVEL_READ_THROUGH = "read_through"
+BACKUP_LEVEL_RESTORED = "restored"
+
+NOT_RESTORED_STATEMENT = (
+    "The backup was NOT restored into a database. That it restores cleanly "
+    "(constraints, indexes, row contents) is unproven; run a deep verification "
+    "against a scratch server to prove it.")
+NOT_READ_THROUGH_STATEMENT = (
+    "Only the table of contents was read. The table data was NOT read, so "
+    "truncation or corruption after the table of contents would go unnoticed.")
+NOT_STATE_STATEMENT = (
+    "Verification says nothing about WHICH database state the backup holds; "
+    "that binding is the target-bound receipt's job.")
+
+
+@dataclass(frozen=True)
+class BackupCheck:
+    """One verification step that was actually executed."""
+
+    name: str
+    passed: bool
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class BackupVerification:
+    """Backend-neutral outcome of verifying one catalog backup.
+
+    ``checks`` lists only what ran; ``not_verified`` states what a passing
+    result still does not prove, so a caller cannot print "verified" without
+    having the caveats in hand.
+    """
+
+    backend: str
+    backup_path: str
+    size_bytes: int = 0
+    sha256: str = ""
+    level: str = BACKUP_LEVEL_NONE
+    checks: tuple = ()
+    not_verified: tuple = ()
+    artifacts: dict = field(default_factory=dict)
+    details: dict = field(default_factory=dict)
+
+    @property
+    def ok(self):
+        return bool(self.checks) and all(c.passed for c in self.checks)
+
+    @property
+    def failures(self):
+        return tuple(c for c in self.checks if not c.passed)
+
+    def as_dict(self):
+        payload = asdict(self)
+        payload["ok"] = self.ok
+        payload["checks"] = [asdict(c) for c in self.checks]
+        payload["not_verified"] = list(self.not_verified)
+        return payload
+
+    def summary(self):
+        """Honest, operator-facing statement of what was and was not proven."""
+        verdict = "PASSED" if self.ok else "FAILED"
+        lines = [f"[DB BACKUP] Verification {verdict} "
+                 f"(level: {self.level}) for {self.backup_path}"]
+        for check in self.checks:
+            mark = "ok  " if check.passed else "FAIL"
+            lines.append(f"  [{mark}] {check.name}"
+                         + (f": {check.detail}" if check.detail else ""))
+        for statement in self.not_verified:
+            lines.append(f"  [not verified] {statement}")
+        return "\n".join(lines)
+
+    def raise_if_failed(self):
+        if not self.ok:
+            raise RuntimeError(self.summary())
+        return self
 
 
 def _safe_filename_part(value, fallback):
@@ -166,7 +266,11 @@ def _backup_with_local_pg_dump(cfg, output_path, snapshot_id=None):
 
 
 def _restore_list_with_docker_container(
-        backup_path, restore_list_path, container_name):
+        backup_path, restore_list_path, container_name, read_through=False):
+    """List the archive's table of contents inside the container; with
+    ``read_through`` also decode every data block there (one copy-in for
+    both). Returns the step that failed (None when all ran), so the caller can
+    tell a bad table of contents from bad table data."""
     container_path = f"/tmp/{backup_path.name}"
     try:
         _run_command([
@@ -178,6 +282,14 @@ def _restore_list_with_docker_container(
             "pg_restore", "--list", container_path,
         ])
         restore_list_path.write_text(result.stdout, encoding="utf-8")
+        if read_through:
+            try:
+                _run_command([
+                    "docker", "exec", container_name,
+                    "pg_restore", "--file=/dev/null", container_path,
+                ])
+            except RuntimeError as exc:
+                raise _ReadThroughFailed(str(exc)) from exc
     finally:
         subprocess.run(
             ["docker", "exec", container_name, "rm", "-f", container_path],
@@ -186,7 +298,8 @@ def _restore_list_with_docker_container(
         )
 
 
-def _restore_list_with_local_pg_restore(backup_path, restore_list_path):
+def _restore_list_with_local_pg_restore(
+        backup_path, restore_list_path, read_through=False):
     if not shutil.which("pg_restore"):
         raise RuntimeError(
             "pg_restore is not on PATH. Install PostgreSQL client tools or "
@@ -194,48 +307,280 @@ def _restore_list_with_local_pg_restore(backup_path, restore_list_path):
         )
     result = _run_command(["pg_restore", "--list", str(backup_path)])
     restore_list_path.write_text(result.stdout, encoding="utf-8")
+    if read_through:
+        try:
+            _run_command([
+                "pg_restore", f"--file={os.devnull}", str(backup_path)])
+        except RuntimeError as exc:
+            raise _ReadThroughFailed(str(exc)) from exc
 
 
-def verify_backup_file(cfg, backup_path):
-    backup_path = validate_backup_local_path(
-        cfg, backup_path, expected_kind="file", allow_missing=False)
-    if backup_path.stat().st_size <= 0:
-        raise RuntimeError(f"[DB BACKUP] Backup is missing or empty: {backup_path}")
-    restore_list_path = backup_path.with_suffix(".restore_list.txt")
-    validate_backup_local_path(
-        cfg, restore_list_path, expected_kind="file", allow_missing=True)
+class _ReadThroughFailed(RuntimeError):
+    """The table of contents listed, but decoding the table data failed."""
+
+
+def _pg_inspect_archive(cfg, backup_path, restore_list_path, *, read_through):
+    """PostgreSQL backend: list the TOC and (optionally) read every block.
+
+    Returns ``(checks, restore_list_written)``. Tries the configured local
+    Docker container first, then client tools on PATH - the same order as the
+    dump itself.
+    """
     temporary = restore_list_path.with_name(
         f".{restore_list_path.name}.{os.getpid()}.{uuid.uuid4().hex}.part")
     validate_backup_local_path(
         cfg, temporary, expected_kind="file", allow_missing=True)
-    errors = []
-    verified = False
+    attempts = []
     if _can_try_docker_backup(cfg):
+        container = _docker_container(cfg)
+        attempts.append((
+            f"Docker ({container})",
+            lambda: _restore_list_with_docker_container(
+                backup_path, temporary, container,
+                read_through=read_through)))
+    attempts.append((
+        "Local",
+        lambda: _restore_list_with_local_pg_restore(
+            backup_path, temporary, read_through=read_through)))
+
+    errors = []
+    listed = False
+    read_error = None
+    read_ok = False
+    for label, attempt in attempts:
         try:
-            _restore_list_with_docker_container(
-                backup_path, temporary, _docker_container(cfg))
-            verified = True
+            attempt()
+            listed = True
+            read_ok = read_through
+            break
+        except _ReadThroughFailed as exc:
+            # The archive itself is bad; another tool would only read the
+            # same bytes, so do not retry elsewhere.
+            listed = True
+            read_error = f"{label} pg_restore read-through failed: {exc}"
+            break
         except RuntimeError as exc:
-            errors.append(f"Docker pg_restore --list failed: {exc}")
+            errors.append(f"{label} pg_restore --list failed: {exc}")
             temporary.unlink(missing_ok=True)
-    if not verified:
-        try:
-            _restore_list_with_local_pg_restore(backup_path, temporary)
-            verified = True
-        except RuntimeError as exc:
-            errors.append(f"Local pg_restore --list failed: {exc}")
-            temporary.unlink(missing_ok=True)
-    if (not verified or not temporary.exists()
-            or temporary.stat().st_size <= 0):
-        details = "\n".join(f"  - {err}" for err in errors)
+
+    listed = (listed and temporary.exists()
+              and temporary.stat().st_size > 0)
+    checks = [BackupCheck(
+        "table_of_contents", listed,
+        "pg_restore --list read the archive's table of contents" if listed
+        else "restore-list verification failed: " + "; ".join(errors))]
+    if listed:
+        validate_backup_local_path(
+            cfg, temporary, expected_kind="file", allow_missing=False)
+        os.replace(temporary, restore_list_path)
+        if read_through:
+            checks.append(BackupCheck(
+                "full_read_through", read_ok,
+                "pg_restore decoded every data block of the archive "
+                "(output discarded)" if read_ok else read_error))
+    else:
+        temporary.unlink(missing_ok=True)
+    return checks, listed
+
+
+def verify_backup(cfg, backup_path, *, read_through=True, deep_target=None,
+                  scratch_dbname=None):
+    """Verify a catalog backup and say exactly what was proven.
+
+    Never restores into a real server by default. ``deep_target`` (see
+    :func:`deep_verify_backup`) adds a restore into a scratch database on a
+    server the operator named. A failed check is reported in the returned
+    :class:`BackupVerification` (``ok`` is False); only an unsafe path raises.
+    """
+    backup_path = validate_backup_local_path(
+        cfg, backup_path, expected_kind="file", allow_missing=False)
+    size = backup_path.stat().st_size
+    checks = [BackupCheck(
+        "non_empty", size > 0,
+        f"{size:,} bytes" if size > 0 else "backup is missing or empty")]
+    artifacts = {}
+    details = {}
+    level = BACKUP_LEVEL_NONE
+    digest = ""
+    if size > 0:
+        restore_list_path = backup_path.with_suffix(".restore_list.txt")
+        validate_backup_local_path(
+            cfg, restore_list_path, expected_kind="file", allow_missing=True)
+        inspected, listed = _pg_inspect_archive(
+            cfg, backup_path, restore_list_path, read_through=read_through)
+        checks.extend(inspected)
+        if listed:
+            artifacts["restore_list_path"] = str(restore_list_path)
+            level = BACKUP_LEVEL_STRUCTURE
+            if read_through and all(c.passed for c in inspected):
+                level = BACKUP_LEVEL_READ_THROUGH
+        digest = _sha256_file(backup_path)
+        if deep_target is not None and all(c.passed for c in checks):
+            check, restored = _pg_restore_into_scratch(
+                backup_path, restore_list_path, deep_target,
+                scratch_dbname=scratch_dbname)
+            checks.append(check)
+            details["scratch_restore"] = restored
+            if check.passed:
+                level = BACKUP_LEVEL_RESTORED
+
+    not_verified = []
+    if level != BACKUP_LEVEL_RESTORED:
+        not_verified.append(NOT_RESTORED_STATEMENT)
+    if level in (BACKUP_LEVEL_NONE, BACKUP_LEVEL_STRUCTURE):
+        not_verified.append(NOT_READ_THROUGH_STATEMENT)
+    not_verified.append(NOT_STATE_STATEMENT)
+    return BackupVerification(
+        backend="postgresql", backup_path=str(backup_path), size_bytes=size,
+        sha256=digest, level=level, checks=tuple(checks),
+        not_verified=tuple(not_verified), artifacts=artifacts,
+        details=details)
+
+
+def verify_backup_file(cfg, backup_path):
+    """Verify a dump (table of contents + full read-through) or raise.
+
+    Returns the restore-list path, as it always has. It does NOT restore the
+    dump anywhere; use :func:`verify_backup` for the structured result and
+    its ``not_verified`` statements, or :func:`deep_verify_backup` for a
+    scratch restore.
+    """
+    result = verify_backup(cfg, backup_path)
+    if not result.ok:
+        if result.size_bytes <= 0:
+            raise RuntimeError(
+                f"[DB BACKUP] Backup is missing or empty: {result.backup_path}")
+        details = "\n".join(
+            f"  - {check.name}: {check.detail}" for check in result.failures)
         raise RuntimeError(
-            "[DB BACKUP] Backup file exists but restore-list verification "
-            f"failed.\n{details}"
-        )
-    validate_backup_local_path(
-        cfg, temporary, expected_kind="file", allow_missing=False)
-    os.replace(temporary, restore_list_path)
-    return str(restore_list_path)
+            "[DB BACKUP] Backup file exists but verification failed.\n"
+            f"{details}")
+    return result.artifacts["restore_list_path"]
+
+
+_TOC_TABLE_DATA_RE = re.compile(
+    r"^\d+; \d+ \d+ TABLE DATA (?P<schema>\S+) (?P<table>\S+) ")
+
+
+def _toc_tables(restore_list_path):
+    """(schema, table) pairs the archive holds table data for."""
+    tables = []
+    for line in Path(restore_list_path).read_text(
+            encoding="utf-8").splitlines():
+        match = _TOC_TABLE_DATA_RE.match(line)
+        if match:
+            tables.append((match["schema"], match["table"]))
+    return tables
+
+
+def scratch_server(*, host, port, user, password=None, sslmode="prefer",
+                   docker_container=None):
+    """Describe the scratch server a deep verification may restore into.
+
+    Every field is explicit: there is no default host, port or container, so
+    a deep verification can never land on a server nobody named.
+    ``docker_container`` is used only if given (the container whose
+    ``pg_restore`` matches the server); otherwise client tools on PATH are
+    required.
+    """
+    if not host or not port or not user:
+        raise RuntimeError(
+            "[DB BACKUP] A scratch server needs an explicit host, port and "
+            "user")
+    return SimpleNamespace(
+        pg_host=str(host), pg_port=str(port), pg_user=str(user),
+        pg_password=password, pg_sslmode=sslmode, pg_dbname="postgres",
+        pg_docker_container=docker_container or "")
+
+
+def _pg_restore_into_scratch(backup_path, restore_list_path, target, *,
+                             scratch_dbname=None):
+    """Restore into a NEW scratch database on ``target`` and inspect it.
+
+    The database is created here (creation fails if the name exists, so
+    nothing pre-existing is ever touched) and dropped here whatever happens.
+    """
+    require_psycopg()
+    dbname = scratch_dbname or (
+        f"ltoverify_{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
+        f"{uuid.uuid4().hex[:8]}")
+    report = {"scratch_database": dbname,
+              "server": f"{target.pg_host}:{target.pg_port}",
+              "tables": {}, "dropped": False}
+    created = False
+    try:
+        create_database(target, dbname)
+        created = True
+        if getattr(target, "pg_docker_container", ""):
+            _restore_with_docker(target, backup_path, dbname)
+        else:
+            _restore_with_local_pg_restore(target, backup_path, dbname)
+        expected = _toc_tables(restore_list_path)
+        with cast("psycopg.Connection", psycopg.connect(
+                _admin_conninfo(target, dbname=dbname),
+                autocommit=True)) as conn:
+            missing = []
+            for schema, table in expected:
+                present = conn.execute(
+                    "SELECT 1 FROM information_schema.tables "
+                    "WHERE table_schema=%s AND table_name=%s",
+                    (schema, table)).fetchone() is not None
+                if not present:
+                    missing.append(f"{schema}.{table}")
+                    continue
+                count = conn.execute(sql.SQL(
+                    "SELECT count(*) FROM {}.{}").format(
+                        sql.Identifier(schema),
+                        sql.Identifier(table))).fetchone()[0]
+                report["tables"][f"{schema}.{table}"] = int(count)
+        if missing:
+            return BackupCheck(
+                "scratch_restore", False,
+                "restored, but tables listed in the archive are missing: "
+                + ", ".join(missing)), report
+        if not expected:
+            return BackupCheck(
+                "scratch_restore", False,
+                "the archive lists no table data; nothing to restore"), report
+        total = sum(report["tables"].values())
+        return BackupCheck(
+            "scratch_restore", True,
+            f"restored into scratch database {dbname} on "
+            f"{report['server']}: {len(expected)} table(s), {total:,} row(s); "
+            "scratch database dropped afterwards"), report
+    except RuntimeError as exc:
+        return BackupCheck(
+            "scratch_restore", False, f"scratch restore failed: {exc}"), report
+    except Exception as exc:            # psycopg errors are not RuntimeError
+        return BackupCheck(
+            "scratch_restore", False,
+            f"scratch restore failed: {type(exc).__name__}: {exc}"), report
+    finally:
+        if created:
+            try:
+                with cast("psycopg.Connection", psycopg.connect(
+                        _admin_conninfo(target), autocommit=True)) as conn:
+                    conn.execute(sql.SQL(
+                        "DROP DATABASE IF EXISTS {} WITH (FORCE)").format(
+                            sql.Identifier(dbname)))
+                report["dropped"] = True
+            except Exception:
+                report["dropped"] = False
+
+
+def deep_verify_backup(cfg, backup_path, target, *, scratch_dbname=None):
+    """Opt-in: verify, then restore into a scratch database on ``target``.
+
+    ``target`` must be built with :func:`scratch_server` - the operator names
+    the server; nothing is inferred from ``cfg``. Returns the same
+    :class:`BackupVerification` shape with level ``restored`` on success.
+    """
+    if target is None:
+        raise RuntimeError(
+            "[DB BACKUP] Deep verification needs an explicitly named scratch "
+            "server; refusing to choose one")
+    return verify_backup(cfg, backup_path, read_through=True,
+                         deep_target=target, scratch_dbname=scratch_dbname)
 
 
 def _sha256_file(path):
@@ -384,13 +729,24 @@ def _backup_catalog_fingerprint(cfg, conn=None):
 
 def create_backup_receipt(
         cfg, backup_path, *, database_identity=None,
-        catalog_fingerprint=None):
-    """Write a hashed, target-bound receipt beside a verified custom dump."""
+        catalog_fingerprint=None, verification=None):
+    """Write a hashed, target-bound receipt beside a verified custom dump.
+
+    ``verification`` may carry a passing :class:`BackupVerification` of this
+    same file so the dump is not read through twice.
+    """
     backup = validate_backup_local_path(
         cfg, backup_path, expected_kind="file", allow_missing=False)
+    if verification is not None:
+        if (not verification.ok
+                or Path(verification.backup_path) != backup):
+            raise RuntimeError(
+                "[DB BACKUP] Refusing a receipt for an unverified backup")
+        verified_list = verification.artifacts["restore_list_path"]
+    else:
+        verified_list = verify_backup_file(cfg, backup)
     restore_list = validate_backup_local_path(
-        cfg, verify_backup_file(cfg, backup), expected_kind="file",
-        allow_missing=False)
+        cfg, verified_list, expected_kind="file", allow_missing=False)
     payload = {
         "version": 2,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -482,6 +838,12 @@ def validate_backup_local_path(
             "[DB BACKUP] Backup artifact path is not an absolute local path")
 
     lto_text = str(getattr(cfg, "lto_drive", "") or "").strip()
+    if getattr(cfg, "lto_drive_configured", None) is False:
+        # No tape drive is configured at all. ``cfg.lto_drive`` would still
+        # hand back "." (a blank value, normalised) or a default letter, and
+        # comparing against that refused every backup on the program's own
+        # drive. Whenever a drive IS configured the refusal below stands.
+        lto_text = ""
     if lto_text:
         lto_absolute = os.path.abspath(lto_text)
         if (lto_absolute.startswith(("\\\\", "//"))
@@ -693,9 +1055,11 @@ def create_verified_production_backup(cfg, output_dir=None):
             cfg, output_dir=output_dir,
             prefix="prod_before_container_format", verify=False,
             snapshot_id=snapshot_id)
+        verification = verify_backup(cfg, path).raise_if_failed()
         receipt = create_backup_receipt(
             cfg, path, database_identity=database_identity,
-            catalog_fingerprint=catalog_fingerprint)
+            catalog_fingerprint=catalog_fingerprint,
+            verification=verification)
         conn.commit()
     restore_list = str(Path(path).with_suffix(".restore_list.txt"))
     return {
@@ -704,6 +1068,8 @@ def create_verified_production_backup(cfg, output_dir=None):
         "backup_path": path,
         "restore_list_path": restore_list,
         "receipt_path": receipt,
+        # What "verified" means here, including what was NOT proven.
+        "verification": verification.as_dict(),
     }
 
 
@@ -755,14 +1121,17 @@ def _restore_with_local_pg_restore(cfg, backup_path, dbname):
 
 
 def _restore_with_docker(cfg, backup_path, dbname):
+    # The container the cfg names - the same one _can_try_docker_backup
+    # checked - not unconditionally the production default.
+    container = _docker_container(cfg)
     container_path = f"/tmp/{backup_path.name}"
     try:
         _run_command([
             "docker", "cp", str(backup_path),
-            f"{DOCKER_DB_CONTAINER}:{container_path}",
+            f"{container}:{container_path}",
         ])
         _run_command([
-            "docker", "exec", DOCKER_DB_CONTAINER,
+            "docker", "exec", container,
             "pg_restore",
             "-U", cfg.pg_user,
             "-d", dbname,
@@ -772,7 +1141,7 @@ def _restore_with_docker(cfg, backup_path, dbname):
         ])
     finally:
         subprocess.run(
-            ["docker", "exec", DOCKER_DB_CONTAINER, "rm", "-f", container_path],
+            ["docker", "exec", container, "rm", "-f", container_path],
             text=True,
             capture_output=True,
         )

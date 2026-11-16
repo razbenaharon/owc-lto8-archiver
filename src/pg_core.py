@@ -29,8 +29,9 @@ else:
         dict_row = None
         PoolTimeout = None
 
+from . import db_backend
 from .constants import PROJECT_ROOT
-from .pg_bulk import make_pool, require_psycopg
+from .pg_bulk import copy_rows, make_pool, require_psycopg
 
 
 class PgRow(dict):
@@ -76,27 +77,361 @@ def _coerce_timestamp_kwargs(kwargs):
     }
 
 
+class ArchiverLockLost(RuntimeError):
+    """The single-writer advisory lock is not provably held any more.
+
+    Raised by :meth:`PgConnectionCore.verify_archiver_lock`. It is a hard
+    safety stop, never a retry: the lock lives on one PostgreSQL session, so
+    once that session is gone another archiver or a tape reset may already
+    hold the lock, and re-acquiring it here would only hide that.
+    """
+
+
 class PgConnectionCore:
     """Pool, retrying transaction runner, schema init and archiver lock."""
 
     # Session-level advisory lock key ('LTO8'): cross-process single-writer
     # guard for tape-write runs. The in-process tape I/O lock cannot stop a
     # second `python run.py` instance; this can.
-    ARCHIVER_LOCK_KEY = 0x4C544F38
+    ARCHIVER_LOCK_KEY = db_backend.ARCHIVER_LOCK_KEY
 
-    def __init__(self, conninfo, *, init_schema=True, pool=None):
-        require_psycopg()
+    #: Which engine this core talks to. The method-group mixins never look at
+    #: it: everything engine-specific is one of the ``_..._conn`` hooks below,
+    #: which :class:`src.sqlite_core.SqliteConnectionCore` overrides.
+    BACKEND = db_backend.BACKEND_POSTGRESQL
+
+    def __init__(self, conninfo, *, init_schema=True, pool=None,
+                 complete_fresh_schema=False):
+        """``complete_fresh_schema=True`` (the application's own start-up,
+        :func:`src.db.create_database_manager`) also installs the explicit
+        migrations when - and only when - the database held no catalog at all
+        before this start-up. See :meth:`_complete_fresh_schema`."""
+        self._require_driver()
         self.db_path = conninfo
         self._lock_conn: Optional[Any] = None
-        self._pool: Any = pool or make_pool(
-            conninfo, min_size=1, max_size=8, row_factory=dict_row)
+        #: Backend pid of the session that took the archiver lock, and whether
+        #: this process is inside an acquire/release window at all. Both exist
+        #: so a lost lock can be told apart from "never asked for one".
+        self._lock_backend_pid: Optional[int] = None
+        self._archiver_lock_expected = False
+        #: Migration files this start-up installed because the database was
+        #: empty; ``()`` for every existing catalog.
+        self.fresh_schema_installed: tuple = ()
+        self._pool: Any = pool or self._open_pool(conninfo)
         try:
-            if init_schema:
+            if init_schema and complete_fresh_schema:
+                self._init_schema_completing_a_fresh_database()
+            elif init_schema:
                 self._init_schema()
                 self._ensure_runtime_constraints()
         except Exception:
             self.close()
             raise
+
+    #: Session advisory lock serialising the fresh-database installation, so
+    #: two programs started together on one empty database cannot both decide
+    #: "empty" and migrate at once. Unrelated to the archiver lock.
+    FRESH_INSTALL_LOCK_KEY = 0x4C544F46         # "LTOF"
+    #: Exists only while a fresh-database installation is in progress. Left
+    #: behind by a crash, it lets the next start-up finish the job.
+    FRESH_INSTALL_MARKER = "lto_fresh_schema_install"
+
+    def _init_schema_completing_a_fresh_database(self):
+        """Start-up schema, plus the explicit migrations on an EMPTY database.
+
+        The explicit route (``inspect_db.py --apply-*-schema``) protects data:
+        every command demands a verified ``pg_dump`` backup first. A database
+        that holds no catalog has nothing to protect, and without those
+        migrations it cannot take a packed archive at all.
+
+        "Empty" is decided before anything is created and is deliberately
+        strict - see :meth:`_fresh_install_state`. Every other database is
+        opened exactly as before: explicit migrations stay explicit.
+        """
+        with self._pool.connection() as guard:
+            guard.execute("SELECT pg_advisory_lock(%s)",
+                          (self.FRESH_INSTALL_LOCK_KEY,))
+            guard.rollback()
+            try:
+                state = self._fresh_install_state()
+                if state == "empty":
+                    with self._pool.connection() as conn:
+                        conn.execute(
+                            f"CREATE TABLE {self.FRESH_INSTALL_MARKER} ("
+                            "started_at TIMESTAMPTZ NOT NULL DEFAULT now())")
+                        conn.commit()
+                self._init_schema()
+                self._ensure_runtime_constraints()
+                if state != "existing":
+                    self._complete_fresh_schema(resumed=state == "interrupted")
+            finally:
+                try:
+                    guard.execute("SELECT pg_advisory_unlock(%s)",
+                                  (self.FRESH_INSTALL_LOCK_KEY,))
+                    guard.rollback()
+                except Exception:
+                    pass        # closing the connection releases it anyway
+
+    def _fresh_install_state(self):
+        """``'empty'``, ``'interrupted'`` or ``'existing'``.
+
+        * ``empty`` - the current schema has no table or view at all. One
+          pre-existing relation, a catalog table from any version or anything
+          else, makes the database ``existing``.
+        * ``interrupted`` - an earlier fresh installation left its marker and
+          the catalog still records nothing (no tape, file or session).
+        * ``existing`` - everything else, including a marked database that
+          has since been used: it is never migrated implicitly.
+        """
+        with self._pool.connection() as conn:
+            try:
+                relations = {row["relname"] for row in conn.execute(
+                    """SELECT c.relname
+                       FROM pg_class c
+                       JOIN pg_namespace n ON n.oid = c.relnamespace
+                       WHERE n.nspname = current_schema()
+                         AND c.relkind IN ('r', 'p', 'v', 'm')""").fetchall()}
+                if not relations:
+                    return "empty"
+                if self.FRESH_INSTALL_MARKER not in relations:
+                    return "existing"
+                # Every table that holds operator activity: any row in any of
+                # them means the catalog is in use and is never touched
+                # implicitly.
+                for table in self.FRESH_INSTALL_ACTIVITY_TABLES:
+                    if table in relations and conn.execute(
+                            f"SELECT 1 FROM {table} LIMIT 1").fetchone():
+                        return "existing"
+                return "interrupted"
+            finally:
+                conn.rollback()
+
+    #: Tables whose rows prove a catalog has been used (see
+    #: ``_fresh_install_state``).
+    FRESH_INSTALL_ACTIVITY_TABLES = (
+        "tapes", "files_index", "remote_sessions", "local_sessions",
+        "local_chunks_manifest", "archive_runs", "archive_bundles",
+        "catalog_directories", "remote_snapshots", "remote_plans",
+        "remote_chunks", "remote_file_state",
+    )
+
+    def _complete_fresh_schema(self, resumed=False):
+        """Install whichever explicit migrations are still missing, in the
+        order of the explicit commands: 007, 014 + finalize, 015, 016 + 017,
+        018, 019. Each step is skipped when its own report says it is
+        installed, so an interrupted installation simply continues."""
+        steps = (
+            ("007", self.directory_catalog_schema_installed,
+             self.apply_directory_catalog_schema),
+            ("014 + finalize", self.incremental_scan_schema_finalized,
+             lambda: self.apply_incremental_scan_schema(finalize=True)),
+            # Not the migration-015 report: its fingerprint stops matching
+            # once 016/017 extend the same tables, so it reads "not ready" on
+            # a complete schema. 015 is atomic; its table is the evidence.
+            ("015",
+             lambda: self._run_read(
+                 lambda conn: self._table_exists_conn(
+                     conn, "archive_containers"),
+                 "container format schema presence"),
+             self.apply_container_format_schema),
+            ("016 + 017",
+             lambda: self.stored_tar_plan_schema_report()[
+                 "installation_state"] == "installed",
+             self.apply_stored_tar_plan_schema),
+            ("018",
+             lambda: self.manifest_directory_catalog_schema_report()[
+                 "installation_state"] == "installed",
+             self.apply_manifest_directory_catalog_schema),
+            ("019",
+             lambda: self.container_format_schema_authority_v2_report()[
+                 "installed"],
+             self.apply_container_format_schema_authority_v2),
+        )
+        installed = []
+        for name, is_installed, apply in steps:
+            try:
+                if is_installed():
+                    continue
+                apply()
+            except Exception as exc:
+                raise RuntimeError(
+                    "[DB] This PostgreSQL database was empty, and installing "
+                    f"the complete catalog schema stopped at migration {name} "
+                    f"(installed in this run: {', '.join(installed) or 'none'}"
+                    f"): {exc}\n[DB] Nothing was archived. Fix the cause and "
+                    "start the program again: the installation continues "
+                    "where it stopped.") from exc
+            installed.append(name)
+        with self._pool.connection() as conn:
+            conn.execute(f"DROP TABLE IF EXISTS {self.FRESH_INSTALL_MARKER}")
+            conn.commit()
+        self.fresh_schema_installed = tuple(installed)
+        message = (
+            "[DB] New, empty PostgreSQL database: "
+            + ("finished installing" if resumed else "installed")
+            + " the complete catalog schema (migrations "
+            + (", ".join(installed) or "none were missing") + ").")
+        from .logsetup import get_logger
+        get_logger().info("fresh_postgresql_schema_installed: resumed=%s "
+                          "migrations=%s", resumed, ", ".join(installed))
+        print(message)
+
+    # ------------------------------------------------------------------
+    # Backend hooks (PostgreSQL implementations)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _require_driver():
+        require_psycopg()
+
+    def _open_pool(self, conninfo):
+        return make_pool(conninfo, min_size=1, max_size=8,
+                         row_factory=dict_row)
+
+    def _owns_archiver_lock_conn(self, conn):
+        """True when the database session behind ``conn`` holds the archiver
+        lock. The one "does this session own it" probe for both backends."""
+        return db_backend.pg_session_owns_archiver_lock(conn)
+
+    def _archiver_lock_held_conn(self, conn):
+        """True when ANY session/process holds the archiver lock. The one
+        "is an archiver running" probe for both backends."""
+        return bool(db_backend.pg_archiver_lock_holders(conn))
+
+    @staticmethod
+    def _database_name_conn(conn):
+        return db_backend.database_name(conn)
+
+    @staticmethod
+    def _set_local_setting_conn(conn, name, value):
+        """Transaction-local setting read back by schema guards."""
+        conn.execute("SELECT set_config(%s, %s, true)", (name, value))
+
+    @staticmethod
+    def _index_exists_conn(conn, index_name):
+        return conn.execute(
+            """SELECT 1 FROM pg_indexes
+               WHERE schemaname='public' AND indexname=%s""",
+            (index_name,)).fetchone() is not None
+
+    @staticmethod
+    def _view_exists_conn(conn, view_name):
+        return conn.execute(
+            """SELECT 1 FROM information_schema.views
+               WHERE table_schema='public' AND table_name=%s""",
+            (view_name,),
+        ).fetchone() is not None
+
+    @staticmethod
+    def _create_stage_table_conn(conn, stage_table, source_table, col_sql):
+        """Empty transaction-scoped copy of ``source_table``'s columns."""
+        conn.execute(
+            f"CREATE TEMP TABLE {stage_table} ON COMMIT DROP AS "
+            f"SELECT {col_sql} FROM {source_table} WITH NO DATA")
+
+    @staticmethod
+    def _copy_rows_conn(conn, table, columns, rows):
+        """Bulk-load ``rows`` into ``table`` (COPY on PostgreSQL)."""
+        with conn.cursor() as cur:
+            copy_rows(cur, table, columns, rows)
+
+    @staticmethod
+    def _upsert_from_stage_counts_conn(conn, table, stage_table, col_sql,
+                                       conflict_column, conflict_action):
+        """``INSERT .. SELECT .. FROM stage ON CONFLICT`` and report
+        ``(freshly_inserted, rows_touched)``.
+
+        PostgreSQL tells inserted from updated rows with ``xmax = 0`` in the
+        same statement, without a second membership scan.
+        """
+        affected = conn.execute(
+            f"""INSERT INTO {table} ({col_sql})
+                SELECT {col_sql} FROM {stage_table} WHERE true
+                ON CONFLICT ({conflict_column}) {conflict_action}
+                RETURNING (xmax = 0) AS inserted"""
+        ).fetchall()
+        return sum(1 for row in affected if row["inserted"]), len(affected)
+
+    @staticmethod
+    def _insert_local_session_conn(conn, session_label, source_dir,
+                                   total_chunks, backup_mode, created_at):
+        """Idempotent insert of a local session keyed on its label.
+
+        Returns ``(session_id, inserted)``; ``inserted`` is False when an
+        earlier attempt's COMMIT already landed.
+        """
+        row = conn.execute(
+            """INSERT INTO local_sessions
+               (session_label, source_dir, total_chunks, backup_mode,
+                created_at, status)
+               VALUES (%s, %s, %s, %s, %s, 'active')
+               ON CONFLICT (session_label) DO UPDATE
+                   SET session_label = EXCLUDED.session_label
+               RETURNING session_id, (xmax = 0) AS inserted""",
+            (session_label, source_dir, total_chunks, backup_mode,
+             created_at),
+        ).fetchone()
+        return row["session_id"], bool(row["inserted"])
+
+    @staticmethod
+    def _single_column_references_conn(conn, parent_table):
+        """``(child_table, child_column, parent_column)`` for every
+        single-column foreign key that points at ``parent_table``; the child
+        identifiers are quoted and safe to interpolate."""
+        return [
+            (row["child_table"], row["child_column"], row["parent_column"])
+            for row in conn.execute(
+                """SELECT c.conrelid::regclass::text AS child_table,
+                          quote_ident(a.attname) AS child_column,
+                          fa.attname AS parent_column
+                   FROM pg_constraint c
+                   JOIN pg_attribute a
+                     ON a.attrelid=c.conrelid AND a.attnum=c.conkey[1]
+                   JOIN pg_attribute fa
+                     ON fa.attrelid=c.confrelid AND fa.attnum=c.confkey[1]
+                   WHERE c.contype='f' AND c.confrelid=%s::regclass
+                     AND array_length(c.conkey, 1)=1
+                   ORDER BY 1, 2""", (parent_table,)).fetchall()]
+
+    @staticmethod
+    def _sql_assign_new_chunk_format_conn(
+            conn, session_id, chunk_index, stored_tar_write_enabled,
+            schema_version, reader_contract_version):
+        """The only legal packaging format for a new chunk (schema function
+        ``lto_assign_new_chunk_format``)."""
+        return conn.execute(
+            """SELECT lto_assign_new_chunk_format(%s,%s,%s,%s,%s)
+                      AS packaging_format""",
+            (session_id, chunk_index, stored_tar_write_enabled,
+             schema_version, reader_contract_version),
+        ).fetchone()["packaging_format"]
+
+    @staticmethod
+    def _sql_transition_chunk_plan_source_conn(
+            conn, session_id, chunk_index, plan_manifest_artifact_id,
+            plan4_gate_id, plan4_evidence_id, approval_identity):
+        """Audited ``legacy_db`` -> ``manifest`` move (schema function
+        ``lto_transition_chunk_plan_source``); returns the audit row id."""
+        return conn.execute(
+            """SELECT lto_transition_chunk_plan_source(
+                       %s, %s, %s, %s, %s, %s) AS transition_id""",
+            (session_id, chunk_index, plan_manifest_artifact_id,
+             plan4_gate_id, plan4_evidence_id, approval_identity),
+        ).fetchone()["transition_id"]
+
+    @staticmethod
+    def _vacuum_analyze_conn(conn):
+        conn.execute("VACUUM (ANALYZE)")
+
+    @staticmethod
+    def _retryable_write_errors():
+        """(fast-retry classes, slow-retry classes) for ``_transaction``."""
+        return ((errors.SerializationFailure, errors.DeadlockDetected),
+                (psycopg.OperationalError, PoolTimeout))
+
+    @staticmethod
+    def _retryable_read_errors():
+        return (psycopg.OperationalError, PoolTimeout)
 
     def _init_schema(self):
         sql_dir = Path(PROJECT_ROOT) / "scripts" / "sql"
@@ -112,6 +447,9 @@ class PgConnectionCore:
             "010_postgres_local_manifest_archive.sql",
             "011_postgres_tape_status.sql",
             "013_postgres_tape_reset_safety.sql",
+            # Additive and idempotent: one audit table plus a row trigger that
+            # stops a raw UPDATE moving a 'backing'/'done' chunk backwards.
+            "020_postgres_chunk_transition_guard.sql",
         )
         with self._pool.connection() as conn:
             with conn.cursor() as cur:
@@ -186,23 +524,13 @@ class PgConnectionCore:
         def apply_on(conn):
             with conn.transaction():
                 if require_archiver_lock:
-                    owned = conn.execute(
-                        """SELECT EXISTS (
-                               SELECT 1 FROM pg_locks
-                               WHERE locktype='advisory' AND granted
-                                 AND pid=pg_backend_pid()
-                                 AND classid=%s AND objid=%s
-                                 AND objsubid=1) AS owned""",
-                        (self.ARCHIVER_LOCK_KEY >> 32,
-                         self.ARCHIVER_LOCK_KEY & 0xFFFFFFFF),
-                    ).fetchone()["owned"]
+                    owned = self._owns_archiver_lock_conn(conn)
                     if not owned:
                         raise RuntimeError(
                             "[DB] Refusing migration 019 without the archiver "
                             "advisory lock on this session")
                 for name, value in settings.items():
-                    conn.execute("SELECT set_config(%s, %s, true)",
-                                 (name, value))
+                    self._set_local_setting_conn(conn, name, value)
                 with conn.cursor() as cur:
                     cur.execute(sql_path.read_text(encoding="utf-8"))
 
@@ -301,23 +629,13 @@ class PgConnectionCore:
             # loses both the lock and the migration transaction.
             with conn.transaction():
                 if require_archiver_lock:
-                    owned = conn.execute(
-                        """SELECT EXISTS (
-                               SELECT 1 FROM pg_locks
-                               WHERE locktype='advisory' AND granted
-                                 AND pid=pg_backend_pid()
-                                 AND classid=%s AND objid=%s
-                                 AND objsubid=1) AS owned""",
-                        (self.ARCHIVER_LOCK_KEY >> 32,
-                         self.ARCHIVER_LOCK_KEY & 0xFFFFFFFF),
-                    ).fetchone()["owned"]
+                    owned = self._owns_archiver_lock_conn(conn)
                     if not owned:
                         raise RuntimeError(
                             "[DB] Migration 015 requires the current database "
                             "session to own the archiver advisory lock")
                 for name, value in settings.items():
-                    conn.execute("SELECT set_config(%s, %s, true)",
-                                 (name, value))
+                    self._set_local_setting_conn(conn, name, value)
                 with conn.cursor() as cur:
                     cur.execute(sql_path.read_text(encoding="utf-8"))
 
@@ -377,8 +695,7 @@ class PgConnectionCore:
 
     def _stored_tar_plan_schema_report_conn(self, conn):
         report = {
-            "database": conn.execute(
-                "SELECT current_database() AS db").fetchone()["db"],
+            "database": self._database_name_conn(conn),
             "expected_migration_checksums":
                 self.stored_tar_plan_migration_checksums(),
             "installation_state": "absent",
@@ -425,10 +742,7 @@ class PgConnectionCore:
                 issues.append(f"missing constraint: {constraint}")
         for index in self.STORED_TAR_PLAN_INDEXES:
             expected += 1
-            if conn.execute(
-                    """SELECT 1 FROM pg_indexes
-                       WHERE schemaname='public' AND indexname=%s""",
-                    (index,)).fetchone() is not None:
+            if self._index_exists_conn(conn, index):
                 present += 1
             else:
                 issues.append(f"missing index: {index}")
@@ -483,16 +797,7 @@ class PgConnectionCore:
         def apply_on(conn):
             with conn.transaction():
                 if require_archiver_lock:
-                    owned = conn.execute(
-                        """SELECT EXISTS (
-                               SELECT 1 FROM pg_locks
-                               WHERE locktype='advisory' AND granted
-                                 AND pid=pg_backend_pid()
-                                 AND classid=%s AND objid=%s
-                                 AND objsubid=1) AS owned""",
-                        (self.ARCHIVER_LOCK_KEY >> 32,
-                         self.ARCHIVER_LOCK_KEY & 0xFFFFFFFF),
-                    ).fetchone()["owned"]
+                    owned = self._owns_archiver_lock_conn(conn)
                     if not owned:
                         raise RuntimeError(
                             "[DB] Refusing migrations 016/017 without the "
@@ -559,24 +864,14 @@ class PgConnectionCore:
         def apply_on(conn):
             with conn.transaction():
                 if require_archiver_lock:
-                    owned = conn.execute(
-                        """SELECT EXISTS (
-                               SELECT 1 FROM pg_locks
-                               WHERE locktype='advisory' AND granted
-                                 AND pid=pg_backend_pid()
-                                 AND classid=%s AND objid=%s
-                                 AND objsubid=1) AS owned""",
-                        (self.ARCHIVER_LOCK_KEY >> 32,
-                         self.ARCHIVER_LOCK_KEY & 0xFFFFFFFF),
-                    ).fetchone()["owned"]
+                    owned = self._owns_archiver_lock_conn(conn)
                     if not owned:
                         raise RuntimeError(
                             "[DB] Migration 018 requires the current database "
                             "session to own the archiver advisory lock")
-                conn.execute(
-                    "SELECT set_config(%s, %s, true)",
-                    ("lto.manifest_directory_catalog_migration_checksum",
-                     checksum))
+                self._set_local_setting_conn(
+                    conn, "lto.manifest_directory_catalog_migration_checksum",
+                    checksum)
                 with conn.cursor() as cur:
                     cur.execute(sql_path.read_text(encoding="utf-8"))
 
@@ -669,11 +964,8 @@ class PgConnectionCore:
         prevents two ordinals colliding, so the frontier must not activate.
         """
         with self._pool.connection() as conn:
-            return conn.execute(
-                """SELECT 1 FROM pg_indexes
-                   WHERE schemaname='public' AND indexname=%s""",
-                (self.INCREMENTAL_SCAN_FINAL_INDEX,),
-            ).fetchone() is not None
+            return self._index_exists_conn(
+                conn, self.INCREMENTAL_SCAN_FINAL_INDEX)
 
     def incremental_scan_schema_preflight(self):
         """Read-only report of what applying migration 014 would face.
@@ -696,32 +988,19 @@ class PgConnectionCore:
             "blocking": [],
         }
         with self._pool.connection() as conn:
-            report["database"] = conn.execute(
-                "SELECT current_database() AS db").fetchone()["db"]
+            report["database"] = self._database_name_conn(conn)
             report["installed"] = all(
                 self._table_exists_conn(conn, name)
                 for name in self.INCREMENTAL_SCAN_TABLES) and all(
                 self._column_exists_conn(conn, "remote_chunks", column)
                 for column in self.INCREMENTAL_SCAN_CHUNK_COLUMNS)
-            report["finalized"] = conn.execute(
-                """SELECT 1 FROM pg_indexes
-                   WHERE schemaname='public' AND indexname=%s""",
-                (self.INCREMENTAL_SCAN_FINAL_INDEX,),
-            ).fetchone() is not None
+            report["finalized"] = self._index_exists_conn(
+                conn, self.INCREMENTAL_SCAN_FINAL_INDEX)
 
             # Another archiver holding the cluster-wide advisory lock means a
             # live run. Migrating under it is how a session gets its schema
             # changed mid-write.
-            # A bigint advisory key appears in pg_locks split across
-            # classid (high 32 bits) / objid (low 32), with objsubid=1.
-            # Constraining all three avoids matching an unrelated advisory lock.
-            held = conn.execute(
-                """SELECT COUNT(*) AS n FROM pg_locks
-                   WHERE locktype='advisory' AND granted
-                     AND classid=%s AND objid=%s AND objsubid=1""",
-                (self.ARCHIVER_LOCK_KEY >> 32,
-                 self.ARCHIVER_LOCK_KEY & 0xFFFFFFFF),
-            ).fetchone()["n"]
+            held = self._archiver_lock_held_conn(conn)
             report["archiver_lock_held"] = bool(held)
             if held:
                 report["blocking"].append(
@@ -779,22 +1058,11 @@ class PgConnectionCore:
 
     @staticmethod
     def _table_exists_conn(conn, table_name):
-        return conn.execute(
-            """SELECT 1
-               FROM information_schema.tables
-               WHERE table_schema='public' AND table_name=%s""",
-            (table_name,),
-        ).fetchone() is not None
+        return db_backend.table_exists(conn, table_name)
 
     @staticmethod
     def _column_exists_conn(conn, table_name, column_name):
-        return conn.execute(
-            """SELECT 1
-               FROM information_schema.columns
-               WHERE table_schema='public'
-                 AND table_name=%s AND column_name=%s""",
-            (table_name, column_name),
-        ).fetchone() is not None
+        return db_backend.column_exists(conn, table_name, column_name)
 
     def directory_catalog_schema_installed(self):
         required = (
@@ -812,7 +1080,7 @@ class PgConnectionCore:
                 "database. Apply scripts/sql/007_postgres_directory_catalog.sql "
                 "explicitly to the migrated PostgreSQL database after creating "
                 "and verifying a production backup. See "
-                "docs/directory_catalog_migration_runbook.md."
+                "docs/installation.md (Schema on PostgreSQL)."
             )
 
     def _ensure_runtime_constraints(self):
@@ -841,8 +1109,8 @@ class PgConnectionCore:
         # so a restarting server can come back. Every write routed through here
         # is an idempotent keyed upsert/update, so re-running a batch whose
         # commit outcome is unknown converges to the same state.
-        retryable = (errors.SerializationFailure, errors.DeadlockDetected,
-                     psycopg.OperationalError, PoolTimeout)
+        fast_retry, slow_retry = self._retryable_write_errors()
+        retryable = tuple(fast_retry) + tuple(slow_retry)
         for attempt in range(1, attempts + 1):
             try:
                 with self._pool.connection() as conn:
@@ -851,8 +1119,7 @@ class PgConnectionCore:
             except retryable as e:
                 if attempt == attempts:
                     raise
-                if isinstance(e, (errors.SerializationFailure,
-                                  errors.DeadlockDetected)):
+                if isinstance(e, tuple(fast_retry)):
                     wait_s = min(5, attempt)
                 else:
                     wait_s = min(30, 2 ** attempt)
@@ -871,7 +1138,7 @@ class PgConnectionCore:
         # absorbed by _transaction. Reads are naturally idempotent, so
         # re-running is always safe; back off like the write path so a
         # restarting server has time to come back.
-        retryable = (psycopg.OperationalError, PoolTimeout)
+        retryable = tuple(self._retryable_read_errors())
         for attempt in range(1, attempts + 1):
             try:
                 with self._pool.connection() as conn:
@@ -902,10 +1169,12 @@ class PgConnectionCore:
         conn = self._pool.getconn()
         try:
             conn.autocommit = True
-            locked = conn.execute(
-                "SELECT pg_try_advisory_lock(%s) AS locked",
+            row = conn.execute(
+                """SELECT pg_try_advisory_lock(%s) AS locked,
+                          pg_backend_pid() AS pid""",
                 (self.ARCHIVER_LOCK_KEY,),
-            ).fetchone()["locked"]
+            ).fetchone()
+            locked = row["locked"]
         except Exception:
             self._pool.putconn(conn)
             raise
@@ -917,10 +1186,65 @@ class PgConnectionCore:
                 "a time; finish or close the other instance and retry."
             )
         self._lock_conn = conn
+        self._lock_backend_pid = int(row["pid"])
+        self._archiver_lock_expected = True
+
+    def verify_archiver_lock(self):
+        """Prove THIS process still owns the archiver lock, or raise.
+
+        The lock is a session-level advisory lock on one pinned connection. If
+        PostgreSQL restarts (or that backend is terminated) the lock is gone,
+        while the pool quietly reconnects and every other query keeps working -
+        so nothing else in the application notices. This asks the pinned
+        session itself two questions in one round trip: "are you still the
+        backend that took the lock?" and "does pg_locks show you holding it?".
+
+        Fails CLOSED on every doubt - no pinned connection, a dead connection,
+        a different backend pid, a missing lock row, or any error while asking
+        - by raising :class:`ArchiverLockLost`. It never re-acquires: after a
+        loss another archiver or a tape reset may hold the lock, and only a
+        fresh, explicitly started run may ask for it again.
+
+        PostgreSQL-only by nature (``pg_locks`` / ``pg_backend_pid``); a
+        different backend must supply its own proof behind the same name.
+        """
+        conn = self._lock_conn
+        expected_pid = getattr(self, "_lock_backend_pid", None)
+        if conn is None or expected_pid is None:
+            raise ArchiverLockLost(
+                "[LOCK] The archiver lock is not held by this process. "
+                "Refusing to start a tape write without it.")
+        try:
+            row = conn.execute(
+                """SELECT pg_backend_pid() AS pid, EXISTS (
+                       SELECT 1 FROM pg_locks
+                       WHERE locktype='advisory' AND granted
+                         AND pid=pg_backend_pid()
+                         AND classid=%s AND objid=%s AND objsubid=1
+                   ) AS owned""",
+                (self.ARCHIVER_LOCK_KEY >> 32,
+                 self.ARCHIVER_LOCK_KEY & 0xFFFFFFFF),
+            ).fetchone()
+        except Exception as exc:
+            raise ArchiverLockLost(
+                "[LOCK] The database session holding the archiver lock is "
+                f"gone ({type(exc).__name__}: {exc}). The lock died with it "
+                "and another archiver or a tape reset may now hold it. "
+                "Stopping: this run must not write to tape again.") from exc
+        if row is None or int(row["pid"]) != int(expected_pid)                 or not row["owned"]:
+            raise ArchiverLockLost(
+                "[LOCK] The pinned database session no longer owns the "
+                "archiver lock (expected backend "
+                f"{expected_pid}, got {row['pid'] if row else None}, "
+                f"owned={bool(row['owned']) if row else False}). "
+                "Stopping: this run must not write to tape again.")
+        return True
 
     def release_archiver_lock(self):
         conn = self._lock_conn
         self._lock_conn = None
+        self._lock_backend_pid = None
+        self._archiver_lock_expected = False
         if conn is None:
             return
         try:

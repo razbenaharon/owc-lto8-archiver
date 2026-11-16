@@ -5,7 +5,7 @@ import os
 from .cli_errors import OperationalError
 from .logsetup import get_logger
 from .pipeline_types import ChunkStatus
-from .pg_bulk import copy_rows
+from .db_backend import as_timestamp, lease_deadline
 from .pg_core import (_coerce_timestamp_kwargs, _now_utc, _row, _rows,
                       _valid_columns)
 
@@ -63,18 +63,10 @@ class PgSessionMixin:
             # Upsert on the timestamped label so a connection-loss retry whose
             # first COMMIT actually landed converges on the committed session
             # instead of creating a duplicate (with a duplicate manifest).
-            row = conn.execute(
-                """INSERT INTO local_sessions
-                   (session_label, source_dir, total_chunks, backup_mode,
-                    created_at, status)
-                   VALUES (%s, %s, %s, %s, %s, 'active')
-                   ON CONFLICT (session_label) DO UPDATE
-                       SET session_label = EXCLUDED.session_label
-                   RETURNING session_id, (xmax = 0) AS inserted""",
-                (session_label, source_dir, len(chunks), backup_mode, now),
-            ).fetchone()
-            session_id = row["session_id"]
-            if not row["inserted"]:
+            session_id, inserted = self._insert_local_session_conn(
+                conn, session_label, source_dir, len(chunks), backup_mode,
+                now)
+            if not inserted:
                 # Session + manifest were committed atomically by the earlier
                 # attempt; re-inserting the manifest would duplicate it.
                 return session_id
@@ -681,16 +673,7 @@ class PgSessionMixin:
 
         def operation(conn):
             if require_archiver_lock:
-                owned = conn.execute(
-                    """SELECT EXISTS (
-                           SELECT 1 FROM pg_locks
-                           WHERE locktype='advisory' AND granted
-                             AND pid=pg_backend_pid()
-                             AND classid=%s AND objid=%s AND objsubid=1
-                       ) AS owned""",
-                    (self.ARCHIVER_LOCK_KEY >> 32,
-                     self.ARCHIVER_LOCK_KEY & 0xFFFFFFFF),
-                ).fetchone()["owned"]
+                owned = self._owns_archiver_lock_conn(conn)
                 if not owned:
                     raise RuntimeError(
                         "[DB] Refusing a membership backfill without the "
@@ -830,13 +813,12 @@ class PgSessionMixin:
         if not existing:
             # COPY, not executemany: multi-million-file snapshots insert in
             # one stream instead of a pipelined statement per row.
-            with conn.cursor() as cur:
-                copy_rows(
-                    cur, "remote_snapshot_files",
-                    ("snapshot_id", "remote_path", "file_size_bytes"),
-                    ((snapshot_id, path, size)
-                     for path, size in by_path.items()),
-                )
+            self._copy_rows_conn(
+                conn, "remote_snapshot_files",
+                ("snapshot_id", "remote_path", "file_size_bytes"),
+                ((snapshot_id, path, size)
+                 for path, size in by_path.items()),
+            )
         conn.execute(
             """INSERT INTO remote_plans
                (snapshot_id, fingerprint, chunk_count, created_at)
@@ -862,14 +844,13 @@ class PgSessionMixin:
                     (snapshot_id,),
                 ).fetchall()
             }
-            with conn.cursor() as cur:
-                copy_rows(
-                    cur, "remote_plan_files",
-                    ("plan_id", "snapshot_file_id", "chunk_index", "ordinal"),
-                    ((plan_id, ids[_canonical_remote_path(row[1])],
-                      int(row[0]), ordinal)
-                     for ordinal, row in enumerate(rows)),
-                )
+            self._copy_rows_conn(
+                conn, "remote_plan_files",
+                ("plan_id", "snapshot_file_id", "chunk_index", "ordinal"),
+                ((plan_id, ids[_canonical_remote_path(row[1])],
+                  int(row[0]), ordinal)
+                 for ordinal, row in enumerate(rows)),
+            )
         conn.execute(
             "UPDATE remote_sessions SET plan_id=%s WHERE session_id=%s",
             (plan_id, session_id),
@@ -1088,10 +1069,12 @@ class PgSessionMixin:
             report["artifact"] = self._export_fetch_state(
                 archive_root, session_id, wanted, rows)
             report["deleted"] = conn.execute(
-                """DELETE FROM remote_file_state s
-                   USING remote_plan_files pf
-                   WHERE s.plan_file_id=pf.plan_file_id
-                     AND s.session_id=%s AND pf.chunk_index = ANY(%s)""",
+                """DELETE FROM remote_file_state
+                   WHERE session_id=%s
+                     AND EXISTS (
+                         SELECT 1 FROM remote_plan_files pf
+                         WHERE pf.plan_file_id=remote_file_state.plan_file_id
+                           AND pf.chunk_index = ANY(%s))""",
                 (session_id, wanted)).rowcount
             return report
 
@@ -1433,37 +1416,105 @@ class PgSessionMixin:
         and validated locally. The terminal manifest stays on local disk and in
         the database-backup procedure; it is never written to tape after the
         data write.
+
+        A ready terminal artifact and the aggregates that point at it are
+        immutable (migration 018). Recording the SAME artifact and aggregates
+        again - a retry after an ambiguous commit - is therefore a no-op that
+        returns the existing artifact id; anything different is refused here,
+        before a statement the schema guards would reject.
         """
         if not terminal_locator or str(terminal_locator).endswith(".part"):
             raise RuntimeError(
                 "[DB] a terminal manifest locator must name a ready artifact")
         now = _now_utc()
         counts = dict(disposition_counts or {})
+        final_columns = (
+            "final_archived_count", "final_source_missing_count",
+            "final_source_permission_denied_count",
+            "final_source_unreadable_count", "final_source_changed_count",
+            "final_unresolved_count", "final_archived_bytes")
+        finals = (
+            int(counts.get("archived", 0)),
+            int(counts.get("source_missing", 0)),
+            int(counts.get("source_permission_denied", 0)),
+            int(counts.get("source_unreadable", 0)),
+            int(counts.get("source_changed", 0)),
+            int(counts.get("unresolved", 0)),
+            int(archived_bytes or 0))
+
+        def refuse(detail):
+            return RuntimeError(
+                f"[DB] chunk {int(chunk_index)} of session {session_id} "
+                f"already has a ready terminal manifest with {detail}; "
+                "refusing to overwrite terminal state")
 
         def operation(conn):
             if not self._column_exists_conn(conn, "remote_chunks",
                                             "final_archived_count"):
                 raise RuntimeError(
                     "[DB] terminal state requires migration 018")
-            artifact_id = conn.execute(
-                """INSERT INTO archive_artifacts
-                       (session_id, chunk_index, artifact_kind,
-                        artifact_version, local_locator, artifact_size_bytes,
-                        readiness_state, published_at, created_at, updated_at)
-                   VALUES (%s,%s,'terminal_manifest','terminal-state-v1',%s,%s,
-                           'ready',%s,%s,%s)
-                   ON CONFLICT (session_id, chunk_index, artifact_kind,
-                                artifact_version)
-                   DO UPDATE SET local_locator=EXCLUDED.local_locator,
-                                 artifact_size_bytes=
-                                     EXCLUDED.artifact_size_bytes,
-                                 readiness_state='ready',
-                                 published_at=EXCLUDED.published_at,
-                                 updated_at=EXCLUDED.updated_at
-                   RETURNING artifact_id""",
-                (session_id, int(chunk_index), str(terminal_locator),
-                 artifact_size_bytes, now, now, now),
-            ).fetchone()["artifact_id"]
+            chunk = conn.execute(
+                """SELECT terminal_manifest_artifact_id, final_archived_count,
+                          final_source_missing_count,
+                          final_source_permission_denied_count,
+                          final_source_unreadable_count,
+                          final_source_changed_count, final_unresolved_count,
+                          final_archived_bytes
+                   FROM remote_chunks
+                   WHERE session_id=%s AND chunk_index=%s FOR UPDATE""",
+                (session_id, int(chunk_index)),
+            ).fetchone()
+            if chunk is None:
+                raise RuntimeError(
+                    f"[DB] Remote chunk not found: session {session_id}, "
+                    f"chunk {int(chunk_index)}")
+            existing = conn.execute(
+                """SELECT artifact_id, local_locator, artifact_size_bytes,
+                          readiness_state
+                   FROM archive_artifacts
+                   WHERE session_id=%s AND chunk_index=%s
+                     AND artifact_kind='terminal_manifest'
+                     AND artifact_version='terminal-state-v1'
+                     AND container_id IS NULL""",
+                (session_id, int(chunk_index)),
+            ).fetchone()
+
+            if existing is not None and existing["readiness_state"] == "ready":
+                if (existing["local_locator"] != str(terminal_locator)
+                        or existing["artifact_size_bytes"]
+                        != artifact_size_bytes):
+                    raise refuse("a different artifact")
+                artifact_id = existing["artifact_id"]
+                if chunk["terminal_manifest_artifact_id"] is not None:
+                    recorded = tuple(chunk[name] for name in final_columns)
+                    if (chunk["terminal_manifest_artifact_id"] != artifact_id
+                            or recorded != finals):
+                        raise refuse("different final dispositions")
+                    return artifact_id
+            else:
+                # The unique index is partial (WHERE container_id IS NULL), so
+                # the conflict target must repeat its predicate.
+                artifact_id = conn.execute(
+                    """INSERT INTO archive_artifacts
+                           (session_id, chunk_index, artifact_kind,
+                            artifact_version, local_locator,
+                            artifact_size_bytes, readiness_state, published_at,
+                            created_at, updated_at)
+                       VALUES (%s,%s,'terminal_manifest','terminal-state-v1',
+                               %s,%s,'ready',%s,%s,%s)
+                       ON CONFLICT (session_id, chunk_index, artifact_kind,
+                                    artifact_version)
+                           WHERE container_id IS NULL
+                       DO UPDATE SET local_locator=EXCLUDED.local_locator,
+                                     artifact_size_bytes=
+                                         EXCLUDED.artifact_size_bytes,
+                                     readiness_state='ready',
+                                     published_at=EXCLUDED.published_at,
+                                     updated_at=EXCLUDED.updated_at
+                       RETURNING artifact_id""",
+                    (session_id, int(chunk_index), str(terminal_locator),
+                     artifact_size_bytes, now, now, now),
+                ).fetchone()["artifact_id"]
 
             conn.execute(
                 """UPDATE remote_chunks
@@ -1477,15 +1528,7 @@ class PgSessionMixin:
                        final_archived_bytes=%s,
                        updated_at=%s
                    WHERE session_id=%s AND chunk_index=%s""",
-                (artifact_id,
-                 int(counts.get("archived", 0)),
-                 int(counts.get("source_missing", 0)),
-                 int(counts.get("source_permission_denied", 0)),
-                 int(counts.get("source_unreadable", 0)),
-                 int(counts.get("source_changed", 0)),
-                 int(counts.get("unresolved", 0)),
-                 int(archived_bytes or 0), now,
-                 session_id, int(chunk_index)),
+                (artifact_id, *finals, now, session_id, int(chunk_index)),
             )
             return artifact_id
 
@@ -1710,7 +1753,7 @@ class PgSessionMixin:
 
     def transition_chunk(self, session_id, chunk_index, to_status, *,
                          expected_from=None, owner_token=None, attempt_id=None,
-                         error_msg=None, clear_error=False, validate=True):
+                         error_msg=None, clear_error=False):
         """The ONE method that moves a chunk between persisted states.
 
         Plan 1, Task 1.5. Before this, chunk status was written from half a
@@ -1722,8 +1765,9 @@ class PgSessionMixin:
         Arguments:
           ``expected_from``  compare-and-swap predicate: a status or iterable of
                              statuses the row must currently be in. ``None``
-                             means unconditional (the legacy behaviour, kept for
-                             the compatibility wrapper).
+                             means "whatever it is now": the row is locked,
+                             its real status read, and the matrix checked
+                             against that inside the same transaction.
           ``owner_token`` /
           ``attempt_id``     validated against the row when those columns exist
                              (migration 014). On a database without them a
@@ -1733,30 +1777,34 @@ class PgSessionMixin:
           ``error_msg`` /
           ``clear_error``    written deliberately, never as a side effect. Pass
                              ``clear_error=True`` to blank a stale message.
-          ``validate``       check :data:`~src.pipeline_types.CHUNK_TRANSITIONS`.
+
+        Every call is checked against
+        :data:`~src.pipeline_types.CHUNK_TRANSITIONS`; there is no unvalidated
+        mode (audit H5). The only way across the matrix is the named, audited
+        :meth:`override_chunk_transition`, and migration 020 enforces the same
+        rule for ``backing``/``done`` in the database itself.
 
         Returns True when the row moved, False when the compare-and-swap did not
         match (someone else changed it first). Raises
         :class:`~src.pipeline_types.ForbiddenTransition` for a transition the
         matrix does not allow — the old state is preserved either way.
         """
-        from .pipeline_types import (ChunkStatus, ForbiddenTransition,
-                                     assert_chunk_transition)
+        from .pipeline_types import ChunkStatus, assert_chunk_transition
 
-        target = ChunkStatus(to_status).value if validate else str(to_status)
+        target = ChunkStatus(to_status).value
         if expected_from is None:
             expected = None
         elif isinstance(expected_from, (str, ChunkStatus)):
             expected = [ChunkStatus(expected_from).value]
         else:
             expected = [ChunkStatus(s).value for s in expected_from]
-        if validate and expected:
+        if expected:
             for source in expected:
                 assert_chunk_transition(source, target)
         now = _now_utc()
 
         def operation(conn):
-            if validate and not expected:
+            if not expected:
                 # No caller-supplied predicate: read the row's actual state and
                 # check the matrix against THAT, so a forbidden move (notably an
                 # automatic retry out of 'backing') is refused wherever it comes
@@ -1826,6 +1874,14 @@ class PgSessionMixin:
                 )
             return True
 
+        # Audit H6: 'backing' is the instant a physical tape write begins. A
+        # run that took the single-writer lock must still own it at that
+        # instant - PostgreSQL may have restarted since the group started, and
+        # the pool reconnects silently. Raises ArchiverLockLost; never retried.
+        if target == ChunkStatus.BACKING.value and getattr(
+                self, "_archiver_lock_expected", False):
+            self.verify_archiver_lock()
+
         return self._transaction(
             operation, f"chunk {chunk_index + 1} -> {target}")
 
@@ -1865,13 +1921,13 @@ class PgSessionMixin:
             cur = conn.execute(
                 """UPDATE remote_chunks
                    SET status='fetching', owner_token=%s, attempt_id=%s,
-                       lease_expires_at=%s + make_interval(secs => %s),
+                       lease_expires_at=%s,
                        updated_at=%s
                    WHERE session_id=%s AND chunk_index=%s
                      AND status IN ('pending','fetch_failed','backup_failed')
                      AND (owner_token IS NULL OR lease_expires_at < %s)""",
-                (owner_token, attempt_id, now, float(lease_seconds), now,
-                 session_id, int(chunk_index), now),
+                (owner_token, attempt_id, lease_deadline(now, lease_seconds),
+                 now, session_id, int(chunk_index), now),
             )
             return cur.rowcount == 1
 
@@ -1886,12 +1942,12 @@ class PgSessionMixin:
         def operation(conn):
             cur = conn.execute(
                 """UPDATE remote_chunks
-                   SET lease_expires_at=%s + make_interval(secs => %s),
+                   SET lease_expires_at=%s,
                        updated_at=%s
                    WHERE session_id=%s AND chunk_index=%s AND owner_token=%s
                      AND status <> 'backing'""",
-                (now, float(lease_seconds), now, session_id, int(chunk_index),
-                 owner_token),
+                (lease_deadline(now, lease_seconds), now, session_id,
+                 int(chunk_index), owner_token),
             )
             return cur.rowcount == 1
 
@@ -1906,6 +1962,8 @@ class PgSessionMixin:
         ``pending``). Omit it to drop the lease while leaving the status alone
         — used when the caller has already transitioned the chunk itself.
         """
+        from .pipeline_types import assert_chunk_transition
+
         now = _now_utc()
 
         def operation(conn):
@@ -1916,6 +1974,18 @@ class PgSessionMixin:
                 sets.insert(0, "status=%s")
                 params.insert(0, str(to_status))
             params.extend([session_id, int(chunk_index), owner_token])
+            if to_status is not None:
+                # The pool-return is a status change like any other: check it
+                # against the matrix on the row's real, locked state.
+                row = conn.execute(
+                    """SELECT status FROM remote_chunks
+                       WHERE session_id=%s AND chunk_index=%s
+                         AND owner_token=%s AND status <> 'backing'
+                       FOR UPDATE""",
+                    (session_id, int(chunk_index), owner_token),
+                ).fetchone()
+                if row is not None and row["status"] != str(to_status):
+                    assert_chunk_transition(row["status"], to_status)
             cur = conn.execute(
                 f"""UPDATE remote_chunks SET {', '.join(sets)}
                     WHERE session_id=%s AND chunk_index=%s AND owner_token=%s
@@ -1991,13 +2061,92 @@ class PgSessionMixin:
             operation, f"reclaim chunk {int(chunk_index) + 1}")
 
     def update_chunk_status(self, session_id, chunk_index, status):
-        """Compatibility wrapper over :meth:`transition_chunk` (Task 1.5).
+        """Move a chunk to ``status``, validated against its real state.
 
-        Unconditional and unvalidated, exactly as before, so no existing caller
-        changes behaviour while they migrate. New code should call
-        ``transition_chunk`` with an ``expected_from`` predicate.
+        A thin name over :meth:`transition_chunk` kept for the pipeline's call
+        sites. It used to be unconditional and unvalidated, which let any
+        caller move a ``backing`` or ``done`` chunk back into the pool (audit
+        H5). It now locks the row, reads its actual status and refuses any
+        move :data:`~src.pipeline_types.CHUNK_TRANSITIONS` does not allow by
+        raising :class:`~src.pipeline_types.ForbiddenTransition`.
         """
-        self.transition_chunk(session_id, chunk_index, status, validate=False)
+        self.transition_chunk(session_id, chunk_index, status)
+
+    def _override_chunk_transition_conn(
+            self, conn, session_id, chunk_index, *, expected_from, to_status,
+            override, reason, authorized_by, error_msg=None):
+        """Record a named override and apply it, inside the caller's tx.
+
+        Returns True when the chunk moved. A lost compare-and-swap returns
+        False and leaves NO open override behind: the audit row is written
+        only for a move that really happened.
+        """
+        from .pipeline_types import (ChunkStatus,
+                                     assert_chunk_override_transition)
+
+        name = assert_chunk_override_transition(
+            override, expected_from, to_status)
+        source = ChunkStatus(expected_from).value
+        target = ChunkStatus(to_status).value
+        reason = str(reason or "").strip()
+        authorized_by = str(authorized_by or "").strip()
+        if not reason or not authorized_by:
+            raise ValueError(
+                "a chunk transition override needs a reason and the identity "
+                "that authorised it")
+        row = conn.execute(
+            """SELECT status FROM remote_chunks
+               WHERE session_id=%s AND chunk_index=%s FOR UPDATE""",
+            (int(session_id), int(chunk_index)),
+        ).fetchone()
+        if row is None or row["status"] != source:
+            return False
+        conn.execute(
+            """INSERT INTO remote_chunk_transition_overrides
+                   (session_id, chunk_index, from_status, to_status,
+                    override_name, reason, authorized_by)
+               VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+            (int(session_id), int(chunk_index), source, target, name.value,
+             reason, authorized_by),
+        )
+        cur = conn.execute(
+            """UPDATE remote_chunks
+               SET status=%s, error_msg=%s, updated_at=%s
+               WHERE session_id=%s AND chunk_index=%s AND status=%s""",
+            (target, error_msg, _now_utc(), int(session_id),
+             int(chunk_index), source),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError(
+                "[DB] chunk transition override compare-and-set failed")
+        get_logger().warning(
+            "chunk_transition_override: session=%s chunk=%s %s -> %s "
+            "override=%s authorized_by=%s reason=%s",
+            session_id, int(chunk_index) + 1, source, target, name.value,
+            authorized_by, reason)
+        return True
+
+    def override_chunk_transition(self, session_id, chunk_index, to_status, *,
+                                  expected_from, override, reason,
+                                  authorized_by):
+        """Cross the transition matrix through a NAMED, AUDITED override.
+
+        This is the only supported way to move a ``backing`` or ``done`` chunk
+        backwards, and it is for a human-driven recovery, never for the
+        pipeline. ``override`` must be a
+        :class:`~src.pipeline_types.ChunkTransitionOverride` that permits
+        exactly this ``expected_from -> to_status`` move; ``reason`` and
+        ``authorized_by`` are mandatory and are stored permanently in
+        ``remote_chunk_transition_overrides``. The move is a compare-and-swap
+        on ``expected_from``: returns False (and records nothing) if the chunk
+        is no longer in that state.
+        """
+        return self._transaction(
+            lambda conn: self._override_chunk_transition_conn(
+                conn, session_id, chunk_index, expected_from=expected_from,
+                to_status=to_status, override=override, reason=reason,
+                authorized_by=authorized_by),
+            f"override chunk {int(chunk_index) + 1} -> {to_status}")
 
     def get_pending_chunks(self, session_id):
         rows = self._run_read(
@@ -2143,7 +2292,19 @@ class PgSessionMixin:
         if it were the footprint once produced a wrong conclusion that a
         session's completed work had been destroyed.
         """
-        return self._run_read(
+        def typed(rows):
+            # min()/max() of a timestamp is an expression: an engine without
+            # typed expression results returns text. Normalise (a no-op for
+            # the datetimes PostgreSQL returns).
+            out = []
+            for row in rows:
+                row = dict(row)
+                row["first_run"] = as_timestamp(row["first_run"])
+                row["last_run"] = as_timestamp(row["last_run"])
+                out.append(row)
+            return _rows(out)
+
+        return typed(self._run_read(
             lambda conn: conn.execute(
                 """SELECT r.tape_label,
                           count(DISTINCT r.run_id)      AS runs,
@@ -2158,7 +2319,7 @@ class PgSessionMixin:
                    ORDER BY r.tape_label""",
                 (session_id,),
             ).fetchall(),
-            f"tape footprint for session {session_id}")
+            f"tape footprint for session {session_id}"))
 
     def find_sessions_sharing_plan(self, session_id):
         """Other sessions on the SAME plan or snapshot. Read-only.
@@ -2224,7 +2385,25 @@ class PgSessionMixin:
         if kind not in ("local", "remote"):
             raise RuntimeError(f"[DB] Unknown session kind: {kind}")
 
+        table = "local_sessions" if kind == "local" else "remote_sessions"
+        active_message = (
+            f"[DB] Refusing to delete {kind} session {session_id}: it is "
+            "marked active. A row marked active is treated as live until "
+            "proven otherwise - finish it, or prove it stale with "
+            "`inspect_db.py --reconcile-stale-sessions`, before deleting.")
+
         def operation(conn):
+            # Audit M8: one click in the inspector used to delete the session
+            # an archiver was writing. The refusal lives here, in the only
+            # write path, and the final DELETE repeats the condition so a
+            # session that turns active mid-transaction rolls everything back.
+            current = conn.execute(
+                f"SELECT status FROM {table} WHERE session_id=%s",
+                (session_id,)).fetchone()
+            if current is not None and str(
+                    current["status"] or "").strip().lower() == "active":
+                raise RuntimeError(active_message)
+
             if kind == "local":
                 refs = conn.execute(
                     "SELECT COUNT(*) AS n FROM files_index WHERE local_session_id=%s",
@@ -2242,10 +2421,12 @@ class PgSessionMixin:
                     (session_id,),
                 )
                 cur = conn.execute(
-                    "DELETE FROM local_sessions WHERE session_id=%s",
+                    """DELETE FROM local_sessions WHERE session_id=%s
+                       AND COALESCE(status,'') <> 'active'""",
                     (session_id,))
                 self._require_updated(
-                    cur, f"[DB] Local session not found: {session_id}")
+                    cur, active_message if current is not None
+                    else f"[DB] Local session not found: {session_id}")
                 return cur.rowcount
 
             conn.execute(
@@ -2257,9 +2438,11 @@ class PgSessionMixin:
                 (session_id,),
             )
             cur = conn.execute(
-                "DELETE FROM remote_sessions WHERE session_id=%s", (session_id,))
+                """DELETE FROM remote_sessions WHERE session_id=%s
+                   AND COALESCE(status,'') <> 'active'""", (session_id,))
             self._require_updated(
-                cur, f"[DB] Remote session not found: {session_id}")
+                cur, active_message if current is not None
+                else f"[DB] Remote session not found: {session_id}")
             return cur.rowcount
 
         removed = self._transaction(
@@ -2312,31 +2495,39 @@ class PgSessionMixin:
 
         def operation(conn):
             plan_files = conn.execute("""
-                DELETE FROM remote_plan_files pf
-                USING remote_plans p
-                WHERE p.plan_id=pf.plan_id
-                  AND NOT EXISTS (
-                    SELECT 1 FROM remote_sessions s WHERE s.plan_id=p.plan_id
+                DELETE FROM remote_plan_files
+                WHERE EXISTS (
+                    SELECT 1 FROM remote_plans p
+                    WHERE p.plan_id=remote_plan_files.plan_id
+                      AND NOT EXISTS (
+                        SELECT 1 FROM remote_sessions s
+                        WHERE s.plan_id=p.plan_id
+                      )
                   )
             """)
             plans = conn.execute("""
-                DELETE FROM remote_plans p
+                DELETE FROM remote_plans
                 WHERE NOT EXISTS (
-                    SELECT 1 FROM remote_sessions s WHERE s.plan_id=p.plan_id
+                    SELECT 1 FROM remote_sessions s
+                    WHERE s.plan_id=remote_plans.plan_id
                 )
             """)
             snapshot_files = conn.execute("""
-                DELETE FROM remote_snapshot_files sf
-                USING remote_snapshots sn
-                WHERE sn.snapshot_id=sf.snapshot_id
-                  AND NOT EXISTS (
-                    SELECT 1 FROM remote_plans p WHERE p.snapshot_id=sn.snapshot_id
+                DELETE FROM remote_snapshot_files
+                WHERE EXISTS (
+                    SELECT 1 FROM remote_snapshots sn
+                    WHERE sn.snapshot_id=remote_snapshot_files.snapshot_id
+                      AND NOT EXISTS (
+                        SELECT 1 FROM remote_plans p
+                        WHERE p.snapshot_id=sn.snapshot_id
+                      )
                   )
             """)
             snapshots = conn.execute("""
-                DELETE FROM remote_snapshots sn
+                DELETE FROM remote_snapshots
                 WHERE NOT EXISTS (
-                    SELECT 1 FROM remote_plans p WHERE p.snapshot_id=sn.snapshot_id
+                    SELECT 1 FROM remote_plans p
+                    WHERE p.snapshot_id=remote_snapshots.snapshot_id
                 )
             """)
             return {
@@ -2362,7 +2553,7 @@ class PgSessionMixin:
                 previous = conn.autocommit
                 conn.autocommit = True
                 try:
-                    conn.execute("VACUUM (ANALYZE)")
+                    self._vacuum_analyze_conn(conn)
                 finally:
                     conn.autocommit = previous
         return result

@@ -78,11 +78,19 @@ class RemoteTarStoreResult:
 
 
 def _stored_tar_command(remote_base):
-    """The pinned first-version producer dialect; paths arrive only on stdin."""
+    """The pinned first-version producer dialect; paths arrive only on stdin.
+
+    ``--hard-dereference`` (GNU tar >= 1.23): without it, the second name of a
+    hard-linked pair in one container is written as a zero-byte link entry
+    instead of a file. The strict reader rightly refuses that entry, so such a
+    chunk failed on every attempt (audit H11). With it every planned name is a
+    regular member carrying its own bytes, and restore never depends on
+    another member being present.
+    """
     return (
         f"LC_ALL=C tar -C {shlex.quote(str(remote_base))} -b 512 "
-        "--format=pax --sparse --sparse-version=1.0 --no-recursion "
-        "--ignore-failed-read -cf - --null -T -"
+        "--format=pax --sparse --sparse-version=1.0 --hard-dereference "
+        "--no-recursion --ignore-failed-read -cf - --null -T -"
     )
 
 
@@ -508,13 +516,19 @@ def _ssh_run(remote_user, remote_host, command, capture=True, password='',
     sshpass when available, or OpenSSH askpass. PuTTY's ``-pw`` fallback is
     intentionally not supported because it exposes the password in process
     arguments.
+
+    Every form carries the SSH keepalive options, so a dead or half-open
+    connection ends the command with exit 255 after about a minute instead of
+    blocking for ever; ``timeout`` (exit 124) bounds a peer that still answers
+    keepalives but never finishes. Both outcomes are ordinary failures the
+    caller can retry.
     """
     password = password or ''
     if password:
         if _has_command('sshpass'):
             ssh_cmd = [
                 'sshpass', '-e',
-                'ssh',
+                'ssh', *_SSH_STREAM_KEEPALIVE_OPTS,
                 '-o', 'BatchMode=no',
                 '-o', 'PubkeyAuthentication=no',
                 '-o', f'StrictHostKeyChecking={SSH_HOSTKEY_POLICY}',
@@ -545,7 +559,7 @@ def _ssh_run(remote_user, remote_host, command, capture=True, password='',
                     ssh_cmd, 124, '', f"SSH command timed out after {timeout}s")
         if _has_command('ssh'):
             ssh_cmd = [
-                'ssh',
+                'ssh', *_SSH_STREAM_KEEPALIVE_OPTS,
                 '-o', 'BatchMode=no',
                 '-o', 'PubkeyAuthentication=no',
                 '-o', 'NumberOfPasswordPrompts=1',
@@ -590,7 +604,7 @@ def _ssh_run(remote_user, remote_host, command, capture=True, password='',
         )
 
     ssh_cmd = [
-        'ssh',
+        'ssh', *_SSH_STREAM_KEEPALIVE_OPTS,
         '-o', 'BatchMode=yes',
         '-o', f'StrictHostKeyChecking={SSH_HOSTKEY_POLICY}',
         f'{remote_user}@{remote_host}',
@@ -615,59 +629,6 @@ def _ssh_run(remote_user, remote_host, command, capture=True, password='',
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(
             ssh_cmd, 124, '', f"SSH command timed out after {timeout}s")
-
-
-def _scp_fetch_file(remote_user, remote_host, remote_file_path, local_dest_path, password=''):
-    """Copy a single file from remote_user@remote_host:remote_file_path to
-    local_dest_path using SCP.  stdout/stderr are NOT redirected so SCP's
-    native progress output is visible in the terminal.
-    Returns SCP's exit code (0 = success).
-    """
-    os.makedirs(os.path.dirname(os.path.abspath(local_dest_path)), exist_ok=True)
-    remote_spec = f'{remote_user}@{remote_host}:{remote_file_path}'
-
-    password = password or ''
-    if password:
-        if _has_command('sshpass'):
-            env = os.environ.copy()
-            env['SSHPASS'] = password
-            proc = subprocess.Popen(
-                [
-                    'sshpass', '-e', 'scp',
-                    '-o', f'StrictHostKeyChecking={SSH_HOSTKEY_POLICY}',
-                    '-p', remote_spec, local_dest_path,
-                ],
-                env=env
-            )
-            return proc.wait()
-        if _has_command('scp'):
-            env = _openssh_askpass_env(password)
-            proc = subprocess.Popen(
-                [
-                    'scp',
-                    '-o', 'BatchMode=no',
-                    '-o', 'PubkeyAuthentication=no',
-                    '-o', 'NumberOfPasswordPrompts=1',
-                    '-o', f'StrictHostKeyChecking={SSH_HOSTKEY_POLICY}',
-                    '-p',
-                    remote_spec,
-                    local_dest_path,
-                ],
-                stdin=subprocess.DEVNULL,
-                env=env,
-            )
-            return proc.wait()
-        print("[REMOTE] remote_password is set, but scp/OpenSSH or sshpass was not found.")
-        return 255
-
-    proc = subprocess.Popen(
-        [
-            'scp',
-            '-o', f'StrictHostKeyChecking={SSH_HOSTKEY_POLICY}',
-            '-p', remote_spec, local_dest_path,
-        ]
-    )
-    return proc.wait()
 
 
 def _ssh_stream_command(remote_user, remote_host, command, password='', cipher=''):
@@ -786,8 +747,12 @@ def _remote_tar_fetch(remote_user, remote_host, remote_base, rel_paths, local_de
     # filter below matches literal English diagnostics, and a localized remote
     # would otherwise turn every legitimately-missing/unreadable file into a
     # fatal fetch error.
+    # --hard-dereference: ship every hard-linked name as a file with its own
+    # bytes. A link entry whose target is in another batch or chunk cannot be
+    # extracted locally and failed the fetch on every attempt.
     tar_core = (
         f"LC_ALL=C tar -C {shlex.quote(remote_base)} -b 512 --sparse "
+        "--hard-dereference "
         "--no-recursion --ignore-failed-read -cf - --null -T -"
     )
     if use_mbuffer:

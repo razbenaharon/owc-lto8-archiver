@@ -18,7 +18,7 @@ or tape progress ever appears again.
 ## Root cause (confirmed 2026-07-23, first py-spy dump)
 
 A **`db_sync` ⇄ `pack` deadly embrace** in `ResourceGovernor.decision()`
-([src/resource_governor.py](../../src/resource_governor.py)):
+([src/resource_governor.py](../../../src/resource_governor.py)):
 
 - The tape thread finishes robocopy (`tape_active` clears), then does its DB
   catalog write via `wait_or_pause("db_sync", "continue")` — but the `db_sync`

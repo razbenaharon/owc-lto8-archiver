@@ -7,6 +7,7 @@ parent of this package directory, and the root runner scripts ``chdir()`` there
 so a relative ``CONFIG_FILE`` resolves against the root exactly as before.
 """
 import os
+from typing import NamedTuple
 
 PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(PACKAGE_DIR)
@@ -40,7 +41,7 @@ TAPE_BUDGET_LABEL = f"{LOCAL_TAPE_BUDGET_BYTES / 1000**4:.1f} TB"
 DEFAULT_TAPE_CAPACITY_GB = 12288
 # tapes.status values (migration 011). 'full' = retired from writing, whatever
 # the reason — genuinely out of space, or unwritable like Tape_02 after its PWE
-# bit latched (docs/incidents/010-20260724-ltfs-write-perm-readonly.md).
+# bit latched (docs/history/incidents/010-20260724-ltfs-write-perm-readonly.md).
 TAPE_STATUS_ACTIVE = 'active'
 TAPE_STATUS_FULL = 'full'
 TAPE_STATUSES = (TAPE_STATUS_ACTIVE, TAPE_STATUS_FULL)
@@ -86,6 +87,41 @@ def tape_budget_bytes(total_capacity_gb, used_bytes, reserved_bytes=0,
     available_bytes = max(
         0, capacity_bytes - int(used_bytes) - int(reserved_bytes))
     return capacity_bytes, available_bytes
+
+
+class TapeUsage(NamedTuple):
+    """How full a tape is, measured the way the planner measures it."""
+    used_bytes: int
+    budget_bytes: int
+    available_bytes: int
+    percent: float
+
+    @property
+    def percent_text(self):
+        return f"{self.percent:.1f}%"
+
+    @property
+    def bar_fraction(self):
+        """``percent`` as a 0..1 fraction, clamped for drawing a bar."""
+        return min(max(self.percent / 100.0, 0.0), 1.0)
+
+
+def tape_usage(total_capacity_gb, used_bytes, status=None):
+    """The single source of truth for a tape's displayed usage percentage.
+
+    Used bytes over the planning budget from ``tape_budget_bytes`` — the
+    figure the archiver actually refuses on. The GUI used to divide by the
+    registered capacity read as GiB and the text menu by the same number read
+    as GB, so one cartridge showed 80.5% in one place and 86.5% in the other
+    while planning already had it at 92.5%. Every display must call this.
+    """
+    used = int(used_bytes or 0)
+    budget_bytes, available_bytes = tape_budget_bytes(
+        total_capacity_gb, used, status=status)
+    percent = (used / budget_bytes * 100.0) if budget_bytes else 0.0
+    return TapeUsage(used, budget_bytes, available_bytes, percent)
+
+
 # Seal a bundle ZIP slightly before max_zip_size_gb so the ZIP central
 # directory and per-entry headers never push it past the configured cap.
 ZIP_BUNDLE_FILL_FACTOR = 0.99

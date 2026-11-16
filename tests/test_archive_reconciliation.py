@@ -86,5 +86,59 @@ class SegmentTotalsTests(unittest.TestCase):
                 recon._segment_totals(path, heavy=True, expected_sha="0" * 64)
 
 
+class CatalogTargetTests(unittest.TestCase):
+    """The script must reach the catalog the way the application does."""
+
+    @staticmethod
+    def _config(root, lines, env=None):
+        from unittest import mock
+        from src.config import ConfigManager
+        path = os.path.join(root, "config.ini")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+        with mock.patch("src.config._load_env_file",
+                        return_value=dict(env or {})):
+            return ConfigManager(config_path=path)
+
+    def test_postgresql_target_carries_the_env_file_password(self):
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as root, \
+                mock.patch.dict(os.environ, clear=False) as environ:
+            environ.pop("PGPASSWORD", None)
+            cfg = self._config(
+                root,
+                ["[DATABASE]", "backend = postgresql", "host = db.example",
+                 "port = 15432", "dbname = cat", "user = lto"],
+                env={"PGPASSWORD": "from-env-file"})
+            target = recon._conninfo(cfg)
+            self.assertEqual(target, cfg.db_dsn)
+        self.assertIn("lto:from-env-file@db.example:15432/cat", target)
+
+    def test_sqlite_is_refused_in_one_line_before_connecting(self):
+        import contextlib
+        import io
+        import tempfile
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as root:
+            catalog = os.path.join(root, "c.sqlite3")
+            cfg = self._config(
+                root, ["[DATABASE]", "backend = sqlite",
+                       "sqlite_path = " + catalog])
+            stderr = io.StringIO()
+            with mock.patch.object(recon, "ConfigManager",
+                                   return_value=cfg), \
+                    mock.patch.object(
+                        recon, "run_checks",
+                        side_effect=AssertionError("must not run")), \
+                    contextlib.redirect_stderr(stderr):
+                code = recon.main([])
+            self.assertFalse(os.path.exists(catalog))
+        self.assertEqual(code, 1)
+        message = stderr.getvalue().strip()
+        self.assertIn("Not available on the SQLite backend", message)
+        self.assertEqual(len(message.splitlines()), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

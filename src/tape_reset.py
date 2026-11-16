@@ -16,7 +16,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .constants import DEFAULT_TAPE_CAPACITY_GB, LTFS_DIR, PROJECT_ROOT
+from . import db_backend
+from .constants import LTFS_DIR, PROJECT_ROOT
 from .ltfs import get_volume_label
 from .runtime import _acquire_tape_io_lock, _release_tape_io_lock
 from .windows_update_guard import ltfs_current_mount_status
@@ -168,10 +169,7 @@ def latest_chunk_write_evidence(summary_path=SUMMARY):
 
 
 def _table_exists(conn, table):
-    return conn.execute(
-        """SELECT 1 FROM information_schema.tables
-           WHERE table_schema='public' AND table_name=%s""", (table,)
-    ).fetchone() is not None
+    return db_backend.table_exists(conn, table)
 
 
 def _label_rows(conn, table, key_columns, label):
@@ -276,15 +274,8 @@ def build_impact_report(db, *, operation_id, tape_label, identity,
                 ("directory_tree_index", "dir_id"),
                 ("local_manifest_folder_aggregates", "aggregate_id"))
         }
-        cascades = [dict(r) for r in conn.execute(
-            """SELECT c.conname,c.conrelid::regclass::text AS child_table,
-                      pg_get_constraintdef(c.oid) AS definition
-               FROM pg_constraint c WHERE c.contype='f'
-                 AND c.confrelid='tapes'::regclass
-               ORDER BY child_table,c.conname""").fetchall()]
-        db_identity = dict(conn.execute(
-            """SELECT current_database() AS database,current_user AS username,
-                      pg_database_size(current_database()) AS bytes""").fetchone())
+        cascades = db_backend.foreign_keys_referencing(conn, "tapes")
+        db_identity = db_backend.database_identity(conn)
 
     return {
         "schema_version": 1,
@@ -461,9 +452,45 @@ def _impact_core(report):
     }
 
 
+def refuse_unrewritable_chunks(db, transitions):
+    """Refuse a reset that would strand chunks nothing can write again.
+
+    A Stored-TAR chunk keeps its container rows through the reset (they are
+    sealed), and this version cannot stage such a chunk a second time. Erasing
+    the cartridge would leave it ``pending`` with its only tape copy gone, so
+    the reset is refused before anything is changed.
+    """
+    stranded = []
+    with db._pool.connection() as conn:
+        if not db_backend.table_exists(conn, "archive_containers"):
+            return
+        for item in transitions:
+            row = conn.execute(
+                """SELECT COUNT(*) AS n FROM archive_containers
+                   WHERE session_id=%s AND chunk_index=%s
+                     AND container_format='stored_tar'""",
+                (int(item["session_id"]), int(item["chunk_index"])),
+            ).fetchone()
+            if row and int(row["n"]):
+                stranded.append(f"{item['session_id']}/{item['chunk_index']}")
+    if stranded:
+        shown = ", ".join(stranded[:10]) + (" ..." if len(stranded) > 10
+                                            else "")
+        raise RuntimeError(
+            "[TAPE RESET] Refused: this cartridge holds Stored-TAR chunks "
+            f"({len(stranded)}: {shown}). After a reset they could not be "
+            "written again in this version, so their only tape copy would be "
+            "lost. Nothing was changed.")
+
+
 def prepare_impact_file(db, cfg, *, operation_id, tape_label, backup,
-                        shadow_database, shadow_verification):
-    """Read-only preparation helper. Caller does not need a migrated schema."""
+                        shadow_database, shadow_verification,
+                        output_path=None):
+    """Read-only preparation helper. Caller does not need a migrated schema.
+
+    ``output_path`` chooses where the report is written (default: the
+    operation's audit directory). The file is created exactly once.
+    """
     _acquire_tape_io_lock("prepare destructive tape-reset impact")
     try:
         identity = mounted_identity(cfg.lto_drive)
@@ -478,9 +505,130 @@ def prepare_impact_file(db, cfg, *, operation_id, tape_label, backup,
     report = build_impact_report(
         db, operation_id=operation_id, tape_label=tape_label,
         identity=identity, backup=backup, shadow_database=shadow_database)
-    path = audit_dir(operation_id) / "impact.json"
+    refuse_unrewritable_chunks(db, report["planned_chunk_transitions"])
+    path = (Path(output_path) if output_path
+            else audit_dir(operation_id) / "impact.json")
     written, digest = write_immutable_json(path, report)
     return written, digest, report
+
+
+def open_read_only_catalog(cfg):
+    """Open the catalog so that the database engine refuses every write.
+
+    Used by the report preparation: it never runs start-up schema changes
+    and cannot alter a row.
+    """
+    if db_backend.is_sqlite(cfg):
+        from .sqlite_db import SqliteDatabaseManager
+        return SqliteDatabaseManager(cfg.db_dsn, read_only=True)
+    from psycopg.conninfo import make_conninfo
+    from .pg_db import PgDatabaseManager
+    return PgDatabaseManager(
+        make_conninfo(cfg.db_dsn,
+                      options="-c default_transaction_read_only=on"),
+        init_schema=False)
+
+
+def prepare_impact_report(cfg, *, tape_label, output_path, backup_path,
+                          scratch_server=None):
+    """Write the impact report ``execute_reset`` requires. Changes nothing.
+
+    This is the command-line entry to :func:`prepare_impact_file`
+    (``run.py tape-reset --prepare-impact-report``). It reads the catalog
+    through a read-only connection, reads the IBM LTFS log and the label of
+    the mounted cartridge (the identity the destructive step later insists
+    on; no file on the cartridge is opened), and writes one new file. It
+    never formats, ejects, loads or writes to a cartridge and never writes to
+    the catalog.
+
+    The report may only say the backup was proven restorable when that was
+    proven here:
+
+    * SQLite - the backup is itself a database file; it is opened and read
+      through completely (``integrity_check``, ``foreign_key_check``).
+    * PostgreSQL - the dump is restored into a new scratch database on the
+      server the operator names (``scratch_server``), inspected, and the
+      scratch database is dropped again.
+    """
+    from .db_backup import verify_backup
+    from .pg_backup import (BACKUP_LEVEL_READ_THROUGH, BACKUP_LEVEL_RESTORED,
+                            validate_backup_local_path)
+
+    output = validate_backup_local_path(
+        cfg, output_path, expected_kind="file", allow_missing=True)
+    if output.exists():
+        raise RuntimeError(
+            f"[TAPE RESET] Refusing to overwrite an existing file: {output}")
+    if db_backend.is_sqlite(cfg):
+        if (os.path.normcase(os.path.abspath(os.fspath(backup_path)))
+                == os.path.normcase(os.path.abspath(cfg.sqlite_path))):
+            raise RuntimeError(
+                "[TAPE RESET] --backup-file is the live catalog itself, "
+                "which the reset changes. Create a backup first "
+                "(python run.py --backup-db).")
+        from .db_backup import _has_pending_wal
+        if _has_pending_wal(backup_path):
+            # The reset pins the backup by the hash of this one file; data
+            # that lives only in a log beside it would not be covered.
+            raise RuntimeError(
+                "[TAPE RESET] --backup-file has a write-ahead log beside "
+                "it, so it is not one self-contained file. Use a backup "
+                "made by `python run.py --backup-db`.")
+        verification = verify_backup(cfg, backup_path)
+        required_level = BACKUP_LEVEL_READ_THROUGH
+    else:
+        if scratch_server is None:
+            raise RuntimeError(
+                "[TAPE RESET] On PostgreSQL the backup must be proven "
+                "restorable first: name a scratch server with "
+                "--scratch-host, --scratch-port and --scratch-user. The "
+                "dump is restored there into a new scratch database, "
+                "checked, and that database is dropped again.")
+        verification = verify_backup(
+            cfg, backup_path, deep_target=scratch_server)
+        required_level = BACKUP_LEVEL_RESTORED
+    if not verification.ok or verification.level != required_level:
+        raise RuntimeError(
+            "[TAPE RESET] The catalog backup was not proven restorable; no "
+            "impact report was written.\n" + verification.summary())
+    restore_list = verification.artifacts.get("restore_list_path")
+    if not restore_list:
+        raise RuntimeError(
+            "[TAPE RESET] Backup verification produced no restore list")
+    backup = verify_backup_inputs(verification.backup_path, restore_list)
+    if db_backend.is_sqlite(cfg):
+        shadow_database = backup["backup_path"]
+    else:
+        shadow_database = str((verification.details.get("scratch_restore")
+                               or {}).get("scratch_database") or "")
+        if not shadow_database:
+            raise RuntimeError(
+                "[TAPE RESET] Scratch restore left no database name")
+
+    db = open_read_only_catalog(cfg)
+    try:
+        written, digest, report = prepare_impact_file(
+            db, cfg, operation_id=new_operation_id(), tape_label=tape_label,
+            backup=backup, shadow_database=shadow_database,
+            shadow_verification=verification.as_dict(), output_path=output)
+    finally:
+        db.close()
+    return {
+        "impact_report": written,
+        "impact_report_sha256": digest,
+        "operation_id": report["operation_id"],
+        "target_label": report["target_label"],
+        "backup_path": backup["backup_path"],
+        "backup_verification_level": verification.level,
+        "sessions": len(report["sessions"]),
+        "chunks_returning_to_pending": len(
+            report["planned_chunk_transitions"]),
+        "catalog_rows_to_delete": report["tape03_counts"],
+        "changed": "nothing: the catalog and the cartridge were only read",
+        "next_command": (
+            f"python run.py tape-reset --tape {tape_label} "
+            f"--impact-report {written} --delete-catalog --yes"),
+    }
 
 
 def execute_reset(db, cfg, *, tape_label, impact_path, delete_catalog,
@@ -522,9 +670,21 @@ def execute_reset(db, cfg, *, tape_label, impact_path, delete_catalog,
         post_format = bool(hardware_path.exists() or (
             op and op["state"] in
             ("hardware_succeeded", "cleanup_succeeded", "verified")))
-        expected = (read_json(hardware_path)["mounted_identity"]
-                    if post_format and hardware_path.exists()
-                    else impact["mounted_identity"])
+        if post_format and hardware_path.exists():
+            expected = read_json(hardware_path)["mounted_identity"]
+        elif post_format:
+            # The audit file is gone but the database recorded the same
+            # evidence when the format succeeded. Falling back to the
+            # PRE-format identity here would compare the new filesystem
+            # against the erased one and refuse every resume.
+            expected = ((op.get("hardware_evidence") or {})
+                        .get("mounted_identity"))
+            if not expected:
+                raise RuntimeError(
+                    "[TAPE RESET] Post-format identity evidence is missing "
+                    "from both the audit directory and the database")
+        else:
+            expected = impact["mounted_identity"]
         identity_keys = ["label", "drive", "drive_serial", "device",
                          "ltfs_generation"]
         if not post_format:
@@ -535,15 +695,35 @@ def execute_reset(db, cfg, *, tape_label, impact_path, delete_catalog,
                     f"[TAPE RESET] Mounted identity changed at {key}: "
                     f"{identity.get(key)!r} != {expected.get(key)!r}")
 
-        current = build_impact_report(
-            db, operation_id=operation_id, tape_label=tape_label,
-            identity=identity, backup=impact["backup"],
-            shadow_database=impact["shadow_database"])
-        if canonical_json_bytes(_impact_core(current)) != canonical_json_bytes(
-                _impact_core(impact)):
-            raise RuntimeError(
-                "[TAPE RESET] Observed deletion scope differs from impact report")
+        cleanup_done = bool(op and op["state"] in
+                            ("cleanup_succeeded", "verified"))
+        if cleanup_done:
+            # The cleanup transaction already committed: the catalog now
+            # (correctly) no longer matches the PRE-cleanup scope in the impact
+            # report, so re-deriving and comparing that scope would refuse
+            # every resume and leave the operation open forever - which also
+            # blocks any new reset of this tape. What must still hold is that
+            # this is the SAME approved report the cleanup ran under.
+            if op["impact_report_sha256"] != sha256_file(impact_path):
+                raise RuntimeError(
+                    "[TAPE RESET] Impact report differs from the one this "
+                    "operation's cleanup was executed under")
+        else:
+            current = build_impact_report(
+                db, operation_id=operation_id, tape_label=tape_label,
+                identity=identity, backup=impact["backup"],
+                shadow_database=impact["shadow_database"])
+            if canonical_json_bytes(_impact_core(current)) != \
+                    canonical_json_bytes(_impact_core(impact)):
+                raise RuntimeError(
+                    "[TAPE RESET] Observed deletion scope differs from impact "
+                    "report")
 
+        if not post_format:
+            # Nothing has been erased yet, so refusing still loses nothing.
+            # Once the cartridge is formatted the operation is finished as
+            # approved rather than stopped half-way.
+            refuse_unrewritable_chunks(db, impact["planned_chunk_transitions"])
         if op is None:
             op = db.create_tape_reset_intent(
                 operation_id=operation_id, tape_label=tape_label,
@@ -563,6 +743,15 @@ def execute_reset(db, cfg, *, tape_label, impact_path, delete_catalog,
         hardware_path = directory / "hardware_result.json"
         cleanup_path = directory / "cleanup_result.json"
         verification_path = directory / "verification.json"
+
+        if (op["state"] in ("hardware_succeeded", "cleanup_succeeded",
+                            "verified")
+                and not hardware_path.exists()
+                and op.get("hardware_evidence")):
+            # Every later stage (and the final report) reads this file; the
+            # database holds the same evidence, so a lost file never strands
+            # an operation that already formatted the cartridge.
+            write_immutable_json(hardware_path, op["hardware_evidence"])
 
         if op["state"] in ("intent_recorded", "hardware_started"):
             if hardware_path.exists():
@@ -586,7 +775,20 @@ def execute_reset(db, cfg, *, tape_label, impact_path, delete_catalog,
         else:
             cleanup = read_json(cleanup_path) if cleanup_path.exists() else (
                 op.get("cleanup_evidence") or {})
+        if (op["state"] in ("cleanup_succeeded", "verified")
+                and not cleanup_path.exists()):
+            # Interrupted between the cleanup commit and its audit file: the
+            # database copy is the durable evidence, so re-create the file
+            # from it (without the later verification annotation).
+            write_immutable_json(cleanup_path, {
+                key: value for key, value in dict(cleanup).items()
+                if key != "verification"})
 
+        if op["state"] == "verified" and not verification_path.exists():
+            verification = (op.get("cleanup_evidence") or {}).get(
+                "verification")
+            if verification:
+                write_immutable_json(verification_path, verification)
         if op["state"] == "cleanup_succeeded":
             if verification_path.exists():
                 verification = read_json(verification_path)

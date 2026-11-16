@@ -101,66 +101,45 @@ Data boundaries (unchanged by Plan 1)
 (Robocopy + catalog sync), ``src.pg_catalog.PgCatalogMixin`` (file/directory
 rows), ``src.retriever.LTORetriever`` (ZIP/loose restore).
 """
-import gc
-import json
 import os
-import random
 import time
-import queue
 import shutil
 import threading
 import posixpath
-import uuid
 from datetime import datetime, timezone
-from collections import defaultdict
 from typing import Optional
 
 from .backup import LTOBackup, _NoEjectBackup
 from .constants import (DEFAULT_TAPE_CAPACITY_GB, LOCAL_STAGING_RESERVE_BYTES,
                         LTFS_WRITE_WARNING, tape_budget_bytes, tape_is_full,
                         tape_status_reason_suffix)
-from .db import _apply_canonical_remote_paths
 from .exit_codes import (
     ExitCode, StopResult,
     REASON_NETWORK_RETRY_EXHAUSTED, REASON_SCCM_REBOOT_PENDING,
     REASON_WINDOWS_REBOOT_PENDING, REASON_STOPPED_AT_CHUNK_BOUNDARY,
-    REASON_TAPE_WRITE_FAILED,
     REASON_AMBIGUOUS_BACKING_CHUNK, REASON_LTFS_SYNC_MODE_NOT_TIME5,
     REASON_LTFS_MEDIA_DEGRADED,
     REASON_LTFS_MOUNT_UNVERIFIABLE, REASON_UNEXPECTED_TAPE_OR_DB_STATE,
     REASON_LTFS_OWNERSHIP_UNAVAILABLE,
     REASON_SEALED_BATCH_FEATURE_UNAVAILABLE, REASON_SCAN_FRONTIER_UNAVAILABLE,
-    REASON_AMBIGUOUS_ACTIVE_SESSIONS, REASON_SSH_AUTHENTICATION_FAILED,
-    REASON_SSH_PERMISSION_DENIED, REASON_SSH_HOST_KEY_MISMATCH,
-    REASON_MISSING_NONINTERACTIVE_CREDENTIAL, REASON_BAD_CONFIG,
+    REASON_AMBIGUOUS_ACTIVE_SESSIONS, REASON_BAD_CONFIG,
     REASON_NO_ACTIVE_SESSION, REASON_NONINTERACTIVE_REQUIRES_RESUME,
-    REASON_USER_REQUESTED_STOP, REASON_COMPLETED,
-    CLASS_DNS_RESOLUTION_FAILURE, CLASS_CONNECTION_TIMEOUT,
-    CLASS_CONNECTION_RESET, CLASS_CONNECTION_REFUSED,
-    CLASS_NETWORK_UNREACHABLE, CLASS_TEMPORARY_TRANSPORT_FAILURE)
+    REASON_USER_REQUESTED_STOP, REASON_COMPLETED)
 from .logsetup import get_logger
 from .status_file import write_status, write_last_failure
 from .windows_update_guard import (RebootSentinel, assess_reboot_state,
                                    ltfs_current_mount_status,
                                    ltfs_media_health,
                                    ltfs_sync_mode_status,
-                                   pending_reboot_reasons,
-                                   reboot_block_reasons)
+                                   pending_reboot_reasons)
 from .ltfs import (_ensure_lto_drive_ready, get_volume_label,
                    note_device_state_change)
-from .ltfs_ownership import (LtfsOwnershipError, OWNERSHIP,
-                             writer_timeout_seconds)
-from .packer import LTOPacker
-from .paths import (_LEGACY_PATH_LIMIT, _dir_tree_size,
-                    _disambiguate_local_rel, _exceeds_legacy_path_limit,
-                    _long, _remote_fetch_base_and_rel,
-                    _reserved_name_component, _volume_cluster_size,
-                    _winsafe_extracted_rel)
+from .ltfs_ownership import LtfsOwnershipError, OWNERSHIP
+from .paths import _volume_cluster_size
 from .pipeline_types import ScanMetrics, StagedChunk, StreamState
 from .pg_containers import stored_tar_reader_contract_version
 from .ready_queue import ReadyQueue
 from .remote_pipeline import RemotePipelineCoordinator
-from .ram_telemetry import RamStageSampler
 from .remote_transport import _remote_tar_fetch
 from .resource_governor import ResourceGovernor
 from .reporting import _write_source_missing_only_log
@@ -170,10 +149,10 @@ from .planning import StreamingChunkBuilder
 from .scan_frontier import (FrontierScanCoordinator,
                             build_frontier_scanner_factory,
                             incremental_scan_schema_ready)
-from .runtime import (CANCEL, _acquire_tape_io_lock, _fmt_eta, _phase,
-                      _priority_class, _progress_done, _progress_line,
-                      _release_tape_io_lock, _status, compute_affinity_sets,
-                      pin_current_process, unpin_current_process)
+from .runtime import (CANCEL, _acquire_tape_io_lock, _phase,
+                      _priority_class, _release_tape_io_lock, _status,
+                      compute_affinity_sets, pin_current_process,
+                      unpin_current_process)
 from .skipped import SkippedFileTracker
 from .telegram_notify import TelegramNotifier, send_best_effort
 from .ui import ConsoleUI
@@ -439,9 +418,9 @@ class RemoteOrchestrator:
             err, retry_attempt=retry_attempt, next_retry_delay=next_retry_delay)
 
     def _fetch_batches_parallel(self, work_items, fetch_dir, fetch_abort,
-                                streams):
+                                session_id, streams):
         return self._stager()._fetch_batches_parallel(
-            work_items, fetch_dir, fetch_abort, streams)
+            work_items, fetch_dir, fetch_abort, session_id, streams)
 
     def _fetch_collisions(self, session_id, collisions, fetch_dir,
                           fetch_abort, *args, **kwargs):
@@ -1192,8 +1171,8 @@ class RemoteOrchestrator:
         #
         # This exists because writing an already-planned chunk needs no
         # discovery whatsoever, while the resumed scanner currently cannot run
-        # on a pre-frontier session at all (see the ordinal-collision blocker
-        # in docs/SESSION_37_CONTINUATION_RUNBOOK.md). Making the two
+        # on a pre-frontier session at all (its ordinals would collide with
+        # the ones the older planner already used). Making the two
         # independent means a bounded write group no longer depends on
         # traversal being healthy.
         write_only = bool(getattr(self.cfg, 'write_only_resume', False))
@@ -1247,6 +1226,10 @@ class RemoteOrchestrator:
                 remote_password=self.remote_password,
                 skipped_tracker=self.skipped_tracker,
                 ui=self.ui,
+                # [PERFORMANCE] ssh_command_timeout_seconds: a hung listing
+                # fails cleanly (the directory stays 'partial' and is retried)
+                # instead of blocking the scan for ever.
+                timeout=getattr(self, "ssh_timeout", None),
             ),
             ui=self.ui,
             on_budget_exceeded=_on_budget_exceeded,
@@ -1798,7 +1781,7 @@ class RemoteOrchestrator:
                f"restart can lose every chunk written since the mount.")
         print(f"\n[TAPE] {msg}")
         print("[TAPE] Fix the mount's sync_type and reload the cartridge, then "
-              "re-run. See docs/performance_insights_and_recommendations.md.")
+              "re-run. See docs/safety.md.")
         get_logger().error("ltfs_sync_mode_blocked: declared=%s at=%s",
                            declared, status["declared_at"])
         send_best_effort(self.notifier, f"[PIPELINE] {msg}")
@@ -1948,13 +1931,19 @@ class RemoteOrchestrator:
                 reason=REASON_LTFS_MEDIA_DEGRADED, resumable=False,
                 source="gate", detailed_reason=msg)
 
+        # Remembered so the writer can repeat the PASSIVE half of this check
+        # (IBM LogFile.csv only) before each later chunk of the same group.
+        self._gate_mount_started_at = mount_started_at
         health = ltfs_media_health(since_iso=mount_started_at)
 
         if not health.get("determinate"):
             err = health.get("error") or "LTFS event log could not be read"
             msg = (f"Cannot verify LTFS drive/medium health ({err}). Refusing to "
-                   "start a tape write: an unreadable drive log is exactly how "
-                   "the 2026-07-24 cartridge freeze went unnoticed for four days.")
+                   "start a tape write: an unreadable drive log is how a "
+                   "failing drive went unnoticed for four days before it "
+                   "made a cartridge permanently read-only on a real "
+                   "deployment (see "
+                   "docs/history/incidents/010-20260724-ltfs-write-perm-readonly.md).")
             print(f"\n[TAPE] {msg}")
             get_logger().error("ltfs_media_health_unverifiable: %s", err)
             send_best_effort(self.notifier, f"[PIPELINE] {msg}")
@@ -1978,9 +1967,10 @@ class RemoteOrchestrator:
                   f"[{first['id']}] {first['meaning']}; latest {last['at']} "
                   f"[{last['id']}] {last['meaning']}")
         msg = (f"LTFS reports drive/medium {kind}. Refusing to start a tape "
-               f"write: {detail}. Writing into a failing drive is what froze "
-               "Tape_02 permanently. Investigate before resuming — see "
-               "docs/incidents/010-20260724-ltfs-write-perm-readonly.md.")
+               f"write: {detail}. Writing into a failing drive has made a "
+               "cartridge permanently read-only on a real deployment. "
+               "Investigate before resuming — see "
+               "docs/history/incidents/010-20260724-ltfs-write-perm-readonly.md.")
         print(f"\n[TAPE] {msg}")
         for ev in worst[:5]:
             print(f"[TAPE]   {ev['at']}  [{ev['id']}]  {ev['message'][:140]}")
@@ -2444,24 +2434,39 @@ class RemoteOrchestrator:
                  desc.pack_dir)
         try:
             assessment = assess_reboot_state(block_on_unknown=True)
-        except Exception:
-            # The gate itself must never take the pipeline down. Fall back to
-            # the critical Windows markers alone rather than blocking forever.
-            log.exception("pre_tape_write_reboot_check failed; "
-                          "falling back to Windows markers")
-            return list(pending_reboot_reasons(include_soft=False)), None
+        except Exception as exc:
+            # FAIL CLOSED. The gate must not crash the pipeline, but "the
+            # restart state could not be evaluated" is not "no restart is
+            # staged": this path used to consult the Windows markers alone,
+            # silently dropping the SCCM answer — the one control plane that
+            # actually took the 2026-07-15 restart. Keep whatever the Windows
+            # markers do say, and add the unknown as a blocking reason. The
+            # stop is transient and the pack is preserved; the operator
+            # override below still applies.
+            log.exception("pre_tape_write_reboot_check could not evaluate the "
+                          "restart state; blocking this write")
+            try:
+                reasons = list(pending_reboot_reasons(include_soft=False))
+            except Exception:
+                log.exception("Windows restart markers unreadable as well")
+                reasons = []
+            reasons.append(
+                f"The restart state could not be evaluated ({exc}) — "
+                "refusing to start a tape write blind")
+            sccm = {"determinate": False, "error": str(exc)}
+        else:
+            sccm = assessment.sccm
+            # Warning-only indicators are never discarded: they are recorded
+            # here and on the console so a stale rename queue stays visible in
+            # diagnostics without stopping a tape write.
+            if assessment.warnings:
+                summary = assessment.warning_summary()
+                log.info(
+                    "pre_tape_write_reboot_warning: session=%s chunk=%s %s",
+                    session_id, desc.chunk_index + 1, summary)
+                print(f"[WU] {summary}")
+            reasons = assessment.blocking_reasons
 
-        sccm = assessment.sccm
-        # Warning-only indicators are never discarded: they are recorded here
-        # and on the console so a stale rename queue stays visible in
-        # diagnostics without stopping a tape write.
-        if assessment.warnings:
-            summary = assessment.warning_summary()
-            log.info("pre_tape_write_reboot_warning: session=%s chunk=%s %s",
-                     session_id, desc.chunk_index + 1, summary)
-            print(f"[WU] {summary}")
-
-        reasons = assessment.blocking_reasons
         if reasons and not self._block_on_soft_reboot_marker():
             # Explicit operator override of a real, critical pending restart.
             log.warning(

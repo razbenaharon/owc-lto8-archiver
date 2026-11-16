@@ -24,7 +24,7 @@ import os
 import queue
 import threading
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from typing import Optional, Tuple
@@ -380,6 +380,14 @@ def maybe_build_observation_worker(cfg, db_dsn):
     observation only (returns ``None``); it never propagates to the writer.
     """
     if not getattr(cfg, "sealed_tape_write_batches_observation_enabled", False):
+        return None
+    from . import db_backend
+    if db_backend.is_sqlite(db_dsn):
+        # Observation is advisory, so it is switched off rather than stopping
+        # the writer - but loudly, with the one PostgreSQL-only refusal.
+        refusal = db_backend.PostgresOnlyFeature("sealed_batches")
+        print(f"\n[FEATURES] {refusal}")
+        get_logger().error("sealed_batch_observation_unavailable: %s", refusal)
         return None
     try:
         obs_cfg = ObservationConfig.from_cfg(cfg)

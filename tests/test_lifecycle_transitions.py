@@ -11,6 +11,7 @@ deliberately exhaustive over the declared statuses: a new status that nobody
 wires into ``CHUNK_TRANSITIONS`` shows up here as an unreachable state rather
 than as a silent runtime refusal.
 """
+from source_facts import code_text
 import inspect
 import unittest
 from itertools import product
@@ -187,7 +188,7 @@ def _repo(**kwargs):
 class TransitionChunkTests(unittest.TestCase):
     def test_it_is_the_only_place_chunk_status_is_written(self):
         from src.pg_sessions import PgSessionMixin
-        wrapper = inspect.getsource(PgSessionMixin.update_chunk_status)
+        wrapper = code_text(PgSessionMixin.update_chunk_status)
         self.assertIn("transition_chunk", wrapper)
         # The wrapper contains no SQL of its own any more.
         self.assertNotIn("UPDATE remote_chunks", wrapper)
@@ -232,21 +233,20 @@ class TransitionChunkTests(unittest.TestCase):
     def test_an_unconditional_miss_is_still_an_error(self):
         repo = _repo(rowcount=0, current_status=None)
         with self.assertRaises(RuntimeError):
-            repo.transition_chunk(37, 4, ChunkStatus.DONE, validate=False)
+            repo.transition_chunk(37, 4, ChunkStatus.DONE)
 
     def test_a_claim_without_the_columns_is_refused_not_ignored(self):
         """A claim you believe you hold but that is unenforced is worse than
         none, so this fails closed rather than dropping the predicate."""
         for kwargs in ({"owner_token": "t"}, {"attempt_id": "a"}):
-            repo = _repo(has_owner_column=False)
+            repo = _repo(has_owner_column=False, current_status="fetching")
             with self.assertRaises(RuntimeError) as caught:
-                repo.transition_chunk(37, 4, ChunkStatus.PACKING,
-                                      validate=False, **kwargs)
+                repo.transition_chunk(37, 4, ChunkStatus.PACKING, **kwargs)
             self.assertIn("migration 014", str(caught.exception))
 
     def test_a_claim_with_the_columns_becomes_a_where_clause(self):
-        repo = _repo(has_owner_column=True)
-        repo.transition_chunk(37, 4, ChunkStatus.PACKING, validate=False,
+        repo = _repo(has_owner_column=True, current_status="fetching")
+        repo.transition_chunk(37, 4, ChunkStatus.PACKING,
                               owner_token="tok", attempt_id="att")
         update = [s for s, _ in repo.conn.statements
                   if s.startswith("UPDATE remote_chunks")][0]
@@ -296,12 +296,18 @@ class TransitionChunkTests(unittest.TestCase):
         repo = _repo(current_status="backing")
         self.assertTrue(repo.transition_chunk(37, 4, ChunkStatus.BACKING))
 
-    def test_the_compatibility_wrapper_stays_unvalidated(self):
-        """Existing callers keep the old unconditional behaviour."""
+    def test_the_pipeline_setter_is_validated_too(self):
+        """CHANGED BY AUDIT H5, deliberately.
+
+        ``update_chunk_status`` used to stay unconditional "while callers
+        migrate". Every pipeline call site still used it, so the matrix was
+        never applied where it mattered. It is now the validated path.
+        """
         repo = _repo(current_status="backing")
-        repo.update_chunk_status(37, 4, "pending")     # would be forbidden
-        self.assertTrue([s for s, _ in repo.conn.statements
-                         if s.startswith("UPDATE remote_chunks")])
+        with self.assertRaises(ForbiddenTransition):
+            repo.update_chunk_status(37, 4, "pending")
+        self.assertFalse([s for s, _ in repo.conn.statements
+                          if s.startswith("UPDATE remote_chunks")])
 
 
 # =============================================================================
@@ -311,7 +317,7 @@ class TypedCallSiteTests(unittest.TestCase):
     def test_the_writer_and_stager_use_the_enum_not_bare_strings(self):
         from src import remote_staging, remote_writer
         for module in (remote_staging, remote_writer):
-            source = inspect.getsource(module)
+            source = code_text(module)
             for literal in ("'backing'", "'done'", "'fetching'", "'packing'",
                             "'fetch_failed'", "'backup_failed'"):
                 self.assertNotIn(

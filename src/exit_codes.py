@@ -63,6 +63,9 @@ REASON_UNEXPECTED_TAPE_OR_DB_STATE = "unexpected_tape_or_db_state"
 #: written, so no chunk is ambiguous and the staged pack stays reusable.
 REASON_LTFS_OWNERSHIP_UNAVAILABLE = "ltfs_ownership_unavailable"
 REASON_AMBIGUOUS_ACTIVE_SESSIONS = "ambiguous_active_sessions"
+#: The cross-process single-writer lock is no longer provably held (its
+#: PostgreSQL session died). Never retried: another writer may hold it.
+REASON_ARCHIVER_LOCK_LOST = "archiver_lock_lost"
 #: The sealed-batch feature flag was explicitly enabled, but the feature is not
 #: ready (schema not applied, checksum mismatch, or exact schema drift). Startup
 #: refuses BEFORE any worker thread rather than fall back to legacy behaviour
@@ -84,6 +87,59 @@ REASON_NONINTERACTIVE_REQUIRES_RESUME = "noninteractive_requires_resume"
 # 40 / 0
 REASON_USER_REQUESTED_STOP = "user_requested_stop"
 REASON_COMPLETED = "completed"
+
+# --- auto-restart policy: the single source of truth --------------------------
+# scripts/archive_watchdog.ps1 may relaunch a stopped run ONLY when the recorded
+# stop is one a machine can safely resume without a human. The PowerShell lists
+# there are a copy of the sets below; tests/test_watchdog_hard_stop_sync.py
+# fails when the copy drifts, when a reason emitted with a hard exit code is
+# missing here, or when a new REASON_* constant is left unclassified.
+
+#: Exit codes after which NOTHING may restart the archiver automatically: a
+#: human must inspect (20), fix configuration (30), or chose to stop (40).
+NO_AUTO_RESTART_EXIT_CODES = frozenset({
+    ExitCode.SAFETY_BLOCK, ExitCode.FATAL_CONFIG, ExitCode.USER_STOP})
+
+#: The only exit code a supervisor may relaunch after. Anything else that is
+#: not listed here — including a code this module does not define — refuses.
+AUTO_RESTARTABLE_EXIT_CODES = frozenset({ExitCode.TRANSIENT_RESUMABLE})
+
+#: Stop reasons that must never be auto-restarted.
+NO_AUTO_RESTART_REASONS = frozenset({
+    # 20 — SAFETY_BLOCK
+    REASON_AMBIGUOUS_BACKING_CHUNK,
+    REASON_LTFS_SYNC_MODE_NOT_TIME5,
+    REASON_LTFS_MOUNT_UNVERIFIABLE,
+    REASON_LTFS_MEDIA_DEGRADED,
+    REASON_UNEXPECTED_TAPE_OR_DB_STATE,
+    REASON_LTFS_OWNERSHIP_UNAVAILABLE,
+    REASON_AMBIGUOUS_ACTIVE_SESSIONS,
+    REASON_SEALED_BATCH_FEATURE_UNAVAILABLE,
+    REASON_SCAN_FRONTIER_UNAVAILABLE,
+    REASON_ARCHIVER_LOCK_LOST,
+    # 30 — FATAL_CONFIG
+    REASON_SSH_AUTHENTICATION_FAILED,
+    REASON_SSH_PERMISSION_DENIED,
+    REASON_SSH_HOST_KEY_MISMATCH,
+    REASON_MISSING_NONINTERACTIVE_CREDENTIAL,
+    REASON_BAD_CONFIG,
+    REASON_NO_ACTIVE_SESSION,
+    REASON_NONINTERACTIVE_REQUIRES_RESUME,
+    # 40 — USER_STOP: restarting ten minutes after the operator stopped the
+    # run on purpose would simply undo the stop.
+    REASON_USER_REQUESTED_STOP,
+    # 10 — but a tape write failed. Transient by exit code, yet never retried
+    # into automatically (AGENTS.md: after a tape failure, stop and diagnose).
+    REASON_TAPE_WRITE_FAILED,
+})
+
+#: Stop reasons a supervisor may relaunch after (exit code 10, self-clearing).
+AUTO_RESTARTABLE_REASONS = frozenset({
+    REASON_NETWORK_RETRY_EXHAUSTED,
+    REASON_SCCM_REBOOT_PENDING,
+    REASON_WINDOWS_REBOOT_PENDING,
+    REASON_STOPPED_AT_CHUNK_BOUNDARY,
+})
 
 # ``stopped_at_chunk_boundary`` is the only reason that may be replaced by a more
 # specific one after the fact; every other reason, once recorded, wins.
@@ -127,9 +183,9 @@ class StopResult:
     source: Optional[str] = None
     session_id: Optional[int] = None
     chunk_index: Optional[int] = None
-    #: Whether the caller should keep the staged pack for a direct resume. A gate
-    #: block (the write never started) keeps it; a mid-attempt write failure
-    #: (re-fetchable) does not. Not serialized to the status files.
+    #: Whether the caller should keep the staged pack for a direct resume.
+    #: Every writer stop keeps it: the pack is intact local data whatever
+    #: happened at the tape. Not serialized to the status files.
     preserve_pack: bool = True
 
     @property

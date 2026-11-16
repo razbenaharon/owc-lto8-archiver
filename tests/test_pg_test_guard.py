@@ -82,6 +82,191 @@ class UnsafeDsnIsRejectedTests(unittest.TestCase):
         guard.assert_safe_dsn(match.group(1))
 
 
+class AddressOverrideBypassTests(unittest.TestCase):
+    """Audit M11 low-severity (a): host and port looked safe, the connection
+    went elsewhere.
+
+    Every DSN marked BYPASS below was ACCEPTED by the guard before this class
+    existed, returning ``('127.0.0.1', 15432, ...)`` while libpq would have
+    connected somewhere else. Nothing here opens a connection.
+    """
+
+    def setUp(self):
+        patcher = mock.patch.dict(os.environ, {}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for var in guard.ADDRESS_OVERRIDE_ENV:
+            os.environ.pop(var, None)
+
+    def _refused(self, dsn, fragment=None):
+        with self.assertRaises(UnsafeTestDatabase, msg=dsn) as caught:
+            guard.assert_safe_dsn(dsn)
+        if fragment:
+            self.assertIn(fragment, str(caught.exception))
+
+    def test_hostaddr_is_refused(self):
+        # BYPASS: libpq connects to hostaddr; host is only a label.
+        self._refused(
+            "host=127.0.0.1 hostaddr=10.0.0.5 port=15432 dbname=postgres",
+            "hostaddr")
+        self._refused(
+            "postgresql://lto:pw@127.0.0.1:15432/postgres?hostaddr=10.0.0.5",
+            "hostaddr")
+        self._refused(
+            "host=localhost hostaddr=192.168.1.9 port=15432 dbname=postgres",
+            "hostaddr")
+
+    def test_a_loopback_hostaddr_is_refused_too(self):
+        """No "it is loopback anyway" exception: one way to name the server."""
+        self._refused(
+            "host=127.0.0.1 hostaddr=127.0.0.1 port=15432 dbname=postgres",
+            "hostaddr")
+
+    def test_percent_encoded_hostaddr_is_refused(self):
+        # BYPASS: decoded by libpq to hostaddr=10.0.0.5.
+        self._refused(
+            "postgresql://lto:pw@%31%32%37.0.0.1:15432/postgres"
+            "?hostaddr=%31%30.0.0.5", "hostaddr")
+
+    def test_a_service_name_is_refused(self):
+        # BYPASS: a service-file entry can supply hostaddr.
+        self._refused(
+            "host=127.0.0.1 port=15432 dbname=postgres service=prod",
+            "service")
+        self._refused(
+            "postgresql://lto:pw@127.0.0.1:15432/postgres?service=prod",
+            "service")
+
+    def test_a_connection_string_inside_dbname_is_refused(self):
+        # BYPASS: libpq expands a dbname that is itself a conninfo/URI, and
+        # the expansion overrides host and port.
+        self._refused(
+            "host=127.0.0.1 port=15432 "
+            "dbname='postgresql://lto@127.0.0.1:5432/lto_archive'",
+            "connection string")
+        self._refused(
+            "host=127.0.0.1 port=15432 "
+            "dbname='host=10.0.0.5 port=5432 dbname=lto_archive'",
+            "connection string")
+
+    def test_several_hosts_are_refused(self):
+        self._refused(
+            "postgresql://lto:pw@127.0.0.1:15432,10.0.0.5:5432/postgres",
+            "several hosts or ports")
+        self._refused(
+            "postgresql://lto:pw@127.0.0.1:15432,127.0.0.1:5432/postgres",
+            "several hosts or ports")
+        self._refused("host=127.0.0.1,10.0.0.5 port=15432 dbname=postgres",
+                      "several hosts or ports")
+        self._refused("host=127.0.0.1,127.0.0.1 port=15432 dbname=postgres",
+                      "several hosts or ports")
+
+    def test_several_ports_are_refused_as_unsafe_not_as_a_crash(self):
+        # Used to escape as ValueError from int('15432,5432') - not the
+        # guard's own refusal, so a caller catching UnsafeTestDatabase missed
+        # it.
+        self._refused("host=127.0.0.1 port=15432,5432 dbname=postgres",
+                      "several hosts or ports")
+
+    def test_uri_query_overrides_are_refused(self):
+        self._refused(
+            "postgresql://lto:pw@127.0.0.1:15432/postgres?host=10.0.0.5")
+        self._refused(
+            "postgresql://lto:pw@127.0.0.1:15432/postgres?port=5432")
+        self._refused(
+            "postgresql://lto:pw@127.0.0.1:15432/postgres?dbname=lto_archive")
+        self._refused(
+            "postgresql://lto:pw@127.0.0.1:15432/postgres"
+            "?host=127.0.0.1,10.0.0.5")
+
+    def test_a_non_numeric_or_padded_port_is_refused(self):
+        self._refused("host=127.0.0.1 port=' 5432' dbname=postgres")
+        self._refused("host=127.0.0.1 port=05432 dbname=postgres")
+        self._refused("host=127.0.0.1 port=' 15432' dbname=postgres",
+                      "not a single plain port number")
+        self._refused("host=127.0.0.1 port=99999 dbname=postgres",
+                      "not a single plain port number")
+
+    def test_a_padded_host_is_refused_not_normalised(self):
+        # BYPASS (accepted after .strip()): the validated string was not the
+        # string libpq receives.
+        self._refused("host=' 127.0.0.1' port=15432 dbname=postgres",
+                      "Only a loopback address")
+
+    def test_a_socket_directory_host_is_refused(self):
+        self._refused("host=/var/run/postgresql port=15432 dbname=postgres",
+                      "Only a loopback address")
+
+    def test_production_name_variants_are_refused(self):
+        # BYPASS: 'LTO_ARCHIVE' was accepted (exact-case comparison only).
+        self._refused("host=127.0.0.1 port=15432 dbname=LTO_ARCHIVE",
+                      "production")
+        self._refused(
+            "host=127.0.0.1 port=15432 "
+            "dbname=lto_archive_directory_catalog_20260710_103359",
+            "production")
+        self._refused("host=127.0.0.1 port=15432 dbname=' lto_archive'")
+
+    def test_parameters_outside_the_allow_list_are_refused(self):
+        for extra in ("passfile=C:/x/pgpass", "target_session_attrs=any",
+                      "load_balance_hosts=random", "options='-c x=1'",
+                      "sslrootcert=C:/x/ca.pem", "krbsrvname=x"):
+            self._refused(
+                f"host=127.0.0.1 port=15432 dbname=postgres {extra}",
+                "unsupported parameter")
+
+    def test_ambient_address_overrides_are_refused(self):
+        # BYPASS: with PGHOSTADDR set, libpq ignores where `host` resolves.
+        for var in guard.ADDRESS_OVERRIDE_ENV:
+            with mock.patch.dict(os.environ, {var: "10.0.0.5"}):
+                with self.assertRaises(UnsafeTestDatabase) as caught:
+                    guard.assert_safe_dsn(SAFE)
+                self.assertIn(var, str(caught.exception))
+                with mock.patch.dict(os.environ, {TEST_DSN_ENV: SAFE}):
+                    with self.assertRaises(UnsafeTestDatabase):
+                        guard.configured_dsn()
+                    with self.assertRaises(UnsafeTestDatabase):
+                        guard.pg_available()
+
+    def test_ambient_pghost_and_pgport_cannot_stand_in_for_the_dsn(self):
+        with mock.patch.dict(os.environ, {"PGHOST": "127.0.0.1",
+                                          "PGPORT": "15432",
+                                          "PGDATABASE": "postgres"}):
+            self._refused("dbname=postgres", "does not name a host")
+            self._refused("host=127.0.0.1 dbname=postgres",
+                          "does not name a port")
+            self._refused("host=127.0.0.1 port=15432",
+                          "does not name a database")
+
+    def test_harmless_parameters_are_still_accepted(self):
+        self.assertEqual(
+            guard.assert_safe_dsn(
+                # Split so the privacy gate (scripts/check_public_repo.py)
+                # does not read this synthetic value as a DSN with a password.
+                "postgresql://lto:" + "ltotest_local_only"
+                + "@127.0.0.1:15432/postgres"),
+            ("127.0.0.1", 15432, "postgres"))
+        self.assertEqual(
+            guard.assert_safe_dsn(
+                "host=localhost port=15432 dbname=postgres user=lto "
+                "password=pw connect_timeout=5 application_name=t"),
+            ("localhost", 15432, "postgres"))
+        self.assertEqual(
+            guard.assert_safe_dsn(
+                "postgresql://lto:pw@[::1]:15432/postgres?sslmode=disable"),
+            ("::1", 15432, "postgres"))
+
+    def test_derived_dsns_keep_the_validated_address(self):
+        from psycopg.conninfo import conninfo_to_dict
+        with mock.patch.dict(os.environ, {TEST_DSN_ENV: SAFE}):
+            derived = conninfo_to_dict(
+                guard.dsn_for(guard.test_database_name("x")))
+        self.assertEqual((derived["host"], derived["port"]),
+                         ("127.0.0.1", "15432"))
+        self.assertNotIn("hostaddr", derived)
+        self.assertNotIn("service", derived)
+
+
 class UnsafeConfigurationFailsRatherThanSkipsTests(unittest.TestCase):
     """The distinction that matters: not configured skips, MISconfigured fails."""
 
@@ -261,6 +446,49 @@ class ConftestConnectionGuardTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {TEST_DSN_ENV: SAFE}):
             self.wrapper("host=127.0.0.1 port=15432 dbname=ltotest_x")
         self.wrapper.__wrapped__.assert_called_once()
+
+    def test_an_address_override_keyword_is_blocked(self):
+        """``psycopg.connect(dsn, hostaddr=...)`` used to reach the real
+        connect: only host/port/dbname/user/password keywords were parsed."""
+        with mock.patch.dict(os.environ, {TEST_DSN_ENV: SAFE}):
+            for extra in ({"hostaddr": "10.0.0.5"}, {"service": "prod"}):
+                with self.assertRaises(UnsafeTestDatabase, msg=extra):
+                    self.wrapper("host=127.0.0.1 port=15432 dbname=ltotest_x",
+                                 **extra)
+            with self.assertRaises(UnsafeTestDatabase):
+                self.wrapper("host=127.0.0.1 port=15432 dbname=ltotest_x "
+                             "hostaddr=10.0.0.5")
+            with self.assertRaises(UnsafeTestDatabase):
+                self.wrapper(
+                    "postgresql://lto:pw@127.0.0.1:15432/ltotest_x"
+                    "?hostaddr=10.0.0.5")
+            with self.assertRaises(UnsafeTestDatabase):
+                self.wrapper(
+                    "host=127.0.0.1 port=15432 "
+                    "dbname='host=10.0.0.5 port=5432 dbname=lto_archive'")
+        self.wrapper.__wrapped__.assert_not_called()
+
+    def test_a_second_host_is_blocked(self):
+        with mock.patch.dict(os.environ, {TEST_DSN_ENV: SAFE}):
+            with self.assertRaises(UnsafeTestDatabase):
+                self.wrapper("host=127.0.0.1,10.0.0.5 port=15432,5432 "
+                             "dbname=ltotest_x")
+        self.wrapper.__wrapped__.assert_not_called()
+
+    def test_an_ambient_address_override_blocks_every_connection(self):
+        with mock.patch.dict(os.environ, {TEST_DSN_ENV: SAFE,
+                                          "PGHOSTADDR": "10.0.0.5"}):
+            with self.assertRaises(UnsafeTestDatabase):
+                self.wrapper("host=127.0.0.1 port=15432 dbname=ltotest_x")
+        self.wrapper.__wrapped__.assert_not_called()
+
+    def test_psycopg_only_keywords_still_pass_through(self):
+        with mock.patch.dict(os.environ, {TEST_DSN_ENV: SAFE}):
+            self.wrapper("host=127.0.0.1 port=15432 dbname=ltotest_x",
+                         autocommit=True, connect_timeout=5, row_factory=None)
+        self.wrapper.__wrapped__.assert_called_once_with(
+            "host=127.0.0.1 port=15432 dbname=ltotest_x",
+            autocommit=True, connect_timeout=5, row_factory=None)
 
     def test_keyword_form_is_checked_too(self):
         with mock.patch.dict(os.environ, {TEST_DSN_ENV: SAFE}):

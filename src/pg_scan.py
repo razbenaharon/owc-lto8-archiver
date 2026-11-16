@@ -25,10 +25,10 @@ is a way to lose data or to claim coverage that was never established:
 
 Every method refuses on a database without migration 014 rather than degrading.
 """
-import json
 import uuid
 
 from .logsetup import get_logger
+from .db_backend import lease_deadline
 from .pg_core import _now_utc, _row, _rows
 from .pipeline_types import (SCOPE_KIND_DIRECTORY, SCOPE_KIND_FILE,
                              ScanCoverageState, ScanDirectoryState,
@@ -237,13 +237,14 @@ class PgScanMixin:
             cur = conn.execute(
                 """UPDATE remote_scan_directories
                    SET listing_state=%s, owner_token=%s, attempt_id=%s,
-                       lease_expires_at=%s + make_interval(secs => %s),
+                       lease_expires_at=%s,
                        updated_at=%s
                    WHERE scan_directory_id=%s
                      AND listing_state IN (%s, %s)
                    RETURNING *""",
                 (ScanDirectoryState.SCANNING.value, owner_token, attempt_id,
-                 now, float(lease_seconds), now, row["scan_directory_id"],
+                 lease_deadline(now, lease_seconds), now,
+                 row["scan_directory_id"],
                  ScanDirectoryState.PENDING.value,
                  ScanDirectoryState.PARTIAL.value),
             )
@@ -918,12 +919,12 @@ class PgScanMixin:
                     remote_process_group,
                     lease_expires_at, heartbeat_at, created_at, updated_at)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                           %s + make_interval(secs => %s), %s, %s, %s)""",
+                           %s, %s, %s, %s)""",
                 (attempt_id, owner_token, session_id, chunk_index,
                  scan_directory_id, attempt_kind, local_pid,
                  local_process_started_at, remote_command_token,
-                 remote_process_group, now, float(lease_seconds), now, now,
-                 now),
+                 remote_process_group, lease_deadline(now, lease_seconds),
+                 now, now, now),
             )
             return attempt_id
 

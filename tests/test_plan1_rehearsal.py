@@ -19,6 +19,7 @@ ZIP/loose restore) cannot run here and must not: it needs the physical drive.
 evidence Plan 3 reviews. What runs here is everything that does not need the
 cartridge.
 """
+from source_facts import code_text
 import os
 import tempfile
 import threading
@@ -360,7 +361,7 @@ class ProductionGateTests(unittest.TestCase):
     def test_migration_014_is_not_applied_at_startup(self):
         import inspect
         from src.pg_core import PgConnectionCore
-        startup = inspect.getsource(PgConnectionCore._init_schema)
+        startup = code_text(PgConnectionCore._init_schema)
         self.assertNotIn("014", startup)
 
     def test_stored_tar_creation_is_still_disabled(self):
@@ -378,12 +379,10 @@ class ProductionGateTests(unittest.TestCase):
         # Plan 2 Phase 1 installs the dormant consumer contract.  The writer
         # remains disabled by the feature gate asserted immediately above.
         self.assertEqual(stored_tar_reader_contract_version(), 1)
-        assignment = inspect.getsource(
+        assignment = code_text(
             PgSessionMixin.append_remote_streaming_chunk)
         self.assertIn("if stored_tar_write_enabled", assignment)
-        with open(os.path.join(root, "src", "remote_staging.py"),
-                  encoding="utf-8") as handle:
-            staging = handle.read()
+        staging = code_text("remote_staging")
         self.assertIn("get_chunk_packaging_format", staging)
         self.assertIn("_stage_stored_tar_chunk", staging)
 
@@ -391,8 +390,7 @@ class ProductionGateTests(unittest.TestCase):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         for name in ("scan_frontier.py", "pg_scan.py", "frontier_bootstrap.py",
                      "startup_reconcile.py", "archive_artifacts.py"):
-            with open(os.path.join(root, "src", name), encoding="utf-8") as h:
-                source = h.read()
+            source = code_text(name[:-3])
             for pruning in ("DELETE FROM remote_snapshot_files",
                             "DELETE FROM remote_plan_files",
                             "DELETE FROM files_index", "TRUNCATE"):

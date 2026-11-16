@@ -9,6 +9,7 @@ The rule these lock in: a production streaming run builds
 :class:`~src.scan_frontier.FrontierScanCoordinator`, and the legacy whole-root
 scanner cannot be reached from normal execution at all.
 """
+from source_facts import code_text
 import ast
 import inspect
 import os
@@ -29,7 +30,7 @@ class TheProductionPathBuildsTheFrontierScannerTests(unittest.TestCase):
 
     @staticmethod
     def _streaming_source():
-        return inspect.getsource(ro.RemoteOrchestrator._run_streaming_session)
+        return code_text(ro.RemoteOrchestrator._run_streaming_session)
 
     def test_the_streaming_session_constructs_the_frontier_coordinator(self):
         self.assertIn("FrontierScanCoordinator(", self._streaming_source())
@@ -70,20 +71,20 @@ class TheProductionPathBuildsTheFrontierScannerTests(unittest.TestCase):
     def test_the_inert_scan_mode_state_is_gone(self):
         """``self._scan_mode`` was written and never read. If it comes back,
         it must come back with a reader."""
-        text = open(os.path.join(PROJECT_ROOT, "src",
-                                 "remote_orchestrator.py"),
-                    encoding="utf-8").read()
+        text = code_text("remote_orchestrator", strings=False)
         self.assertNotIn("_scan_mode", text)
         self.assertFalse(hasattr(ro.RemoteOrchestrator, "_resolve_scan_mode"))
 
     def test_the_schema_gate_fails_closed_rather_than_downgrading(self):
         """No usable schema must STOP the run, not quietly pick the old
         scanner — a downgrade is how two scanners meet on one frontier."""
-        source = inspect.getsource(
+        source = code_text(
             ro.RemoteOrchestrator._require_frontier_schema)
         self.assertIn("SAFETY_BLOCK", source)
         self.assertIn("incremental_scan_schema_ready", source)
-        self.assertNotIn("legacy", source.split('"""')[2].lower())
+        self.assertNotIn("legacy", code_text(
+            ro.RemoteOrchestrator._require_frontier_schema,
+            strings=False).lower())
 
 
 class KnownFilesNeverReachTheChunkBuilderTests(unittest.TestCase):
@@ -221,7 +222,7 @@ class KnownFilesNeverReachTheChunkBuilderTests(unittest.TestCase):
         naive split silently truncate what was being checked.
         """
         import textwrap
-        source = inspect.getsource(
+        source = code_text(
             __import__("src.pg_scan", fromlist=["x"])
             .PgScanMixin.classify_segment_entries)
         func = ast.parse(textwrap.dedent(source)).body[0]
@@ -236,7 +237,7 @@ class KnownFilesNeverReachTheChunkBuilderTests(unittest.TestCase):
 
     def test_the_filter_is_one_bulk_query_per_segment_not_per_file(self):
         """The whole point of the frontier. One round trip, N paths."""
-        source = inspect.getsource(
+        source = code_text(
             __import__("src.pg_scan", fromlist=["x"])
             .PgScanMixin.classify_segment_entries)
         self.assertIn("remote_path = ANY(", source)
@@ -284,7 +285,7 @@ class ScanFinalityNeedsTraversalEvidenceTests(unittest.TestCase):
     def test_completion_is_gated_behind_finalize_in_the_run_loop(self):
         """Order matters: finalize() grants scope finality from traversal, and
         only then may the session flag be set."""
-        source = inspect.getsource(sf.FrontierScanCoordinator.run)
+        source = code_text(sf.FrontierScanCoordinator.run)
         self.assertIn("self.frontier.finalize()", source)
         self.assertLess(
             source.index("self.frontier.finalize()"),
@@ -377,7 +378,7 @@ class NewSqlMatchesTheRealSchemaTests(unittest.TestCase):
 
     def test_mark_segment_fully_allocated_uses_real_columns(self):
         from src.pg_scan import PgScanMixin
-        source = inspect.getsource(PgScanMixin.mark_segment_fully_allocated)
+        source = code_text(PgScanMixin.mark_segment_fully_allocated)
         self.assertNotIn("readiness_state", source)
         self.assertIn("SET state=", source)
 

@@ -2,16 +2,21 @@
 import os
 import shutil
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Type
 
+from .archiver_lock_guard import assert_archiver_lock_held
 from .backup import LTOBackup, _NoEjectBackup
 from .constants import (DEFAULT_TAPE_CAPACITY_GB, LOCAL_STAGING_RESERVE_BYTES,
                         LOCAL_TAPE_BUDGET_BYTES, ROOT_FILES_GROUP,
                         TAPE_BUDGET_LABEL, _auto_pack_decision,
                         tape_budget_bytes, tape_is_full,
                         tape_status_reason_suffix)
-from .ltfs import _ensure_lto_drive_ready, get_volume_label
+from .logsetup import get_logger
+from .ltfs import (_ensure_lto_drive_ready, confirm_physical_action,
+                   eject_tape_drive, get_volume_label)
 from .packer import LTOAnalyzer, LTOPacker, ensure_staging_space
+from .remote_orchestrator import RemoteOrchestrator
 from .resource_governor import ResourceGovernor
 from .runtime import _acquire_tape_io_lock, _release_tape_io_lock
 from .skipped import SkippedFileTracker
@@ -32,6 +37,75 @@ class LocalOrchestrator:
         self.staging_dir = cfg.staging_dir
         self.fill_pct = cfg.staging_fill_pct
         self.governor = ResourceGovernor(cfg, self.staging_dir)
+
+    # The SAME pre-write gate checks the remote writer runs, reused rather than
+    # re-implemented so the two paths can never drift apart: the live LTFS
+    # mount must be time@5, the drive/medium must not be reporting faults, and
+    # no restart may be staged. They only need ``self.cfg`` / ``self.notifier``
+    # and read passive evidence (event log, IBM log, SCCM) - never the tape.
+    _verify_current_mount_time5 = RemoteOrchestrator._verify_current_mount_time5
+    _verify_ltfs_media_health = RemoteOrchestrator._verify_ltfs_media_health
+    _block_on_soft_reboot_marker = (
+        RemoteOrchestrator._block_on_soft_reboot_marker)
+    _pre_tape_write_reboot_check = (
+        RemoteOrchestrator._pre_tape_write_reboot_check)
+
+    def _pre_write_gate_ok(self, session_id, chunk_index, tape_label, staging):
+        """True when a tape write may START. Fails closed.
+
+        The local path used to start writes with no sync-mode, media-health or
+        pending-restart check at all. A gate that blocks - or that cannot be
+        evaluated - refuses the write; nothing here retries, ejects or touches
+        the drive.
+        """
+        try:
+            block = self._verify_current_mount_time5()
+            if block is None:
+                block = self._verify_ltfs_media_health()
+            if block is not None:
+                detail = block.detailed_reason or block.reason
+            else:
+                desc = SimpleNamespace(chunk_index=chunk_index,
+                                       pack_dir=staging)
+                reasons, _sccm = self._pre_tape_write_reboot_check(
+                    session_id, desc, tape_label)
+                detail = "; ".join(reasons) if reasons else None
+        except Exception as e:
+            get_logger().exception("local pre-write gate could not be evaluated")
+            detail = (f"the pre-write safety gate could not be evaluated ({e}); "
+                      "refusing to start a tape write blind")
+            print(f"\n[TAPE] {detail}")
+        if detail is None:
+            return True
+        get_logger().error(
+            "local_tape_write_blocked: session=%s chunk=%s tape=%s reason=%s",
+            session_id, chunk_index + 1, tape_label, detail)
+        print(f"[LOCAL] Tape write NOT started for chunk {chunk_index + 1}. "
+              "Resolve the condition above, then re-run option 1 to resume.")
+        return False
+
+    def _eject_at_session_end(self):
+        """Eject only when configured AND confirmed by a typed word.
+
+        The local path used to eject after every chunk regardless of
+        ``[HARDWARE] eject_after_session``. An eject is physical and cannot be
+        undone from software, so it now happens once, at the end of a completed
+        session, and only after the operator types EJECT.
+        """
+        if not bool(getattr(self.cfg, "eject_after_session", False)):
+            print("[TAPE] The cartridge stays loaded ([HARDWARE] "
+                  "eject_after_session = false). Eject it from Tape "
+                  "Maintenance when somebody is at the drive.")
+            return False
+        if not confirm_physical_action("EJECT", (
+                "[EJECT] The local session is complete and [HARDWARE] "
+                "eject_after_session is true.",
+                "        Ejecting is PHYSICAL: an ejected cartridge cannot be "
+                "reloaded by software;",
+                "        somebody must go to the drive and push it back in.")):
+            return False
+        eject_tape_drive(self.cfg.lto_drive, self.cfg.ibm_eject_cmd)
+        return True
 
     def _backup_writer(self, cls: Type[LTOBackup] = _NoEjectBackup) -> LTOBackup:
         return cls(
@@ -195,12 +269,25 @@ class LocalOrchestrator:
         print(f"\n[LOCAL] Processing {len(pending)} pending chunk(s).")
         for loop_idx, chunk_index in enumerate(pending):
             if loop_idx > 0:
-                # The previous chunk finished and ejected its tape. A local
-                # session uses one tape per chunk, so pause for a tape swap and
-                # re-verify drive readiness before continuing.
-                print("\n[LOCAL] The previous tape has been ejected.")
-                input("Insert the NEXT blank/formatted tape, wait until ready, "
-                      "then press Enter...")
+                # The previous chunk finished. Its cartridge is deliberately
+                # NOT ejected (an eject is physical and never automatic). A
+                # local session plans one tape per chunk, so pause for a
+                # manual swap and re-verify drive readiness before continuing.
+                print("\n[LOCAL] The previous chunk is complete. The cartridge "
+                      "was NOT ejected.")
+                print("        If the next chunk belongs on another tape, type "
+                      "STOP, eject from Tape Maintenance")
+                print("        (typed confirmation), load the next "
+                      "blank/formatted tape and re-run option 1.")
+                try:
+                    answer = input("Press Enter when the correct tape is "
+                                   "loaded and ready, or type STOP: ").strip()
+                except EOFError:
+                    answer = "STOP"
+                if answer.upper() == "STOP":
+                    print("[LOCAL] Stopped between chunks. Re-run option 1 to "
+                          "resume.")
+                    return
                 if not _ensure_lto_drive_ready(self.cfg.lto_drive):
                     print("[LOCAL] Drive not ready. Re-run option 1 to resume.")
                     return
@@ -216,10 +303,19 @@ class LocalOrchestrator:
             completed_at=datetime.now().isoformat()
         )
         print("\n[LOCAL] Session complete. All chunks archived.")
+        self._eject_at_session_end()
 
     def _process_chunk(self, session, chunk_index, entries):
+        # Audit H6: prove the single-writer lock is still ours before this
+        # chunk touches the tape. Raises (a hard stop); never re-acquires.
+        assert_archiver_lock_held(self.db)
         tape_label = self._prepare_tape_for_chunk(session, chunk_index, entries)
         if not tape_label:
+            return False
+        # Fail before any staging/packing work when a write could not start.
+        if not self._pre_write_gate_ok(
+                session['session_id'], chunk_index, tape_label,
+                self.staging_dir):
             return False
 
         self.db.assign_local_chunk_tape(session['session_id'], chunk_index, tape_label)
@@ -297,6 +393,12 @@ class LocalOrchestrator:
                     session['session_id'], chunk_index, tape_label,
                     batch_name, pack_dir
                 )
+                # Synchronous re-check immediately before the write: packing
+                # can take long enough for a restart to be staged meanwhile.
+                if not self._pre_write_gate_ok(
+                        session['session_id'], chunk_index, tape_label,
+                        pack_dir):
+                    return False
                 self._backup_writer().run(
                     source=pack_dir,
                     tape_drive=self.cfg.lto_drive,
@@ -318,21 +420,29 @@ class LocalOrchestrator:
                 self._cleanup_dir(pack_dir)
 
         self.db.update_local_chunk_status(session['session_id'], chunk_index, 'backed_up')
-        self._backup_writer(LTOBackup).eject_tape(self.cfg.lto_drive)
+        # No eject here: see _eject_at_session_end.
         return True
 
     def _prepare_tape_for_chunk(self, session, chunk_index, entries):
         assigned = next((e['tape_label'] for e in entries if e['tape_label']), None)
-        detected = get_volume_label(self.cfg.lto_drive)
-        if detected:
-            print(f"[TAPE] Detected label: {detected}")
-            tape_label = detected
-        else:
-            print("[TAPE] Could not auto-detect tape label.")
-            tape_label = input("Enter tape Volume Label manually (or Enter to cancel): ").strip()
-        if not tape_label:
-            print("[ABORTED] No tape label provided.")
+        try:
+            detected = get_volume_label(self.cfg.lto_drive)
+        except Exception as e:
+            get_logger().exception("local_cartridge_label_unreadable")
+            print(f"[TAPE] Reading the cartridge label failed: {e}")
+            detected = None
+        if not detected:
+            # Fail closed. A label typed by the operator cannot be verified
+            # against the cartridge, and the catalog is keyed by cartridge: a
+            # typo would send a future restore to the wrong tape.
+            print("[TAPE] Could not read the label of the mounted cartridge. "
+                  "Refusing to write: a typed label")
+            print("       cannot be verified against the tape. Check the drive "
+                  "(Tape Maintenance -> Tape drives info),")
+            print("       then re-run option 1.")
             return None
+        print(f"[TAPE] Detected label: {detected}")
+        tape_label = detected
 
         if assigned and tape_label.upper() != assigned.upper():
             print(f"[TAPE] This chunk is assigned to '{assigned}', "
@@ -353,8 +463,12 @@ class LocalOrchestrator:
             elif not root_empty or record_count > 0:
                 print(f"[TAPE] Appending to registered tape '{tape_label}' "
                       f"({record_count} indexed file record(s) already present).")
-            if not self._ensure_chunk_fits_tape(tape_label, entries):
-                return None
+
+        # Runs for an already-assigned (resumed) chunk too: a cartridge marked
+        # FULL after a latched write error, or one that no longer has budget,
+        # must be refused whether or not this chunk was assigned to it earlier.
+        if not self._ensure_chunk_fits_tape(tape_label, entries):
+            return None
 
         return tape_label
 
@@ -481,6 +595,10 @@ class LocalOrchestrator:
                     raise RuntimeError(f"Direct source directory not found: {source}")
                 print(f"\n[LOCAL] Direct backup: {entry['top_level_dir']} "
                       f"({entry['dir_size_bytes'] / 1024**3:.2f} GiB)")
+                if not self._pre_write_gate_ok(
+                        session['session_id'], chunk_index, tape_label,
+                        source):
+                    return False
                 self._backup_writer().run(
                     source=source,
                     tape_drive=self.cfg.lto_drive,
@@ -496,7 +614,7 @@ class LocalOrchestrator:
             return False
 
         self.db.update_local_chunk_status(session['session_id'], chunk_index, 'backed_up')
-        self._backup_writer(LTOBackup).eject_tape(self.cfg.lto_drive)
+        # No eject here: see _eject_at_session_end.
         return True
 
     def _make_batches(self, files):

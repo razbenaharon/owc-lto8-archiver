@@ -23,7 +23,7 @@ Before proposing or doing anything on this system, ask:
 somebody standing at the drive?"** If no — redesign it or reject it.
 
 Hard rules that follow (full list, with rationale:
-[docs/incidents/000-no-physical-intervention-policy.md](docs/incidents/000-no-physical-intervention-policy.md)):
+[docs/history/incidents/000-no-physical-intervention-policy.md](docs/history/incidents/000-no-physical-intervention-policy.md)):
 
 - **Never eject, remount, format, reset the drive, or run `ltfsck` unprompted.**
   All are last-resort and can strand a recoverable volume. Ask first, every time.
@@ -35,15 +35,15 @@ Hard rules that follow (full list, with rationale:
   `_pre_tape_write_reboot_check` pattern) rather than aborting it midway.
 - **Treat every hard write error as potentially latching.** One unrecoverable
   write set the cartridge's PWE bit and made Tape_02 permanently read-only
-  ([incident 010](docs/incidents/010-20260724-ltfs-write-perm-readonly.md)).
+  ([incident 010](docs/history/incidents/010-20260724-ltfs-write-perm-readonly.md)).
   Stop and diagnose after the first one — never retry blindly into a failing drive.
 - **Prefer a smaller blast radius over bigger batches.** Long single operations
   widen the window for a crash or drive fault to strand the volume. This is why
   the ~500 GB-per-transfer idea was rejected:
-  [docs/tape_transfer_size_analysis.md](docs/tape_transfer_size_analysis.md).
+  [docs/history/tape_transfer_size_analysis.md](docs/history/tape_transfer_size_analysis.md).
 
 **Incident history — read before touching a live run:
-[docs/incidents/](docs/incidents/README.md)** (what broke, when, why, and what fixed it).
+[docs/history/incidents/](docs/history/incidents/README.md)** (what broke, when, why, and what fixed it).
 
 ## Do not miss
 
@@ -65,7 +65,7 @@ Hard rules that follow (full list, with rationale:
   reliably win a 60-second countdown. The required mount mode is `time@5`,
   verified from event 61259 for the live mount. The durable organisational fix
   remains an **SCCM maintenance window / deployment exemption**. Evidence:
-  [incident 005](docs/incidents/005-20260715-sccm-forced-restart-data-loss.md).
+  [incident 005](docs/history/incidents/005-20260715-sccm-forced-restart-data-loss.md).
 - **Never eject the tape remotely.** `LtfsCmdEject` is physical; a cartridge
   ejected with nobody at the drive cannot be reloaded remotely (no software
   "load" for a tape out of the slot). LTFS `sync_type` changes need a physical
@@ -87,13 +87,13 @@ Hard rules that follow (full list, with rationale:
 - **Never infer that `robocopy` returncode 0 means success.** It exits 0 even
   after `ERROR: RETRY LIMIT EXCEEDED` having copied nothing. Trust only the
   durable raw log + classifier in `backup_logs/tape_write/`
-  ([incident 009](docs/incidents/009-20260724-robocopy-exit0-lie.md)).
+  ([incident 009](docs/history/incidents/009-20260724-robocopy-exit0-lie.md)).
 - **The LTFS mount letter is not stable** (was `E:`, now `Z:`). Verify
   `config.ini [HARDWARE] lto_drive` with `Test-Path` before every run —
   `Get-Volume` cannot see LTFS. Verify `sync_type` from the *mount* (LTFS event
   61259), never from `ltfs.conf.local`; an MSI reinstall silently reset it once.
 - Full detail, measurements, and future recommendations:
-  **[docs/performance_insights_and_recommendations.md](docs/performance_insights_and_recommendations.md)**.
+  **[docs/history/performance_insights_and_recommendations.md](docs/history/performance_insights_and_recommendations.md)**.
 
 ## Layout
 
