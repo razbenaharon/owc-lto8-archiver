@@ -277,8 +277,10 @@ the report recorded; prepare a new report then.
 Treat it as an expert operation that has not been run on hardware. If a
 reset fails, the error file in `tape_reset_audits\` holds the command that
 resumes it (`--resume-operation`). A reset interrupted during the format
-itself needs a person at the drive. Stored TAR chunks cannot be written
-again after a reset; ZIP chunks can.
+itself needs a person at the drive. A cartridge that holds Stored TAR
+chunks (PostgreSQL only) cannot be reset in this version: such a chunk could
+not be written again afterwards, so both steps refuse it before anything is
+changed. ZIP chunks are written again as usual.
 
 **Retiring a tape.** To take a tape out of the write rotation (full, or
 read-only after an error), mark it full: option 7 (Database management), then

@@ -452,6 +452,37 @@ def _impact_core(report):
     }
 
 
+def refuse_unrewritable_chunks(db, transitions):
+    """Refuse a reset that would strand chunks nothing can write again.
+
+    A Stored-TAR chunk keeps its container rows through the reset (they are
+    sealed), and this version cannot stage such a chunk a second time. Erasing
+    the cartridge would leave it ``pending`` with its only tape copy gone, so
+    the reset is refused before anything is changed.
+    """
+    stranded = []
+    with db._pool.connection() as conn:
+        if not db_backend.table_exists(conn, "archive_containers"):
+            return
+        for item in transitions:
+            row = conn.execute(
+                """SELECT COUNT(*) AS n FROM archive_containers
+                   WHERE session_id=%s AND chunk_index=%s
+                     AND container_format='stored_tar'""",
+                (int(item["session_id"]), int(item["chunk_index"])),
+            ).fetchone()
+            if row and int(row["n"]):
+                stranded.append(f"{item['session_id']}/{item['chunk_index']}")
+    if stranded:
+        shown = ", ".join(stranded[:10]) + (" ..." if len(stranded) > 10
+                                            else "")
+        raise RuntimeError(
+            "[TAPE RESET] Refused: this cartridge holds Stored-TAR chunks "
+            f"({len(stranded)}: {shown}). After a reset they could not be "
+            "written again in this version, so their only tape copy would be "
+            "lost. Nothing was changed.")
+
+
 def prepare_impact_file(db, cfg, *, operation_id, tape_label, backup,
                         shadow_database, shadow_verification,
                         output_path=None):
@@ -474,6 +505,7 @@ def prepare_impact_file(db, cfg, *, operation_id, tape_label, backup,
     report = build_impact_report(
         db, operation_id=operation_id, tape_label=tape_label,
         identity=identity, backup=backup, shadow_database=shadow_database)
+    refuse_unrewritable_chunks(db, report["planned_chunk_transitions"])
     path = (Path(output_path) if output_path
             else audit_dir(operation_id) / "impact.json")
     written, digest = write_immutable_json(path, report)
@@ -688,6 +720,9 @@ def execute_reset(db, cfg, *, tape_label, impact_path, delete_catalog,
                     "report")
 
         if op is None:
+            # A new operation only: one already under way is finished as
+            # approved rather than stopped half-way.
+            refuse_unrewritable_chunks(db, impact["planned_chunk_transitions"])
             op = db.create_tape_reset_intent(
                 operation_id=operation_id, tape_label=tape_label,
                 expected_drive=identity["drive"],

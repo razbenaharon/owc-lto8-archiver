@@ -109,6 +109,18 @@ directories only.
 
 ### Fixed
 
+- A tape reset is refused, before anything is changed, for a cartridge that
+  holds Stored-TAR chunks. Such a chunk could not be written again after the
+  reset, so the reset would have erased its only tape copy.
+- `[DATABASE] backend = postgres` is accepted as another spelling of
+  `postgresql`; an existing configuration written that way no longer stops
+  at start-up.
+- `inspect_db.py --print-db-target` reports a SQLite catalog that has not
+  been created yet (`"exists": false`) instead of failing; it still creates
+  nothing.
+- `[PERFORMANCE] eject_after_pack`, a setting removed earlier, is reported
+  as retired rather than as an unknown key.
+
 - Remote files are requested by their exact name; trailing spaces are no
   longer stripped.
 - Extracted names are matched across Unicode normalisation forms (NFC/NFD);

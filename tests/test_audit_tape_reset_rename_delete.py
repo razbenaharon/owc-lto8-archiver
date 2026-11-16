@@ -314,7 +314,7 @@ class PrepareImpactReportTests(_ResetFixture, unittest.TestCase):
             db_backend=self.BACKEND, db_dsn=self.conninfo,
             sqlite_path=self.tdb.path, lto_drive="",
             lto_drive_configured=False)
-        latest = {(self.session_id, index): {
+        self.latest = latest = {(self.session_id, index): {
             "tape_label": "T_A", "status": "completed",
             "finished_at": "2026-01-01T00:00:00"} for index in range(3)}
 
@@ -467,6 +467,65 @@ class PrepareImpactReportTests(_ResetFixture, unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "scope differs"):
             self._reset(result["impact_report"])
         self.assertEqual(self.formats, 0)
+
+    def _make_container_stored_tar(self):
+        """Add a done Stored-TAR chunk 3 on T_A that owns one container.
+
+        Stored TAR needs an approved session boundary that this fixture does
+        not model, so the throwaway catalog's new-chunk format guard is
+        switched off for this one row.
+        """
+        if self.BACKEND == "sqlite":
+            self._exec("DROP TRIGGER trg_remote_chunks_initial_format")
+        else:
+            self._exec("ALTER TABLE remote_chunks DISABLE TRIGGER USER")
+        self._exec(
+            """INSERT INTO remote_chunks (session_id,chunk_index,status,
+                   updated_at,membership_state,expected_file_count,
+                   expected_bytes,packaging_format,packaging_assigned_at)
+               VALUES (%s,3,'done',now(),'sealed',1,100,'stored_tar',
+                       now())""", (self.session_id,))
+        if self.BACKEND != "sqlite":
+            self._exec("ALTER TABLE remote_chunks ENABLE TRIGGER USER")
+        self.latest[(self.session_id, 3)] = {
+            "tape_label": "T_A", "status": "completed",
+            "finished_at": "2026-01-01T00:00:00"}
+        self._query(
+            """INSERT INTO archive_containers (session_id,chunk_index,
+                   container_ordinal,container_format,format_version,
+                   tar_dialect,storage_class,container_name,
+                   expected_member_count,expected_logical_bytes,
+                   validation_state,writer_state,catalog_state,
+                   tape_label,tape_path,tape_generation_id)
+               VALUES (%s,3,3,'stored_tar','1','ustar','small_files',
+                       'c3.tar',1,100,'planned','not_started','not_started',
+                       'T_A','/tape/c3.tar',%s)
+               RETURNING container_id""",
+            (self.session_id, self.generations["T_A"]))
+
+    def test_a_cartridge_with_stored_tar_chunks_gets_no_report(self):
+        # Such a chunk cannot be written again after the reset, so erasing
+        # its only tape copy is refused before anything is changed.
+        self._make_container_stored_tar()
+        before = self._catalog_state()
+        with self.assertRaisesRegex(RuntimeError, "Stored-TAR"):
+            self._prepare()
+        self.assertEqual(self._catalog_state(), before)
+        self.assertFalse(self.out.exists())
+        self.assertEqual(self.formats, 0)
+
+    def test_the_reset_itself_refuses_stored_tar_chunks_before_formatting(
+            self):
+        # A report written before this check existed.
+        self._make_container_stored_tar()
+        with mock.patch.object(tape_reset, "refuse_unrewritable_chunks",
+                               lambda *a, **k: None):
+            result = self._prepare()
+        before = self._catalog_state()
+        with self.assertRaisesRegex(RuntimeError, "Stored-TAR"):
+            self._reset(result["impact_report"])
+        self.assertEqual(self.formats, 0)
+        self.assertEqual(self._catalog_state(), before)
 
     def test_an_existing_file_is_never_overwritten(self):
         self.out.write_text("mine", encoding="utf-8")
