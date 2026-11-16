@@ -53,6 +53,9 @@ class Opt(NamedTuple):
     maximum: Optional[float] = None
     above: Optional[float] = None        # exclusive lower bound
     choices: Tuple[str, ...] = ()
+    # choice only: (spelling, canonical) pairs accepted as another name for
+    # a choice, e.g. ``postgres`` for ``postgresql``
+    aliases: Tuple[Tuple[str, str], ...] = ()
     # live    - read and acted on
     # inert   - validated and accepted, but nothing reads it: it has no
     #           effect, and a config that sets it gets a notice saying so
@@ -77,8 +80,8 @@ def _str():
     return Opt('str')
 
 
-def _choice(*choices):
-    return Opt('choice', choices=tuple(choices))
+def _choice(*choices, aliases=()):
+    return Opt('choice', choices=tuple(choices), aliases=tuple(aliases))
 
 
 def _inert(option, note):
@@ -100,7 +103,9 @@ CONFIG_SCHEMA = {
         'backup_log_dir': _str(),
     },
     'DATABASE': {
-        'backend': _choice('sqlite', 'postgresql'),
+        # 'postgres' is the name most people type; it means the same server.
+        'backend': _choice('sqlite', 'postgresql',
+                           aliases=(('postgres', 'postgresql'),)),
         'sqlite_path': _str(),
         'host': _str(),
         'port': _int(1, 65535),
@@ -170,6 +175,12 @@ CONFIG_SCHEMA = {
     'PERFORMANCE': {
         'pipeline_profile': _inert(
             _str(), "there is a single pipeline; no profile is selectable"),
+        # Removed feature (mid-pipeline eject). Retired rather than unknown so
+        # the notice does not suggest [HARDWARE] eject_after_session, which
+        # ejects the cartridge.
+        'eject_after_pack': _retired(
+            "the mid-pipeline eject was removed; the remote pipeline never "
+            "ejects"),
         'chunk_cap_gb': _float(above=0),
         'chunk_max_files': _int(1),
         'prefetch_chunks_ahead': _float(minimum=0),
@@ -310,6 +321,7 @@ def parse_option(section, key, raw, option):
         return _parse_number(section, key, raw, option)
     if option.kind == 'choice':
         text = str(raw).strip().lower()
+        text = dict(option.aliases).get(text, text)
         if text not in option.choices:
             raise ConfigError(_describe(
                 section, key, raw,

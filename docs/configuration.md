@@ -117,7 +117,7 @@ Which catalog database to use. See [database-backends.md](database-backends.md).
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `backend` | choice: sqlite / postgresql | `postgresql` | Catalog backend. **Absent means PostgreSQL**, so an install that predates SQLite is never switched. `config.example.ini` and the config generated on first run set `sqlite`. |
+| `backend` | choice: sqlite / postgresql | `postgresql` | Catalog backend (`postgres` is accepted as another spelling of `postgresql`). **Absent means PostgreSQL**, so an install that predates SQLite is never switched. `config.example.ini` and the config generated on first run set `sqlite`. |
 | `sqlite_path` | str | `lto_archive.sqlite3` | SQLite catalog file. A bare name lives in the project folder. Must be on a local disk; a network path is refused. |
 | `host` | str | `localhost` | PostgreSQL server host. |
 | `port` | int, >= 1, <= 65535 | `5432` | PostgreSQL server port. |
@@ -207,6 +207,7 @@ Chunk size, staging and memory limits, and what may run while the tape is being 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `pipeline_profile` | str (inert) | - | No effect: there is one pipeline. |
+| `eject_after_pack` | retired | - | Ignored, with a warning: the mid-pipeline eject was removed and the remote pipeline never ejects. Remove it. |
 | `chunk_cap_gb` | float, > 0 | `50` | Largest size of one chunk. A smaller chunk limits what one interrupted write can cost. Applies to chunks planned after the change. |
 | `chunk_max_files` | int, >= 1 | `100000` | Largest number of files in one chunk. |
 | `prefetch_chunks_ahead` | float, >= 0 | `1` | Chunks fetched and packed ahead of the tape writer. Values below 1 are treated as 1. |

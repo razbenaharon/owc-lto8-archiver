@@ -351,3 +351,23 @@ def test_every_inert_key_still_loads_with_a_no_effect_notice(tmp_path):
         assert any(f"[{section}] {key} has no effect" in note
                    for note in cfg.warnings), (section, key)
     assert len(cfg.warnings) == len(inert)
+
+
+def test_backend_postgres_is_accepted_as_postgresql(tmp_path):
+    # 'postgres' is how most people spell it; an existing config.ini with
+    # that line must keep starting on the PostgreSQL catalog.
+    cfg = _load(tmp_path, "[DATABASE]\nbackend = postgres\n")
+    assert cfg.db_backend == "postgresql"
+    assert cfg.warnings == []
+    message = _error(tmp_path, "[DATABASE]\nbackend = mysql\n")
+    assert "[DATABASE] backend" in message
+
+
+def test_removed_eject_after_pack_is_retired_not_a_typo(tmp_path):
+    # As an unknown key it would be "corrected" toward a setting that ejects
+    # the cartridge; it must say it was removed and suggest nothing.
+    cfg = _load(tmp_path, "[PERFORMANCE]\neject_after_pack = on\n")
+    assert len(cfg.warnings) == 1
+    assert "retired" in cfg.warnings[0]
+    assert "eject_after_session" not in cfg.warnings[0]
+    assert cfg.eject_after_session is False

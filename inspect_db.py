@@ -1847,6 +1847,17 @@ def _dispatch(parser, args):
                 return _sqlite_installed_at_creation(cfg, flag)
 
     if args.print_db_target:
+        if (db_backend.is_sqlite(cfg)
+                and not os.path.exists(cfg.sqlite_path)):
+            # Not created yet (the first archive run creates it). Opening it
+            # read-only would fail, and opening it read-write would create
+            # it - a report must do neither.
+            _print_json({
+                "configured_target": cfg.db_display_ref,
+                "identity": {"database": cfg.sqlite_path, "exists": False},
+                "archiver_lock_holders": 0,
+            })
+            return 0
         payload = {
             "configured_target": cfg.db_display_ref,
             "identity": describe_database(_conninfo(cfg)),

@@ -616,6 +616,20 @@ class InspectDbOnSqliteTests(unittest.TestCase):
                 self.assertEqual(payload["schema_version"], 1)
                 self.assertEqual(payload["applied"], [])
 
+    def test_print_db_target_before_the_catalog_exists(self):
+        # A fresh install has no catalog file until the first archive run.
+        # The report must say so and must not create the file.
+        missing = os.path.join(os.path.dirname(self.tdb.path),
+                               "not_created_yet.sqlite3")
+        self.cfg.sqlite_path = missing
+        self.cfg.db_dsn = self.cfg.db_display_ref = "sqlite:///" + missing
+        code, out, err = self._run("--print-db-target")
+        self.assertEqual((code, err), (0, ""))
+        payload = json.loads(out)
+        self.assertIs(payload["identity"]["exists"], False)
+        self.assertEqual(payload["archiver_lock_holders"], 0)
+        self.assertFalse(os.path.exists(missing))
+
     def test_read_only_reports_and_target_identity_work(self):
         code, out, _err = self._run("--print-db-target")
         self.assertEqual(code, 0)
