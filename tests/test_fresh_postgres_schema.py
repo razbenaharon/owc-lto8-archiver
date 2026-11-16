@@ -235,6 +235,30 @@ class FreshPostgresDatabaseTests(unittest.TestCase):
         self.assertNotIn("New, empty PostgreSQL database", printed)
         self.assertFalse(db.directory_catalog_schema_installed())
 
+    def test_a_local_session_alone_makes_a_marked_database_existing(self):
+        """Review finding: the resume check looked at tapes, files_index and
+        remote_sessions only, so a marked database holding nothing but a
+        local session was still resumed."""
+        from src.pg_db import PgDatabaseManager
+        with mock.patch.object(
+                PgDatabaseManager, "apply_directory_catalog_schema",
+                side_effect=RuntimeError("stopped")):
+            with self.assertRaises(RuntimeError):
+                self._open_as_the_application()
+        used = self._open_directly()
+        with used._pool.connection() as conn:
+            conn.execute(
+                "INSERT INTO local_sessions "
+                "(session_label, source_dir, total_chunks, created_at) "
+                "VALUES ('review-f1', 'D:/src', 0, now())")
+            conn.commit()
+        used.close()
+
+        db, printed = self._open_as_the_application()
+
+        self.assertEqual(db.fresh_schema_installed, ())
+        self.assertFalse(db.directory_catalog_schema_installed())
+
     # -- a catalog that already existed ------------------------------------
     def test_an_existing_base_only_catalog_is_left_exactly_as_it_was(self):
         base = self._open_directly()                 # start-up schema only

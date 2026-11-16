@@ -195,13 +195,25 @@ class PgConnectionCore:
                     return "empty"
                 if self.FRESH_INSTALL_MARKER not in relations:
                     return "existing"
-                for table in ("tapes", "files_index", "remote_sessions"):
+                # Every table that holds operator activity: any row in any of
+                # them means the catalog is in use and is never touched
+                # implicitly.
+                for table in self.FRESH_INSTALL_ACTIVITY_TABLES:
                     if table in relations and conn.execute(
                             f"SELECT 1 FROM {table} LIMIT 1").fetchone():
                         return "existing"
                 return "interrupted"
             finally:
                 conn.rollback()
+
+    #: Tables whose rows prove a catalog has been used (see
+    #: ``_fresh_install_state``).
+    FRESH_INSTALL_ACTIVITY_TABLES = (
+        "tapes", "files_index", "remote_sessions", "local_sessions",
+        "local_chunks_manifest", "archive_runs", "archive_bundles",
+        "catalog_directories", "remote_snapshots", "remote_plans",
+        "remote_chunks", "remote_file_state",
+    )
 
     def _complete_fresh_schema(self, resumed=False):
         """Install whichever explicit migrations are still missing, in the
