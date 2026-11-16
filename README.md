@@ -248,8 +248,9 @@ Full instructions: [docs/user-guide.md](docs/user-guide.md).
   `python run.py tape-reset --tape <LABEL> --prepare-impact-report <FILE> --backup-file <BACKUP>`.
   The reset has not been run on hardware.
   See [the user guide](docs/user-guide.md#tape-maintenance-option-3).
-- **Stored TAR chunks cannot be rewritten after a tape reset.** ZIP chunks
-  can.
+- **A cartridge holding Stored TAR chunks (PostgreSQL only) cannot be
+  reset**: such a chunk could not be written again afterwards, so the reset
+  refuses before changing anything. ZIP chunks are reset normally.
 - **A reset interrupted during the format itself needs a person at the
   drive.**
 - **Renaming a tape that has loose-file restore routes is refused.**
