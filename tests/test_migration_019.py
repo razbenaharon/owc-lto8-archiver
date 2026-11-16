@@ -313,6 +313,137 @@ class Migration019SchemaAuthorityTests(unittest.TestCase):
             self.db.require_existing_stored_tar_recovery(session_id, 1)
 
 
+    # ---- the 015-only validation command on a fully migrated database -----
+
+    def _cli_validate_015(self):
+        """Run ``inspect_db.py --validate-container-format-schema`` for real
+        against this test database; return (exit code, stdout, stderr)."""
+        import contextlib
+        import io
+        from src.pg_db import PgDatabaseManager
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(
+                inspect_db, "ConfigManager",
+                return_value=SimpleNamespace(db_backend="postgresql")),                 mock.patch.object(
+                    inspect_db, "_open_read_only_db",
+                    side_effect=lambda cfg: PgDatabaseManager(
+                        self.conninfo, init_schema=False)),                 contextlib.redirect_stdout(out),                 contextlib.redirect_stderr(err):
+            code = inspect_db.main(["--validate-container-format-schema"])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_cli_015_validation_passes_on_015_alone(self):
+        self._apply_015()
+        code, out, err = self._cli_validate_015()
+        self.assertEqual(code, 0, err)
+        self.assertIn('"ready": true', out)
+
+    def test_cli_015_validation_points_to_v2_on_a_fully_migrated_schema(self):
+        """A correct 015+016+017+019 schema used to end in a traceback
+        ("fingerprint drift"): the 015 fingerprint cannot match once 016/017
+        extended the same tables. The command now says so in one line."""
+        self._apply_015()
+        self._apply_016_017()
+        self._apply_019()
+        code, out, err = self._cli_validate_015()
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertEqual(len(err.strip().splitlines()), 1, err)
+        self.assertIn("--validate-container-format-schema-authority-v2", err)
+        self.assertIn("016/017", err)
+        self.assertNotIn("Traceback", err)
+        # The authority that does cover this schema validates it.
+        self.assertTrue(
+            self.db.validate_container_format_schema_authority_v2()["ready"])
+
+    def test_cli_015_validation_still_reports_a_genuine_drift(self):
+        """Drift on a 015-only database is not explained away."""
+        self._apply_015()
+        self._exec(
+            "ALTER TABLE archive_containers "
+            "DROP CONSTRAINT archive_containers_dialect_ck")
+        code, out, err = self._cli_validate_015()
+        self.assertEqual(code, 1)
+        self.assertIn("missing or drifted", err)
+        self.assertIn(inspect_db.CONTAINER_FORMAT_V1_FINGERPRINT_DRIFT, err)
+        self.assertNotIn("authority-v2", err)
+        self.assertNotIn("Traceback", err)
+
+
+class ContainerFormat015ValidationCliTests(unittest.TestCase):
+    """``--validate-container-format-schema`` with mocks only (no server)."""
+
+    DRIFT = "container format catalog-definition fingerprint drift"
+
+    def _run(self, v1, stored_tar_state="installed"):
+        import contextlib
+        import io
+        db = mock.Mock()
+        db.container_format_schema_report.return_value = v1
+        db.stored_tar_plan_schema_report.return_value = {
+            "installation_state": stored_tar_state}
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(
+                inspect_db, "ConfigManager",
+                return_value=SimpleNamespace(db_backend="postgresql")),                 mock.patch.object(
+                    inspect_db, "_open_read_only_db", return_value=db),                 contextlib.redirect_stdout(out),                 contextlib.redirect_stderr(err):
+            code = inspect_db.main(["--validate-container-format-schema"])
+        db.close.assert_called_once()
+        return code, out.getvalue(), err.getvalue()
+
+    def test_the_drift_text_is_the_one_the_report_produces(self):
+        self.assertEqual(
+            inspect_db.CONTAINER_FORMAT_V1_FINGERPRINT_DRIFT, self.DRIFT)
+        import inspect
+        from src import pg_containers
+        source = " ".join(inspect.getsource(pg_containers).split())
+        self.assertIn(
+            '"container format catalog-definition fingerprint " "drift"',
+            source)
+
+    def test_ready_schema_prints_the_report_and_exits_zero(self):
+        code, out, err = self._run(
+            {"ready": True, "issues": [], "installation_state": "installed"})
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn('"ready": true', out)
+
+    def test_superseded_by_016_017_is_one_readable_line(self):
+        code, out, err = self._run(
+            {"ready": False, "issues": [self.DRIFT],
+             "installation_state": "installed"})
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertEqual(len(err.strip().splitlines()), 1, err)
+        self.assertIn("--validate-container-format-schema-authority-v2", err)
+
+    def test_drift_without_016_017_is_a_genuine_drift(self):
+        code, _out, err = self._run(
+            {"ready": False, "issues": [self.DRIFT],
+             "installation_state": "installed"},
+            stored_tar_state="absent")
+        self.assertEqual(code, 1)
+        self.assertIn("missing or drifted", err)
+        self.assertNotIn("authority-v2", err)
+
+    def test_any_other_issue_is_reported_even_with_016_017(self):
+        code, _out, err = self._run(
+            {"ready": False,
+             "issues": [self.DRIFT, "missing index: some_index"],
+             "installation_state": "installed"})
+        self.assertEqual(code, 1)
+        self.assertIn("missing or drifted", err)
+        self.assertIn("missing index: some_index", err)
+        self.assertNotIn("authority-v2", err)
+
+    def test_a_partial_015_is_never_explained_away(self):
+        code, _out, err = self._run(
+            {"ready": False, "issues": [self.DRIFT],
+             "installation_state": "partial"})
+        self.assertEqual(code, 1)
+        self.assertIn("missing or drifted", err)
+        self.assertNotIn("authority-v2", err)
+
+
 class Migration019CliDispatchTests(unittest.TestCase):
     """Local-only guarded-CLI tests; never opens LTFS or PostgreSQL."""
 
