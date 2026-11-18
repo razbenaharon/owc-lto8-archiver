@@ -109,7 +109,7 @@ class ReportingAndRobocopyTests(unittest.TestCase):
             "2026-07-03T08:12:43", "308.315", "0:04:59", "9077.322",
             "707.575", "8.770", "107380679989", "107380679989",
             "107372328901", "107380679989", "6", "0", "0", "0", "0",
-            "1", r"C:\owc-lto8-archiver\backup_logs\skipped.csv",
+            "1", r"C:\tape-ledger\backup_logs\skipped.csv",
             "25897", "0", "0", "3633327538007", "1", "342.051774",
             "",
         ]
