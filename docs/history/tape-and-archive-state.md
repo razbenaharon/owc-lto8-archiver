@@ -80,7 +80,8 @@ verification has **not** completed — see below.
   the DB keeps the export ledger, folder aggregates, loose/large file rows,
   sessions/chunks/bundles/runs, and tape state.
 - **Per-file manifests**:
-  `E:\Projects\owc-lto8-archiver\LTO_METADATA\LOCAL_MANIFEST_ARCHIVE\` —
+  `E:\Projects\tape-ledger\LTO_METADATA\LOCAL_MANIFEST_ARCHIVE\` (the project
+  folder was `owc-lto8-archiver` until it was renamed in 2026-11) —
   on the internal fixed ReFS Dev Drive, not on the unstable external drive.
   Relocated here 2026-09-18 from the operator's Desktop, where a full-disk
   sweep found it was the **only** copy on the workstation; the tree is
