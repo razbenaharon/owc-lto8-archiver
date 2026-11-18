@@ -389,7 +389,8 @@ class RemoteChunkWriter:
             return False
         used_bytes = self.host.db.recalculate_tape_used_space(tape_label)
         _, available_bytes = tape_budget_bytes(
-            tape['total_capacity'], used_bytes, status=tape.get('status'))
+            tape['total_capacity'], used_bytes, status=tape.get('status'),
+            profile=self.host.cfg.tape_profile)
         if staged_bytes > available_bytes:
             indices = (list(chunk_index) if isinstance(
                 chunk_index, (list, tuple, set)) else [chunk_index])

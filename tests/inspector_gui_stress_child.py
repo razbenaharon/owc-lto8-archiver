@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from PySide6.QtWidgets import QApplication, QInputDialog, QMessageBox  # noqa: E402
 
 import src.db_inspector_qt as inspector  # noqa: E402
+from src.constants import LEGACY_TAPE_PROFILE  # noqa: E402
 
 
 class FakeDb:
@@ -73,7 +74,8 @@ def main(actions):
     QInputDialog.getText = staticmethod(lambda *_a, **_k: ("Tape_T", True))
 
     db = FakeDb()
-    widget = inspector.ManageWidget(db, "fake-dsn")
+    widget = inspector.ManageWidget(db, "fake-dsn",
+                                    tape_profile=LEGACY_TAPE_PROFILE)
     widget.refresh()
     replies = 0
     for i in range(actions):

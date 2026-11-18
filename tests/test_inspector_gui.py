@@ -18,6 +18,7 @@ os.environ["QT_QPA_PLATFORM"] = "offscreen"
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 import src.db_inspector_qt as inspector  # noqa: E402
+from src.constants import LEGACY_TAPE_PROFILE  # noqa: E402
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(TESTS_DIR)
@@ -139,7 +140,8 @@ def test_h15_replies_arrive_on_the_gui_thread_for_success_and_failure(qapp):
 def test_h15_only_one_write_is_in_flight(qapp, fake_repo, monkeypatch):
     monkeypatch.setattr(inspector.QMessageBox, "critical",
                         staticmethod(lambda *_a, **_k: None))
-    widget = inspector.ManageWidget(FakeDb(), "fake-dsn")
+    widget = inspector.ManageWidget(FakeDb(), "fake-dsn",
+                                    tape_profile=LEGACY_TAPE_PROFILE)
     release = threading.Event()
     done = []
     assert widget._run_db_task(lambda: release.wait(10), on_done=done.append)
@@ -207,7 +209,8 @@ def _manage_with_sessions(qapp, fake_repo, rows):
 
     fake_repo.require_session_deletable = require_session_deletable
     db = FakeDb()
-    widget = inspector.ManageWidget(db, "fake-dsn")
+    widget = inspector.ManageWidget(db, "fake-dsn",
+                                    tape_profile=LEGACY_TAPE_PROFILE)
     widget.refresh_sessions()
     assert pump(qapp, lambda: widget.sessions_table.rowCount() == len(rows))
     return db, widget
@@ -275,7 +278,8 @@ def test_m8_tape_destruction_needs_the_label_typed(qapp, fake_repo, dialogs,
     db.delete_tape = lambda label: db.calls.append(("delete_tape", label))
     db.delete_files_for_tape = lambda label: db.calls.append(
         ("delete_files_for_tape", label))
-    widget = inspector.ManageWidget(db, "fake-dsn")
+    widget = inspector.ManageWidget(db, "fake-dsn",
+                                    tape_profile=LEGACY_TAPE_PROFILE)
     widget.refresh_tapes()
     widget.tapes_table.selectRow(0)
     dialogs.typed_answer = ("tape_t", True)        # close, but not the label
@@ -389,7 +393,8 @@ def test_m8_refresh_with_database_down_shows_an_error(qapp, fake_repo,
     db = ListingDb()
     fake_repo.require_catalog_v3 = lambda self: None
     fake_repo.list_tapes = lambda self: []
-    window = inspector.DBInspectorQtApp(db, "fake-dsn")
+    window = inspector.DBInspectorQtApp(db, "fake-dsn",
+                                        tape_profile=LEGACY_TAPE_PROFILE)
     window.tabs.setCurrentWidget(window.manage)
     _settle(qapp, window.manage)
     assert dialogs.errors == []

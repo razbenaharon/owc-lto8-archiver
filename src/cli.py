@@ -4,7 +4,8 @@ from typing import TYPE_CHECKING
 
 from .config import ConfigManager
 from .constants import (CONFIG_FILE, TAPE_STATUS_ACTIVE, TAPE_STATUS_FULL,
-                        tape_is_full, tape_status_reason_suffix)
+                        registered_capacity_problem, tape_is_full,
+                        tape_status_reason_suffix)
 from .db import _fmt_ts, create_database_manager
 from .exit_codes import (ExitCode, StopResult, REASON_BAD_CONFIG,
                          REASON_WINDOWS_REBOOT_PENDING,
@@ -214,7 +215,7 @@ def run_remote_archiver_headless(cfg: ConfigManager, db: "PgDatabaseManager",
     return int(getattr(result, "exit_code", ExitCode.FATAL_CONFIG))
 
 
-def _print_tapes_table(db):
+def _print_tapes_table(db, tape_profile):
     tapes = db.list_tapes()
     if not tapes:
         print("[DB] No tapes registered.")
@@ -225,7 +226,7 @@ def _print_tapes_table(db):
     print("-" * 80)
     for t in tapes:
         date_s  = _fmt_ts(t['date_formatted'])
-        # total_capacity is stored in decimal GB (see DEFAULT_TAPE_CAPACITY_GB);
+        # total_capacity is stored in decimal GB (see TapeProfile.register_gb);
         # convert used bytes with the same base so the bar compares like units.
         cap_gb  = t['total_capacity']
         used_b  = t['used_space'] or 0
@@ -239,7 +240,7 @@ def _print_tapes_table(db):
         else:
             # Percent of the planning budget (constants.tape_usage) — the one
             # figure shared with the GUI and with the planner itself.
-            usage   = tape_usage(cap_gb, used_b)
+            usage   = tape_usage(cap_gb, used_b, profile=tape_profile)
             filled  = round(usage.bar_fraction * BAR_W)
             bar     = '█' * filled + '░' * (BAR_W - filled)
             space_s = (f"[{bar}] {usage.percent_text}  {used_gb:.1f}/"
@@ -249,7 +250,7 @@ def _print_tapes_table(db):
     return tapes
 
 
-def _db_management_menu(db):
+def _db_management_menu(db, tape_profile):
     while True:
         print("\n--- Database Management ---")
         print("  1. Delete tape & all file records")
@@ -267,7 +268,7 @@ def _db_management_menu(db):
             break
 
         elif sub == '1':
-            tapes = _print_tapes_table(db)
+            tapes = _print_tapes_table(db, tape_profile)
             if not tapes:
                 continue
             label = input("Enter volume label to DELETE (tape + all file records): ").strip()
@@ -304,7 +305,7 @@ def _db_management_menu(db):
                 print("[ABORTED]")
 
         elif sub == '3':
-            tapes = _print_tapes_table(db)
+            tapes = _print_tapes_table(db, tape_profile)
             if not tapes:
                 continue
             old_label = input("Enter current volume label: ").strip()
@@ -332,7 +333,7 @@ def _db_management_menu(db):
                   "catalog.")
 
         elif sub == '4':
-            tapes = _print_tapes_table(db)
+            tapes = _print_tapes_table(db, tape_profile)
             if not tapes:
                 continue
             label = input("Enter volume label: ").strip()
@@ -345,10 +346,14 @@ def _db_management_menu(db):
             except ValueError:
                 print("[ERROR] Invalid number.")
                 continue
+            problem = registered_capacity_problem(cap_gb, tape_profile)
+            if problem:
+                print(f"[ERROR] {problem}")
+                continue
             db.update_tape_capacity(label, cap_gb)
 
         elif sub == '5':
-            tapes = _print_tapes_table(db)
+            tapes = _print_tapes_table(db, tape_profile)
             if not tapes:
                 continue
             label = input("Enter volume label: ").strip()
@@ -362,7 +367,7 @@ def _db_management_menu(db):
             print(f"[DB] Used space updated: {old_used/1000**3:.2f} GB → {new_used/1000**3:.2f} GB")
 
         elif sub == '6':
-            tapes = _print_tapes_table(db)
+            tapes = _print_tapes_table(db, tape_profile)
             if not tapes:
                 continue
             label = input("Enter volume label to wipe file records for: ").strip()
@@ -377,7 +382,7 @@ def _db_management_menu(db):
                 print("[ABORTED]")
 
         elif sub == '7':
-            tapes = _print_tapes_table(db)
+            tapes = _print_tapes_table(db, tape_profile)
             if not tapes:
                 continue
             label = input("Enter volume label: ").strip()
@@ -418,7 +423,8 @@ def main():
     # Diagnostic trace file (backup_logs/archiver.log); console UX unchanged.
     configure_file_logging(cfg.backup_log_dir)
     db        = create_database_manager(cfg)
-    tape_mgr  = TapeManager(db, cfg.lto_drive, cfg.ibm_eject_cmd)
+    tape_mgr  = TapeManager(db, cfg.lto_drive, cfg.ibm_eject_cmd,
+                            tape_profile=cfg.tape_profile)
     retriever = LTORetriever(
         db, cfg.lto_drive, cfg.staging_dir, cfg.restore_dir,
         manifest_archive_root=cfg.local_manifest_archive_root)
@@ -526,7 +532,7 @@ def main():
                 tape_mgr.eject_tape()
 
         elif choice == '4':
-            _print_tapes_table(db)
+            _print_tapes_table(db, cfg.tape_profile)
 
         elif choice == '5':
             cfg_abs = os.path.abspath(CONFIG_FILE)
@@ -538,7 +544,7 @@ def main():
             last_result = run_remote_archiver(cfg, db)
 
         elif choice == '7':
-            _db_management_menu(db)
+            _db_management_menu(db, cfg.tape_profile)
 
         elif choice == '8':
             path = generate_backup_summary(cfg.backup_log_dir)

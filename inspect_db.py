@@ -13,7 +13,7 @@ if __name__ == "__main__" and "--version" in sys.argv[1:]:
     # Answered before anything else is imported: no config.ini is read or
     # created, no database is opened and no database driver is needed.
     from src import __version__
-    print(f"owc-lto8-archiver {__version__}")
+    print(f"tape-ledger {__version__}")
     raise SystemExit(0)
 
 from src.constants import PROJECT_ROOT
@@ -1568,7 +1568,7 @@ def _build_parser():
                     "(SQLite or PostgreSQL).")
     from src import __version__
     parser.add_argument("--version", action="version",
-                        version=f"owc-lto8-archiver {__version__}",
+                        version=f"tape-ledger {__version__}",
                         help="Print the program version and exit.")
     parser.add_argument("--db", help="Override target database name.")
     parser.add_argument("--tape", help="Limit an operation to one tape label.")
@@ -2019,7 +2019,8 @@ def _dispatch(parser, args):
     db = _open_db(cfg)
     from src.db_inspector_qt import run_qt_inspector
     try:
-        return run_qt_inspector(db, cfg.db_dsn, display_ref=cfg.db_display_ref)
+        return run_qt_inspector(db, cfg.db_dsn, display_ref=cfg.db_display_ref,
+                                tape_profile=cfg.tape_profile)
     finally:
         db.close()
 

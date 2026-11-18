@@ -9,8 +9,9 @@ from typing import NamedTuple, Optional, Tuple
 from urllib.parse import quote
 
 from .cli_errors import OperationalError
-from .constants import (BACKUP_LOG_DIR, CONFIG_FILE, LOCAL_STAGING_RESERVE_BYTES,
-                        PROJECT_ROOT)
+from .constants import (BACKUP_LOG_DIR, CONFIG_FILE, LEGACY_TAPE_PROFILE,
+                        LOCAL_STAGING_RESERVE_BYTES, PROJECT_ROOT,
+                        TAPE_PROFILES)
 from .paths import _clean_config_path, _clean_remote_path, _config_list
 
 #: Default SQLite catalog file, relative to the project root (gitignored).
@@ -119,6 +120,13 @@ CONFIG_SCHEMA = {
         'lto_drive': _str(),
         'ibm_eject_cmd': _str(),
         'eject_after_session': _bool(),
+        # Cartridge generation -> planning budget (constants.TAPE_PROFILES).
+        # A name, not a number: cartridge boxes print the native and the
+        # compressed capacity side by side, and a number invites the wrong one.
+        'tape_generation': _choice(
+            *TAPE_PROFILES,
+            aliases=(('lto6', 'lto-6'), ('lto7', 'lto-7'), ('ltom8', 'lto-m8'),
+                     ('lto8', 'lto-8'), ('lto9', 'lto-9'))),
         # Read by src/ltfs_ownership.py (its own minimal reader), not here.
         'ltfs_ownership_id': _str(),
         'ltfs_writer_lock_timeout_seconds': _float(above=0),
@@ -760,6 +768,21 @@ class ConfigManager:
         return _clean_config_path(self.config.get(
             'HARDWARE', 'ibm_eject_cmd',
             fallback=r'C:\Program Files\IBM\LTFS\LtfsCmdEject.exe'))
+    @property
+    def tape_profile(self):
+        """The cartridge generation's planning figures (``TapeProfile``).
+
+        Without ``[HARDWARE] tape_generation`` this is the legacy LTO-8
+        profile, byte-for-byte what the archiver always planned. A value that
+        is not a known generation was already refused when the file loaded;
+        it is parsed again here so a hand-built parser cannot slip past.
+        """
+        raw = self.config.get('HARDWARE', 'tape_generation', fallback=None)
+        if raw is None:
+            return LEGACY_TAPE_PROFILE
+        generation = parse_option('HARDWARE', 'tape_generation', raw,
+                                  CONFIG_SCHEMA['HARDWARE']['tape_generation'])
+        return TAPE_PROFILES[generation]._replace(configured=True)
     @property
     def eject_after_session(self):
         """Whether a completed remote session physically ejects the cartridge.

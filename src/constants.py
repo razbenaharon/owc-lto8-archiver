@@ -6,6 +6,7 @@ in the PROJECT ROOT — the parent of ``src/``. ``PROJECT_ROOT`` is therefore th
 parent of this package directory, and the root runner scripts ``chdir()`` there
 so a relative ``CONFIG_FILE`` resolves against the root exactly as before.
 """
+import math
 import os
 from typing import NamedTuple
 
@@ -23,22 +24,115 @@ LTFS_WRITE_WARNING = (
     "copy jobs. Internal tape access is serialized, but external processes can "
     "still degrade tape throughput."
 )
-# Per-tape planning budget for the local bin-packer. LTFS reports a free-space
-# figure (shutil.disk_usage(...).free) that depends on hardware compression and
-# is therefore only ADVISORY — this budget, not the live probe, is the real
-# guard against overfilling a tape. Expressed on a single binary basis (TiB)
-# with an explicit headroom margin. The result is kept at/below the previous
-# 11.5 TB budget so the planner only ever rejects MORE, never accepts more than
-# before.
-TAPE_PLAN_NOMINAL_BYTES = 11 * 1024**4          # 11 TiB nominal (binary basis)
+# Per-tape planning budget. LTFS reports a free-space figure
+# (shutil.disk_usage(...).free) that depends on hardware compression and is
+# therefore only ADVISORY — this budget, not the live probe, is the real guard
+# against overfilling a tape.
+#
+# The budget depends on the cartridge generation, chosen by
+# ``config.ini [HARDWARE] tape_generation`` and resolved by
+# ``ConfigManager.tape_profile``. There is deliberately NO module-level budget
+# constant: every caller receives a ``TapeProfile`` explicitly, so a code path
+# that forgot to ask the configuration fails loudly instead of silently
+# planning an LTO-7 cartridge with the LTO-8 figure.
+#
+# The headroom is a code constant, not a setting: the margin can never be
+# configured away.
 TAPE_PLAN_HEADROOM = 0.95                        # leave 5% for LTFS overhead
-LOCAL_TAPE_BUDGET_BYTES = int(TAPE_PLAN_NOMINAL_BYTES * TAPE_PLAN_HEADROOM)
-# Human label for the budget above; keeps operator messages in sync with the
-# actual constant instead of hardcoding "11.5 TB" strings around the codebase.
-TAPE_BUDGET_LABEL = f"{LOCAL_TAPE_BUDGET_BYTES / 1000**4:.1f} TB"
-# Default registered capacity for a fresh LTO-8 cartridge (decimal-GB figure
-# used verbatim in prompts and stored in tapes.total_capacity).
-DEFAULT_TAPE_CAPACITY_GB = 12288
+
+
+class TapeProfile(NamedTuple):
+    """Planning figures for one LTO cartridge generation.
+
+    ``native_bytes`` is the native (uncompressed) capacity printed on the
+    cartridge, in decimal bytes. ``nominal_bytes`` is what the headroom is
+    applied to. ``register_gb`` is the decimal-GB figure a fresh cartridge is
+    registered with in ``tapes.total_capacity``. ``configured`` is True when
+    the generation was chosen in config.ini, False for the legacy default.
+    """
+    generation: str
+    native_bytes: int
+    nominal_bytes: int
+    register_gb: int
+    configured: bool = False
+
+    @property
+    def budget_bytes(self):
+        return int(self.nominal_bytes * TAPE_PLAN_HEADROOM)
+
+    @property
+    def label(self):
+        """Human label for the budget, e.g. "11.5 TB"."""
+        return f"{self.budget_bytes / 1000**4:.1f} TB"
+
+    @property
+    def native_tb_text(self):
+        """Native capacity in decimal TB, e.g. "12" or "2.5"."""
+        return f"{self.native_bytes / 1000**4:g}"
+
+
+# Keyed by the lower-case spelling config.py accepts. LTO-8 keeps the legacy
+# figures verbatim (11 TiB nominal, 12288 GB registration) so choosing it
+# explicitly plans exactly what the archiver always planned. Every other
+# generation applies the headroom to its native decimal capacity. LTO-10 is
+# absent on purpose: it ships as 30 TB and 40 TB cartridges, so it needs its
+# own reviewed entry rather than a guess.
+TAPE_PROFILES = {
+    'lto-6': TapeProfile('LTO-6', 2_500 * 1000**3, 2_500 * 1000**3, 2500),
+    'lto-7': TapeProfile('LTO-7', 6 * 1000**4, 6 * 1000**4, 6000),
+    'lto-m8': TapeProfile('LTO-M8', 9 * 1000**4, 9 * 1000**4, 9000),
+    'lto-8': TapeProfile('LTO-8', 12 * 1000**4, 11 * 1024**4, 12288),
+    'lto-9': TapeProfile('LTO-9', 18 * 1000**4, 18 * 1000**4, 18000),
+}
+# What a config.ini without ``tape_generation`` gets: the LTO-8 figures the
+# archiver has always used (budget 11,489,896,510,259 bytes, "11.5 TB",
+# registration default 12288 GB), with the legacy capacity rule.
+LEGACY_TAPE_PROFILE = TAPE_PROFILES['lto-8']
+
+
+def registered_budget(total_capacity_gb):
+    """Planning bytes for a cartridge from its registered capacity.
+
+    A registration equal to some generation's ``register_gb`` gets that
+    generation's budget — so a cartridge registered with the legacy LTO-8
+    figure (12288 GB, which is larger than LTO-8's native 12000 GB) keeps the
+    legacy LTO-8 budget on a host configured for a larger generation. Any
+    other figure gets the headroom applied to it.
+    """
+    gb = float(total_capacity_gb)
+    for profile in TAPE_PROFILES.values():
+        if gb == profile.register_gb:
+            return profile.budget_bytes
+    return int(gb * 1000**3 * TAPE_PLAN_HEADROOM)
+
+
+def registered_capacity_problem(capacity_gb, profile):
+    """Why ``capacity_gb`` may not be registered, or None when it may.
+
+    Only a configured generation is checked (the legacy default keeps the
+    legacy behaviour). A figure above the configured generation's native
+    capacity cannot be a cartridge this drive writes: it is almost always the
+    compressed figure printed next to the native one on the box.
+    """
+    if not profile.configured:
+        return None
+    if not math.isfinite(capacity_gb) or capacity_gb <= 0:
+        return "capacity must be a finite number greater than 0 GB."
+    if capacity_gb > profile.register_gb:
+        return (f"{capacity_gb:g} GB is more than an {profile.generation} "
+                f"cartridge holds ({profile.register_gb} GB native). Enter the "
+                "NATIVE capacity, not the compressed figure.")
+    return None
+
+
+def tape_profile_banner(profile):
+    """One line naming the active budget, printed before every tape write."""
+    source = ("from config.ini [HARDWARE] tape_generation" if profile.configured
+              else "default; [HARDWARE] tape_generation is not set")
+    return (f"Tape budget: {profile.generation}, {profile.label} per cartridge "
+            f"({source}).")
+
+
 # tapes.status values (migration 011). 'full' = retired from writing, whatever
 # the reason — genuinely out of space, or unwritable like Tape_02 after its PWE
 # bit latched (docs/history/incidents/010-20260724-ltfs-write-perm-readonly.md).
@@ -63,25 +157,34 @@ def tape_status_reason_suffix(tape):
 
 
 def tape_budget_bytes(total_capacity_gb, used_bytes, reserved_bytes=0,
-                      status=None):
+                      status=None, *, profile):
     """Return ``(capacity_bytes, available_bytes)`` for a registered tape.
 
     ``total_capacity_gb`` is the ``tapes.total_capacity`` column — a
-    decimal-GB figure (see ``DEFAULT_TAPE_CAPACITY_GB``). The planning
-    capacity is the smaller of that and the ``LOCAL_TAPE_BUDGET_BYTES``
-    safety budget. Decimal GB replaces a previous GiB interpretation that
+    decimal-GB figure (see ``TapeProfile.register_gb``). The planning
+    capacity is the smaller of the profile's budget and the registered
+    capacity. Decimal GB replaces a previous GiB interpretation that
     overstated capacity by ~7%; the change can only ever reject MORE, never
     accept more than before.
+
+    With the legacy default profile the registered capacity is used raw,
+    exactly as before. With a configured generation it goes through
+    ``registered_budget`` so it carries the headroom too: the profile budget
+    is then no longer the only margin protecting an older, smaller
+    cartridge.
 
     ``status`` is ``tapes.status``: a tape marked ``full`` reports zero
     available bytes regardless of its counters, which is the only
     representation that survives ``recalculate_tape_used_space`` rewriting
     ``used_space`` from the catalog on every mount.
     """
-    capacity_bytes = LOCAL_TAPE_BUDGET_BYTES
+    capacity_bytes = profile.budget_bytes
     if total_capacity_gb:
-        capacity_bytes = min(capacity_bytes,
-                             int(float(total_capacity_gb) * 1000**3))
+        if profile.configured:
+            registered = registered_budget(total_capacity_gb)
+        else:
+            registered = int(float(total_capacity_gb) * 1000**3)
+        capacity_bytes = min(capacity_bytes, registered)
     if tape_is_full(status):
         return capacity_bytes, 0
     available_bytes = max(
@@ -106,7 +209,7 @@ class TapeUsage(NamedTuple):
         return min(max(self.percent / 100.0, 0.0), 1.0)
 
 
-def tape_usage(total_capacity_gb, used_bytes, status=None):
+def tape_usage(total_capacity_gb, used_bytes, status=None, *, profile):
     """The single source of truth for a tape's displayed usage percentage.
 
     Used bytes over the planning budget from ``tape_budget_bytes`` — the
@@ -117,7 +220,7 @@ def tape_usage(total_capacity_gb, used_bytes, status=None):
     """
     used = int(used_bytes or 0)
     budget_bytes, available_bytes = tape_budget_bytes(
-        total_capacity_gb, used, status=status)
+        total_capacity_gb, used, status=status, profile=profile)
     percent = (used / budget_bytes * 100.0) if budget_bytes else 0.0
     return TapeUsage(used, budget_bytes, available_bytes, percent)
 

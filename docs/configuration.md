@@ -138,6 +138,24 @@ The tape drive.
 | `ltfs_ownership_id` | str | none (required for tape access) | Stable name of the physical drive, for example its serial number. It names the cross-process mutex that lets only one process touch LTFS. 1-64 characters from `A-Z a-z 0-9 . _ -`. If it is missing or malformed, every LTFS operation fails closed. Never derive it from the drive letter. |
 | `ltfs_writer_lock_timeout_seconds` | float, > 0 | `300` | How long a tape writer waits for LTFS ownership. Clamped to 1-3600. |
 | `ltfs_helper_lock_timeout_seconds` | float, > 0 | `30` | How long a helper or diagnostic waits for LTFS ownership. Clamped to 1-3600. |
+| `tape_generation` | choice: lto-6 / lto-7 / lto-m8 / lto-8 / lto-9 | none: the legacy LTO-8 budget | The generation of the cartridges this host writes. It sets the per-cartridge planning budget: native capacity minus a fixed 5% margin, which no setting can remove. LTO-8 = 11.5 TB (the figures the archiver always used), LTO-9 = 17.1 TB, LTO-M8 = 8.6 TB, LTO-7 = 5.7 TB, LTO-6 = 2.4 TB. It also sets the default capacity offered when a cartridge is registered. Name the generation, never a capacity figure: the box prints native and compressed capacity side by side. Case does not matter, and `LTO9`-style spellings without the dash are accepted. Any other value refuses to start. LTO-10 is not listed yet. See [the notes below](#tape_generation). |
+
+### `tape_generation`
+
+- **No line, or `LTO-8`:** the budget is exactly what the archiver always
+  planned. Cartridges keep their registered capacity.
+- **Older cartridges on a newer host.** With a generation set, a cartridge's
+  registered capacity also gets the 5% margin. A cartridge registered with the
+  old LTO-8 default (12288 GB) keeps the LTO-8 budget, so an LTO-8 cartridge
+  loaded on an LTO-9 host is never planned past what it holds.
+- **Registering.** With a generation set, a capacity above that generation's
+  native figure is refused when a cartridge is registered or its capacity is
+  changed. Such a figure is almost always the compressed one.
+- **Changing it.** Change it only between sessions. The budget is checked
+  again before every chunk and every write group. A local session resumed
+  with chunks larger than the new budget refuses to start and asks you to
+  re-plan, before anything touches the drive. Every tape-write run prints the
+  budget in force.
 
 ## `[SETTINGS]`
 

@@ -33,6 +33,7 @@ from unittest import mock
 from db_backends import SQLITE, create_test_db
 
 from src.backup import _NoEjectBackup
+from src.constants import LEGACY_TAPE_PROFILE
 from src.packer import LTOAnalyzer, LTOPacker
 from src.retriever import LTORetriever
 from src.runtime import CANCEL
@@ -149,7 +150,8 @@ class SqliteArchiveRestoreRoundTrip(unittest.TestCase):
         self.addCleanup(self.db.release_archiver_lock)
 
         chunks = LTOAnalyzer().build_local_allocation_plan(
-            self.source, first_tape_budget_bytes=10 * 1024 ** 4)
+            self.source, tape_profile=LEGACY_TAPE_PROFILE,
+            first_tape_budget_bytes=10 * 1024 ** 4)
         session_id = self.db.create_local_session(
             "LOCAL_e2e_sqlite", self.source, chunks, backup_mode="pack")
         session = self.db.get_local_session(session_id)

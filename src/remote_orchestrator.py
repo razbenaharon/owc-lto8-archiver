@@ -110,8 +110,8 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from .backup import LTOBackup, _NoEjectBackup
-from .constants import (DEFAULT_TAPE_CAPACITY_GB, LOCAL_STAGING_RESERVE_BYTES,
-                        LTFS_WRITE_WARNING, tape_budget_bytes, tape_is_full,
+from .constants import (LOCAL_STAGING_RESERVE_BYTES, LTFS_WRITE_WARNING,
+                        tape_budget_bytes, tape_is_full, tape_profile_banner,
                         tape_status_reason_suffix)
 from .exit_codes import (
     ExitCode, StopResult,
@@ -133,7 +133,7 @@ from .windows_update_guard import (RebootSentinel, assess_reboot_state,
                                    ltfs_sync_mode_status,
                                    pending_reboot_reasons)
 from .ltfs import (_ensure_lto_drive_ready, get_volume_label,
-                   note_device_state_change)
+                   note_device_state_change, prompt_tape_capacity_gb)
 from .ltfs_ownership import LtfsOwnershipError, OWNERSHIP
 from .paths import _volume_cluster_size
 from .pipeline_types import ScanMetrics, StagedChunk, StreamState
@@ -621,11 +621,14 @@ class RemoteOrchestrator:
 
         if not self.db.tape_exists(tape_label):
             print(f"[TAPE] '{tape_label}' not in database. Registering...")
-            cap = input(f"Tape capacity in GB (default {DEFAULT_TAPE_CAPACITY_GB} "
-                        "for 12 TB, Enter to skip): ").strip()
-            self.db.register_tape(
-                tape_label,
-                int(cap) if cap.isdigit() else DEFAULT_TAPE_CAPACITY_GB)
+            capacity = prompt_tape_capacity_gb(self.cfg.tape_profile)
+            if capacity is None:
+                return StopResult(
+                    exit_code=ExitCode.USER_STOP,
+                    reason=REASON_USER_REQUESTED_STOP,
+                    resumable=True, source="new-session",
+                    detailed_reason="no valid tape capacity")
+            self.db.register_tape(tape_label, capacity)
 
         tape_context = self._remote_tape_capacity_context(tape_label)
 
@@ -747,7 +750,7 @@ class RemoteOrchestrator:
             reserved_bytes = self.db.get_pending_remote_reserved_bytes(session_id)
         capacity_bytes, available_bytes = tape_budget_bytes(
             tape['total_capacity'], used_bytes, reserved_bytes,
-            status=tape.get('status'))
+            status=tape.get('status'), profile=self.cfg.tape_profile)
         print(f"[TAPE] '{tape_label}': DB occupied "
               f"{used_bytes / 1024**3:.2f} GiB; "
               f"reserved pending {reserved_bytes / 1024**3:.2f} GiB; "
@@ -1084,6 +1087,7 @@ class RemoteOrchestrator:
                            f"prefetch {self.prefetch_ahead} ahead | "
                            f"staging cap {self.staging_max_bytes / 1024**3:.0f} GB")
         print(f"[WARNING] {LTFS_WRITE_WARNING}")
+        print(f"[TAPE] {tape_profile_banner(self.cfg.tape_profile)}")
 
         if not self._validate_ltfs_sync_mode():
             return self._finalize(StopResult(
@@ -1428,6 +1432,7 @@ class RemoteOrchestrator:
                            f"{self.prefetch_ahead} ahead | staging cap "
                            f"{self.staging_max_bytes / 1024**3:.0f} GB")
         print(f"[WARNING] {LTFS_WRITE_WARNING}")
+        print(f"[TAPE] {tape_profile_banner(self.cfg.tape_profile)}")
 
         # Only per-chunk byte totals stay resident. One GROUP BY aggregate
         # replaces the former per-chunk full-row fetches (millions of rows

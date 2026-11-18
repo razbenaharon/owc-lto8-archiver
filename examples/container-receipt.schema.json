@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/razbenaharon/owc-lto8-archiver/examples/container-receipt.schema.json",
+  "$id": "https://github.com/razbenaharon/tape-ledger/examples/container-receipt.schema.json",
   "title": "Container receipt (receipt.json)",
   "description": "Published beside the stored-TAR containers of one archive chunk. The receipt is the integrity anchor for those containers: it records, per container, the exact byte size and SHA-256, so an intact container can be told from a truncated or corrupted one without reading tape or re-fetching the source.",
   "type": "object",

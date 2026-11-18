@@ -1,4 +1,4 @@
-# OWC LTO-8 archiver — dependencies for the PostgreSQL catalog backend
+# Tape Ledger — dependencies for the PostgreSQL catalog backend
 # ([DATABASE] backend = postgresql): the core set plus the psycopg 3 driver.
 #
 #     python -m pip install -r requirements-postgres.txt

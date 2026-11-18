@@ -1,6 +1,6 @@
 # Third-party licences
 
-OWC LTO-8 Archiver itself is released under the [MIT License](LICENSE),
+Tape Ledger itself is released under the [MIT License](LICENSE),
 copyright (c) 2026 Raz Ben Aharon.
 
 This repository and its release package contain **no third-party code**. The

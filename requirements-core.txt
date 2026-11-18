@@ -1,4 +1,4 @@
-# OWC LTO-8 archiver — CORE dependencies.
+# Tape Ledger — CORE dependencies.
 #
 # Enough for the command-line program with the SQLite catalog backend
 # ([DATABASE] backend = sqlite): no database server and no psycopg.

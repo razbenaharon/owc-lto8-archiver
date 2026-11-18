@@ -13,7 +13,7 @@ Windows, Python 3.11 to 3.14.
 
 ```powershell
 git clone <your fork>
-cd owc-lto8-archiver
+cd tape-ledger
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt

@@ -1,4 +1,4 @@
-# OWC LTO-8 archiver — ALL Python dependencies. Kept for backward
+# Tape Ledger — ALL Python dependencies. Kept for backward
 # compatibility: `pip install -r requirements.txt` installs what it always
 # did. It is the sum of the three dependency sets:
 #

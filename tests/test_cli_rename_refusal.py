@@ -4,6 +4,7 @@ from contextlib import redirect_stdout
 from unittest import mock
 
 from src import cli
+from src.constants import LEGACY_TAPE_PROFILE
 
 
 class _Db:
@@ -25,7 +26,7 @@ def test_a_refused_rename_keeps_the_menu_running():
                            return_value=[{"volume_label": "T_A"}]), \
             mock.patch("builtins.input", lambda *_a: next(answers)), \
             redirect_stdout(out):
-        cli._db_management_menu(db)       # returns on "0": no exception
+        cli._db_management_menu(db, LEGACY_TAPE_PROFILE)   # returns on "0"
     text = out.getvalue()
     assert "Rename refused; nothing was changed" in text
     assert "[OK]" not in text

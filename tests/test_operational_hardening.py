@@ -1,10 +1,16 @@
 import os
 import unittest
+from functools import partial
 from types import SimpleNamespace
 
-from src.constants import (LOCAL_TAPE_BUDGET_BYTES, TAPE_STATUS_ACTIVE,
-                           TAPE_STATUS_FULL, tape_budget_bytes, tape_is_full,
+from src.constants import (LEGACY_TAPE_PROFILE, TAPE_STATUS_ACTIVE,
+                           TAPE_STATUS_FULL, tape_is_full,
                            tape_status_reason_suffix)
+from src.constants import tape_budget_bytes as _tape_budget_bytes
+
+# These tests pin the legacy (no tape_generation) behaviour.
+tape_budget_bytes = partial(_tape_budget_bytes, profile=LEGACY_TAPE_PROFILE)
+LEGACY_BUDGET_BYTES = LEGACY_TAPE_PROFILE.budget_bytes
 from src.remote_transport import (
     _ASKPASS_HELPERS,
     _cleanup_askpass_helpers,
@@ -17,8 +23,8 @@ class TapeBudgetTests(unittest.TestCase):
     def test_safety_budget_caps_large_capacities(self):
         # A 12288-GB LTO-8 capacity exceeds the safety budget, which wins.
         capacity, available = tape_budget_bytes(12288, used_bytes=0)
-        self.assertEqual(capacity, LOCAL_TAPE_BUDGET_BYTES)
-        self.assertEqual(available, LOCAL_TAPE_BUDGET_BYTES)
+        self.assertEqual(capacity, LEGACY_BUDGET_BYTES)
+        self.assertEqual(available, LEGACY_BUDGET_BYTES)
 
     def test_capacity_is_decimal_gb_and_reserved_is_subtracted(self):
         # 1000 GB is decimal (1e12 bytes), not GiB — the GiB reading
@@ -32,7 +38,7 @@ class TapeBudgetTests(unittest.TestCase):
         _, available = tape_budget_bytes(100, used_bytes=200 * 1000**3)
         self.assertEqual(available, 0)
         capacity, _ = tape_budget_bytes(None, used_bytes=0)
-        self.assertEqual(capacity, LOCAL_TAPE_BUDGET_BYTES)
+        self.assertEqual(capacity, LEGACY_BUDGET_BYTES)
 
     def test_remote_admission_counts_actual_sidecar_overhead(self):
         class _DB:
@@ -51,7 +57,8 @@ class TapeBudgetTests(unittest.TestCase):
                 return 999_999_900
 
         db = _DB()
-        writer = RemoteChunkWriter(SimpleNamespace(db=db))
+        writer = RemoteChunkWriter(SimpleNamespace(
+            db=db, cfg=SimpleNamespace(tape_profile=LEGACY_TAPE_PROFILE)))
 
         # The 100-byte logical TAR payload fits exactly. Its one-byte sidecar
         # overhead makes the staged footprint inadmissible.
@@ -68,7 +75,7 @@ class TapeStatusTests(unittest.TestCase):
         # say "room left", the status is what must win.
         capacity, available = tape_budget_bytes(
             12288, used_bytes=5 * 1000**4, status=TAPE_STATUS_FULL)
-        self.assertEqual(capacity, LOCAL_TAPE_BUDGET_BYTES)
+        self.assertEqual(capacity, LEGACY_BUDGET_BYTES)
         self.assertEqual(available, 0)
 
     def test_active_and_missing_status_are_inert(self):

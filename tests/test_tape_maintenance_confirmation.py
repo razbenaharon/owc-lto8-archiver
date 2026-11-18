@@ -12,12 +12,14 @@ import unittest
 from unittest import mock
 
 from src import ltfs
+from src.constants import LEGACY_TAPE_PROFILE
 from src.ltfs import TapeManager
 
 
 class _Base(unittest.TestCase):
     def setUp(self):
-        self.mgr = TapeManager(mock.MagicMock(), "X:\\", ibm_eject_cmd=None)
+        self.mgr = TapeManager(mock.MagicMock(), "X:\\", ibm_eject_cmd=None,
+                               tape_profile=LEGACY_TAPE_PROFILE)
         self.runs = []
         self.ejects = []
         for target, replacement in (

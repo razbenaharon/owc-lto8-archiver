@@ -323,7 +323,7 @@ def _check_environment(backend, tree):
         [sys.executable, "run.py", "--version"], cwd=tree,
         capture_output=True, text=True, timeout=120)
     check(version.returncode == 0 and version.stdout.strip()
-          == f"owc-lto8-archiver {src.__version__}",
+          == f"tape-ledger {src.__version__}",
           f"run.py --version failed: {version.stdout!r} {version.stderr!r}")
     say(f"program version    : {src.__version__}")
     return src.__version__
@@ -592,7 +592,8 @@ def _round_trip(paths, data):
         db.acquire_archiver_lock()
         try:
             chunks = LTOAnalyzer().build_local_allocation_plan(
-                paths["source"], first_tape_budget_bytes=10 * 1024 ** 4)
+                paths["source"], tape_profile=cfg.tape_profile,
+                first_tape_budget_bytes=10 * 1024 ** 4)
             session_id = db.create_local_session(
                 "LOCAL_install_smoke", paths["source"], chunks,
                 backup_mode="pack")

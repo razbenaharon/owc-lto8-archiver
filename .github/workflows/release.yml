@@ -76,13 +76,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$TAG" \
-            dist/owc-lto8-archiver-*.zip \
+            dist/tape-ledger-*.zip \
             dist/SHA256SUMS.txt \
             --repo "$GITHUB_REPOSITORY" \
             --verify-tag \
             --draft \
             --prerelease \
-            --title "OWC LTO-8 Archiver $TAG (pre-release)" \
+            --title "Tape Ledger $TAG (pre-release)" \
             --notes-file "docs/releases/$TAG.md"
 
       - name: Summary

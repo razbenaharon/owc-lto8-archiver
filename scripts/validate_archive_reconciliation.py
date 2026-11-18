@@ -78,7 +78,7 @@ def _segment_totals(path, *, heavy=False, expected_sha=None):
     return rows, total, dirs
 
 
-def run_checks(conninfo, archive_root, *, heavy=False,
+def run_checks(conninfo, archive_root, *, tape_profile, heavy=False,
                threshold_bytes=SMALL_FILE_THRESHOLD_BYTES):
     checks = []
 
@@ -178,7 +178,7 @@ def run_checks(conninfo, archive_root, *, heavy=False,
         for tape in tapes:
             _, available = tape_budget_bytes(
                 tape["total_capacity"], tape["used_space"] or 0,
-                status=tape["status"])
+                status=tape["status"], profile=tape_profile)
             protected = str(tape["status"] or "").lower() == "full"
             protection_detail[tape["volume_label"]] = {
                 "status": tape["status"], "reason": tape["status_reason"],
@@ -205,7 +205,7 @@ def main(argv=None):
         print(f"{exc}", file=sys.stderr)
         return 1
     report = run_checks(conninfo, cfg.local_manifest_archive_root,
-                        heavy=args.heavy)
+                        tape_profile=cfg.tape_profile, heavy=args.heavy)
     if args.json:
         print(json.dumps(report, indent=2, default=str))
     else:

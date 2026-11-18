@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/razbenaharon/owc-lto8-archiver/examples/file-manifest-segment.schema.json",
+  "$id": "https://github.com/razbenaharon/tape-ledger/examples/file-manifest-segment.schema.json",
   "title": "Per-file manifest segment row (one line of a JSONL.zst segment)",
   "description": "After a validated export is pruned, these segments are the per-file source of truth for packed small files; PostgreSQL keeps only the export ledger and folder-level aggregates. One JSON object per line, zstd-compressed as a whole file.",
   "type": "object",

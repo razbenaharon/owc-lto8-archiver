@@ -7,12 +7,19 @@ planning budget the archiver enforces. Every display must now agree with
 """
 import os
 import re
+from functools import partial
 
 import pytest
 
 from src import cli
-from src.constants import (LOCAL_TAPE_BUDGET_BYTES, tape_budget_bytes,
-                           tape_usage)
+from src.constants import LEGACY_TAPE_PROFILE
+from src.constants import tape_budget_bytes as _tape_budget_bytes
+from src.constants import tape_usage as _tape_usage
+
+# These tests pin the legacy (no tape_generation) behaviour.
+tape_budget_bytes = partial(_tape_budget_bytes, profile=LEGACY_TAPE_PROFILE)
+tape_usage = partial(_tape_usage, profile=LEGACY_TAPE_PROFILE)
+LEGACY_BUDGET_BYTES = LEGACY_TAPE_PROFILE.budget_bytes
 
 CAPACITY_GB = 12288
 # 86.5% of the registered decimal capacity: the audit's worked example.
@@ -34,7 +41,7 @@ class FakeDb:
 
 
 def _cli_percent(db, capsys):
-    cli._print_tapes_table(db)
+    cli._print_tapes_table(db, LEGACY_TAPE_PROFILE)
     out = capsys.readouterr().out
     match = re.search(r"(\d+\.\d)%", out)
     assert match, out
@@ -52,7 +59,7 @@ def test_m7_audit_example_was_three_different_numbers():
 def test_m7_usage_is_measured_against_the_planning_budget():
     usage = tape_usage(CAPACITY_GB, USED_BYTES)
     budget, available = tape_budget_bytes(CAPACITY_GB, USED_BYTES)
-    assert usage.budget_bytes == budget == LOCAL_TAPE_BUDGET_BYTES
+    assert usage.budget_bytes == budget == LEGACY_BUDGET_BYTES
     assert usage.used_bytes == USED_BYTES
     assert usage.available_bytes == available
     assert usage.percent == pytest.approx(USED_BYTES / budget * 100)
@@ -65,7 +72,7 @@ def test_m7_usage_is_measured_against_the_planning_budget():
     assert over.percent_text == "150.0%"
     assert over.bar_fraction == 1.0
     # No registered capacity: planning falls back to the default budget.
-    assert tape_usage(None, 0).budget_bytes == LOCAL_TAPE_BUDGET_BYTES
+    assert tape_usage(None, 0).budget_bytes == LEGACY_BUDGET_BYTES
     assert tape_usage(0, None).percent_text == "0.0%"
 
 
@@ -73,7 +80,7 @@ def test_m7_text_menu_shows_the_planning_budget_percentage(capsys):
     percent, out = _cli_percent(FakeDb(), capsys)
     assert percent == "92.5%"
     # Decimal units, labelled as decimal: used / planning budget in GB.
-    assert f"{USED_BYTES / 1000**3:.1f}/{LOCAL_TAPE_BUDGET_BYTES / 1000**3:.0f} GB" in out
+    assert f"{USED_BYTES / 1000**3:.1f}/{LEGACY_BUDGET_BYTES / 1000**3:.0f} GB" in out
 
 
 @pytest.mark.parametrize("capacity,used", [
@@ -90,7 +97,8 @@ def test_m7_gui_and_text_menu_show_the_same_percentage(capacity, used, capsys):
 
     app = QApplication.instance() or QApplication([])
     db = FakeDb(capacity, used)
-    widget = inspector.ManageWidget(db, "fake-dsn")
+    widget = inspector.ManageWidget(db, "fake-dsn",
+                                    tape_profile=LEGACY_TAPE_PROFILE)
     widget.refresh_tapes()
     gui_percent = widget.tapes_table.item(0, 6).text()
     menu_percent, _out = _cli_percent(db, capsys)

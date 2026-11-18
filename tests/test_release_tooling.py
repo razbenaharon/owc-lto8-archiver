@@ -81,11 +81,11 @@ class BuildRelease(_ThrowawayRepo):
         result = self._build(expect_tag=self.TAG)
 
         self.assertEqual(result["zip_name"],
-                         f"owc-lto8-archiver-{self.VERSION}.zip")
+                         f"tape-ledger-{self.VERSION}.zip")
         self.assertTrue(result["prerelease"])
         self.assertEqual(sorted(os.listdir(self.out)),
                          ["SHA256SUMS.txt", result["zip_name"]])
-        prefix = f"owc-lto8-archiver-{self.VERSION}/"
+        prefix = f"tape-ledger-{self.VERSION}/"
         with zipfile.ZipFile(result["zip"]) as bundle:
             names = bundle.namelist()
         self.assertTrue(all(name.startswith(prefix) for name in names))

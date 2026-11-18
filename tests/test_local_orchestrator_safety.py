@@ -22,6 +22,7 @@ from unittest import mock
 from src import local_orchestrator as lo
 from src.windows_update_guard import (RebootAssessment, RebootSignal,
                                       SEVERITY_CRITICAL)
+from src.constants import LEGACY_TAPE_PROFILE
 
 MOUNT_OK = {"ok": True, "determinate": True, "sync_type": "time",
             "sync_seconds": 300, "declared_at": "2026-11-01T10:00:00",
@@ -59,6 +60,7 @@ class _Base(unittest.TestCase):
 
         orch = lo.LocalOrchestrator.__new__(lo.LocalOrchestrator)
         orch.cfg = SimpleNamespace(
+            tape_profile=LEGACY_TAPE_PROFILE,
             lto_drive=self.tape, ibm_eject_cmd=None,
             eject_after_session=False,
             windows_update_block_on_pending_reboot=True)
