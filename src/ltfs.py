@@ -32,7 +32,7 @@ import time
 from typing import TYPE_CHECKING
 
 from . import ltfs_ownership as _ltfs_ownership
-from .constants import DEFAULT_TAPE_CAPACITY_GB, LTFS_DIR
+from .constants import LTFS_DIR, registered_capacity_problem
 from .logsetup import get_logger
 from .ltfs_ownership import require_ownership
 from .runtime import _acquire_tape_io_lock, _release_tape_io_lock
@@ -505,11 +505,36 @@ def confirm_physical_action(word, consequence_lines):
     return True
 
 
+def prompt_tape_capacity_gb(tape_profile, question="Tape capacity in GB",
+                            attempts=3):
+    """Ask for a cartridge's registered capacity in decimal GB.
+
+    Enter (or anything that is not a whole number) takes the profile's
+    default, exactly as the prompt always did. With a configured
+    ``[HARDWARE] tape_generation`` a figure larger than that generation's
+    native capacity is refused and asked again; after ``attempts`` refusals
+    this returns None and the caller registers nothing.
+    """
+    for _ in range(attempts):
+        cap = input(f"{question} (default {tape_profile.register_gb} for "
+                    f"{tape_profile.native_tb_text} TB, Enter to skip): ").strip()
+        capacity = int(cap) if cap.isdigit() else tape_profile.register_gb
+        problem = registered_capacity_problem(capacity, tape_profile)
+        if problem is None:
+            return capacity
+        print(f"[REFUSED] {problem}")
+    print("[REFUSED] No valid capacity was entered; the tape was not "
+          "registered. Register it from Tape Maintenance -> Register tape.")
+    return None
+
+
 class TapeManager:
-    def __init__(self, db: "PgDatabaseManager", tape_drive: str, ibm_eject_cmd=None):
+    def __init__(self, db: "PgDatabaseManager", tape_drive: str, ibm_eject_cmd=None,
+                 *, tape_profile):
         self.db            = db
         self.tape_drive    = tape_drive
         self.ibm_eject_cmd = ibm_eject_cmd
+        self.tape_profile  = tape_profile
 
     def _drive_letter(self):
         return _drive_letter(self.tape_drive)
@@ -618,10 +643,9 @@ class TapeManager:
             if result.stdout:
                 print(result.stdout)
 
-            cap      = input(f"Tape capacity in GB (default {DEFAULT_TAPE_CAPACITY_GB} "
-                             "for 12 TB, Enter to skip): ").strip()
-            capacity = int(cap) if cap.isdigit() else DEFAULT_TAPE_CAPACITY_GB
-            self.db.register_tape(label, capacity)
+            capacity = prompt_tape_capacity_gb(self.tape_profile)
+            if capacity is not None:
+                self.db.register_tape(label, capacity)
         except subprocess.CalledProcessError as e:
             output = ((e.stdout or '') + (e.stderr or '')).strip()
             print(f"[ERROR] LtfsCmdFormat.exe failed:\n{output}")
@@ -635,10 +659,10 @@ class TapeManager:
         label = input("Volume label of tape to register: ").strip()
         if not label:
             return
-        cap      = input(f"Capacity in GB (default {DEFAULT_TAPE_CAPACITY_GB} "
-                         "for 12 TB, Enter to skip): ").strip()
-        capacity = int(cap) if cap.isdigit() else DEFAULT_TAPE_CAPACITY_GB
-        self.db.register_tape(label, capacity)
+        capacity = prompt_tape_capacity_gb(self.tape_profile,
+                                           question="Capacity in GB")
+        if capacity is not None:
+            self.db.register_tape(label, capacity)
 
     def check_tape(self):
         """Run LtfsCmdCheck.exe to check and repair the tape filesystem."""

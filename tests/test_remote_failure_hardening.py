@@ -44,6 +44,7 @@ from src.exit_codes import (ExitCode, StopResult, REASON_NETWORK_RETRY_EXHAUSTED
                             CLASS_CONNECTION_TIMEOUT)
 from src.pipeline_types import ContainerFormat, StagedChunk
 from src.ready_queue import ReadyQueueLimits
+from src.constants import LEGACY_TAPE_PROFILE
 
 
 def _orch(**attrs):
@@ -55,7 +56,8 @@ def _orch(**attrs):
     orch._stop_lock = threading.Lock()
     orch._stop_result = None
     orch._last_fetch_failure = None
-    orch.cfg = SimpleNamespace(backup_log_dir=None)
+    orch.cfg = SimpleNamespace(
+        tape_profile=LEGACY_TAPE_PROFILE, backup_log_dir=None)
     # Neutralised like the mount-mode and media-health checks: these cases
     # exercise the other gate steps and must not read this host's real LTFS
     # volume label. MountedCartridgeGuardTests covers the check itself.
@@ -459,7 +461,8 @@ class StatusFileTests(unittest.TestCase):
 
     def test_finalize_preserves_exit_code_when_status_write_fails(self):
         # Scenario 47: a status-write failure never changes the stop result.
-        orch = _orch(cfg=SimpleNamespace(backup_log_dir="/whatever"))
+        orch = _orch(cfg=SimpleNamespace(
+            tape_profile=LEGACY_TAPE_PROFILE, backup_log_dir="/whatever"))
         sr = StopResult(exit_code=ExitCode.TRANSIENT_RESUMABLE,
                         reason=REASON_NETWORK_RETRY_EXHAUSTED)
         with mock.patch.object(ro, "write_last_failure",
@@ -712,8 +715,9 @@ class WriteChunkRaceTests(unittest.TestCase):
         orch.remote_session_path = "/p"
         orch.skipped_tracker = None
         orch.governor = None
-        orch.cfg = SimpleNamespace(lto_drive="Z:", backup_log_dir=None,
-                                   ibm_eject_cmd="")
+        orch.cfg = SimpleNamespace(
+            tape_profile=LEGACY_TAPE_PROFILE, lto_drive="Z:",
+            backup_log_dir=None, ibm_eject_cmd="")
         statuses = []
         orch.db = SimpleNamespace(
             verify_archiver_lock=lambda: True,
@@ -849,8 +853,9 @@ class CooperativeCancelWriteTests(unittest.TestCase):
         orch.remote_session_path = "/p"
         orch.skipped_tracker = None
         orch.governor = None
-        orch.cfg = SimpleNamespace(lto_drive="Z:", backup_log_dir=None,
-                                   ibm_eject_cmd="")
+        orch.cfg = SimpleNamespace(
+            tape_profile=LEGACY_TAPE_PROFILE, lto_drive="Z:",
+            backup_log_dir=None, ibm_eject_cmd="")
         statuses = []
         orch.db = SimpleNamespace(
             verify_archiver_lock=lambda: True,
@@ -1098,7 +1103,9 @@ class FinalChunkCancelTerminalTests(unittest.TestCase):
 
     def _run(self):
         orch = _orch(prefetch_ahead=1, staging_max_bytes=10**9, fetch_cores=None)
-        orch.cfg = SimpleNamespace(lto_drive="Z:", backup_log_dir=None)
+        orch.cfg = SimpleNamespace(
+            tape_profile=LEGACY_TAPE_PROFILE, lto_drive="Z:",
+            backup_log_dir=None)
         orch.notifier = None
         orch.chunk_max_files = 10**9
         state = {"done": set()}
@@ -1271,6 +1278,7 @@ class DocsAssertionTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 def _fake_cfg():
     return SimpleNamespace(
+        tape_profile=LEGACY_TAPE_PROFILE,
         remote_host="h", remote_user="u", remote_path="/p",
         windows_update_guard=False, backup_log_dir=None,
         lto_drive="Z:", ibm_eject_cmd="", staging_dir="s", restore_dir="r",

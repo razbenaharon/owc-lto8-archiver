@@ -45,6 +45,7 @@ from unittest import mock
 from lto_fakes import MinimalBackupDB, TAPE_LOCK_USE_SITES
 
 from src import ltfs
+from src.constants import LEGACY_TAPE_PROFILE
 from src.ltfs_ownership import LtfsOwnershipError
 from src.pipeline_types import (CHUNK_TRANSITIONS, ChunkStatus,
                                 ContainerFormat, ForbiddenTransition,
@@ -414,7 +415,8 @@ class GateWorld:
             lto_drive=self.tape, backup_log_dir=self.logs, ibm_eject_cmd="",
             index_min_file_mb=10, index_packed_small_files=False,
             windows_update_block_on_pending_reboot=True,
-            eject_after_session=False, staging_dir=self.staging)
+            eject_after_session=False, staging_dir=self.staging,
+            tape_profile=LEGACY_TAPE_PROFILE)
         values.update(extra)
         return SimpleNamespace(**values)
 

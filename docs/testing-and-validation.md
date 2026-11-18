@@ -150,7 +150,7 @@ python scripts/build_release.py --expect-tag v1.0.0-rc.1
 `check_public_repo.py` fails if anything tracked by git looks like private
 or operational data (a database, a dump, a log, a real manifest, a secret, a
 real host name). Run it before every push. `build_release.py` builds
-`dist\owc-lto8-archiver-<version>.zip` and `SHA256SUMS.txt` from `HEAD`; it
+`dist\tape-ledger-<version>.zip` and `SHA256SUMS.txt` from `HEAD`; it
 refuses a dirty working tree, a failing privacy gate, or a package that
 lacks a required file. `dist\` is not committed.
 

@@ -20,6 +20,7 @@ from unittest import mock
 
 from src import cli
 from src.exit_codes import ExitCode, StopResult, REASON_BAD_CONFIG
+from src.constants import LEGACY_TAPE_PROFILE
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUN_PY = os.path.join(REPO_ROOT, "run.py")
@@ -27,6 +28,7 @@ RUN_PY = os.path.join(REPO_ROOT, "run.py")
 
 def _fake_cfg():
     return SimpleNamespace(
+        tape_profile=LEGACY_TAPE_PROFILE,
         remote_host="h", remote_user="u", remote_path="/p",
         windows_update_guard=False, backup_log_dir=None,
         lto_drive="X:", ibm_eject_cmd="", staging_dir="s", restore_dir="r",

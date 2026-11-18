@@ -1,4 +1,6 @@
-# OWC LTO-8 Archiver
+# Tape Ledger
+
+*Formerly OWC LTO-8 Archiver.*
 
 A Windows command-line tool that archives data to LTO/LTFS tape and keeps a
 searchable catalog of what is on which cartridge.
@@ -148,6 +150,7 @@ sqlite_path = lto_archive.sqlite3
 lto_drive = T:\\
 ltfs_ownership_id = drive_0000000000
 eject_after_session = false
+tape_generation = LTO-8
 
 [SETTINGS]
 zip_threshold_mb = 100

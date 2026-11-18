@@ -25,6 +25,7 @@ from src import scan_frontier as sf
 from src.exit_codes import ExitCode
 from src.pipeline_types import ContainerFormat, StagedChunk
 from src.ready_queue import ReadyQueueLimits
+from src.constants import LEGACY_TAPE_PROFILE
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TIMEOUT = 20            # every blocking assertion in this module is bounded
@@ -198,6 +199,7 @@ def build_streaming_orchestrator(db, *, prefetch_ahead=1, chunk_budget=4096,
     orch = ro.RemoteOrchestrator.__new__(ro.RemoteOrchestrator)
     orch.db = db
     orch.cfg = SimpleNamespace(
+        tape_profile=LEGACY_TAPE_PROFILE,
         lto_drive="X:\\", backup_log_dir=None, ibm_eject_cmd="",
         eject_after_session=False, allow_resume_oversized_chunks=False,
         windows_update_block_on_pending_reboot=False,

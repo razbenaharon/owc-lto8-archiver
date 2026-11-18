@@ -71,11 +71,11 @@ class VersionFlag(unittest.TestCase):
 
     def test_run_py_prints_the_version_without_config_or_database(self):
         self.assertEqual(self._version_of("run.py"),
-                         f"owc-lto8-archiver {src.__version__}")
+                         f"tape-ledger {src.__version__}")
 
     def test_inspect_db_prints_the_version_without_config_or_database(self):
         self.assertEqual(self._version_of("inspect_db.py"),
-                         f"owc-lto8-archiver {src.__version__}")
+                         f"tape-ledger {src.__version__}")
 
     def test_inspect_db_parser_lists_the_flag(self):
         import inspect_db

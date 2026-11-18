@@ -5,6 +5,35 @@ All notable changes to this project are recorded here. The format follows
 [PEP 440](https://peps.python.org/pep-0440/) in the program (`1.0.0rc1`) and
 SemVer spelling in tags (`v1.0.0-rc.1`).
 
+## Unreleased
+
+### Added
+
+- `[HARDWARE] tape_generation` (LTO-6, LTO-7, LTO-M8, LTO-8, LTO-9) sets the
+  per-cartridge planning budget for other LTO generations. Without the line
+  the budget, its "11.5 TB" label and the 12288 GB registration default are
+  unchanged. The 5% margin stays fixed in code, and an unknown value refuses
+  to start. With a generation set, a cartridge's registered capacity also
+  gets the margin: an LTO-8 cartridge registered at 12288 GB keeps its LTO-8
+  budget on an LTO-9 host. Registering a capacity above the generation's
+  native figure is refused. Every tape-write run prints the budget in force.
+  A local session resumed with chunks larger than the current budget refuses
+  to start.
+
+### Changed
+
+- The project is renamed from OWC LTO-8 Archiver to **Tape Ledger**
+  (`tape-ledger`): it never depended on one drive vendor, and the cartridge
+  generation is now a setting. The `--version` text and the release archive
+  name change with it (`tape-ledger-<version>.zip`). The cross-process LTFS
+  ownership mutex (`OWC_LTO8_LTFS_OWNERSHIP_*`), the PostgreSQL advisory lock
+  key and the `lto8_observations` folder keep their old names on purpose, so
+  an older and a newer copy still exclude each other and existing logs stay
+  where they are.
+- The planning budget is passed explicitly from the configuration to every
+  caller. `LOCAL_TAPE_BUDGET_BYTES`, `TAPE_BUDGET_LABEL` and
+  `DEFAULT_TAPE_CAPACITY_GB` are removed from `src/constants.py`.
+
 ## 1.0.0-rc.1 - unreleased
 
 Pre-release. First version prepared for public use. Release notes with

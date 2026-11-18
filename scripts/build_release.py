@@ -5,7 +5,7 @@
 
 Produces, in ``dist/`` (gitignored):
 
-    owc-lto8-archiver-<version>.zip    ``git archive`` of HEAD - tracked files
+    tape-ledger-<version>.zip    ``git archive`` of HEAD - tracked files
                                        only, under one top-level folder
     SHA256SUMS.txt                     ``<sha256>  <file name>``
 
@@ -36,7 +36,7 @@ import sys
 import zipfile
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PACKAGE_NAME = "owc-lto8-archiver"
+PACKAGE_NAME = "tape-ledger"
 CHECKSUM_FILE = "SHA256SUMS.txt"
 
 #: Must be in the package: both dependency sets, the config template, the
@@ -234,7 +234,7 @@ def build(repo=REPO_ROOT, output_dir=None, expect_tag=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Build dist/owc-lto8-archiver-<version>.zip and "
+        description="Build dist/tape-ledger-<version>.zip and "
                     "SHA256SUMS.txt from the committed tree. Builds files "
                     "only: no tag, no push, no publishing.")
     parser.add_argument("--expect-tag",

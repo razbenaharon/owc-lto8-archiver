@@ -1,4 +1,4 @@
-# OWC LTO-8 archiver — the optional DB Inspector GUI (`python inspect_db.py`
+# Tape Ledger — the optional DB Inspector GUI (`python inspect_db.py`
 # with no command flag). Install it on top of requirements-core.txt or
 # requirements-postgres.txt; the command-line program does not need it.
 #

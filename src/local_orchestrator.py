@@ -7,11 +7,9 @@ from typing import Type
 
 from .archiver_lock_guard import assert_archiver_lock_held
 from .backup import LTOBackup, _NoEjectBackup
-from .constants import (DEFAULT_TAPE_CAPACITY_GB, LOCAL_STAGING_RESERVE_BYTES,
-                        LOCAL_TAPE_BUDGET_BYTES, ROOT_FILES_GROUP,
-                        TAPE_BUDGET_LABEL, _auto_pack_decision,
-                        tape_budget_bytes, tape_is_full,
-                        tape_status_reason_suffix)
+from .constants import (LOCAL_STAGING_RESERVE_BYTES, ROOT_FILES_GROUP,
+                        _auto_pack_decision, tape_budget_bytes, tape_is_full,
+                        tape_profile_banner, tape_status_reason_suffix)
 from .logsetup import get_logger
 from .ltfs import (_ensure_lto_drive_ready, confirm_physical_action,
                    eject_tape_drive, get_volume_label)
@@ -153,13 +151,16 @@ class LocalOrchestrator:
             print("[ABORTED] Local session was not created.")
             return
 
+        tape_profile = self.cfg.tape_profile
         plan = self._mounted_tape_plan_context()
         chunks = analyzer.build_local_allocation_plan(
             source_dir,
+            tape_profile=tape_profile,
             first_tape_budget_bytes=plan['available_bytes'],
         )
         analyzer.render_allocation_plan(
             chunks,
+            tape_profile=tape_profile,
             first_tape_used_bytes=plan['used_bytes'],
             first_tape_label=plan['tape_label'],
         )
@@ -178,14 +179,15 @@ class LocalOrchestrator:
 
     def _mounted_tape_plan_context(self):
         """Return the first-tape budget after reconciling DB occupancy."""
+        tape_profile = self.cfg.tape_profile
         tape_label = get_volume_label(self.cfg.lto_drive)
         if not tape_label:
             print("[TAPE] No mounted volume label detected; the plan assumes the "
-                  f"first tape has the full {TAPE_BUDGET_LABEL} safety budget.")
+                  f"first tape has the full {tape_profile.label} safety budget.")
             return {
                 'tape_label': None,
                 'used_bytes': 0,
-                'available_bytes': LOCAL_TAPE_BUDGET_BYTES,
+                'available_bytes': tape_profile.budget_bytes,
             }
 
         tape = self.db.get_tape(tape_label)
@@ -196,12 +198,13 @@ class LocalOrchestrator:
             return {
                 'tape_label': tape_label,
                 'used_bytes': 0,
-                'available_bytes': LOCAL_TAPE_BUDGET_BYTES,
+                'available_bytes': tape_profile.budget_bytes,
             }
 
         used_bytes = self.db.recalculate_tape_used_space(tape_label)
         _, available_bytes = tape_budget_bytes(
-            tape['total_capacity'], used_bytes, status=tape.get('status'))
+            tape['total_capacity'], used_bytes, status=tape.get('status'),
+            profile=tape_profile)
         print(f"[TAPE] Mounted '{tape_label}': DB occupied "
               f"{used_bytes / 1024**4:.2f} TiB; safe remaining "
               f"{available_bytes / 1024**4:.2f} TiB.")
@@ -214,7 +217,7 @@ class LocalOrchestrator:
         if available_bytes <= 0:
             raise RuntimeError(
                 f"[TAPE] Mounted tape '{tape_label}' has no capacity remaining "
-                f"under the {TAPE_BUDGET_LABEL} safety budget."
+                f"under the {tape_profile.label} safety budget."
             )
         return {
             'tape_label': tape_label,
@@ -263,8 +266,15 @@ class LocalOrchestrator:
             print("[LOCAL] Session complete. All chunks archived.")
             return
 
+        tape_profile = self.cfg.tape_profile
+        if not self._pending_chunks_fit_budget(session_id, pending,
+                                               tape_profile):
+            return
+
         if not _ensure_lto_drive_ready(self.cfg.lto_drive):
             return
+
+        print(f"[TAPE] {tape_profile_banner(tape_profile)}")
 
         print(f"\n[LOCAL] Processing {len(pending)} pending chunk(s).")
         for loop_idx, chunk_index in enumerate(pending):
@@ -304,6 +314,36 @@ class LocalOrchestrator:
         )
         print("\n[LOCAL] Session complete. All chunks archived.")
         self._eject_at_session_end()
+
+    def _pending_chunks_fit_budget(self, session_id, pending, tape_profile):
+        """Refuse to resume when a pending chunk exceeds the current budget.
+
+        Chunk sizes are fixed when a session is planned. If
+        ``[HARDWARE] tape_generation`` has since been lowered, a chunk planned
+        for the larger cartridge can no longer fit on any cartridge, and the
+        per-chunk check would only refuse it after the operator has loaded a
+        tape. Refusing here, before anything touches the drive, follows the
+        "refuse to start work likely to be interrupted" rule.
+        """
+        budget = tape_profile.budget_bytes
+        oversized = []
+        for chunk_index in pending:
+            entries = self.db.get_local_chunk_entries(session_id, chunk_index)
+            planned = sum(e['dir_size_bytes'] for e in entries)
+            if planned > budget:
+                oversized.append((chunk_index, planned))
+        if not oversized:
+            return True
+        print(f"[LOCAL] REFUSED: {len(oversized)} pending chunk(s) are larger "
+              f"than the current {tape_profile.generation} budget of "
+              f"{tape_profile.label} per cartridge:")
+        for chunk_index, planned in oversized:
+            print(f"        chunk {chunk_index + 1}: "
+                  f"{planned / 1000**4:.2f} TB planned")
+        print("        The session was planned for a larger cartridge. Restore "
+              "the previous [HARDWARE] tape_generation, or abandon this "
+              "session and plan it again. Nothing was written.")
+        return False
 
     def _process_chunk(self, session, chunk_index, entries):
         # Audit H6: prove the single-writer lock is still ours before this
@@ -459,7 +499,8 @@ class LocalOrchestrator:
                           "and is not empty. Register it first or use a blank tape.")
                     return None
                 print(f"[TAPE] Registering fresh tape '{tape_label}'.")
-                self.db.register_tape(tape_label, DEFAULT_TAPE_CAPACITY_GB)
+                self.db.register_tape(tape_label,
+                                      self.cfg.tape_profile.register_gb)
             elif not root_empty or record_count > 0:
                 print(f"[TAPE] Appending to registered tape '{tape_label}' "
                       f"({record_count} indexed file record(s) already present).")
@@ -487,7 +528,7 @@ class LocalOrchestrator:
         planned_bytes = sum(e['dir_size_bytes'] for e in entries)
 
         # The LTFS free-space figure is advisory only (it varies with hardware
-        # compression); LOCAL_TAPE_BUDGET_BYTES is the authoritative guard. This
+        # compression); the tape profile's budget is the authoritative guard. This
         # probe is a best-effort early-out, so a read failure is non-fatal.
         _acquire_tape_io_lock(f"read free space {self.cfg.lto_drive}")
         try:
@@ -515,7 +556,8 @@ class LocalOrchestrator:
 
         used_bytes = self.db.recalculate_tape_used_space(tape_label)
         _, available_bytes = tape_budget_bytes(
-            tape['total_capacity'], used_bytes, status=tape.get('status'))
+            tape['total_capacity'], used_bytes, status=tape.get('status'),
+            profile=self.cfg.tape_profile)
         if planned_bytes > available_bytes:
             print(f"[TAPE] '{tape_label}' does not have enough indexed "
                   f"capacity for this chunk ({planned_bytes / 1024**3:.2f} "

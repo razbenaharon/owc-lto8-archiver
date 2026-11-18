@@ -1001,10 +1001,11 @@ class DirectoryCatalogWidget(QWidget):
 
 
 class ManageWidget(QWidget):
-    def __init__(self, db, db_path, parent=None):
+    def __init__(self, db, db_path, parent=None, *, tape_profile):
         super().__init__(parent)
         self.db = db
         self.db_path = db_path
+        self.tape_profile = tape_profile
         self.tasks = TaskRunner(self)
         self._sessions_token = 0
         self._write_in_flight = False
@@ -1140,7 +1141,7 @@ class ManageWidget(QWidget):
             cap = tape["total_capacity"] or 0
             full = tape_is_full(tape.get("status"))
             # Percent of the planning budget — shared with the text menu.
-            usage = tape_usage(cap, used)
+            usage = tape_usage(cap, used, profile=self.tape_profile)
             values = [
                 tape["tape_id"], label, _fmt_ts(tape["date_formatted"]),
                 cap or "", _fmt_bytes(used),
@@ -1341,7 +1342,7 @@ class ManageWidget(QWidget):
 
 
 class DBInspectorQtApp(QMainWindow):
-    def __init__(self, db, db_path, display_ref=None):
+    def __init__(self, db, db_path, display_ref=None, *, tape_profile):
         super().__init__()
         self.db = db
         self.db_path = db_path
@@ -1355,7 +1356,8 @@ class DBInspectorQtApp(QMainWindow):
         self.browse = BrowseWidget(db, db_path, self)
         self.search = SearchWidget(db, db_path, self)
         self.directory_catalog = DirectoryCatalogWidget(db, db_path, self)
-        self.manage = ManageWidget(db, db_path, self)
+        self.manage = ManageWidget(db, db_path, self,
+                                   tape_profile=tape_profile)
         tabs.addTab(self.browse, "Files")
         tabs.addTab(self.search, "Search")
         tabs.addTab(self.directory_catalog, "Directory Catalog")
@@ -1395,10 +1397,11 @@ class DBInspectorQtApp(QMainWindow):
             self.manage.refresh()
 
 
-def run_qt_inspector(db, db_path, display_ref=None):
+def run_qt_inspector(db, db_path, display_ref=None, *, tape_profile):
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("LTO Archive Inspector")
-    window = DBInspectorQtApp(db, db_path, display_ref=display_ref)
+    window = DBInspectorQtApp(db, db_path, display_ref=display_ref,
+                              tape_profile=tape_profile)
     window.show()
     code = app.exec()
     # Let in-flight database calls finish before the window (and the runners
@@ -1417,6 +1420,7 @@ if __name__ == "__main__":
     db = create_database_manager(cfg)
     try:
         raise SystemExit(run_qt_inspector(
-            db, cfg.db_dsn, display_ref=cfg.db_display_ref))
+            db, cfg.db_dsn, display_ref=cfg.db_display_ref,
+            tape_profile=cfg.tape_profile))
     finally:
         db.close()

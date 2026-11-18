@@ -14,8 +14,7 @@ try:
 except ImportError:  # pragma: no cover - requirements includes zstandard
     zstd = None
 
-from .constants import (LOCAL_STAGING_RESERVE_BYTES, LOCAL_TAPE_BUDGET_BYTES,
-                        ROOT_FILES_GROUP, TAPE_BUDGET_LABEL,
+from .constants import (LOCAL_STAGING_RESERVE_BYTES, ROOT_FILES_GROUP,
                         ZIP_BUNDLE_FILL_FACTOR, _auto_pack_decision)
 from .pipeline_types import FileRecord
 from .robocopy import _robocopy_file
@@ -161,9 +160,9 @@ class LTOAnalyzer:
             print(">>> RECOMMENDATION: DIRECT BACKUP (packing is not worth staging the large files)")
             return False
 
-    def build_local_allocation_plan(self, source_dir,
-                                    budget_bytes=LOCAL_TAPE_BUDGET_BYTES,
+    def build_local_allocation_plan(self, source_dir, *, tape_profile,
                                     first_tape_budget_bytes=None):
+        budget_bytes = tape_profile.budget_bytes
         print(f"\n[ANALYZER] Building local multi-tape plan: {source_dir}")
         if not os.path.isdir(source_dir):
             raise RuntimeError(f"[ANALYZER] Source directory not found: {source_dir}")
@@ -186,7 +185,7 @@ class LTOAnalyzer:
 
                 if size > budget_bytes:
                     raise RuntimeError(
-                        f"[FATAL] Single file exceeds the {TAPE_BUDGET_LABEL} "
+                        f"[FATAL] Single file exceeds the {tape_profile.label} "
                         "tape safety limit. Spanning one file across tapes is "
                         "unsupported; manually split it with CLI utilities "
                         "before archiving:\n"
@@ -214,7 +213,7 @@ class LTOAnalyzer:
         for entry in entries:
             if entry['size_bytes'] > budget_bytes:
                 raise RuntimeError(
-                    f"[FATAL] Top-level directory exceeds the {TAPE_BUDGET_LABEL} "
+                    f"[FATAL] Top-level directory exceeds the {tape_profile.label} "
                     "tape budget and cannot be split automatically:\n"
                     f"        {entry['name']} ({entry['size_bytes'] / 1000**4:.2f} TB)"
                 )
@@ -241,7 +240,9 @@ class LTOAnalyzer:
         capacities = []
         if first_tape_budget_bytes is not None:
             chunks.append([])
-            capacities.append(max(0, first_tape_budget_bytes))
+            # Never above the per-cartridge budget, whatever a caller passes.
+            capacities.append(
+                max(0, min(first_tape_budget_bytes, budget_bytes)))
         for entry in sorted(entries, key=lambda e: (-e['size_bytes'], e['name'].lower())):
             placed = False
             for chunk, capacity in zip(chunks, capacities):
@@ -255,10 +256,10 @@ class LTOAnalyzer:
                 capacities.append(budget_bytes)
         return [chunk for chunk in chunks if chunk]
 
-    def render_allocation_plan(self, chunks,
-                               budget_bytes=LOCAL_TAPE_BUDGET_BYTES,
+    def render_allocation_plan(self, chunks, *, tape_profile,
                                first_tape_used_bytes=0,
                                first_tape_label=None):
+        budget_bytes = tape_profile.budget_bytes
         print("\n" + "=" * 60)
         print("LOCAL MULTI-TAPE ALLOCATION PLAN")
         print("=" * 60)
@@ -272,10 +273,10 @@ class LTOAnalyzer:
                 print(f"Tape {idx}{label}: {planned / 1024**4:.2f} TiB planned | "
                       f"DB occupied {occupied / 1024**4:.2f} TiB | "
                       f"after archive {resulting / 1024**4:.2f} TiB "
-                      f"({pct:.1f}% of {TAPE_BUDGET_LABEL} budget)")
+                      f"({pct:.1f}% of {tape_profile.label} budget)")
             else:
                 print(f"Tape {idx}{label}: {planned / 1024**4:.2f} TiB "
-                      f"({pct:.1f}% of {TAPE_BUDGET_LABEL} budget)")
+                      f"({pct:.1f}% of {tape_profile.label} budget)")
             for entry in sorted(chunk, key=lambda e: e['name'].lower()):
                 print(f"  - {entry['name']}  {entry['size_bytes'] / 1024**3:.2f} GiB")
         print("-" * 60)

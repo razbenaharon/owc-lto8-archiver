@@ -13,7 +13,12 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.constants import tape_budget_bytes, tape_is_full  # noqa: E402
+from functools import partial  # noqa: E402
+
+from src.constants import LEGACY_TAPE_PROFILE, tape_is_full  # noqa: E402
+from src.constants import tape_budget_bytes as _tape_budget_bytes  # noqa: E402
+
+tape_budget_bytes = partial(_tape_budget_bytes, profile=LEGACY_TAPE_PROFILE)
 
 try:
     import zstandard as zstd
